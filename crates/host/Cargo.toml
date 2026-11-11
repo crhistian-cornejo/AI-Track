@@ -8,6 +8,43 @@ publish = false
 
 [dependencies]
 aitrack-dsp.workspace = true
+aitrack-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rtrb.workspace = true
+# VST3: coupler-rs bindings generated from the MIT VST3 SDK 3.8 (MIT OR Apache-2.0).
+# NOT `vst3-sys` (GPLv3), which deny.toml bans.
+vst3 = "0.3"
+# CLAP: prokopyl/clack (MIT OR Apache-2.0).
+clack-host = "0.2"
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "tail", "log", "timer"] }
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_Security",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSThread"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSGraphics"] }
+core-foundation = "0.10"
+
+[dev-dependencies]
 
 [lints]
 workspace = true

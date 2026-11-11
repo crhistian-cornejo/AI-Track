@@ -78,3 +78,8 @@ opt-level = 2
 
 [profile.dev]
 opt-level = 1
+
+# Avoids intermittent LNK1103 (corrupt debug info) when rebuilding the host crate on Windows.
+[profile.dev.package.aitrack-host]
+debug = "line-tables-only"
+

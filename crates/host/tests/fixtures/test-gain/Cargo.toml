@@ -1,0 +1,19 @@
+[package]
+name = "aitrack-test-gain"
+description = "Test fixture for aitrack-host: a gain plugin exported as both CLAP and VST3."
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+clap-sys = "0.5"
+vst3 = "0.3"
+
+# Standalone: not a member of the AI-Track workspace. The integration tests
+# build it with `cargo build --manifest-path` into a separate target dir.
+[workspace]

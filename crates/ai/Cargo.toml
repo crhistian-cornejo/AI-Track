@@ -6,8 +6,45 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "aitrack-ml-worker"
+path = "src/bin/aitrack-ml-worker.rs"
+
 [dependencies]
 aitrack-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+
+# Decoding (MPL-2.0, file-level copyleft only; allowed by deny.toml).
+symphonia = { version = "0.5.5", default-features = false, features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis", "aac", "isomp4", "alac", "adpcm", "aiff"] }
+# Resampling (MIT).
+rubato = "0.16"
+# FFT (MIT/Apache-2.0).
+rustfft = "6.4"
+realfft = "3.5"
+# WAV writing for stems (Apache-2.0).
+hound = "3.5"
+# Model manager: app-data dir, HTTPS download (rustls), SHA-256, archives.
+dirs = "6"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+# Preloads DirectML.dll next to onnxruntime.dll on Windows before ORT loads.
+libloading = "0.9"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+# ONNX Runtime, loaded at runtime from the shared library the model manager
+# downloads, so the app binary carries no ORT and links nothing at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["coreml"] }
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["directml"] }
 
 [lints]
 workspace = true

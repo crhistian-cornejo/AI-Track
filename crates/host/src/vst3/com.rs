@@ -508,11 +508,11 @@ impl ParamQueue {
     fn add(&self, offset: i32, value: f64) -> i32 {
         let pts = &mut self.d().1;
         // Points must be ordered by offset; replace a same-offset point.
-        if let Some(last) = pts.last_mut() {
-            if last.0 >= offset {
-                *last = (last.0.max(offset), value);
-                return pts.len() as i32 - 1;
-            }
+        if let Some(last) = pts.last_mut()
+            && last.0 >= offset
+        {
+            *last = (last.0.max(offset), value);
+            return pts.len() as i32 - 1;
         }
         if pts.len() < pts.capacity() {
             pts.push((offset, value));

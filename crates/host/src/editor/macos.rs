@@ -27,9 +27,7 @@ impl Window {
             style |= NSWindowStyleMask::Resizable;
         }
         let rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width as f64, height as f64));
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, style, NSBackingStoreType::Buffered, false)
-        };
+        let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, style, NSBackingStoreType::Buffered, false) };
         // We own the window; closing it must only hide it so the host can
         // detach the plugin view first.
         unsafe { window.setReleasedWhenClosed(false) };
@@ -87,9 +85,8 @@ pub(super) fn pump_messages() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let app = NSApplication::sharedApplication(mtm);
     loop {
-        let event = unsafe {
-            app.nextEventMatchingMask_untilDate_inMode_dequeue(NSEventMask::Any, Some(&NSDate::distantPast()), NSDefaultRunLoopMode, true)
-        };
+        let event =
+            unsafe { app.nextEventMatchingMask_untilDate_inMode_dequeue(NSEventMask::Any, Some(&NSDate::distantPast()), NSDefaultRunLoopMode, true) };
         match event {
             Some(e) => app.sendEvent(&e),
             None => break,

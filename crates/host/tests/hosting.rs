@@ -169,5 +169,6 @@ fn enumerate_both_formats() {
     assert_eq!(vst3[0].version, "1.0.0");
     assert!(vst3[0].probed);
     assert_eq!(vst3[0].params, 1);
-    assert_eq!(vst3[0].uid.len(), 32);
+    // Canonical INLINE_UID form, independent of the COM byte order on Windows.
+    assert_eq!(vst3[0].uid, "41495452544741494E50524F43000001");
 }

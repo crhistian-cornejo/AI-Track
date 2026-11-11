@@ -74,21 +74,13 @@ unsafe impl Send for ClapAudio {}
 
 pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
     let entry = load_entry(&info.path)?;
-    let mut hosted = super::enumerate(&info.path)?
-        .into_iter()
-        .find(|i| i.uid == info.uid)
-        .ok_or_else(|| Error::NotFound(info.uid.clone()))?;
+    let mut hosted = super::enumerate(&info.path)?.into_iter().find(|i| i.uid == info.uid).ok_or_else(|| Error::NotFound(info.uid.clone()))?;
     let id = CString::new(info.uid.clone()).map_err(|_| Error::NotFound(info.uid.clone()))?;
     let flags = Arc::new(ClapFlags::default());
     let (f1, f2) = (flags.clone(), flags.clone());
-    let mut instance = PluginInstance::<ClapHost>::new(
-        move |_| ClapShared { flags: f1 },
-        move |_| ClapMainThread::new(f2),
-        &entry,
-        &id,
-        &host_info()?,
-    )
-    .map_err(|e| Error::Instantiate(format!("{e:?}")))?;
+    let mut instance =
+        PluginInstance::<ClapHost>::new(move |_| ClapShared { flags: f1 }, move |_| ClapMainThread::new(f2), &entry, &id, &host_info()?)
+            .map_err(|e| Error::Instantiate(format!("{e:?}")))?;
 
     let tail_ext: Option<PluginTail> = instance.plugin_shared_handle().get_extension();
     let handle = instance.plugin_handle();
@@ -127,10 +119,11 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
     hosted.outputs = out_ch.first().copied().unwrap_or(0) as u16;
     hosted.params = params.len() as u32;
     hosted.probed = true;
-    if let Some(np) = &note_ext {
-        if np.count(&handle, true) > 0 && in_ch.is_empty() {
-            hosted.is_instrument = true;
-        }
+    if let Some(np) = &note_ext
+        && np.count(&handle, true) > 0
+        && in_ch.is_empty()
+    {
+        hosted.is_instrument = true;
     }
 
     let (edits_tx, edits_rx) = rtrb::RingBuffer::new(PARAM_EDIT_QUEUE);
@@ -159,14 +152,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
         tail_ext,
         steady: 0,
     };
-    Ok(Loaded {
-        main: MainSide::Clap(Box::new(main)),
-        audio: AudioSide::Clap(Box::new(audio)),
-        info: hosted,
-        params,
-        values,
-        edits: edits_rx,
-    })
+    Ok(Loaded { main: MainSide::Clap(Box::new(main)), audio: AudioSide::Clap(Box::new(audio)), info: hosted, params, values, edits: edits_rx })
 }
 
 fn port_channels(ports: Option<&PluginAudioPorts>, handle: &PluginMainThreadHandle) -> (Vec<usize>, Vec<usize>) {
@@ -190,10 +176,7 @@ impl ClapMain {
         audio.configure(&in_ch, &out_ch, max_frames);
         let flags = self.flags.clone();
         let config = PluginAudioConfiguration { sample_rate, min_frames_count: 1, max_frames_count: max_frames as u32 };
-        let stopped = self
-            .instance
-            .activate(move |_, _| ClapAudioHandler { flags }, config)
-            .map_err(|e| Error::Activate(format!("{e:?}")))?;
+        let stopped = self.instance.activate(move |_, _| ClapAudioHandler { flags }, config).map_err(|e| Error::Activate(format!("{e:?}")))?;
         audio.processor = Some(stopped.into());
         audio.flags.tail_changed.store(true, Ordering::Release);
         let latency = match &self.latency_ext {
@@ -421,10 +404,10 @@ impl ClapAudio {
     }
 
     pub fn reset(&mut self) {
-        if let Some(p) = self.processor.as_mut() {
-            if let Ok(s) = p.as_started_mut() {
-                s.reset();
-            }
+        if let Some(p) = self.processor.as_mut()
+            && let Ok(s) = p.as_started_mut()
+        {
+            s.reset();
         }
     }
 
@@ -521,10 +504,11 @@ impl ClapAudio {
                 latency: 0,
                 channels: AudioPortBufferType::f32_input_only(chs.iter_mut().map(|c| InputChannel::variable(&mut c[..frames]))),
             }));
-            let mut output = self.out_ports.with_output_buffers(self.out_scratch.buses_mut().iter_mut().map(|chs| AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_output_only(chs.iter_mut().map(|c| &mut c[..frames])),
-            }));
+            let mut output =
+                self.out_ports.with_output_buffers(self.out_scratch.buses_mut().iter_mut().map(|chs| AudioPortBuffer {
+                    latency: 0,
+                    channels: AudioPortBufferType::f32_output_only(chs.iter_mut().map(|c| &mut c[..frames])),
+                }));
             started.process(&input, &mut output, &self.in_events.as_input(), &mut self.out_events.as_output(), Some(self.steady), Some(&transport))
         };
         self.steady += frames as u64;
@@ -551,24 +535,29 @@ impl ClapAudio {
             }
         }
 
-        if self.flags.tail_changed.swap(false, Ordering::AcqRel) {
-            if let Some(tail) = self.tail_ext {
-                let t = tail.get(&started.plugin_handle());
-                let samples = if t.is_infinite() { u32::MAX } else { t.to_raw() };
-                state.tail.store(samples, Ordering::Relaxed);
-            }
+        if self.flags.tail_changed.swap(false, Ordering::AcqRel)
+            && let Some(tail) = self.tail_ext
+        {
+            let t = tail.get(&started.plugin_handle());
+            let samples = if t.is_infinite() { u32::MAX } else { t.to_raw() };
+            state.tail.store(samples, Ordering::Relaxed);
         }
         result.is_ok()
     }
 }
 
 fn pckn(channel: u8, key: u8, note_id: i32) -> Pckn {
-    if note_id >= 0 { Pckn::new(0u16, channel as u16, key as u16, note_id as u32) } else { Pckn::new(0u16, channel as u16, key as u16, clack_host::events::Match::All) }
+    if note_id >= 0 {
+        Pckn::new(0u16, channel as u16, key as u16, note_id as u32)
+    } else {
+        Pckn::new(0u16, channel as u16, key as u16, clack_host::events::Match::All)
+    }
 }
 
 fn make_transport(ctx: &ProcessContext<'_>) -> TransportEvent {
     let t = ctx.transport;
-    let mut flags = TransportFlags::HAS_TEMPO | TransportFlags::HAS_BEATS_TIMELINE | TransportFlags::HAS_SECONDS_TIMELINE | TransportFlags::HAS_TIME_SIGNATURE;
+    let mut flags =
+        TransportFlags::HAS_TEMPO | TransportFlags::HAS_BEATS_TIMELINE | TransportFlags::HAS_SECONDS_TIMELINE | TransportFlags::HAS_TIME_SIGNATURE;
     if t.playing {
         flags |= TransportFlags::IS_PLAYING;
     }

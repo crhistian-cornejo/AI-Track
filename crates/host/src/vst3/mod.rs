@@ -8,6 +8,10 @@
 //!   connected through IConnectionPoint), bus setup, `process`, state,
 //!   editor.
 
+// The SDK's enum constants are `c_int` on Windows and `c_uint` elsewhere:
+// casts that are no-ops on one platform are required on the other.
+#![allow(clippy::unnecessary_cast)]
+
 mod com;
 mod instance;
 pub mod module;
@@ -21,7 +25,7 @@ use vst3::Steinberg::*;
 use vst3::{ComPtr, Interface};
 
 use crate::error::Result;
-use crate::info::{HostedPluginInfo, tuid_to_hex};
+use crate::info::HostedPluginInfo;
 use crate::strings::{from_c_chars, from_utf16};
 use aitrack_model::PluginFormat;
 
@@ -78,18 +82,16 @@ pub(crate) fn audio_classes(factory: &ComPtr<IPluginFactory>) -> Vec<ClassEntry>
                 got = true;
             }
         }
-        if !got {
-            if let Some(f2) = &f2 {
-                let mut c2: PClassInfo2 = unsafe { std::mem::zeroed() };
-                if unsafe { f2.getClassInfo2(i, &mut c2) } == vst3::Steinberg::kResultOk {
-                    entry.name = from_c_chars(&c2.name);
-                    let v = from_c_chars(&c2.vendor);
-                    if !v.is_empty() {
-                        entry.vendor = v;
-                    }
-                    entry.version = from_c_chars(&c2.version);
-                    entry.sub_categories = from_c_chars(&c2.subCategories);
+        if !got && let Some(f2) = &f2 {
+            let mut c2: PClassInfo2 = unsafe { std::mem::zeroed() };
+            if unsafe { f2.getClassInfo2(i, &mut c2) } == vst3::Steinberg::kResultOk {
+                entry.name = from_c_chars(&c2.name);
+                let v = from_c_chars(&c2.vendor);
+                if !v.is_empty() {
+                    entry.vendor = v;
                 }
+                entry.version = from_c_chars(&c2.version);
+                entry.sub_categories = from_c_chars(&c2.subCategories);
             }
         }
         out.push(entry);
@@ -97,12 +99,39 @@ pub(crate) fn audio_classes(factory: &ComPtr<IPluginFactory>) -> Vec<ClassEntry>
     out
 }
 
+/// A class id as 32 hex digits of its four 32-bit words (the SDK's
+/// `INLINE_UID` / moduleinfo.json form). Identical on every platform, even
+/// though Windows stores the bytes COM-swapped in memory.
+pub fn uid_to_string(cid: &TUID) -> String {
+    let b: [u8; 16] = cid.map(|x| x as u8);
+    let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let (a, w1) = if cfg!(windows) {
+        let a = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let hi = u16::from_le_bytes([b[4], b[5]]) as u32;
+        let lo = u16::from_le_bytes([b[6], b[7]]) as u32;
+        (a, (hi << 16) | lo)
+    } else {
+        (be(0), be(4))
+    };
+    format!("{a:08X}{w1:08X}{:08X}{:08X}", be(8), be(12))
+}
+
+/// Inverse of [`uid_to_string`].
+pub fn uid_from_string(s: &str) -> Option<TUID> {
+    let bytes = tuid_hex(s)?;
+    let w = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    Some(vst3::uid(w(0), w(4), w(8), w(12)))
+}
+
+fn tuid_hex(s: &str) -> Option<[u8; 16]> {
+    crate::info::hex_to_tuid(s)
+}
+
 pub(crate) fn entry_to_info(path: &Path, e: &ClassEntry) -> HostedPluginInfo {
-    let cid: [u8; 16] = e.cid.map(|b| b as u8);
     let is_instrument = e.sub_categories.split('|').any(|c| c.eq_ignore_ascii_case("Instrument"));
     HostedPluginInfo {
         format: PluginFormat::Vst3,
-        uid: tuid_to_hex(&cid),
+        uid: uid_to_string(&e.cid),
         name: e.name.clone(),
         vendor: e.vendor.clone(),
         version: e.version.clone(),
@@ -143,4 +172,16 @@ pub fn probe(path: &Path) -> Result<Vec<HostedPluginInfo>> {
 
 pub(crate) fn iid_ptr<I: Interface>() -> *const std::ffi::c_char {
     I::IID.as_ptr() as *const std::ffi::c_char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uid_string_is_platform_independent() {
+        let cid = vst3::uid(0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00);
+        assert_eq!(uid_to_string(&cid), "112233445566778899AABBCCDDEEFF00");
+        assert_eq!(uid_from_string("112233445566778899aabbccddeeff00"), Some(cid));
+    }
 }

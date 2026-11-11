@@ -396,12 +396,8 @@ mod clap {
 
     #[no_mangle]
     #[used]
-    pub static clap_entry: clap_plugin_entry = clap_plugin_entry {
-        clap_version: CLAP_VERSION,
-        init: Some(entry_init),
-        deinit: Some(entry_deinit),
-        get_factory: Some(entry_get_factory),
-    };
+    pub static clap_entry: clap_plugin_entry =
+        clap_plugin_entry { clap_version: CLAP_VERSION, init: Some(entry_init), deinit: Some(entry_deinit), get_factory: Some(entry_get_factory) };
 }
 
 // ═════════════════════════════════════ VST3 ═════════════════════════════════

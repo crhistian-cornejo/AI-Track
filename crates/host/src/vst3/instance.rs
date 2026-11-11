@@ -17,7 +17,7 @@ use super::module::Vst3Module;
 use super::{entry_to_info, iid_ptr};
 use crate::editor::EditorWindow;
 use crate::error::{HostError, Result};
-use crate::info::{HostedPluginInfo, hex_to_tuid};
+use crate::info::HostedPluginInfo;
 use crate::io::BusScratch;
 use crate::params::{PARAM_EDIT_QUEUE, PendingParams};
 use crate::plugin::{AudioSide, Loaded, MainSide, SharedState, bar_start_beats};
@@ -101,8 +101,7 @@ fn host_unknown(app: &ComWrapper<HostApp>) -> *mut FUnknown {
 /// Instantiate `info` (a processor class id in `info.path`).
 pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
     let module = Vst3Module::load(&info.path)?;
-    let cid_bytes = hex_to_tuid(&info.uid).ok_or_else(|| HostError::NotFound(info.uid.clone()))?;
-    let cid: TUID = cid_bytes.map(|b| b as i8);
+    let cid: TUID = super::uid_from_string(&info.uid).ok_or_else(|| HostError::NotFound(info.uid.clone()))?;
     let factory = module.factory();
     let entry = super::audio_classes(factory).into_iter().find(|e| e.cid == cid);
     let mut hosted = match &entry {
@@ -237,14 +236,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
         sample_rate: 48_000.0,
         _module: module,
     };
-    Ok(Loaded {
-        main: MainSide::Vst3(Box::new(main)),
-        audio: AudioSide::Vst3(Box::new(audio)),
-        info: hosted,
-        params,
-        values,
-        edits: edits_rx,
-    })
+    Ok(Loaded { main: MainSide::Vst3(Box::new(main)), audio: AudioSide::Vst3(Box::new(audio)), info: hosted, params, values, edits: edits_rx })
 }
 
 /// Instantiate briefly to read `(inputs, outputs, params)`.
@@ -281,8 +273,8 @@ fn read_params(c: &ComPtr<IEditController>, params: &mut Vec<ParamInfo>, values:
             p.scale = ParamScale::Stepped;
         }
         let flags = pi.flags;
-        p.automatable = flags & ParameterInfo_::ParameterFlags_::kCanAutomate as i32 != 0
-            && flags & ParameterInfo_::ParameterFlags_::kIsReadOnly as i32 == 0;
+        p.automatable =
+            flags & ParameterInfo_::ParameterFlags_::kCanAutomate as i32 != 0 && flags & ParameterInfo_::ParameterFlags_::kIsReadOnly as i32 == 0;
         values.push((pi.id, unsafe { c.getParamNormalized(pi.id) } as f32));
         params.push(p);
     }
@@ -504,11 +496,11 @@ impl Vst3Main {
         let flags = self.handler.restart_flags.swap(0, Ordering::AcqRel);
         if flags != 0 {
             use RestartFlags_::*;
-            if flags & kParamValuesChanged as i32 != 0 {
-                if let Some(c) = &self.controller {
-                    for &id in &self.param_ids {
-                        state.params.set(id, unsafe { c.getParamNormalized(id) } as f32);
-                    }
+            if flags & kParamValuesChanged as i32 != 0
+                && let Some(c) = &self.controller
+            {
+                for &id in &self.param_ids {
+                    state.params.set(id, unsafe { c.getParamNormalized(id) } as f32);
                 }
             }
             if flags & kLatencyChanged as i32 != 0 {

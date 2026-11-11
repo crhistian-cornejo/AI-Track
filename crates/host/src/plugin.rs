@@ -297,9 +297,7 @@ impl Processor for HostedPlugin {
         }
         let Some(audio) = self.audio.as_mut() else { return };
         let shared = &self.shared;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            shared.main.with(|main| main.prepare(audio, &shared.state, sample_rate, max_frames))
-        }));
+        let result = catch_unwind(AssertUnwindSafe(|| shared.main.with(|main| main.prepare(audio, &shared.state, sample_rate, max_frames))));
         match result {
             Ok(Ok(Ok(()))) => self.prepared = true,
             Ok(Ok(Err(e))) => {

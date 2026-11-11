@@ -6,9 +6,39 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+# Fall back to the built-in test synth / gain / latency nodes when the injected
+# factory returns `None` (always on in this crate's own unit tests).
+test-nodes = []
+# ASIO on Windows through cpal/asio-sys. Disabled by default: the ASIO SDK must
+# be used under Steinberg's free *proprietary* licence (never its GPLv3 option,
+# which would force the whole DAW to GPL). Needs CPAL_ASIO_DIR and LLVM/Clang.
+asio = ["cpal/asio"]
+
 [dependencies]
 aitrack-model.workspace = true
 aitrack-dsp.workspace = true
+log.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+libloading = "0.8"
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+cpal = "0.18"
+midir = "0.11"
+hound = "3.5"
+rubato = "0.16"
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis", "aiff"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
+[[example]]
+name = "play_demo"
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

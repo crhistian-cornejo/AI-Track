@@ -19,6 +19,7 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::Snap => snap_menu(ws, cx),
         MenuKind::PianoTools => tools_menu(cx),
         MenuKind::AddDevice(track) => device_menu(ws, *track, cx),
+        MenuKind::Presets(device) => preset_menu(ws, *device, cx)?,
         MenuKind::TimeSignature => sig_menu(ws, cx),
     })
 }
@@ -158,6 +159,38 @@ fn device_menu(ws: &mut Workspace, track: aitrack_model::TrackId, cx: &mut Conte
         )));
     }
     div().id("device-menu-scroll").max_h(px(520.)).overflow_y_scroll().child(card).into_any_element()
+}
+
+/// The device's factory presets by category; picking one sets every
+/// parameter (one undo step).
+fn preset_menu(ws: &mut Workspace, device: aitrack_model::DeviceId, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let d = ws.s.project.device(device)?;
+    let aitrack_model::DeviceKind::Stock { plugin_id } = &d.kind else { return None };
+    let current = d.preset.clone();
+    let presets = ws.b.plugins.presets(plugin_id);
+    let mut card = widgets::menu_card("preset-menu", 232.);
+    let mut last: Option<String> = None;
+    for (i, pr) in presets.into_iter().enumerate() {
+        if last.as_deref() != Some(pr.category.as_str()) {
+            card = card.child(menu_header(pr.category.to_uppercase()));
+            last = Some(pr.category.clone());
+        }
+        let on = current.as_deref() == Some(pr.name.as_str());
+        let path = pr.path.clone();
+        card = card.child(menu_item(("preset", i), None, pr.name.clone(), None, on).on_click(cx.listener(move |this, _, _, cx| {
+            this.menu = None;
+            match this.b.plugins.load_preset(&path) {
+                Ok((name, params)) => {
+                    if this.s.load_preset(device, &name, &params) {
+                        this.toast(format!("Loaded {name}"), cx);
+                    }
+                }
+                Err(e) => this.toast(e, cx),
+            }
+            cx.notify();
+        })));
+    }
+    Some(div().id("preset-menu-scroll").max_h(px(480.)).overflow_y_scroll().child(card).into_any_element())
 }
 
 fn sig_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {

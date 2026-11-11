@@ -2,6 +2,7 @@
 //! progress and proposal cards (Accept / Discard through
 //! `History::accept` / `discard`), plus the built-in AI actions.
 
+use crate::bridge::{MidiMode, ModelNotice};
 use crate::icons::{Icon, icon};
 use crate::motion;
 use crate::theme::*;
@@ -29,7 +30,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .border_color(border())
         .child(icon(Icon::Sparkles, 16., pal.accent))
         .child(label("Assistant", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-        .child(badge("stub", pal.muted))
+        .child(badge("local", pal.muted))
         .child(div().flex_1())
         .child(widgets::icon_button("close-ai", Icon::X, false).tooltip(widgets::tip("Close", Some("Ctrl+I"))).on_click(cx.listener(|this, _, _, cx| {
             this.ai_open = false;
@@ -44,8 +45,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .flex_col()
         .border_b_1()
         .border_color(border())
-        .child(action("ai-extract", Icon::Extract, "Extract MIDI from audio", "basic-pitch").on_click(cx.listener(|this, _, _, cx| this.extract_midi(cx))))
+        .child(action("ai-extract", Icon::Extract, "Extract MIDI from audio", "selected audio clip").on_click(cx.listener(|this, _, _, cx| this.extract_midi(cx))))
+        .child(midi_mode(ws, cx))
         .child(action("ai-stems", Icon::Split, "Split stems", "vocals · drums · bass · other").on_click(cx.listener(|this, _, _, cx| this.split_stems(cx))))
+        .child(action("ai-import", Icon::FolderOpen, "Import audio", "new track · detects key and BPM").on_click(cx.listener(|this, _, _, cx| this.pick_audio_file(cx))))
         .child(action("ai-samples", Icon::Search, "Find samples in key", "uses the project key").on_click(cx.listener(|this, _, _, cx| this.find_samples_in_key(cx))));
 
     let mut log = div().flex().flex_col().gap(px(SP3)).p(px(SP3));
@@ -91,6 +94,60 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .into_any_element()
 }
 
+/// Poly (basic-pitch) / Mono / Drums for "Extract MIDI".
+fn midi_mode(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let weak = cx.entity().downgrade();
+    let on: widgets::OnSelect = std::rc::Rc::new(move |i, _, cx| {
+        let _ = weak.update(cx, |ws, cx| {
+            ws.midi_mode = MidiMode::ALL[i];
+            cx.notify();
+        });
+    });
+    let items: Vec<_> = MidiMode::ALL.iter().map(|m| (None, m.label())).collect();
+    let index = MidiMode::ALL.iter().position(|m| *m == ws.midi_mode).unwrap_or(0);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(SP2))
+        .pl(px(SP3))
+        .child(label("MIDI mode", TEXT_XS, pal.faint))
+        .child(widgets::segmented("midi-mode", &items, index, 56., on))
+        .into_any_element()
+}
+
+fn license_card(i: usize, notice: ModelNotice, status: ProposalStatus, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let size = notice.size.map_or("unknown size".to_owned(), |b| format!("{:.0} MB", b as f64 / 1_000_000.));
+    let line = |k: &'static str, v: String| div().flex().gap(px(SP2)).child(label(k, TEXT_XS, pal.faint).w(px(56.))).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).text_color(pal.text).child(v));
+    div()
+        .p(px(SP3))
+        .gap(px(SP2))
+        .flex()
+        .flex_col()
+        .rounded(px(r_lg()))
+        .bg(pal.surface)
+        .border_1()
+        .border_color(if status == ProposalStatus::Pending { accent_alpha(0.45) } else { border() })
+        .child(div().flex().items_center().gap(px(SP2)).child(icon(Icon::Split, 14., pal.accent)).child(label("Model download", TEXT_XS, pal.accent).font_weight(FontWeight::SEMIBOLD)))
+        .child(div().text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(notice.name.clone()))
+        .child(line("Size", size))
+        .child(line("License", notice.license.clone()))
+        .child(line("Source", notice.source.clone()))
+        .when_some(notice.notice.clone(), |d, n| d.child(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(n)))
+        .child(match status {
+            ProposalStatus::Pending => div()
+                .flex()
+                .gap(px(SP2))
+                .child(text_button(("lic-accept", i), "Accept & download", Some(Icon::Check), true).on_click(cx.listener(move |this, _, _, cx| this.resolve_license(i, true, cx))))
+                .child(text_button(("lic-cancel", i), "Cancel", Some(Icon::X), false).on_click(cx.listener(move |this, _, _, cx| this.resolve_license(i, false, cx))))
+                .into_any_element(),
+            ProposalStatus::Accepted => label("Accepted · downloading with the job below", TEXT_SM, pal.play).into_any_element(),
+            ProposalStatus::Discarded => label("Cancelled", TEXT_SM, pal.faint).into_any_element(),
+        })
+        .into_any_element()
+}
+
 fn action(id: &'static str, i: Icon, title: &'static str, hint: &'static str) -> gpui::Stateful<Div> {
     let pal = p();
     div()
@@ -113,6 +170,7 @@ fn action(id: &'static str, i: Icon, title: &'static str, hint: &'static str) ->
 fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     match e {
+        ChatEntry::License { notice, status, .. } => license_card(i, notice, status, cx),
         ChatEntry::User(text) => div()
             .flex()
             .justify_end()

@@ -12,6 +12,7 @@ mod demo;
 mod icons;
 mod motion;
 mod paint;
+mod real;
 mod state;
 mod theme;
 mod views;
@@ -19,6 +20,12 @@ mod widgets;
 mod workspace;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
+
+/// The real engine, plugins and AI; `AITRACK_STUBS=1` runs the UI on the
+/// stub bridges instead (no audio device, fake meters).
+fn bridges() -> bridge::Bridges {
+    if std::env::var_os("AITRACK_STUBS").is_some() { bridge::Bridges::stubs() } else { real::bridges() }
+}
 
 fn main() {
     let platform = gpui_platform::current_platform(false);
@@ -51,7 +58,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let ws = cx.new(|cx| workspace::Workspace::new(demo::project(), bridge::Bridges::stubs(), cx));
+                let ws = cx.new(|cx| workspace::Workspace::new(demo::project(), bridges(), cx));
                 ws.update(cx, |ws, cx| {
                     ws.focus.focus(window, cx);
                     // Follow-system themes switch with the OS.

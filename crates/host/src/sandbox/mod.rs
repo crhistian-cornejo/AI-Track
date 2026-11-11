@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use aitrack_dsp::{Category, PluginInfo, ProcessContext, Processor};
@@ -79,11 +79,27 @@ impl Control {
     }
 }
 
+/// Opens and closes the editor of a [SandboxedPlugin] from another thread.
+#[derive(Clone)]
+pub struct SandboxEditor {
+    control: Arc<Mutex<Control>>,
+}
+
+impl SandboxEditor {
+    pub fn open(&self) -> Result<()> {
+        self.control.lock().call(&Request::OpenEditor, Duration::from_secs(10)).map(|_| ())
+    }
+
+    pub fn close(&self) -> Result<()> {
+        self.control.lock().call(&Request::CloseEditor, Duration::from_secs(10)).map(|_| ())
+    }
+}
+
 /// A plugin hosted in its own `aitrack-plugin-host` process.
 pub struct SandboxedPlugin {
     info: PluginInfo,
     hosted: HostedPluginInfo,
-    control: Mutex<Control>,
+    control: Arc<Mutex<Control>>,
     params: ParamTable,
     pending: PendingParams,
     region: Option<Region>,
@@ -159,7 +175,7 @@ impl SandboxedPlugin {
         Ok(Self {
             info,
             hosted,
-            control: Mutex::new(control),
+            control: Arc::new(Mutex::new(control)),
             params: table,
             pending,
             region: None,
@@ -205,13 +221,19 @@ impl SandboxedPlugin {
         self.control.lock().call(&Request::OpenEditor, Duration::from_secs(10)).map(|_| ())
     }
 
+    /// A cloneable handle for the UI thread: opens and closes this plugin's
+    /// editor while the plugin itself is owned by the audio engine.
+    pub fn editor_handle(&self) -> SandboxEditor {
+        SandboxEditor { control: self.control.clone() }
+    }
+
     pub fn close_editor(&self) -> Result<()> {
         self.control.lock().call(&Request::CloseEditor, Duration::from_secs(10)).map(|_| ())
     }
 
     /// Non-blocking liveness check of the host process.
     pub fn is_alive(&mut self) -> bool {
-        !self.crashed && matches!(self.control.get_mut().child.try_wait(), Ok(None))
+        !self.crashed && matches!(self.control.lock().child.try_wait(), Ok(None))
     }
 
     fn setup_region(&mut self, sample_rate: f64, max_frames: usize) -> Result<()> {
@@ -344,7 +366,8 @@ impl Processor for SandboxedPlugin {
             self.late_blocks += 1;
             ctx.buffer.clear();
             if self.late_blocks.is_multiple_of(64)
-                && let Ok(Some(_)) = self.control.get_mut().child.try_wait()
+                && let Some(mut c) = self.control.try_lock()
+                && let Ok(Some(_)) = c.child.try_wait()
             {
                 log::error!("sandbox for '{}' exited", self.info.name);
                 self.crashed = true;
@@ -413,7 +436,7 @@ impl Processor for SandboxedPlugin {
 
 impl Drop for SandboxedPlugin {
     fn drop(&mut self) {
-        let c = self.control.get_mut();
+        let mut c = self.control.lock();
         let _ = c.call(&Request::Shutdown, Duration::from_secs(2));
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

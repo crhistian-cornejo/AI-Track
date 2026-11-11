@@ -113,14 +113,14 @@ impl History {
         self.redo.clear();
         self.revision += 1;
 
-        if let (Some(key), Some(last)) = (&coalesce, self.undo.last_mut()) {
-            if last.coalesce.as_ref() == Some(key) {
-                last.forward.extend(commands);
-                let mut merged = backward;
-                merged.append(&mut last.backward);
-                last.backward = merged;
-                return Ok(());
-            }
+        if let (Some(key), Some(last)) = (&coalesce, self.undo.last_mut())
+            && last.coalesce.as_ref() == Some(key)
+        {
+            last.forward.extend(commands);
+            let mut merged = backward;
+            merged.append(&mut last.backward);
+            last.backward = merged;
+            return Ok(());
         }
         self.undo.push(Transaction { label, origin, forward: commands, backward, coalesce });
         if self.undo.len() > self.limit {

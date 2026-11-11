@@ -387,6 +387,7 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let buf_items: Vec<(String, bool, bool)> =
         BUFFER_SIZES.iter().map(|b| (b.to_string(), *b == cfg.buffer_size, *b >= range.0 && *b <= range.1)).collect();
     let one_way = cfg.buffer_ms();
+    let scan = ws.b.plugins.scan_status();
     let channel_chips = |id: &'static str, count: u16, enabled: &[u16], output: bool, cx: &mut Context<Workspace>| {
         let items: Vec<(String, bool, bool)> = (0..count.max(1)).map(|c| (format!("{}", c + 1), enabled.contains(&c), count > 0)).collect();
         chip_row(id, items, cx, move |this, i, cx| {
@@ -432,10 +433,30 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             Some("440 Hz on the selected outputs".into()),
             text_button("test-tone", "Play test tone", Some(Icon::Volume), false).on_click(cx.listener(|this, _, _, cx| {
                 this.b.engine.test_tone();
-                this.toast("Test tone: 440 Hz", cx);
+                cx.notify();
             })),
         ))
-        .child(div().pt(px(SP3)).child(label("Engine: stub — settings are kept but no device opens until the real engine is wired.", TEXT_SM, pal.faint)))
+        .child(section_title("PLUGINS"))
+        .child(form_row(
+            "Sandbox",
+            Some("Run VST3/CLAP plugins in a separate process (applies to plugins loaded from now on)".into()),
+            switch("sandbox", ws.b.engine.sandbox_plugins()).on_click(cx.listener(|this, _, _, cx| {
+                let on = !this.b.engine.sandbox_plugins();
+                this.b.engine.set_sandbox_plugins(on);
+                cx.notify();
+            })),
+        ))
+        .child(form_row("Plugin folders", Some(scan.message.clone().into()), {
+            let mut row = div().flex().items_center().gap(px(SP2));
+            if scan.running {
+                row = row.child(widgets::hbar(scan.fraction, 160., 6., pal.accent));
+            }
+            row.child(text_button("rescan", if scan.running { "Scanning…" } else { "Rescan" }, Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
+                this.b.plugins.rescan();
+                cx.notify();
+            })))
+        }))
+        .child(div().pt(px(SP3)).child(label(format!("Engine: {}", ws.b.engine.status_label()), TEXT_SM, pal.faint)))
         .into_any_element()
 }
 

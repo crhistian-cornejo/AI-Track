@@ -7,7 +7,7 @@
 //! Frames are requested only while the transport plays, meters fall, or a
 //! drag or animation is in flight; an idle window draws nothing.
 
-use crate::bridge::{AiEvent, Bridges, JobId, LibraryItem};
+use crate::bridge::{AiEvent, AudioAnalysis, Bridges, JobId, LibraryItem, MidiMode, ModelNotice};
 use crate::icons::Icon;
 use crate::state::*;
 use crate::theme::{self, *};
@@ -59,6 +59,8 @@ pub enum MenuKind {
     Snap,
     PianoTools,
     AddDevice(TrackId),
+    /// Factory presets of a stock device.
+    Presets(DeviceId),
     TimeSignature,
 }
 
@@ -83,6 +85,8 @@ pub enum ChatEntry {
     Proposal { id: u64, label: String, origin: String, summary: Vec<String>, destructive: bool, status: ProposalStatus },
     Job { id: JobId, label: String, fraction: f32, done: bool },
     Samples { title: String, items: Vec<LibraryItem> },
+    /// A model licence the user must accept before it is downloaded.
+    License { notice: ModelNotice, audio: std::path::PathBuf, clip_name: String, status: ProposalStatus },
 }
 
 /// Canvas bounds of the dense views, written during prepaint so mouse
@@ -125,6 +129,13 @@ pub struct Workspace {
     pub modal: Option<views::prefs::Modal>,
     pub export: views::export::ExportDialog,
     pub export_name: Entity<TextInput>,
+    /// Audio-to-MIDI engine picked in the assistant panel.
+    pub midi_mode: MidiMode,
+    /// Analysis jobs → the audio source they fill in.
+    analysis_jobs: std::collections::HashMap<JobId, SourceId>,
+    /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
+    midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
+    _housekeeping: Task<()>,
 }
 
 impl Workspace {
@@ -147,6 +158,16 @@ impl Workspace {
                     }
             }),
         ];
+        // Main-thread plugin work, background scan results and engine
+        // messages, on a short timer that runs even while nothing animates.
+        let housekeeping = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                if this.update(cx, |w, cx| w.housekeeping(cx)).is_err() {
+                    break;
+                }
+            }
+        });
         let mut s = AppState::new(project);
         let mut expanded = BTreeSet::new();
         expanded.insert("categories".to_owned());
@@ -180,6 +201,10 @@ impl Workspace {
             modal: None,
             export: views::export::ExportDialog::default(),
             export_name,
+            midi_mode: MidiMode::default(),
+            analysis_jobs: Default::default(),
+            midi_jobs: Default::default(),
+            _housekeeping: housekeeping,
         };
         // Seed the assistant with a greeting and one reviewable proposal.
         this.chat_log.push(ChatEntry::Assistant(
@@ -203,6 +228,23 @@ impl Workspace {
         if self.synced_revision != Some(rev) {
             self.b.engine.update_project(&self.s.project);
             self.synced_revision = Some(rev);
+        }
+    }
+
+    /// Timer tick: plugin main-thread work, scan progress, engine messages.
+    fn housekeeping(&mut self, cx: &mut Context<Self>) {
+        let mut changed = self.b.engine.idle();
+        changed |= self.b.plugins.poll();
+        for m in self.b.engine.take_messages() {
+            self.toast(m, cx);
+            changed = true;
+        }
+        // Keep the plugin scan progress moving while Preferences is open.
+        if self.b.plugins.scan_status().running && self.modal.is_some() {
+            changed = true;
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -550,13 +592,29 @@ impl Workspace {
         self.s.selected_clip.as_ref().and_then(audio_of).or_else(|| self.s.project.clips.keys().find_map(audio_of))
     }
 
+    /// Arrangement start of the first placement of the clip playing `path`.
+    fn audio_start(&self, path: &std::path::Path) -> Option<Tick> {
+        let p = &self.s.project;
+        p.tracks.iter().flat_map(|t| &t.arrangement).find_map(|pl| {
+            let c = p.clips.get(&pl.clip)?;
+            matches!(p.sources.get(&c.source), Some(Source::Audio(a)) if a.path == path).then_some(pl.start)
+        })
+    }
+
     pub fn extract_midi(&mut self, cx: &mut Context<Self>) {
         let Some((name, path)) = self.audio_target() else {
             self.toast("No audio clip to analyse", cx);
             return;
         };
-        let id = self.b.ai.extract_midi(&path);
-        self.chat_log.push(ChatEntry::Job { id, label: format!("Extracting MIDI from {name}"), fraction: 0., done: false });
+        let bpm = self.s.project.tempo.initial_bpm();
+        let id = self.b.ai.extract_midi(&path, self.midi_mode, bpm);
+        self.midi_jobs.insert(id, self.audio_start(&path));
+        let how = match self.midi_mode {
+            MidiMode::Polyphonic => "basic-pitch",
+            MidiMode::Monophonic => "monophonic",
+            MidiMode::Drums => "drums",
+        };
+        self.chat_log.push(ChatEntry::Job { id, label: format!("Extracting MIDI from {name} ({how})"), fraction: 0., done: false });
         self.ensure_ai_poll(cx);
         cx.notify();
     }
@@ -566,10 +624,106 @@ impl Workspace {
             self.toast("No audio clip to split", cx);
             return;
         };
+        // The model licence comes first; nothing downloads until it is accepted.
+        if let Some(notice) = self.b.ai.stem_license() {
+            let already = self.chat_log.iter().any(|e| matches!(e, ChatEntry::License { status: ProposalStatus::Pending, .. }));
+            if !already {
+                self.chat_log.push(ChatEntry::License { notice, audio: path, clip_name: name, status: ProposalStatus::Pending });
+            }
+            self.ai_open = true;
+            cx.notify();
+            return;
+        }
+        self.start_stems(name, path, cx);
+    }
+
+    fn start_stems(&mut self, name: String, path: std::path::PathBuf, cx: &mut Context<Self>) {
         let id = self.b.ai.split_stems(&path);
+        self.midi_jobs.insert(id, self.audio_start(&path));
         self.chat_log.push(ChatEntry::Job { id, label: format!("Splitting {name} into stems"), fraction: 0., done: false });
         self.ensure_ai_poll(cx);
         cx.notify();
+    }
+
+    /// The user answered a model licence card.
+    pub fn resolve_license(&mut self, index: usize, accept: bool, cx: &mut Context<Self>) {
+        let Some(ChatEntry::License { notice, audio, clip_name, status }) = self.chat_log.get_mut(index) else { return };
+        if *status != ProposalStatus::Pending {
+            return;
+        }
+        if !accept {
+            *status = ProposalStatus::Discarded;
+            cx.notify();
+            return;
+        }
+        let (model, audio, name) = (notice.model.clone(), audio.clone(), clip_name.clone());
+        match self.b.ai.accept_license(&model) {
+            Ok(()) => {
+                if let Some(ChatEntry::License { status, .. }) = self.chat_log.get_mut(index) {
+                    *status = ProposalStatus::Accepted;
+                }
+                self.start_stems(name, audio, cx);
+            }
+            Err(e) => self.toast(format!("Could not save the licence choice: {e}"), cx),
+        }
+    }
+
+    /// Import an audio file as a new audio track, then analyse it (key/BPM).
+    pub fn import_audio(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
+        // A WAV header gives the real length right away; other formats get it from the analysis.
+        let (sample_rate, channels, frames) = hound::WavReader::open(&path)
+            .map(|r| {
+                let s = r.spec();
+                (s.sample_rate, s.channels, r.duration() as u64)
+            })
+            .unwrap_or((48_000, 2, 0));
+        let start = Snap::Bar.floor(self.b.engine.transport().position.max(0));
+        let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
+        let cmds = audio_track_commands(&mut self.s, &name, Color::palette(4), &path, (sample_rate, channels, frames), start, index);
+        let source = cmds.iter().find_map(|c| match c {
+            Command::AddSource { id, .. } => Some(*id),
+            _ => None,
+        });
+        let Some(source) = source.filter(|_| self.s.edit("Import audio", cmds)) else { return };
+        let id = self.b.ai.analyze(&path);
+        self.analysis_jobs.insert(id, source);
+        self.chat_log.push(ChatEntry::Job { id, label: format!("Analysing {name} (key, BPM)"), fraction: 0., done: false });
+        self.ensure_ai_poll(cx);
+        self.toast(format!("Imported {name}"), cx);
+    }
+
+    pub fn pick_audio_file(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Import audio".into()) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.into_iter().next() {
+                    let _ = this.update(cx, |ws, cx| ws.import_audio(p, cx));
+                }
+        })
+        .detach();
+    }
+
+    fn apply_analysis(&mut self, source: SourceId, a: &AudioAnalysis) {
+        let Some(Source::Audio(old)) = self.s.project.sources.get(&source).cloned() else { return };
+        let mut new = old.clone();
+        if a.key.is_some() {
+            new.key = a.key;
+        }
+        if let Some(bpm) = a.bpm {
+            new.warp.original_bpm = Some(bpm);
+        }
+        if a.frames > 0 {
+            new.sample_rate = a.sample_rate;
+            new.channels = a.channels;
+            new.frames = a.frames;
+        }
+        if new != old {
+            self.s.edit_as("Analyse audio", Origin::Feature("analysis".into()), vec![
+                Command::RemoveSource { id: source },
+                Command::AddSource { id: source, source: Box::new(Source::Audio(new)) },
+            ]);
+        }
     }
 
     pub fn find_samples_in_key(&mut self, cx: &mut Context<Self>) {
@@ -607,18 +761,43 @@ impl Workspace {
                 AiEvent::Progress { job, fraction, .. } => self.set_job(job, fraction, false),
                 AiEvent::MidiReady { job, source_name, notes } => {
                     self.set_job(job, 1., true);
+                    if notes.is_empty() {
+                        self.chat_log.push(ChatEntry::Assistant(format!("No notes found in {source_name}.")));
+                        continue;
+                    }
                     let notes: Vec<(u8, Tick, Tick, f32)> = notes.iter().map(|n| (n.key, n.start, n.length, n.velocity)).collect();
-                    let cmds = self.s.midi_track_commands(&source_name, Color::palette(11), &notes);
-                    if let Some(id) = self.s.propose(&format!("Add \"{source_name}\" as a MIDI track"), Origin::Feature("Audio to MIDI".into()), cmds) {
+                    let mut cmds = self.s.midi_track_commands(&source_name, Color::palette(11), &notes);
+                    // Line the MIDI up under the audio it came from.
+                    if let Some(Some(start)) = self.midi_jobs.remove(&job) {
+                        let track = cmds.iter().find_map(|c| if let Command::AddTrack { track, .. } = c { Some(track.id) } else { None });
+                        let clip = cmds.iter().find_map(|c| if let Command::AddClip { id, .. } = c { Some(*id) } else { None });
+                        if let (Some(track), Some(clip)) = (track, clip) {
+                            let id = self.s.project.alloc_placement_id();
+                            cmds.push(Command::PlaceClip { track, placement: Placement { id, clip, start, lane: 0 } });
+                        }
+                    }
+                    let label = format!("Add \"{source_name}\" ({} notes) as a MIDI track", notes.len());
+                    if let Some(id) = self.s.propose(&label, Origin::Feature("audio-to-midi".into()), cmds) {
                         self.chat_log.extend(proposal_entry(&self.s, id));
                     }
                 }
                 AiEvent::StemsReady { job, stems } => {
                     self.set_job(job, 1., true);
-                    let cmds = stem_commands(&mut self.s, &stems);
-                    if let Some(id) = self.s.propose("Add 4 stems as audio tracks", Origin::Feature("Stem split".into()), cmds) {
+                    let start = self.midi_jobs.remove(&job).flatten().unwrap_or(0);
+                    let cmds = stem_commands(&mut self.s, &stems, start);
+                    let label = format!("Add {} stems as audio tracks", stems.len());
+                    if let Some(id) = self.s.propose(&label, Origin::Feature("stem-split".into()), cmds) {
                         self.chat_log.extend(proposal_entry(&self.s, id));
                     }
+                }
+                AiEvent::Analyzed { job, analysis, .. } => {
+                    self.set_job(job, 1., true);
+                    if let Some(source) = self.analysis_jobs.remove(&job) {
+                        self.apply_analysis(source, &analysis);
+                    }
+                    let key = analysis.key.map_or("no clear key".to_owned(), |k| k.display());
+                    let bpm = analysis.bpm.map_or("no clear tempo".to_owned(), |b| format!("{b:.1} BPM"));
+                    self.chat_log.push(ChatEntry::Assistant(format!("Analysis: {key}, {bpm}.")));
                 }
                 AiEvent::Reply { text } => self.chat_log.push(ChatEntry::Assistant(text)),
                 AiEvent::Proposal { label, agent, commands } => {
@@ -628,6 +807,8 @@ impl Workspace {
                 }
                 AiEvent::Failed { job, message } => {
                     self.set_job(job, 1., true);
+                    self.analysis_jobs.remove(&job);
+                    self.midi_jobs.remove(&job);
                     self.chat_log.push(ChatEntry::Assistant(format!("That failed: {message}")));
                 }
             }
@@ -736,9 +917,40 @@ impl Workspace {
             })
             .child(div().flex_1())
             .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
-            .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale} · 48 kHz", self.s.project.name), TEXT_SM, pal.muted))
-            .child(crate::widgets::label("Engine: stub", TEXT_SM, pal.faint))
+            .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))
+            .child(crate::widgets::label(self.b.engine.status_label(), TEXT_SM, pal.faint))
             .into_any_element()
+    }
+
+    /// A dismissable strip under the top bar (no audio device and similar).
+    fn render_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.b.engine.banner()?;
+        let pal = p();
+        Some(
+            div()
+                .flex_none()
+                .mx(px(SP1))
+                .mt(px(SP1))
+                .px(px(SP3))
+                .py(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .rounded(px(r_lg()))
+                .bg(with_alpha(pal.record, 0.12))
+                .border_1()
+                .border_color(with_alpha(pal.record, 0.4))
+                .child(crate::icons::icon(Icon::Volume, 14., pal.record))
+                .child(div().flex_1().min_w(px(0.)).child(crate::widgets::label(text, TEXT_SM, pal.text)))
+                .child(crate::widgets::text_button("banner-audio", "Audio settings", None, false).on_click(cx.listener(|this, _, _, cx| {
+                    this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Audio), cx);
+                })))
+                .child(crate::widgets::icon_button("banner-close", Icon::X, false).on_click(cx.listener(|this, _, _, cx| {
+                    this.b.engine.dismiss_banner();
+                    cx.notify();
+                })))
+                .into_any_element(),
+        )
     }
 
     fn render_toast(&self) -> Option<AnyElement> {
@@ -804,35 +1016,60 @@ pub fn proposal_entry(s: &AppState, id: u64) -> Option<ChatEntry> {
 }
 
 /// Commands adding one audio track per stem.
-fn stem_commands(s: &mut AppState, stems: &[(String, std::path::PathBuf)]) -> Vec<Command> {
+fn stem_commands(s: &mut AppState, stems: &[(String, std::path::PathBuf)], start: Tick) -> Vec<Command> {
     let mut cmds = Vec::new();
     let index = s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
     for (i, (name, path)) in stems.iter().enumerate() {
-        let track = s.project.alloc_track_id();
-        let src = s.project.alloc_source_id();
-        let clip = s.project.alloc_clip_id();
-        let color = Color::palette(2 + i * 3);
-        cmds.push(Command::AddTrack { track: Box::new(Track::new(track, TrackKind::Audio, format!("{name} Stem"), color)), index: index + i });
-        cmds.push(Command::AddSource {
+        // Stems are WAV; the header has the real length.
+        let (sample_rate, channels, frames) =
+            hound::WavReader::open(path).map(|r| (r.spec().sample_rate, r.spec().channels, r.duration() as u64)).unwrap_or((48_000, 2, 0));
+        cmds.extend(audio_track_commands(s, &format!("{name} Stem"), Color::palette(2 + i * 3), path, (sample_rate, channels, frames), start, index + i));
+    }
+    cmds
+}
+
+/// Commands adding an audio track at `index` with one clip of `path` placed at `start`.
+pub fn audio_track_commands(
+    s: &mut AppState,
+    name: &str,
+    color: Color,
+    path: &std::path::Path,
+    (sample_rate, channels, frames): (u32, u16, u64),
+    start: Tick,
+    index: usize,
+) -> Vec<Command> {
+    let track = s.project.alloc_track_id();
+    let src = s.project.alloc_source_id();
+    let clip = s.project.alloc_clip_id();
+    // Clip length at the project tempo (4 bars until the length is known).
+    let length = if frames > 0 && sample_rate > 0 {
+        let secs = frames as f64 / sample_rate as f64;
+        ((secs * s.project.tempo.initial_bpm() / 60. * PPQ as f64).round() as Tick).max(PPQ)
+    } else {
+        4 * BAR
+    };
+    vec![
+        Command::AddTrack { track: Box::new(Track::new(track, TrackKind::Audio, name, color)), index },
+        Command::AddSource {
             id: src,
             source: Box::new(Source::Audio(AudioSource {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 hash: None,
-                sample_rate: 48_000,
-                channels: 2,
-                frames: 48_000 * 15,
+                sample_rate,
+                channels,
+                frames,
                 warp: Warp::default(),
-                key: s.project.scale,
+                key: None,
             })),
-        });
-        cmds.push(Command::AddClip {
+        },
+        Command::AddClip {
             id: clip,
             clip: Box::new(Clip {
-                name: format!("{name} Stem"),
+                name: name.into(),
                 color,
                 source: src,
                 offset: 0,
-                length: 8 * BAR,
+                length,
                 looping: None,
                 gain_db: 0.,
                 envelopes: Vec::new(),
@@ -840,11 +1077,9 @@ fn stem_commands(s: &mut AppState, stems: &[(String, std::path::PathBuf)]) -> Ve
                 muted: false,
                 scale: None,
             }),
-        });
-        let pl = s.project.alloc_placement_id();
-        cmds.push(Command::PlaceClip { track, placement: Placement { id: pl, clip, start: 4 * BAR, lane: 0 } });
-    }
-    cmds
+        },
+        Command::PlaceClip { track, placement: Placement { id: s.project.alloc_placement_id(), clip, start, lane: 0 } },
+    ]
 }
 
 impl Focusable for Workspace {
@@ -856,6 +1091,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_engine();
+        self.b.engine.tick();
         if let Some(animate) = self.look.pending.take() {
             self.apply_look(window, animate, cx);
         }
@@ -896,6 +1132,7 @@ impl Render for Workspace {
         let capture = self.drag_capture(cx);
         let toast = self.render_toast();
         let status = self.render_status(cx);
+        let banner = self.render_banner(cx);
 
         div()
             .id("workspace")
@@ -940,6 +1177,7 @@ impl Render for Workspace {
             .text_color(pal.text)
             .children(backdrop)
             .child(views::topbar::render(self, window, cx))
+            .children(banner)
             .child(
                 div()
                     .flex_1()

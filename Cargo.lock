@@ -115,13 +115,21 @@ dependencies = [
 name = "aitrack-app"
 version = "0.1.0"
 dependencies = [
+ "aitrack-ai",
  "aitrack-dsp",
+ "aitrack-engine",
+ "aitrack-host",
  "aitrack-model",
+ "aitrack-stock",
  "async-channel",
+ "crossbeam-channel",
  "gpui-pre",
  "gpui-pre-platform",
+ "hound",
  "image",
+ "log",
  "notify",
+ "parking_lot",
  "serde",
  "serde_json",
 ]

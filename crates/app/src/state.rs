@@ -522,6 +522,19 @@ impl AppState {
         self.edit("Add device", vec![Command::AddDevice { slot, device: Box::new(device) }]).then_some(id)
     }
 
+    /// Apply a stock preset: every parameter it stores, plus its name for
+    /// display, as one undo step.
+    pub fn load_preset(&mut self, device: DeviceId, name: &str, params: &std::collections::BTreeMap<u32, f32>) -> bool {
+        let mut cmds: Vec<Command> = params.iter().map(|(&param, &v)| Command::SetParam { device, param, value: Some(v) }).collect();
+        // Factory presets are parameters only; the device keeps its state (samples…).
+        let state = self.project.device(device).and_then(|d| d.state.clone());
+        cmds.push(Command::SetDeviceState { device, state, preset: Some(name.to_owned()) });
+        self.seal();
+        let ok = self.edit(&format!("Load preset {name}"), cmds);
+        self.seal();
+        ok
+    }
+
     pub fn remove_device(&mut self, id: DeviceId) -> bool {
         self.edit("Delete device", vec![Command::RemoveDevice { id }])
     }
@@ -834,7 +847,7 @@ mod tests {
     #[test]
     fn parameter_drag_coalesces() {
         let mut s = state();
-        let dev = s.project.tracks.iter().flat_map(|t| &t.devices).find(|d| d.name == "EQ Eight").unwrap().id;
+        let dev = s.project.tracks.iter().flat_map(|t| &t.devices).find(|d| d.name == "EQ").unwrap().id;
         let steps_before = s.history.steps().count();
         for v in [0.1, 0.2, 0.3] {
             s.set_param(dev, 0, v);

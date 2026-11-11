@@ -1,0 +1,71 @@
+//! Adapters that implement the [`bridge`](crate::bridge) traits over the real
+//! crates: the audio engine (`aitrack-engine`), stock devices
+//! (`aitrack-stock`), hosted VST3/CLAP plugins (`aitrack-host`) and the ML
+//! features (`aitrack-ai`). The sample library stays on its stub until
+//! `aitrack-library` lands.
+
+pub mod ai;
+pub mod engine;
+pub mod main_thread;
+pub mod plugins;
+
+use crate::bridge::{Bridges, StubLibrary};
+use aitrack_engine::FactoryStack;
+use std::sync::Arc;
+
+/// Persisted engine settings (`engine.json` in the config folder).
+pub mod settings {
+    use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct Settings {
+        pub audio: aitrack_engine::AudioConfig,
+        /// Run third-party plugins in `aitrack-plugin-host` processes.
+        pub sandbox: bool,
+    }
+
+    fn path() -> PathBuf {
+        crate::appearance::config_dir().join("engine.json")
+    }
+
+    impl Settings {
+        pub fn load() -> Self {
+            std::fs::read(path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        }
+
+        pub fn save(&self) {
+            let p = path();
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_vec_pretty(self) {
+                let _ = std::fs::write(p, json);
+            }
+        }
+    }
+}
+
+/// Stock devices first, then hosted plugins.
+pub fn factory(rt: &Arc<plugins::PluginRuntime>, live: bool) -> FactoryStack {
+    FactoryStack::new()
+        .with(Arc::new(plugins::StockFactory))
+        .with(Arc::new(plugins::HostedFactory::new(rt.clone(), live)))
+}
+
+/// Every bridge wired to the real crates. Call on the main thread.
+pub fn bridges() -> Bridges {
+    let settings = settings::Settings::load();
+    let rt = plugins::PluginRuntime::new(main_thread::MainThread::new(), settings.sandbox);
+    let live = Arc::new(factory(&rt, true));
+    let export = Arc::new(factory(&rt, false));
+    let catalog = plugins::RealCatalog::new(rt.clone(), crate::appearance::config_dir().join("plugins.json"));
+    let engine = engine::RealEngine::new(live, export, rt, settings);
+    Bridges {
+        engine: Box::new(engine),
+        plugins: Box::new(catalog),
+        library: Box::<StubLibrary>::default(),
+        ai: Box::new(ai::RealAi::new()),
+    }
+}

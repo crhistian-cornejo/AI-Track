@@ -20,6 +20,8 @@ actions!(
         TabSteps,
         TabMixer,
         Escape,
+        OpenPreferences,
+        ExportAudio,
         Quit,
     ]
 );
@@ -47,6 +49,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("3", TabSteps, Some(CTX)),
         KeyBinding::new("4", TabMixer, Some(CTX)),
         KeyBinding::new("escape", Escape, Some(CTX)),
+        KeyBinding::new(&format!("{m}-,"), OpenPreferences, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-shift-e"), ExportAudio, Some("Workspace")),
         KeyBinding::new(&format!("{m}-q"), Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());

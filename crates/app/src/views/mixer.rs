@@ -26,7 +26,7 @@ fn slot(text: impl Into<gpui::SharedString>, active: bool, i: Option<Icon>) -> D
         .gap(px(SP1))
         .flex()
         .items_center()
-        .rounded(px(R_SM))
+        .rounded(px(r_sm()))
         .bg(if active { content(0.07) } else { content(0.03) })
         .border_1()
         .border_color(border())
@@ -44,7 +44,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let mut tracks: Vec<(usize, TrackId)> = ws.s.project.tracks.iter().enumerate().map(|(i, t)| (order(t.kind) * 1000 + i, t.id)).collect();
     tracks.sort();
     let returns: Vec<(TrackId, String)> = ws.s.project.tracks.iter().filter(|t| t.kind == TrackKind::Return).map(|t| (t.id, t.name.clone())).collect();
-    let fader_h = (ws.bottom_h - TAB_BAR_H - 300.).clamp(72., 360.);
+    let fader_h = (ws.bottom_h - TAB_BAR_H - 316.).clamp(64., 360.);
     let mut row = div().h_full().flex().gap(px(SP1)).p(px(SP2));
     let mut last_group = 0;
     for (k, id) in tracks {
@@ -102,7 +102,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
                 .gap(px(SP1))
                 .flex()
                 .items_center()
-                .rounded(px(R_SM))
+                .rounded(px(r_sm()))
                 .bg(content(0.03))
                 .when(has, |d| {
                     let index = send.unwrap_or(0);
@@ -148,7 +148,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
         .gap(px(SP1))
         .flex()
         .flex_col()
-        .rounded(px(R_LG))
+        .rounded(px(r_lg()))
         .bg(if selected { pal.raised } else { pal.surface })
         .border_1()
         .border_color(if selected { accent_alpha(0.45) } else { border() })
@@ -211,7 +211,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
                 .flex()
                 .flex_col()
                 .justify_center()
-                .rounded(px(R_SM))
+                .rounded(px(r_sm()))
                 .bg(with_alpha(color, 0.2))
                 .border_t_2()
                 .border_color(color)

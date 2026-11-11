@@ -16,6 +16,13 @@ aitrack-dsp.workspace = true
 # The manifest gives the window per-monitor DPI awareness on Windows.
 gpui = { workspace = true, features = ["windows-manifest"] }
 gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+serde.workspace = true
+serde_json.workspace = true
+# Theme folder hot reload (CC0).
+notify = "8.2"
+async-channel = "2"
+# Background images: decode, downscale and pre-blur once, off the UI thread.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

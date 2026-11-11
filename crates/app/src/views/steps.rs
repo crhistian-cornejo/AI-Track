@@ -51,7 +51,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .gap(px(SP2))
                 .flex()
                 .items_center()
-                .rounded(px(R_MD))
+                .rounded(px(r_md()))
                 .bg(pal.surface)
                 .border_1()
                 .border_color(border())
@@ -80,9 +80,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         Some((_, _, v)) => with_alpha(c, 0.55 + 0.45 * v),
                         None => content(if on_beat { 0.07 } else { 0.045 }),
                     };
-                    window.paint_quad(paint::rrect(at(o, x, y, STEP, ROW), R_SM, bg));
+                    window.paint_quad(paint::rrect(at(o, x, y, STEP, ROW), r_sm(), bg));
                     if playing_step == Some(i) {
-                        window.paint_quad(paint::rrect_border(at(o, x, y, STEP, ROW), R_SM, gpui::transparent_black(), accent(), 1.5));
+                        window.paint_quad(paint::rrect_border(at(o, x, y, STEP, ROW), r_sm(), gpui::transparent_black(), accent(), 1.5));
                     }
                 }
             }

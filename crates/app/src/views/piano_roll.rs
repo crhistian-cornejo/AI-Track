@@ -46,13 +46,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let t = ws.b.engine.transport();
     let mut play_tick = None;
     if t.playing {
-        if let (Some(track), Some(scene)) = (ws.s.clip_track(clip_id), ws.s.clip_scene(clip_id)) {
-            if let Some(SlotState::Playing { scene: s, since }) = ws.b.engine.slot_state(track) {
-                if s == scene {
+        if let (Some(track), Some(scene)) = (ws.s.clip_track(clip_id), ws.s.clip_scene(clip_id))
+            && let Some(SlotState::Playing { scene: s, since }) = ws.b.engine.slot_state(track)
+                && s == scene {
                     play_tick = Some((t.position - since).rem_euclid(len));
                 }
-            }
-        }
         if play_tick.is_none() {
             for tr in &ws.s.project.tracks {
                 for pl in tr.arrangement.iter().filter(|pl| pl.clip == clip_id) {
@@ -111,15 +109,15 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let pc = key % 12;
                 let black = matches!(pc, 1 | 3 | 6 | 8 | 10);
                 let in_scale = mask & (1 << pc) != 0;
-                let fill = if black { if pal.dark { gpui::hsla(0., 0., 0.08, 1.) } else { gpui::hsla(0., 0., 0.22, 1.) } } else if pal.dark { gpui::hsla(0., 0., 0.78, 1.) } else { gpui::hsla(0., 0., 0.98, 1.) };
+                let fill = if black { pal.key_black } else { pal.key_white };
                 let w = if black { KEYS_W * 0.62 } else { KEYS_W - 1. };
                 window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h - 1.), fill));
                 if in_scale && scale.is_some() {
-                    window.paint_quad(paint::fill_rect(at(o, KEYS_W - 4., y + 1., 3., view.row_h - 3.), if Some(pc as u8) == root { accent() } else { accent_alpha(0.45) }));
+                    window.paint_quad(paint::fill_rect(at(o, KEYS_W - 4., y + 1., 3., view.row_h - 3.), if Some(pc as u8) == root { pal.accent } else { pal.scale_highlight }));
                 }
                 if pc == 0 && view.row_h >= 9. {
                     let name = format!("C{}", key / 12 - 1);
-                    paint::text(window, cx, &name, o.x + px(KEYS_W - 8.), o.y + px(y + (view.row_h - 12.) / 2.), TEXT_XS, gpui::hsla(0., 0., 0.25, 1.), FontWeight::MEDIUM, TextAlign::Right);
+                    paint::text(window, cx, &name, o.x + px(KEYS_W - 8.), o.y + px(y + (view.row_h - 12.) / 2.), TEXT_XS, with_alpha(pal.key_black, 0.75), FontWeight::MEDIUM, TextAlign::Right);
                 }
             }
             window.paint_quad(paint::fill_rect(at(o, KEYS_W - 1., 0., 1., h), border()));
@@ -149,9 +147,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let y = r as f32 * view.row_h - view.scroll_y;
                 let pc = key % 12;
                 let in_scale = mask & (1 << pc) != 0;
-                let bg = if Some(pc as u8) == root { theme_mix(pal.row_scale, pal.accent, 0.06) } else if in_scale { pal.row_scale } else { pal.row_out };
+                let bg = if in_scale { pal.row_scale } else { pal.row_out };
                 window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h), bg));
-                window.paint_quad(paint::fill_rect(at(o, 0., y + view.row_h - 1., w, 1.), content(if pc == 0 { 0.08 } else { 0.03 })));
+                if Some(pc as u8) == root {
+                    window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h), pal.root_highlight));
+                }
+                window.paint_quad(paint::fill_rect(at(o, 0., y + view.row_h - 1., w, 1.), if pc == 0 { pal.grid_beat } else { pal.grid_sub }));
             }
             // Vertical grid: snap lines, beats, bars.
             let first_tick = view.scroll_x / ppt;
@@ -160,7 +161,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let start = (view.scroll_x / step).floor() as i64;
                 for i in 0..=((w / step).ceil() as i64 + 1) {
                     let x = (start + i) as f32 * step - view.scroll_x;
-                    window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), content(0.025)));
+                    window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), pal.grid_sub));
                 }
             }
             let beat_start = (first_tick / PPQ as f32).floor() as i64;
@@ -168,7 +169,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let beat = beat_start + i;
                 let x = beat as f32 * view.px_per_beat - view.scroll_x;
                 let bar = beat % 4 == 0;
-                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), content(if bar { 0.11 } else { 0.05 })));
+                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), if bar { pal.grid_bar } else { pal.grid_beat }));
             }
             // Outside the clip.
             let end = len as f32 * ppt - view.scroll_x;
@@ -194,11 +195,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     continue;
                 }
                 let sel = grid_sel.contains(&n.id);
-                let body = with_alpha(if sel { theme_mix(fill, gpui::white(), 0.35) } else { fill }, 0.55 + 0.45 * n.velocity);
-                window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, if sel { accent() } else { with_alpha(gpui::black(), 0.35) }, if sel { 1.5 } else { 1. }));
+                let body = with_alpha(if sel { theme_mix(fill, pal.clip_text_light, 0.35) } else { fill }, 0.55 + 0.45 * n.velocity);
+                window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, if sel { pal.accent } else { shadow(0.35) }, if sel { 1.5 } else { 1. }));
                 // Resize grip.
                 if nw > 10. {
-                    window.paint_quad(paint::fill_rect(at(o, x + nw - 4., y + 3., 1., nh - 6.), with_alpha(gpui::black(), 0.3)));
+                    window.paint_quad(paint::fill_rect(at(o, x + nw - 4., y + 3., 1., nh - 6.), shadow(0.3)));
                 }
             }
             if let Some((a, bb)) = marquee {

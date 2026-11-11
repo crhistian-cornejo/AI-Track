@@ -89,7 +89,8 @@ pub fn text(
     if s.is_empty() {
         return 0.;
     }
-    let mut font = gpui::font(theme::FONT_UI);
+    let font_size = theme::fs(font_size);
+    let mut font = gpui::font(theme::font_ui());
     font.weight = weight;
     let run = TextRun { len: s.len(), font, color, background_color: None, underline: None, strikethrough: None };
     let line = window.text_system().shape_line(SharedString::from(s.to_owned()), px(font_size), &[run], None);

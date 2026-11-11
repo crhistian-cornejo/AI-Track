@@ -26,14 +26,6 @@ pub enum BottomTab {
 
 impl BottomTab {
     pub const ALL: [BottomTab; 4] = [Self::Devices, Self::PianoRoll, Self::Steps, Self::Mixer];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Devices => "Devices",
-            Self::PianoRoll => "Piano Roll",
-            Self::Steps => "Step Sequencer",
-            Self::Mixer => "Mixer",
-        }
-    }
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
@@ -238,11 +230,10 @@ impl AppState {
     }
 
     fn prune_selection(&mut self) {
-        if let Some(c) = self.selected_clip {
-            if !self.project.clips.contains_key(&c) {
+        if let Some(c) = self.selected_clip
+            && !self.project.clips.contains_key(&c) {
                 self.selected_clip = None;
             }
-        }
         let live: BTreeSet<NoteId> = self
             .selected_clip
             .and_then(|c| self.clip_notes(c))
@@ -312,11 +303,10 @@ impl AppState {
     /// The clip the step sequencer edits: the selected clip on a drum-rack
     /// track, else the first clip of the first drum-rack track.
     pub fn step_clip(&self) -> Option<(TrackId, ClipId)> {
-        if let (Some(clip), Some(track)) = (self.selected_clip, self.selected_clip.and_then(|c| self.clip_track(c))) {
-            if self.project.track(track).is_some_and(is_drum_track) {
+        if let (Some(clip), Some(track)) = (self.selected_clip, self.selected_clip.and_then(|c| self.clip_track(c)))
+            && self.project.track(track).is_some_and(is_drum_track) {
                 return Some((track, clip));
             }
-        }
         let t = self.project.tracks.iter().find(|t| is_drum_track(t))?;
         let clip = t.session_slots.values().next().copied().or_else(|| t.arrangement.first().map(|p| p.clip))?;
         Some((t.id, clip))
@@ -381,7 +371,7 @@ impl AppState {
     /// Change the length of `originals` by `dl` ticks (one coalesced drag).
     pub fn resize_notes(&mut self, clip: ClipId, originals: &[Note], dl: Tick) -> bool {
         let Some((source, _)) = self.clip_notes(clip) else { return false };
-        let min_len = self.snap.ticks().min(PPQ / 4).max(PPQ / 16);
+        let min_len = self.snap.ticks().clamp(PPQ / 16, PPQ / 4);
         let notes: Vec<Note> =
             originals.iter().map(|n| Note { length: (n.length + dl).max(min_len), ..n.clone() }).collect();
         if let Some(n) = notes.first() {
@@ -414,7 +404,7 @@ impl AppState {
             .filter_map(|n| {
                 let target = grid.round(n.start);
                 let start = n.start + ((target - n.start) as f32 * s).round() as Tick;
-                (start != n.start).then(|| Note { start, ..n })
+                (start != n.start).then_some(Note { start, ..n })
             })
             .collect();
         let count = changed.len();
@@ -432,7 +422,7 @@ impl AppState {
             .into_iter()
             .filter_map(|n| {
                 let key = scale.snap(n.key);
-                (key != n.key).then(|| Note { key, ..n })
+                (key != n.key).then_some(Note { key, ..n })
             })
             .collect();
         let count = changed.len();

@@ -51,7 +51,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .flex()
                 .items_center()
                 .gap(px(SP2))
-                .rounded(px(R_MD))
+                .rounded(px(r_md()))
                 .bg(pal.surface)
                 .child(icon(Icon::Play, 12., pal.muted))
                 .child(label("Scenes", TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM)),
@@ -61,12 +61,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         scene_col = scene_col.child(
             div()
                 .id(("scene", i))
-                .h(px(SESSION_ROW_H))
+                .h(px(session_row_h()))
                 .px(px(SP1))
                 .flex()
                 .items_center()
                 .gap(px(SP2))
-                .rounded(px(R_MD))
+                .rounded(px(r_md()))
                 .bg(pal.surface)
                 .cursor_pointer()
                 .hover(|s| s.bg(pal.raised))
@@ -75,7 +75,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     this.b.engine.launch_scene(sid);
                     cx.notify();
                 }))
-                .child(div().size(px(20.)).flex().items_center().justify_center().rounded(px(R_SM)).bg(content(0.06)).child(icon(Icon::Play, 10., pal.text)))
+                .child(div().size(px(20.)).flex().items_center().justify_center().rounded(px(r_sm())).bg(content(0.06)).child(icon(Icon::Play, 10., pal.text)))
                 .child(label(name.clone(), TEXT_SM, pal.muted).flex_1())
                 .child(mono(format!("{}", i + 1), TEXT_XS, pal.faint)),
         );
@@ -83,12 +83,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     scene_col = scene_col.child(
         div()
             .id("stop-all")
-            .h(px(SESSION_ROW_H))
+            .h(px(session_row_h()))
             .px(px(SP2))
             .flex()
             .items_center()
             .gap(px(SP2))
-            .rounded(px(R_MD))
+            .rounded(px(r_md()))
             .cursor_pointer()
             .border_1()
             .border_color(border())
@@ -129,7 +129,7 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
         .flex()
         .items_center()
         .gap(px(SP2))
-        .rounded(px(R_MD))
+        .rounded(px(r_md()))
         .bg(if selected { pal.raised } else { pal.surface })
         .border_1()
         .border_color(if selected { accent_alpha(0.5) } else { border() })
@@ -152,11 +152,11 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
     col = col.child(
         div()
             .id(("stop-track", tid.0 as usize))
-            .h(px(SESSION_ROW_H))
+            .h(px(session_row_h()))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(R_MD))
+            .rounded(px(r_md()))
             .border_1()
             .border_color(border())
             .cursor_pointer()
@@ -170,12 +170,12 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
     let (mute, solo, arm) = (t.mute, t.solo, t.arm);
     col.child(
         div()
-            .h(px(SESSION_ROW_H))
+            .h(px(session_row_h()))
             .px(px(SP1))
             .flex()
             .items_center()
             .gap(px(SP1))
-            .rounded(px(R_MD))
+            .rounded(px(r_md()))
             .bg(pal.surface)
             .child(chip(("s-m", tid.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
                 this.s.set_track(tid, TrackProp::Mute(!mute));
@@ -214,8 +214,8 @@ fn slot(
     let Some(cid) = clip else {
         return div()
             .id(("slot-empty", key))
-            .h(px(SESSION_ROW_H))
-            .rounded(px(R_MD))
+            .h(px(session_row_h()))
+            .rounded(px(r_md()))
             .bg(content(if has_clips { 0.035 } else { 0.015 }))
             .border_1()
             .border_color(border())
@@ -250,10 +250,10 @@ fn slot(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(R_SM))
+        .rounded(px(r_sm()))
         .cursor_pointer()
-        .bg(with_alpha(gpui::black(), 0.18))
-        .hover(|s| s.bg(with_alpha(gpui::black(), 0.3)))
+        .bg(shadow(0.18))
+        .hover(|s| s.bg(shadow(0.3)))
         .tooltip(widgets::tip("Launch clip", None))
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
@@ -279,16 +279,16 @@ fn slot(
         });
     div()
         .id(("slot", key))
-        .h(px(SESSION_ROW_H))
+        .h(px(session_row_h()))
         .pl(px(SP1))
         .pr(px(SP2))
         .flex()
         .items_center()
         .gap(px(SP2))
-        .rounded(px(R_MD))
+        .rounded(px(r_md()))
         .bg(clip_fill(c.color))
         .border_1()
-        .border_color(if selected { pal.accent } else if is_playing { with_alpha(fg, 0.6) } else { with_alpha(gpui::black(), 0.2) })
+        .border_color(if selected { pal.accent } else if is_playing { with_alpha(fg, 0.6) } else { shadow(0.2) })
         .cursor_pointer()
         .hover(|s| s.opacity(0.92))
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {

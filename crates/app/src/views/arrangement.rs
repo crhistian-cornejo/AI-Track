@@ -39,13 +39,12 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
     let mut out = Vec::new();
     let mut y = 0.;
     for t in s.project.content_tracks() {
-        if let Some(parent) = t.parent {
-            if s.project.track(parent).is_some_and(|g| g.collapsed) {
+        if let Some(parent) = t.parent
+            && s.project.track(parent).is_some_and(|g| g.collapsed) {
                 continue;
             }
-        }
         let auto = s.automation_shown.contains(&t.id).then(|| t.automation.first().map(|l| l.target)).flatten();
-        let h = t.height.max(40.).round();
+        let h = crate::theme::density(t.height.max(40.).round());
         out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, auto });
         y += out.last().map_or(0., LaneRow::total);
     }
@@ -169,15 +168,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 offset: c.offset,
             });
         }
-        if let Some(target) = r.auto {
-            if let Some(lane) = t.automation.iter().find(|l| l.target == target) {
+        if let Some(target) = r.auto
+            && let Some(lane) = t.automation.iter().find(|l| l.target == target) {
                 autos.push(AutoPaint {
                     y: ry + r.h,
                     points: lane.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect(),
-                    color: track_color(t.color),
+                    color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
                 });
             }
-        }
     }
     let playhead = transport.position as f32 * px_per_tick - view.scroll_x;
     let loop_px = loop_region.map(|(a, b)| (a as f32 * px_per_tick - view.scroll_x, b as f32 * px_per_tick - view.scroll_x));
@@ -209,10 +207,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 if bar % 8 >= 4 {
                     window.paint_quad(paint::fill_rect(at(o, x, 0., ppb * 4., h), content(0.012)));
                 }
-                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), content(if bar % 4 == 0 { 0.09 } else { 0.05 })));
+                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), if bar % 4 == 0 { p().grid_bar } else { p().grid_beat }));
                 if ppb >= 14. {
                     for beat in 1..4 {
-                        window.paint_quad(paint::fill_rect(at(o, x + beat as f32 * ppb, 0., 1., h), content(0.025)));
+                        window.paint_quad(paint::fill_rect(at(o, x + beat as f32 * ppb, 0., 1., h), p().grid_sub));
                     }
                 }
             }
@@ -367,7 +365,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .gap(px(SP1))
                 .flex()
                 .items_center()
-                .rounded(px(R_MD))
+                .rounded(px(r_md()))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
                 .tooltip(widgets::tip("Snap grid", None))
@@ -401,8 +399,8 @@ fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &Cli
     let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
     let fill = clip_fill(c.color);
     let fg = clip_text(c.color);
-    window.paint_quad(paint::rrect_border(body, R_SM, with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
-    window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), R_SM, fill));
+    window.paint_quad(paint::rrect_border(body, r_sm(), with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
+    window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), r_sm(), fill));
     if c.w > 28. {
         window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
             paint::text(window, cx, &paint::fit(&c.name, c.w - 10., TEXT_XS), o.x + px(c.x + 5.), o.y + px(c.y + 0.5), TEXT_XS, fg, FontWeight::MEDIUM, TextAlign::Left);
@@ -450,8 +448,18 @@ fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &Cli
                 top.push(point(o.x + px(x), o.y + px(mid - a)));
             }
             let bottom: Vec<_> = top.iter().rev().map(|p| point(p.x, o.y + px(2. * mid) - (p.y - o.y))).collect();
-            top.extend(bottom);
-            paint::polygon(window, &top, with_alpha(fg, 0.7));
+            let wave = crate::theme::mix(fg, p().waveform, 0.5);
+            if style().waveform == WaveformStyle::Outline {
+                let mut ring = top.clone();
+                ring.extend(bottom);
+                if let Some(first) = ring.first().copied() {
+                    ring.push(first);
+                }
+                paint::polyline(window, &ring, 1., wave);
+            } else {
+                top.extend(bottom);
+                paint::polygon(window, &top, wave);
+            }
         }
     });
 }
@@ -615,7 +623,7 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
     let hit = ws.s.project.track(track).and_then(|t| {
         t.arrangement.iter().rev().find_map(|pl| {
             let c = ws.s.project.clips.get(&pl.clip)?;
-            (tick >= pl.start && tick < pl.start + c.length).then(|| (pl.id, pl.clip, pl.start, c.length))
+            (tick >= pl.start && tick < pl.start + c.length).then_some((pl.id, pl.clip, pl.start, c.length))
         })
     });
     match hit {

@@ -40,7 +40,7 @@ fn scale_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(R_MD))
+                .rounded(px(r_md()))
                 .cursor_pointer()
                 .bg(if on { pal.accent } else if black { content(0.04) } else { content(0.08) })
                 .when(!on, |d| d.hover(|s| s.bg(content(0.14))))

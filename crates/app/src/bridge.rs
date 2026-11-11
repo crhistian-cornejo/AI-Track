@@ -32,12 +32,6 @@ pub struct MeterLevel {
     pub right: f32,
 }
 
-impl MeterLevel {
-    pub fn max(&self) -> f32 {
-        self.left.max(self.right)
-    }
-}
-
 /// What a session slot is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
@@ -65,6 +59,21 @@ pub trait EngineBridge {
     fn launch_scene(&mut self, scene: SceneId);
     fn stop_track(&mut self, track: TrackId);
     fn slot_state(&self, track: TrackId) -> Option<SlotState>;
+
+    // ── Audio device (Preferences → Audio) ──
+    fn audio_hosts(&self) -> Vec<AudioHost>;
+    /// Every device on every host.
+    fn audio_devices(&self) -> Vec<AudioDevice>;
+    fn audio_config(&self) -> AudioConfig;
+    /// Apply a configuration; the engine clamps what the device cannot do.
+    fn set_audio_config(&mut self, config: AudioConfig) -> Result<AudioConfig, String>;
+    /// A short 440 Hz tone on the selected output channels.
+    fn test_tone(&mut self);
+
+    // ── Offline export ──
+    /// Render in the background; `progress` runs on the render thread and
+    /// returns `false` to cancel.
+    fn export(&mut self, options: ExportOptions, project: &Project, progress: ProgressFn);
 }
 
 /// Fake engine: the position follows the wall clock at the project tempo and
@@ -77,6 +86,7 @@ pub struct StubEngine {
     tracks: Vec<(TrackId, TrackKind, bool)>,
     slots: BTreeMap<TrackId, SlotState>,
     clip_slots: BTreeMap<TrackId, Vec<SceneId>>,
+    audio: AudioConfig,
 }
 
 impl Default for StubEngine {
@@ -89,6 +99,7 @@ impl Default for StubEngine {
             tracks: Vec::new(),
             slots: BTreeMap::new(),
             clip_slots: BTreeMap::new(),
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -98,13 +109,11 @@ impl StubEngine {
         let Some((at, from)) = self.started else { return self.state.position };
         let elapsed = at.elapsed().as_secs_f64();
         let mut tick = from + (elapsed * self.bpm / 60. * PPQ as f64) as Tick;
-        if self.state.looping {
-            if let Some((a, b)) = self.loop_region {
-                if b > a && tick >= b {
+        if self.state.looping
+            && let Some((a, b)) = self.loop_region
+                && b > a && tick >= b {
                     tick = a + (tick - a) % (b - a);
                 }
-            }
-        }
         tick
     }
 
@@ -251,6 +260,248 @@ impl EngineBridge for StubEngine {
     fn slot_state(&self, track: TrackId) -> Option<SlotState> {
         self.slots.get(&track).copied()
     }
+
+    fn audio_hosts(&self) -> Vec<AudioHost> {
+        if cfg!(target_os = "macos") {
+            vec![AudioHost::CoreAudio]
+        } else {
+            vec![AudioHost::Wasapi, AudioHost::WasapiExclusive, AudioHost::Asio]
+        }
+    }
+
+    fn audio_devices(&self) -> Vec<AudioDevice> {
+        let dev = |id: &str, name: &str, host, i, o, rates: &[u32], range| AudioDevice {
+            id: id.into(),
+            name: name.into(),
+            host,
+            input_channels: i,
+            output_channels: o,
+            sample_rates: rates.to_vec(),
+            buffer_range: range,
+            default_rate: 48_000,
+        };
+        let all = &SAMPLE_RATES[..];
+        let low = &SAMPLE_RATES[..4];
+        let mut out = Vec::new();
+        for host in self.audio_hosts() {
+            match host {
+                AudioHost::Asio => {
+                    out.push(dev("asio-focusrite", "Focusrite USB ASIO", host, 2, 2, all, (32, 2048)));
+                    out.push(dev("asio-generic", "Generic Low Latency ASIO", host, 2, 2, low, (64, 4096)));
+                }
+                AudioHost::CoreAudio => {
+                    out.push(dev("ca-builtin", "MacBook Speakers", host, 0, 2, low, (32, 4096)));
+                    out.push(dev("ca-mic", "MacBook Microphone", host, 1, 0, low, (32, 4096)));
+                    out.push(dev("ca-interface", "Audio Interface", host, 8, 8, all, (32, 4096)));
+                }
+                _ => {
+                    out.push(dev("wasapi-speakers", "Speakers (Realtek Audio)", host, 0, 2, &[44_100, 48_000], (128, 4096)));
+                    out.push(dev("wasapi-mic", "Microphone (USB Audio)", host, 2, 0, &[44_100, 48_000], (128, 4096)));
+                    out.push(dev("wasapi-interface", "Line (Audio Interface)", host, 4, 4, low, (64, 4096)));
+                }
+            }
+        }
+        out
+    }
+
+    fn audio_config(&self) -> AudioConfig {
+        self.audio.clone()
+    }
+
+    fn set_audio_config(&mut self, mut config: AudioConfig) -> Result<AudioConfig, String> {
+        let devices = self.audio_devices();
+        let output = config.output.as_ref().and_then(|id| devices.iter().find(|d| &d.id == id && d.host == config.host));
+        if let Some(d) = output {
+            if !d.sample_rates.contains(&config.sample_rate) {
+                config.sample_rate = d.default_rate;
+            }
+            config.buffer_size = config.buffer_size.clamp(d.buffer_range.0, d.buffer_range.1);
+            config.output_channels.retain(|c| *c < d.output_channels);
+        }
+        self.audio = config.clone();
+        Ok(config)
+    }
+
+    fn test_tone(&mut self) {}
+
+    fn export(&mut self, options: ExportOptions, _project: &Project, progress: ProgressFn) {
+        stub_export(options, progress);
+    }
+}
+
+
+// ───────────────────────────── Audio device & export ─────────────────────────────
+
+/// Audio driver / host API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AudioHost {
+    Wasapi,
+    WasapiExclusive,
+    Asio,
+    CoreAudio,
+}
+
+impl AudioHost {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wasapi => "WASAPI (shared)",
+            Self::WasapiExclusive => "WASAPI Exclusive",
+            Self::Asio => "ASIO",
+            Self::CoreAudio => "CoreAudio",
+        }
+    }
+}
+
+/// The sample rates the UI offers (a device lists the subset it supports).
+pub const SAMPLE_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+/// Buffer sizes the UI offers (clamped to each device's range).
+pub const BUFFER_SIZES: [u32; 8] = [32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub host: AudioHost,
+    pub input_channels: u16,
+    pub output_channels: u16,
+    pub sample_rates: Vec<u32>,
+    pub buffer_range: (u32, u32),
+    pub default_rate: u32,
+}
+
+/// What the user picks in Preferences → Audio. `None` devices mean "default".
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioConfig {
+    pub host: AudioHost,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub sample_rate: u32,
+    pub buffer_size: u32,
+    /// Enabled channels, 0-based.
+    pub input_channels: Vec<u16>,
+    pub output_channels: Vec<u16>,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            host: if cfg!(target_os = "macos") { AudioHost::CoreAudio } else { AudioHost::Wasapi },
+            input: None,
+            output: None,
+            sample_rate: 48_000,
+            buffer_size: 256,
+            input_channels: vec![0, 1],
+            output_channels: vec![0, 1],
+        }
+    }
+}
+
+impl AudioConfig {
+    /// One-way buffer latency in milliseconds.
+    pub fn buffer_ms(&self) -> f32 {
+        self.buffer_size as f32 / self.sample_rate.max(1) as f32 * 1000.
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WavDepth {
+    /// 16-bit integer with TPDF dither (always on at 16-bit).
+    Int16Dithered,
+    Int24,
+    Float32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Wav(WavDepth),
+    /// Always 320 kbps CBR.
+    Mp3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportRange {
+    Song,
+    Loop,
+    Selection { start: Tick, end: Tick },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportMode {
+    Mixdown,
+    /// One WAV per track/group/return.
+    Stems { tracks: Vec<TrackId> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportOptions {
+    pub format: ExportFormat,
+    pub sample_rate: u32,
+    pub range: ExportRange,
+    pub mode: ExportMode,
+    /// Peak-normalise to -0.3 dBFS (one shared gain for stems).
+    pub normalize: bool,
+    /// Rendered past the end so reverbs and delays ring out.
+    pub tail_seconds: f32,
+    pub folder: PathBuf,
+    pub file_name: String,
+}
+
+impl ExportOptions {
+    /// Stems are always WAV; MP3 only exists for mixdowns.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if matches!(self.mode, ExportMode::Stems { .. }) && self.format == ExportFormat::Mp3 {
+            return Err("Stems are always exported as WAV");
+        }
+        if let ExportMode::Stems { tracks } = &self.mode
+            && tracks.is_empty() {
+                return Err("Choose at least one track for stems");
+            }
+        if let ExportRange::Selection { start, end } = self.range
+            && end <= start {
+                return Err("The selection is empty");
+            }
+        if self.file_name.trim().is_empty() {
+            return Err("Enter a file name");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportProgress {
+    pub fraction: f32,
+    pub stage: String,
+    pub done: bool,
+    pub cancelled: bool,
+    pub error: Option<String>,
+    pub files: Vec<PathBuf>,
+}
+
+/// Called from the render thread; return `false` to cancel.
+pub type ProgressFn = Box<dyn FnMut(ExportProgress) -> bool + Send>;
+
+/// The stub "renders" on a thread for a couple of seconds and reports progress.
+fn stub_export(options: ExportOptions, mut progress: ProgressFn) {
+    std::thread::spawn(move || {
+        let names: Vec<String> = match &options.mode {
+            ExportMode::Mixdown => vec![options.file_name.clone()],
+            ExportMode::Stems { tracks } => tracks.iter().map(|t| format!("{} - track {}", options.file_name, t.0)).collect(),
+        };
+        let ext = if options.format == ExportFormat::Mp3 { "mp3" } else { "wav" };
+        let steps = 40;
+        for i in 0..=steps {
+            let f = i as f32 / steps as f32;
+            let stage = if f < 0.85 { "Rendering" } else if options.normalize && f < 0.95 { "Normalizing" } else { "Writing files" };
+            let keep = progress(ExportProgress { fraction: f, stage: stage.into(), done: false, cancelled: false, error: None, files: Vec::new() });
+            if !keep {
+                progress(ExportProgress { fraction: f, stage: "Cancelled".into(), done: true, cancelled: true, error: None, files: Vec::new() });
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let files = names.iter().map(|n| options.folder.join(format!("{n}.{ext}"))).collect();
+        progress(ExportProgress { fraction: 1., stage: "Done".into(), done: true, cancelled: false, error: None, files });
+    });
 }
 
 // ───────────────────────────── Plugins ─────────────────────────────
@@ -700,7 +951,9 @@ struct StubJob {
 enum StubJobKind {
     Midi(String),
     Stems(PathBuf),
-    Chat(String),
+    /// The reply text and, when the message names a track, a proposal.
+    Chat(String, Option<(String, Vec<aitrack_model::Command>)>),
+    Fail(String),
 }
 
 #[derive(Default)]
@@ -719,16 +972,31 @@ impl StubAi {
 
 impl AiBridge for StubAi {
     fn extract_midi(&mut self, path: &Path) -> JobId {
-        let name = path.file_stem().map_or("Audio".into(), |s| s.to_string_lossy().into_owned());
-        self.push(StubJobKind::Midi(name))
+        match path.file_stem() {
+            Some(s) => self.push(StubJobKind::Midi(s.to_string_lossy().into_owned())),
+            None => self.push(StubJobKind::Fail("no audio file".into())),
+        }
     }
 
     fn split_stems(&mut self, path: &Path) -> JobId {
+        if path.as_os_str().is_empty() {
+            return self.push(StubJobKind::Fail("no audio file".into()));
+        }
         self.push(StubJobKind::Stems(path.to_path_buf()))
     }
 
-    fn chat(&mut self, text: &str, _project: &Project) {
-        self.push(StubJobKind::Chat(text.to_owned()));
+    fn chat(&mut self, text: &str, project: &Project) {
+        // The stub "understands" one thing: a message naming a track proposes
+        // nudging its level up, so the proposal flow can be exercised.
+        let lower = text.to_lowercase();
+        let proposal = project.content_tracks().find(|t| lower.contains(&t.name.to_lowercase())).map(|t| {
+            let db = (t.volume_db + 1.5).min(6.);
+            (
+                format!("Raise {} by 1.5 dB", t.name),
+                vec![aitrack_model::Command::SetTrack { id: t.id, change: aitrack_model::TrackProp::VolumeDb(db) }],
+            )
+        });
+        self.push(StubJobKind::Chat(text.to_owned(), proposal));
     }
 
     fn poll(&mut self) -> Vec<AiEvent> {
@@ -739,11 +1007,12 @@ impl AiBridge for StubAi {
             let total = match job.kind {
                 StubJobKind::Midi(_) => 1.6,
                 StubJobKind::Stems(_) => 3.2,
-                StubJobKind::Chat(_) => 0.9,
+                StubJobKind::Chat(..) => 0.9,
+                StubJobKind::Fail(_) => 0.3,
             };
             let f = (secs / total).min(1.);
             if f < 1. {
-                if f - job.reported >= 0.04 && !matches!(job.kind, StubJobKind::Chat(_)) {
+                if f - job.reported >= 0.04 && matches!(job.kind, StubJobKind::Midi(_) | StubJobKind::Stems(_)) {
                     job.reported = f;
                     let label = match job.kind {
                         StubJobKind::Midi(_) => "Extracting MIDI",
@@ -776,12 +1045,18 @@ impl AiBridge for StubAi {
                         stems: vec![stem("Vocals"), stem("Drums"), stem("Bass"), stem("Other")],
                     });
                 }
-                StubJobKind::Chat(text) => out.push(AiEvent::Reply {
-                    text: format!(
-                        "Stub assistant: I'd answer \"{}\" once a real agent is connected over MCP. Meanwhile, try the actions below.",
-                        text.chars().take(80).collect::<String>()
-                    ),
-                }),
+                StubJobKind::Chat(text, proposal) => {
+                    out.push(AiEvent::Reply {
+                        text: format!(
+                            "Stub assistant: I'd answer \"{}\" once a real agent is connected over MCP. Mention a track name and I'll propose an edit.",
+                            text.chars().take(80).collect::<String>()
+                        ),
+                    });
+                    if let Some((label, commands)) = proposal.clone() {
+                        out.push(AiEvent::Proposal { label, agent: "Stub assistant".into(), commands });
+                    }
+                }
+                StubJobKind::Fail(message) => out.push(AiEvent::Failed { job: job.id, message: message.clone() }),
             }
         }
         self.jobs.retain(|j| !finished.contains(&j.id));
@@ -828,6 +1103,39 @@ mod tests {
         assert!(!e.transport().playing);
         e.stop();
         assert_eq!(e.transport().position, 0);
+    }
+
+    #[test]
+    fn export_rules() {
+        let mut o = ExportOptions {
+            format: ExportFormat::Mp3,
+            sample_rate: 48_000,
+            range: ExportRange::Song,
+            mode: ExportMode::Stems { tracks: vec![TrackId(1)] },
+            normalize: true,
+            tail_seconds: 2.,
+            folder: PathBuf::from("out"),
+            file_name: "Song".into(),
+        };
+        assert!(o.validate().is_err(), "stems cannot be MP3");
+        o.format = ExportFormat::Wav(WavDepth::Int24);
+        assert!(o.validate().is_ok());
+        o.mode = ExportMode::Stems { tracks: vec![] };
+        assert!(o.validate().is_err());
+        o.mode = ExportMode::Mixdown;
+        o.format = ExportFormat::Mp3;
+        assert!(o.validate().is_ok());
+    }
+
+    #[test]
+    fn audio_config_clamps_to_the_device() {
+        let mut e = StubEngine::default();
+        let dev = e.audio_devices().into_iter().find(|d| d.output_channels > 0).unwrap();
+        let cfg = AudioConfig { host: dev.host, output: Some(dev.id.clone()), sample_rate: 192_000, buffer_size: 1, ..AudioConfig::default() };
+        let applied = e.set_audio_config(cfg).unwrap();
+        assert!(dev.sample_rates.contains(&applied.sample_rate));
+        assert!(applied.buffer_size >= dev.buffer_range.0);
+        assert!((AudioConfig { sample_rate: 48_000, buffer_size: 480, ..AudioConfig::default() }.buffer_ms() - 10.).abs() < 1e-3);
     }
 
     #[test]

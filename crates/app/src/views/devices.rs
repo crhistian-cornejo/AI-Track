@@ -38,7 +38,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             .items_center()
             .justify_center()
             .gap(px(SP2))
-            .rounded(px(R_LG))
+            .rounded(px(r_lg()))
             .border_1()
             .border_dashed()
             .border_color(border_strong())
@@ -66,7 +66,7 @@ fn card_shell(id: DeviceId, enabled: bool) -> Stateful<Div> {
         .h_full()
         .flex()
         .flex_col()
-        .rounded(px(R_LG))
+        .rounded(px(r_lg()))
         .bg(pal.surface)
         .border_1()
         .border_color(border())
@@ -254,7 +254,7 @@ fn rack_body(ws: &mut Workspace, track: TrackId, id: DeviceId, rack: &Rack, enab
                     div()
                         .id(("pad", (id.0 as usize) << 8 | i))
                         .size(px(40.))
-                        .rounded(px(R_MD))
+                        .rounded(px(r_md()))
                         .p(px(SP1))
                         .flex()
                         .flex_col()
@@ -287,7 +287,7 @@ fn rack_body(ws: &mut Workspace, track: TrackId, id: DeviceId, rack: &Rack, enab
         let mut list = div().w(px(144.)).p(px(SP2)).flex().flex_col().gap(px(SP1)).border_r_1().border_color(border()).child(label("CHAINS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD));
         for c in &rack.chains {
             list = list.child(
-                div().h(px(24.)).px(px(SP2)).gap(px(SP2)).flex().items_center().rounded(px(R_SM)).bg(content(0.04))
+                div().h(px(24.)).px(px(SP2)).gap(px(SP2)).flex().items_center().rounded(px(r_sm())).bg(content(0.04))
                     .child(div().size(px(8.)).rounded_full().bg(track_color(c.color)))
                     .child(label(c.name.clone(), TEXT_SM, pal.text)),
             );

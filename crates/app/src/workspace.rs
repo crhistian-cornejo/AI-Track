@@ -17,10 +17,10 @@ use aitrack_model::*;
 use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, Task, Window, anchored,
-    canvas, deferred, div, point, prelude::FluentBuilder, px,
+    canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use gpui::{AppContext as _, StatefulInteractiveElement};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -48,6 +48,8 @@ pub enum Drag {
     AutoPoint { track: TrackId, target: AutomationTarget, original: Vec<AutomationPoint>, index: usize },
     LoopBrace { anchor: Tick },
     Scrub,
+    /// Colour picker: the hue strip or the saturation/value square.
+    Pick { hue: bool },
 }
 
 /// Popovers and context menus.
@@ -111,7 +113,6 @@ pub struct Workspace {
     pub expanded: BTreeSet<String>,
     pub chat_log: Vec<ChatEntry>,
     pub regions: Rc<Regions>,
-    pub hover_note: Option<NoteId>,
     pub toast: Option<(String, Instant)>,
     synced_revision: Option<u64>,
     meters_live: bool,
@@ -120,27 +121,30 @@ pub struct Workspace {
     pub view_switch: u64,
     pub tab_switch: u64,
     _subs: Vec<Subscription>,
-    pub scroll_session: Rc<RefCell<f32>>,
+    pub look: views::prefs::Look,
+    pub modal: Option<views::prefs::Modal>,
+    pub export: views::export::ExportDialog,
+    pub export_name: Entity<TextInput>,
 }
 
 impl Workspace {
     pub fn new(project: Project, bridges: Bridges, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextInput::new(cx, "Search samples, devices…", Some(Icon::Search)));
         let chat = cx.new(|cx| TextInput::new(cx, "Ask the assistant…", Some(Icon::Sparkles)));
+        let export_name = cx.new(|cx| TextInput::new(cx, "File name", Some(Icon::File)));
+        let look = views::prefs::Look::load(cx);
         let subs = vec![
             cx.subscribe(&search, |this, _, e: &InputEvent, cx| {
-                if let InputEvent::Changed(q) | InputEvent::Submit(q) = e {
-                    this.query = q.clone();
-                    cx.notify();
-                }
+                let (InputEvent::Changed(q) | InputEvent::Submit(q)) = e;
+                this.query = q.clone();
+                cx.notify();
             }),
             cx.subscribe(&chat, |this, input, e: &InputEvent, cx| {
-                if let InputEvent::Submit(text) = e {
-                    if !text.trim().is_empty() {
+                if let InputEvent::Submit(text) = e
+                    && !text.trim().is_empty() {
                         this.send_chat(text.trim().to_owned(), cx);
                         input.update(cx, |i, cx| i.set_text("", cx));
                     }
-                }
             }),
         ];
         let mut s = AppState::new(project);
@@ -164,7 +168,6 @@ impl Workspace {
             expanded,
             chat_log: Vec::new(),
             regions: Rc::new(Regions::default()),
-            hover_note: None,
             toast: None,
             synced_revision: None,
             meters_live: false,
@@ -173,7 +176,10 @@ impl Workspace {
             view_switch: 0,
             tab_switch: 0,
             _subs: subs,
-            scroll_session: Rc::new(RefCell::new(0.)),
+            look,
+            modal: None,
+            export: views::export::ExportDialog::default(),
+            export_name,
         };
         // Seed the assistant with a greeting and one reviewable proposal.
         this.chat_log.push(ChatEntry::Assistant(
@@ -273,6 +279,10 @@ impl Workspace {
             self.s.bottom_tab = tab;
             self.tab_switch += 1;
         }
+        // The mixer needs room for its faders.
+        if tab == BottomTab::Mixer && self.bottom_h < 460. {
+            self.bottom_h = 460.;
+        }
         self.bottom_open = true;
         cx.notify();
     }
@@ -323,12 +333,6 @@ impl Workspace {
             self.s.selected_notes = n.notes.iter().map(|n| n.id).collect();
             cx.notify();
         }
-    }
-
-    pub fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        theme::set_dark(!theme::is_dark());
-        window.refresh();
-        cx.notify();
     }
 
     pub fn quantize_clip(&mut self, cx: &mut Context<Self>) {
@@ -471,6 +475,12 @@ impl Workspace {
                 let (tick, _) = self.arrange_pos(e.position);
                 self.b.engine.locate(Snap::Beat.floor(tick.max(0)));
             }
+            Drag::Pick { hue } => {
+                let hue = *hue;
+                self.drag = Some(drag);
+                self.pick_at(e.position, hue, cx);
+                return;
+            }
         }
         self.drag = Some(drag);
         cx.notify();
@@ -509,11 +519,10 @@ impl Workspace {
         let ok = if accept { self.s.accept(id) } else { self.s.discard(id) };
         if ok {
             for e in &mut self.chat_log {
-                if let ChatEntry::Proposal { id: pid, status, .. } = e {
-                    if *pid == id {
+                if let ChatEntry::Proposal { id: pid, status, .. } = e
+                    && *pid == id {
                         *status = if accept { ProposalStatus::Accepted } else { ProposalStatus::Discarded };
                     }
-                }
             }
             if accept {
                 self.toast("Proposal applied — one undo step", cx);
@@ -633,12 +642,11 @@ impl Workspace {
 
     fn set_job(&mut self, job: JobId, f: f32, finished: bool) {
         for e in &mut self.chat_log {
-            if let ChatEntry::Job { id, fraction, done, .. } = e {
-                if *id == job {
+            if let ChatEntry::Job { id, fraction, done, .. } = e
+                && *id == job {
                     *fraction = f;
                     *done = finished;
                 }
-            }
         }
     }
 
@@ -707,7 +715,7 @@ impl Workspace {
             .bg(pal.panel)
             .border_t_1()
             .border_color(border())
-            .text_size(px(TEXT_SM))
+            .text_size(px(fs(TEXT_SM)))
             .text_color(pal.muted)
             .child(crate::icons::icon(Icon::Undo, 12., pal.faint))
             .child(crate::widgets::label(undo, TEXT_SM, pal.muted))
@@ -757,7 +765,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap(px(SP2))
-                        .rounded(px(R_LG))
+                        .rounded(px(r_lg()))
                         .bg(pal.raised)
                         .border_1()
                         .border_color(border_strong())
@@ -848,7 +856,10 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_engine();
-        if self.wants_frames() || self.drag.is_some() {
+        if let Some(animate) = self.look.pending.take() {
+            self.apply_look(window, animate, cx);
+        }
+        if self.wants_frames() || self.drag.is_some() || theme::tweening() {
             window.request_animation_frame();
         }
         let pal = p();
@@ -863,8 +874,8 @@ impl Render for Workspace {
             .min_w(px(0.))
             .h_full()
             .overflow_hidden()
-            .bg(pal.panel)
-            .rounded(px(R_LG))
+            .bg(pane_bg(crate::appearance::Pane::Center))
+            .rounded(px(r_lg()))
             .border_1()
             .border_color(border())
             .child(motion::slide_in(switch_id, div().size_full().child(center), if self.view_switch == 0 { 0. } else { dx }));
@@ -880,6 +891,8 @@ impl Render for Workspace {
 
         let bottom = views::bottom::render(self, window, cx);
         let menu = self.render_menu(window, cx);
+        let modal = views::prefs::render_modal(self, window, cx);
+        let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
         let toast = self.render_toast();
         let status = self.render_status(cx);
@@ -898,12 +911,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_ai))
             .on_action(cx.listener(Self::toggle_browser))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(|this, _: &OpenPreferences, _, cx| this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Appearance), cx)))
+            .on_action(cx.listener(|this, _: &ExportAudio, _, cx| this.open_export(cx)))
             .on_action(cx.listener(|this, _: &TabDevices, _, cx| this.set_tab(BottomTab::Devices, cx)))
             .on_action(cx.listener(|this, _: &TabPianoRoll, _, cx| this.set_tab(BottomTab::PianoRoll, cx)))
             .on_action(cx.listener(|this, _: &TabSteps, _, cx| this.set_tab(BottomTab::Steps, cx)))
             .on_action(cx.listener(|this, _: &TabMixer, _, cx| this.set_tab(BottomTab::Mixer, cx)))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.menu = None;
+                this.modal = if this.export.running.is_some() { this.modal } else { None };
                 this.s.selected_notes.clear();
                 this.focus.focus(window, cx);
                 cx.notify();
@@ -919,9 +935,10 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(pal.base)
-            .font_family(FONT_UI)
-            .text_size(px(TEXT_MD))
+            .font_family(font_ui())
+            .text_size(px(fs(TEXT_MD)))
             .text_color(pal.text)
+            .children(backdrop)
             .child(views::topbar::render(self, window, cx))
             .child(
                 div()
@@ -936,12 +953,8 @@ impl Render for Workspace {
             )
             .child(status)
             .children(toast)
+            .children(modal)
             .children(capture)
             .children(menu)
     }
-}
-
-/// A point helper for menus opened from a click.
-pub fn below(bounds_bottom_left: Point<Pixels>) -> Point<Pixels> {
-    point(bounds_bottom_left.x, bounds_bottom_left.y + px(SP1))
 }

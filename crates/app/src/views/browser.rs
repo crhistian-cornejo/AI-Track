@@ -28,7 +28,7 @@ fn row(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
         .gap(px(SP2))
         .flex()
         .items_center()
-        .rounded(px(R_MD))
+        .rounded(px(r_md()))
         .cursor_pointer()
         .when(selected, |d| d.bg(accent_alpha(0.14)))
         .when(!selected, |d| d.hover(|s| s.bg(hover())))
@@ -48,7 +48,6 @@ fn section(title: &'static str, count: usize) -> Div {
 }
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
     let weak = cx.entity().downgrade();
     let tab = ws.s.browser_tab;
     let index = match tab {
@@ -80,8 +79,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .h_full()
         .flex()
         .flex_col()
-        .bg(pal.panel)
-        .rounded(px(R_LG))
+        .bg(pane_bg(crate::appearance::Pane::Browser))
+        .rounded(px(r_lg()))
         .border_1()
         .border_color(border())
         .overflow_hidden()
@@ -214,22 +213,22 @@ fn plugins(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let matches = |name: &str, tags: &[&str]| q.is_empty() || name.to_lowercase().contains(&q) || tags.iter().any(|t| t.contains(&q));
     let track = ws.s.selected_track;
     let mut col = div().flex().flex_col().px(px(SP1)).pb(px(SP2));
-    let stock: Vec<_> = ws.b.plugins.stock_devices().iter().filter(|d| matches(d.name, d.tags)).map(|d| (d.id, d.name, d.category)).collect();
+    let stock: Vec<_> = ws.b.plugins.stock_devices().iter().filter(|d| matches(d.name, d.tags)).map(|d| (d.id, d.name, d.category, d.is_instrument)).collect();
     col = col.child(section("STOCK DEVICES", stock.len()));
-    for (i, (id, name, cat)) in stock.into_iter().enumerate() {
+    for (i, (id, name, cat, instrument)) in stock.into_iter().enumerate() {
         col = col.child(
             row(("stock", i), false)
                 .child(icon(crate::views::menus::device_icon(id, ws), 14., pal.accent))
                 .child(label(name, TEXT_MD, pal.text).flex_1())
+                .when(instrument, |d| d.child(icon(Icon::MusicNote, 12., pal.faint)))
                 .child(badge(cat.label(), pal.muted))
                 .tooltip(widgets::tip("Click to add to the selected track", None))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(t) = track {
-                        if this.s.add_stock_device(t, id, name).is_some() {
+                    if let Some(t) = track
+                        && this.s.add_stock_device(t, id, name).is_some() {
                             this.set_tab(crate::state::BottomTab::Devices, cx);
                             this.toast(format!("Added {name}"), cx);
                         }
-                    }
                 })),
         );
     }
@@ -245,12 +244,11 @@ fn plugins(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     .child(label(plug.vendor.clone(), TEXT_XS, pal.faint))
                     .tooltip(widgets::tip_owned(plug.path.display().to_string()))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(t) = track {
-                            if this.s.add_plugin_device(t, &plug).is_some() {
+                        if let Some(t) = track
+                            && this.s.add_plugin_device(t, &plug).is_some() {
                                 this.set_tab(crate::state::BottomTab::Devices, cx);
                                 this.toast(format!("Added {name}"), cx);
                             }
-                        }
                     })),
             );
         }

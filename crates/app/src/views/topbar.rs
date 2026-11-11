@@ -47,7 +47,7 @@ fn field(id: &'static str, width: f32) -> gpui::Stateful<Div> {
         .px(px(SP2))
         .flex()
         .items_center()
-        .rounded(px(R_LG))
+        .rounded(px(r_lg()))
         .bg(p().panel)
         .border_1()
         .border_color(border())
@@ -67,7 +67,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let cpu = ws.b.engine.cpu_load();
 
     // The Session ⇄ Arrangement switch sits with the identity, balancing the bar.
-    let switch: Rc<dyn Fn(usize, &mut Window, &mut gpui::App)> = {
+    let switch: widgets::OnSelect = {
         let weak = cx.entity().downgrade();
         Rc::new(move |i, _, cx| {
             let _ = weak.update(cx, |this, cx| this.set_view(if i == 0 { MainView::Session } else { MainView::Arrangement }, cx));
@@ -86,7 +86,6 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .child(icon(Icon::Logo, 20., pal.accent))
         .child(label("AI-Track", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
         .when(dirty, |d| d.child(div().size(px(6.)).rounded_full().bg(pal.accent)))
-        .child(div().w(px(SP2)))
         .child(
             widgets::icon_button("toggle-browser", Icon::PanelLeft, ws.browser_open)
                 .tooltip(widgets::tip("Browser", Some("Ctrl+Alt+B")))
@@ -108,7 +107,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             "main-view",
             &[(Some(Icon::Grid), "Session"), (Some(Icon::Timeline), "Arrange")],
             view_index,
-            88.,
+            80.,
             switch,
         ));
 
@@ -200,14 +199,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(mono(format!("{}/{}", sig.numerator, sig.denominator), TEXT_LG, pal.text)),
         )
         .child(
-            field("position", 96.)
+            field("position", 88.)
                 .justify_center()
                 .gap(px(SP1))
                 .tooltip(widgets::tip("Bars . Beats . Sixteenths", None))
                 .child(mono(format!("{bar}.{beat}.{sixteenth}"), TEXT_LG, if t.playing { pal.accent } else { pal.text })),
         )
         .child(
-            field("scale", 148.)
+            field("scale", 136.)
                 .gap(px(SP2))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
@@ -240,11 +239,20 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .gap(px(SP2))
                 .flex()
                 .items_center()
-                .rounded(px(R_LG))
+                .rounded(px(r_lg()))
                 .tooltip(widgets::tip("DSP load", None))
-                .child(icon(Icon::Gauge, 14., pal.muted))
-                .child(widgets::hbar(cpu, 36., 4., if cpu > 0.8 { pal.record } else { pal.accent }))
+                .child(widgets::hbar(cpu, 28., 4., if cpu > 0.8 { pal.record } else { pal.accent }))
                 .child(mono(format!("{:>2.0}%", cpu * 100.), TEXT_SM, pal.muted).w(px(28.))),
+        )
+        .child(
+            widgets::icon_button("export", Icon::Send, false)
+                .tooltip(widgets::tip("Export audio", Some("Ctrl+Shift+E")))
+                .on_click(cx.listener(|this, _, _, cx| this.open_export(cx))),
+        )
+        .child(
+            widgets::icon_button("preferences", Icon::Sliders, false)
+                .tooltip(widgets::tip("Preferences", Some("Ctrl+,")))
+                .on_click(cx.listener(|this, _, _, cx| this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx))),
         )
         .child(
             widgets::icon_button("theme", if is_dark() { Icon::Sun } else { Icon::Moon }, false)
@@ -260,7 +268,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .gap(px(SP2))
                 .flex()
                 .items_center()
-                .rounded(px(R_LG))
+                .rounded(px(r_lg()))
                 .cursor_pointer()
                 .bg(if ws.ai_open { accent_alpha(0.16) } else { pal.panel })
                 .border_1()
@@ -274,8 +282,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(icon(Icon::Sparkles, 16., pal.accent))
                 .child(label("Assistant", TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM)),
         )
-        .child(div().w(px(caption_reserve())))
-        .children(caption_controls(window));
+        .child(div().flex_none().w(px(SP1)));
 
     let _ = BAR;
     div()
@@ -285,22 +292,13 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .w_full()
         .flex()
         .items_center()
-        .gap(px(SP3))
-        .bg(pal.base)
+        .gap(px(SP2))
+        .bg(pane_bg(crate::appearance::Pane::TopBar))
         .child(left)
         .child(transport)
         .child(right)
+        .children(caption_controls(window))
         .into_any_element()
-}
-
-#[cfg(target_os = "windows")]
-fn caption_reserve() -> f32 {
-    3. * CAPTION_W - SP2
-}
-
-#[cfg(not(target_os = "windows"))]
-fn caption_reserve() -> f32 {
-    SP1
 }
 
 /// Windows draws its caption buttons as the system does (Segoe Fluent
@@ -334,9 +332,7 @@ fn caption_controls(window: &Window) -> Option<AnyElement> {
     };
     Some(
         div()
-            .absolute()
-            .top_0()
-            .right_0()
+            .flex_none()
             .h(px(TOP_BAR_H))
             .flex()
             .occlude()

@@ -5,6 +5,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod actions;
+mod appearance;
 mod assets;
 mod bridge;
 mod demo;
@@ -51,7 +52,17 @@ fn main() {
             },
             |window, cx| {
                 let ws = cx.new(|cx| workspace::Workspace::new(demo::project(), bridge::Bridges::stubs(), cx));
-                ws.update(cx, |ws, cx| ws.focus.focus(window, cx));
+                ws.update(cx, |ws, cx| {
+                    ws.focus.focus(window, cx);
+                    // Follow-system themes switch with the OS.
+                    cx.observe_window_appearance(window, |ws, _, cx| {
+                        if ws.look.app.follow_system {
+                            ws.look.pending = Some(true);
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                });
                 window.activate_window();
                 ws
             },

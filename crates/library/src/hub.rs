@@ -76,6 +76,10 @@ pub struct BundledPack {
     pub license: String,
     pub license_url: String,
     pub redistributable: bool,
+    /// Redistributable but left out of the default factory bank (size):
+    /// fetched only on request, e.g. from the app's Content Hub.
+    #[serde(default)]
+    pub optional: bool,
     /// Where we read the license (file in the archive/repo or official page) and what it says.
     #[serde(default)]
     pub license_evidence: String,
@@ -243,8 +247,9 @@ impl Manifest {
              | Pack | Author | License | Source |\n|---|---|---|---|\n",
         );
         for p in &self.packs {
+            let optional = if p.optional { " (optional download)" } else { "" };
             s.push_str(&format!(
-                "| {} | {} | [{}]({}) | {} |\n",
+                "| {}{optional} | {} | [{}]({}) | {} |\n",
                 p.name, p.author, p.license, p.license_url, p.homepage
             ));
         }

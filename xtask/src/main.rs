@@ -1,7 +1,7 @@
 //! Project tasks. Run with `cargo xtask <task>`.
 //!
 //! `cargo xtask soundbank list`                       packs, licenses, download state
-//! `cargo xtask soundbank fetch [--only id] [--max-size-mb N] [--write-manifest] [--no-index]`
+//! `cargo xtask soundbank fetch [--only id] [--max-size-mb N] [--with-optional] [--write-manifest] [--no-index]`
 //! `cargo xtask soundbank verify`                     hashes, LICENSE files, file lists
 //! `cargo xtask soundbank index`                      rebuild content/soundbank/factory.db
 //! `cargo xtask soundbank attribution`                regenerate ATTRIBUTION.md
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
         _ => {
             eprintln!(
                 "usage: cargo xtask soundbank <list|fetch|verify|index|attribution> [options]\n\
-                 \n  fetch options: --only <id> (repeatable)  --max-size-mb <N>  --write-manifest  --no-index"
+                 \n  fetch options: --only <id> (repeatable)  --max-size-mb <N>  --with-optional  --write-manifest  --no-index"
             );
             bail!("unknown task")
         }

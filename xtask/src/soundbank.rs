@@ -30,6 +30,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut max_mb: Option<f64> = None;
     let mut write_manifest = false;
     let mut index = true;
+    let mut with_optional = false;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -39,6 +40,7 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--write-manifest" => write_manifest = true,
             "--no-index" => index = false,
+            "--with-optional" => with_optional = true,
             other => bail!("unknown option {other}"),
         }
     }
@@ -46,7 +48,7 @@ pub fn run(args: &[String]) -> Result<()> {
     match cmd {
         "list" => list(&paths, &manifest),
         "fetch" => {
-            fetch(&paths, &manifest, &only, max_mb, write_manifest)?;
+            fetch(&paths, &manifest, &only, max_mb, write_manifest, with_optional)?;
             if index {
                 build_index(&paths, &Manifest::parse(&fs::read_to_string(&paths.manifest)?)?)?;
             }
@@ -93,11 +95,17 @@ fn list(paths: &Paths, m: &Manifest) -> Result<()> {
     let mut total = 0.0;
     for p in &m.packs {
         let dir = paths.packs.join(p.dir_name());
-        let state = if dir.join("LICENSE").is_file() { "fetched" } else { "-" };
+        let state = match (dir.join("LICENSE").is_file(), p.optional) {
+            (true, _) => "fetched",
+            (false, true) => "optional",
+            (false, false) => "-",
+        };
         println!("  {:<30} {:>8.1} MB  {:<10} {:<8} {}", p.id, p.size_mb, p.license, state, p.name);
-        total += p.size_mb;
+        if !p.optional {
+            total += p.size_mb;
+        }
     }
-    println!("  total {total:.1} MB");
+    println!("  default bank {total:.1} MB (optional packs excluded)");
     let by_kind = |k| m.hub.iter().filter(|h| h.kind == k).count();
     println!(
         "Content Hub: {} entries ({} sample packs, {} instruments, {} plugins), link-only",
@@ -114,7 +122,11 @@ fn list(paths: &Paths, m: &Manifest) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn agent() -> ureq::Agent {
+    // The OS verifier completes chains that miss an intermediate (as browsers
+    // do); certificate checking stays fully on.
+    let tls = ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
     ureq::Agent::config_builder()
+        .tls_config(tls)
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
         .build()
         .into()
@@ -214,7 +226,14 @@ fn url_encode_path(p: &str) -> String {
 // fetch
 // ---------------------------------------------------------------------------
 
-fn fetch(paths: &Paths, m: &Manifest, only: &[String], max_mb: Option<f64>, write_manifest: bool) -> Result<()> {
+fn fetch(
+    paths: &Paths,
+    m: &Manifest,
+    only: &[String],
+    max_mb: Option<f64>,
+    write_manifest: bool,
+    with_optional: bool,
+) -> Result<()> {
     for id in only {
         if m.pack(id).is_none() {
             bail!("no bundled pack with id {id}");
@@ -227,6 +246,10 @@ fn fetch(paths: &Paths, m: &Manifest, only: &[String], max_mb: Option<f64>, writ
     let mut updates: Vec<(String, String, u64)> = Vec::new();
     for p in &m.packs {
         if !only.is_empty() && !only.contains(&p.id) {
+            continue;
+        }
+        if p.optional && only.is_empty() && !with_optional {
+            println!("skip {} ({:.0} MB): optional pack, use --only {} or --with-optional", p.id, p.size_mb, p.id);
             continue;
         }
         // Belt and braces: the manifest parser already enforces this.

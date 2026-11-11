@@ -578,7 +578,7 @@ fn note_prefix(s: &str) -> Option<(u8, &str)> {
     } else if let Some(r) = rest.strip_prefix('b') {
         // "Bb", "Ebm", "Abmaj" but not "Bd"/"Bass": a lowercase 'b' is a flat
         // only when nothing alphabetic other than a mode suffix follows.
-        if r.is_empty() || mode_suffix(r).is_some() {
+        if r.is_empty() || mode_suffix(r).is_some() || r.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
             (-1, r, true)
         } else {
             (0, rest, false)
@@ -738,6 +738,8 @@ struct SegmentHints {
     acc_key: Option<u8>,
     bare_key: Option<u8>,
     camelot: Option<KeyHint>,
+    /// Lowercase key as the last token ("_c", "_em9"): trusted for tonal material only.
+    lower_key: Option<KeyHint>,
     root_note: Option<u8>,
     strong_bpm: Option<f32>,
     weak_bpm: Option<f32>,
@@ -812,7 +814,25 @@ fn analyze_segment(seg: &str) -> SegmentHints {
                 continue;
             }
         }
-        match key_token(raw) {
+        let mut tok = key_token(raw);
+        if tok.is_none() && i + 1 == raws.len() && i > 0 && raw.starts_with(|c: char| c.is_ascii_lowercase()) {
+            // Multisample and Sonic Pi style: "bass_16_1_ab2", "bass_hard_c", "guit_em9".
+            let mut cap: String = raw[..1].to_ascii_uppercase();
+            cap.push_str(&raw[1..]);
+            tok = match key_token(&cap) {
+                Some(KeyTok::Full(k)) => {
+                    h.lower_key.get_or_insert(k);
+                    None
+                }
+                Some(KeyTok::Bare(pc) | KeyTok::Accidental(pc)) => {
+                    h.lower_key.get_or_insert(KeyHint { root: Key(pc), kind: None });
+                    None
+                }
+                Some(t @ KeyTok::NoteOctave(_)) => Some(t),
+                _ => None,
+            };
+        }
+        match tok {
             Some(KeyTok::Full(k)) => {
                 h.full_key.get_or_insert(k);
             }
@@ -935,6 +955,13 @@ pub fn parse_name(stem: &str, folders_nearest_first: &[&str]) -> NameHints {
 
     // Category: the file name wins; folders fill in what is missing.
     let mut cat = file.cat.map(|(c, s, ..)| (c, s));
+    // A weak word in the file ("Glass Break", "Beat 3") yields to a specific folder ("Foley").
+    if let Some((fc, _, fp, _)) = file.cat
+        && fp <= 3
+        && let Some((dc, ds, ..)) = dirs.iter().find_map(|d| d.cat).filter(|(dc, _, dp, _)| *dp >= 4 && *dc != fc)
+    {
+        cat = Some((dc, ds));
+    }
     for d in &dirs {
         match (cat, d.cat) {
             (None, Some((c, s, ..))) => cat = Some((c, s)),
@@ -954,7 +981,10 @@ pub fn parse_name(stem: &str, folders_nearest_first: &[&str]) -> NameHints {
             kind = d.kind;
         }
     }
-    if kind.is_none() && (file.loop_from_break || dirs.iter().any(|d| d.loop_from_break)) {
+    if kind.is_none()
+        && matches!(cat, Some((Category::Drums, _)) | None)
+        && (file.loop_from_break || dirs.iter().any(|d| d.loop_from_break))
+    {
         kind = Some(SampleKind::Loop);
     }
     out.kind = kind;
@@ -970,7 +1000,7 @@ pub fn parse_name(stem: &str, folders_nearest_first: &[&str]) -> NameHints {
             })
             .or_else(|| {
                 tonal_cat
-                    .then_some(seg.bare_key.map(|pc| KeyHint { root: Key(pc), kind: None }))
+                    .then_some(seg.bare_key.map(|pc| KeyHint { root: Key(pc), kind: None }).or(seg.lower_key))
                     .flatten()
             })
     };
@@ -1036,6 +1066,9 @@ mod tests {
             ("Csharp minor pad.wav", k("C#", MIN)),
             ("Sibm Pad Reggaeton.wav", k("A#", MIN)),
             ("Melody_E_minor_93.wav", k("E", MIN)),
+            ("bass_hard_c.flac", k("C", None)),
+            ("guit_em9.flac", k("E", MIN)),
+            ("Ab3 pad.wav", None),
             // No key in these.
             ("Kick_01.wav", None),
             ("Snare B.wav", None),
@@ -1174,6 +1207,12 @@ mod tests {
         assert_eq!(p("C4v16.wav").root_note, Some(60));
         assert_eq!(p("Violin_Sus_C#3.wav").root_note, Some(49));
         assert_eq!(p("Kick.wav").root_note, None);
+        assert_eq!(p("Samples/all_all_all_ab3.wav").root_note, Some(56));
+        assert_eq!(p("Samples/bass_16_1_db2.wav").root_note, Some(37));
+        assert_eq!(p("Samples/blackheart/A1.wav").root_note, Some(33));
+        assert_eq!(p("Hardstyle Kick 1 - G#1.flac").root_note, Some(32));
+        // Lowercase notes elsewhere than the end are not notes.
+        assert_eq!(p("a3 kick.wav").root_note, None);
     }
 
     #[test]
@@ -1191,6 +1230,8 @@ mod tests {
         for (name, want) in cases {
             assert_eq!(p(name).genres, *want, "{name}");
         }
+        let glass = p("Foley/Glass Break.flac");
+        assert_eq!((glass.category, glass.kind), (Some(Fx), None));
         // "drum and bass" is a genre, not Bass.
         assert_eq!(p("Drum and Bass Break 174.wav").category, Some(Drums));
     }

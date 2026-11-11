@@ -90,7 +90,7 @@ pub trait Analyzer: Send + Sync {
 pub struct BasicAnalyzer;
 
 impl BasicAnalyzer {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 }
 
 impl Analyzer for BasicAnalyzer {

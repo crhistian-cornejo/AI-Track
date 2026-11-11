@@ -20,7 +20,7 @@ DAW de música electrónica en Rust. Interfaz GPUI (el mismo `gpui-pre` parchead
 
 ## Reglas
 
-- **Licencias:** el proyecto es MIT. No se copia código de vibez, Lemon-Studio ni Pro-Wave (GPL-3): solo ideas. De futureboard-studio (MIT) se puede adaptar código citándolo en `NOTICE` y con un comentario `// Adapted from futureboard-studio: <ruta>`. Ninguna dependencia GPL/LGPL/AGPL (`deny.toml`).
+- **Referencias:** se pueden estudiar a fondo todos los repos de `reference/`, incluidos los GPL, para entender cómo funcionan, y luego escribir una implementación propia adaptada a nuestra arquitectura. No se copia ni se traduce línea por línea código de vibez, Lemon-Studio ni Pro-Wave (GPL-3). De futureboard-studio (MIT) se reescribe con diseño propio; si algún bloque queda muy cercano al original, se anota una sola vez en `NOTICE` (sin comentarios de atribución en el código). Ninguna dependencia GPL/LGPL/AGPL (`deny.toml`).
 - **Hilo de audio:** nada de asignaciones, locks, strings, E/S ni `println!` dentro de `Processor::process` ni del callback. Lo retirado se libera fuera del hilo RT.
 - **Toda edición del proyecto es un `Command`** de `aitrack-model`. La UI, los scripts y los agentes de IA editan solo con comandos, nunca mutando el `Project` directamente.
 - **Interfaz:** los colores salen del tema (`crates/app/src/theme.rs`), los tiempos y curvas de `crates/app/src/motion.rs`, los iconos de `crates/app/src/icons.rs`. Nada de `rgb(0x…)` sueltos en las vistas. Espaciado en múltiplos de 4 px.

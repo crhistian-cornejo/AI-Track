@@ -17,3 +17,7 @@ Thumbs.db
 /content/soundbank/.cache/
 /models/
 
+
+# Claude Code worktrees
+/.claude/
+

@@ -1,0 +1,22 @@
+{
+  "name": "Master -1 dBTP",
+  "plugin": "fx.limiter",
+  "author": "AI-Track",
+  "tags": [
+    "limiter",
+    "master",
+    "true peak",
+    "edm",
+    "pop"
+  ],
+  "params": {
+    "0": 0.0,
+    "1": 0.9166667,
+    "2": 0.63436335,
+    "3": 1.0,
+    "4": 0.10526316,
+    "5": 1.0,
+    "6": 0.0,
+    "7": 1.0
+  }
+}

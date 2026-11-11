@@ -16,9 +16,28 @@ License text: vendor/gpui-pre/LICENSE-APACHE
 
 futureboard-studio
 ------------------
-Modules marked "Adapted from futureboard-studio" are derived from
-https://github.com/futureboard/futureboard-studio, licensed under MIT.
-Copyright (c) 2026 Ariz Kamizuki, Futureboard Studio.
+Parts of the following files follow the structure of code from
+https://github.com/futureboard/futureboard-studio (MIT License,
+Copyright (c) 2026 Ariz Kamizuki, Futureboard Studio):
+  crates/dsp/src/loudness.rs         (BS.1770 loudness meter)
+  crates/stock/src/fx/reverb.rs      (FDN mixing and absorption design)
+  crates/engine/src/alloc_counter.rs (test-only allocation counter)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions: The above copyright
+notice and this permission notice shall be included in all copies or
+substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+WITHOUT WARRANTY OF ANY KIND.
+
+LAME (MP3 export, optional)
+---------------------------
+MP3 export loads libmp3lame at runtime as a separate shared library; it is
+never linked into AI-Track and can be replaced by the user. LAME is licensed
+under the LGPL-2.0-or-later; source: https://lame.sourceforge.io/
 
 Design references (ideas only, no code)
 ---------------------------------------

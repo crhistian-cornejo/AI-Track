@@ -28,6 +28,9 @@ dependencies = [
 [[package]]
 name = "aitrack-dsp"
 version = "0.1.0"
+dependencies = [
+ "realfft",
+]
 
 [[package]]
 name = "aitrack-engine"
@@ -78,6 +81,9 @@ name = "aitrack-stock"
 version = "0.1.0"
 dependencies = [
  "aitrack-dsp",
+ "hound",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

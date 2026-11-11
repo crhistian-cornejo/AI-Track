@@ -10,9 +10,28 @@
 //! panics on valid input. `prepare` runs off the audio thread and is where
 //! buffers are allocated.
 
+// `next()` on oscillators/envelopes is the DSP idiom; they are not iterators.
+#![allow(clippy::should_implement_trait)]
+
 pub mod buffer;
 pub mod event;
 pub mod param;
+
+// DSP primitives (allocation only in constructors / `prepare`).
+pub mod biquad;
+pub mod crossover;
+pub mod delay;
+pub mod dynamics;
+pub mod envelope;
+pub mod lfo;
+pub mod loudness;
+pub mod osc;
+pub mod oversample;
+pub mod shaper;
+pub mod smooth;
+pub mod spectrum;
+pub mod svf;
+pub mod wavetable;
 
 pub use buffer::AudioBuffer;
 pub use event::{Event, EventKind};

@@ -1,0 +1,22 @@
+{
+  "name": "Streaming -1 dBTP Safe",
+  "plugin": "fx.limiter",
+  "author": "AI-Track",
+  "tags": [
+    "limiter",
+    "master",
+    "streaming",
+    "true peak",
+    "transparent"
+  ],
+  "params": {
+    "0": 0.125,
+    "1": 0.9166667,
+    "2": 0.72536373,
+    "3": 1.0,
+    "4": 0.2631579,
+    "5": 1.0,
+    "6": 1.0,
+    "7": 1.0
+  }
+}

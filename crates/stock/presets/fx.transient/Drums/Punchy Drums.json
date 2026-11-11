@@ -1,0 +1,21 @@
+{
+  "name": "Punchy Drums",
+  "plugin": "fx.transient",
+  "author": "AI-Track",
+  "tags": [
+    "transient",
+    "drums",
+    "punchy",
+    "house",
+    "trap"
+  ],
+  "params": {
+    "0": 0.75,
+    "1": 0.45,
+    "2": 0.6614124,
+    "3": 0.58859193,
+    "4": 0.5,
+    "5": 0.0,
+    "6": 1.0
+  }
+}

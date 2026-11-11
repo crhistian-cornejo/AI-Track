@@ -1,0 +1,22 @@
+{
+  "name": "Broadcast -2 dBTP",
+  "plugin": "fx.limiter",
+  "author": "AI-Track",
+  "tags": [
+    "limiter",
+    "master",
+    "broadcast",
+    "true peak",
+    "safe"
+  ],
+  "params": {
+    "0": 0.0,
+    "1": 0.8333333,
+    "2": 0.76701,
+    "3": 1.0,
+    "4": 0.15789473,
+    "5": 1.0,
+    "6": 1.0,
+    "7": 1.0
+  }
+}

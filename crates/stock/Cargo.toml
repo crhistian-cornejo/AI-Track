@@ -8,6 +8,10 @@ publish = false
 
 [dependencies]
 aitrack-dsp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# MIT OR Apache-2.0. Tiny WAV reader for the sampler / drum sampler state.
+hound = "3.5"
 
 [lints]
 workspace = true

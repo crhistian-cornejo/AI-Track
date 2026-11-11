@@ -1,0 +1,18 @@
+{
+  "name": "High Resolution Lows",
+  "plugin": "fx.analyzer",
+  "author": "AI-Track",
+  "tags": [
+    "analyzer",
+    "mastering",
+    "bass",
+    "precise"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.18790182,
+    "2": 0.0,
+    "3": 0.0,
+    "4": 0.0
+  }
+}

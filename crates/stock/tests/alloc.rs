@@ -89,3 +89,12 @@ fn process_never_allocates() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+#[test]
+fn counter_detects_allocations() {
+    let n = counted(|| {
+        let v: Vec<u8> = Vec::with_capacity(64);
+        std::hint::black_box(&v);
+    });
+    assert!(n >= 1);
+}

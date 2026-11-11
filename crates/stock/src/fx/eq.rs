@@ -422,7 +422,7 @@ impl Band {
 /// orders put their complex pairs at `θ = π (k + 1) / n` (the real pole is
 /// the first-order section).
 fn bw_q(n: usize, k: usize) -> f32 {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         butterworth_q(n, k)
     } else {
         let theta = std::f64::consts::PI * (k + 1) as f64 / n as f64;

@@ -301,7 +301,7 @@ mod tests {
 
     fn burst(i: usize) -> (f32, f32) {
         // 100 ms of −6 dB tone, 100 ms of −60 dB tone, repeating.
-        let amp = if (i / 4800) % 2 == 0 { 0.5 } else { 0.001 };
+        let amp = if (i / 4800).is_multiple_of(2) { 0.5 } else { 0.001 };
         let v = amp * (std::f32::consts::TAU * 200.0 * i as f32 / 48_000.0).sin();
         (v, v)
     }

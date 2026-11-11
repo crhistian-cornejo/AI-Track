@@ -1,0 +1,23 @@
+{
+  "name": "Loud Club",
+  "plugin": "fx.limiter",
+  "author": "AI-Track",
+  "tags": [
+    "limiter",
+    "master",
+    "loud",
+    "edm",
+    "techno",
+    "dembow"
+  ],
+  "params": {
+    "0": 0.33333334,
+    "1": 0.97499996,
+    "2": 0.49237376,
+    "3": 1.0,
+    "4": 0.05263158,
+    "5": 1.0,
+    "6": 0.5,
+    "7": 1.0
+  }
+}

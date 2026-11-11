@@ -5,7 +5,8 @@
 //! UI. Use [`registry`] to list them and [`create`] to instantiate one by
 //! id. Factory presets live in [`presets`].
 
-#![allow(clippy::should_implement_trait)]
+// Index loops over parallel channel/voice arrays are the clearest DSP idiom.
+#![allow(clippy::should_implement_trait, clippy::needless_range_loop)]
 
 pub mod common;
 pub mod fx;
@@ -78,5 +79,16 @@ mod tests {
             assert_eq!(ids.len(), n, "{}: duplicate param ids", p.id);
         }
         assert!(create("fx.nope").is_none());
+    }
+
+    /// `cargo test -p aitrack-stock --lib summary -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn summary() {
+        for p in registry() {
+            let mut proc = (p.create)();
+            proc.prepare(48_000.0, 128);
+            println!("{:<22} {:>3} params  latency {:>4}  presets {:>3}", p.id, proc.info().params.len(), proc.latency(), presets::list(p.id).len());
+        }
     }
 }

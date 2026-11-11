@@ -47,7 +47,7 @@ impl Driver {
                 let v = match kind {
                     0 => 0.0,
                     1 => {
-                        if n % 4096 == 0 {
+                        if n.is_multiple_of(4096) {
                             1.0
                         } else {
                             0.0
@@ -71,7 +71,7 @@ impl Driver {
         if inst {
             self.buf.clear();
             let k = self.frame / BLOCK as u64;
-            if k % 8 == 0 {
+            if k.is_multiple_of(8) {
                 for (j, key) in [36u8, 48, 55, 60, 64, 67, 71, 74].iter().enumerate() {
                     let key = key + ((k / 8) % 5) as u8;
                     self.events.push(Event { offset: j as u32 * 3, kind: EventKind::NoteOn { channel: 0, key, velocity: 0.8, note_id: key as i32 } });

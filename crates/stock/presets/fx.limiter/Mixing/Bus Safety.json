@@ -1,0 +1,21 @@
+{
+  "name": "Bus Safety",
+  "plugin": "fx.limiter",
+  "author": "AI-Track",
+  "tags": [
+    "limiter",
+    "bus",
+    "safety",
+    "transparent"
+  ],
+  "params": {
+    "0": 0.0,
+    "1": 0.9583333,
+    "2": 0.56632334,
+    "3": 1.0,
+    "4": 0.05263158,
+    "5": 0.0,
+    "6": 0.0,
+    "7": 1.0
+  }
+}

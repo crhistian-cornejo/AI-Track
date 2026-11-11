@@ -444,7 +444,7 @@ mod tests {
 
     /// Worst output true peak (dBTP) and sample peak after the latency.
     fn worst(lim: &mut Limiter, input: &mut dyn FnMut(usize) -> (f32, f32), n: usize) -> (f32, f32) {
-        let (l, r) = process_stereo(lim, |i| input(i), n);
+        let (l, r) = process_stereo(lim, input, n);
         let skip = lim.latency() as usize + 64;
         let mut tp = [TruePeak::new(), TruePeak::new()];
         let mut worst_tp = 0.0f32;
@@ -463,7 +463,8 @@ mod tests {
     #[test]
     fn never_exceeds_the_ceiling() {
         let n = 48_000;
-        let signals: Vec<(&str, Box<dyn Fn() -> Box<dyn FnMut(usize) -> (f32, f32)>>)> = vec![
+        type Signal = Box<dyn Fn() -> Box<dyn FnMut(usize) -> (f32, f32)>>;
+        let signals: Vec<(&str, Signal)> = vec![
             (
                 "noise +12",
                 Box::new(|| {

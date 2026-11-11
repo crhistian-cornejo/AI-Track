@@ -72,7 +72,7 @@ fn latency_and_tail_are_sane() {
         assert!(p.latency() < 48_000, "{} latency {}", entry.id, p.latency());
         assert!(p.tail() <= 48_000 * 120, "{} tail {}", entry.id, p.tail());
         for info in &p.info().params {
-            assert!(info.min < info.max || info.min > info.max, "{}: {} has an empty range", entry.id, info.name);
+            assert!(info.min != info.max, "{}: {} has an empty range", entry.id, info.name);
             let d = info.default;
             assert!(d >= info.min.min(info.max) && d <= info.max.max(info.min), "{}: {} default out of range", entry.id, info.name);
             if !info.choices.is_empty() {

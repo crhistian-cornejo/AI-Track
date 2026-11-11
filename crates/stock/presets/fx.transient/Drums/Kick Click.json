@@ -1,0 +1,21 @@
+{
+  "name": "Kick Click",
+  "plugin": "fx.transient",
+  "author": "AI-Track",
+  "tags": [
+    "transient",
+    "kick",
+    "click",
+    "techno",
+    "edm"
+  ],
+  "params": {
+    "0": 0.9,
+    "1": 0.5,
+    "2": 0.39308804,
+    "3": 0.58859193,
+    "4": 0.5,
+    "5": 1.0,
+    "6": 1.0
+  }
+}

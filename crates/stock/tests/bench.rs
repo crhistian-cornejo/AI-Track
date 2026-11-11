@@ -11,7 +11,7 @@ use std::time::Instant;
 #[test]
 #[ignore]
 fn cpu_per_plugin() {
-    let seconds = 10.0;
+    let seconds = 3.0;
     let blocks = (seconds * SR / BLOCK as f64) as usize;
     println!("\n{:<24} {:>8}  (48 kHz, {BLOCK} frames, {seconds} s of audio)", "plugin", "CPU %");
     for entry in aitrack_stock::registry() {

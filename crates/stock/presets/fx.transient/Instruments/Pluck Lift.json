@@ -1,0 +1,21 @@
+{
+  "name": "Pluck Lift",
+  "plugin": "fx.transient",
+  "author": "AI-Track",
+  "tags": [
+    "transient",
+    "pluck",
+    "synth",
+    "future bass",
+    "pop"
+  ],
+  "params": {
+    "0": 0.7,
+    "1": 0.6,
+    "2": 0.56238186,
+    "3": 0.6922378,
+    "4": 0.5,
+    "5": 0.0,
+    "6": 0.7
+  }
+}

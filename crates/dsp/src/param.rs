@@ -86,10 +86,10 @@ impl ParamInfo {
     /// Display text such as "1.20 kHz", "-6.0 dB", "Bell".
     pub fn format(&self, normalized: f32) -> String {
         let v = self.to_plain(normalized);
-        if self.scale == ParamScale::Stepped {
-            if let Some(label) = self.choices.get((v - self.min) as usize) {
-                return (*label).to_string();
-            }
+        if self.scale == ParamScale::Stepped
+            && let Some(label) = self.choices.get((v - self.min) as usize)
+        {
+            return (*label).to_string();
         }
         match self.unit {
             "Hz" if v >= 1000.0 => format!("{:.2} kHz", v / 1000.0),

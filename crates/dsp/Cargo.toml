@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# MIT OR Apache-2.0. Real FFT for the spectrum analyzer and wavetable mipmaps.
+realfft = "3"
 
 [lints]
 workspace = true

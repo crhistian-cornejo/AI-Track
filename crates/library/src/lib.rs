@@ -25,6 +25,9 @@ pub mod watch;
 #[cfg(test)]
 pub(crate) mod test_util;
 
+/// Re-exported so callers can run their own queries on [`Library::connection`].
+pub use rusqlite;
+
 pub use analyze::{Analysis, Analyzer, AudioInfo, BasicAnalyzer, Source};
 pub use db::{Library, PackInfo, Preset, Root, RootId, RootKind, Sample, SampleId};
 pub use error::{LibraryError, Result};

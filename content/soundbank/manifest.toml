@@ -1,0 +1,849 @@
+# AI-Track sound bank manifest.
+#
+# [[pack]]  Bundled in the factory library. ONLY licenses that allow
+#           redistribution inside another free product: CC0-1.0, CC-BY-3.0,
+#           CC-BY-4.0 (with attribution). Each license was read from the
+#           license file in the repository/archive or from the official page
+#           (see `license_evidence`). `cargo xtask soundbank fetch` downloads,
+#           verifies, extracts and indexes them into factory.db.
+# [[hub]]   Content Hub: link-only. Free packs whose terms forbid
+#           redistribution, packs that are too large to bundle, and free
+#           plugins. The user downloads them from the official page and the
+#           app indexes the download folder.
+#
+# sha256: archive hash. For format = "github_tree" it is the sha256 of the
+# sorted "path<TAB>git-blob-sha" list of the selected files at the pinned
+# commit (each file is also checked against its git blob sha1).
+
+[meta]
+version = 1
+updated = "2026-11-11"
+notes = "Target size: <= 1.5 GB on disk. Licenses verified 2026-11-11."
+
+# ---------------------------------------------------------------------------
+# Bundled packs
+# ---------------------------------------------------------------------------
+
+[[pack]]
+id = "mck-drum-machines"
+name = "Mck Drum Machines (TR-8, RD-6)"
+author = "Henri (MckAudio)"
+homepage = "https://github.com/MckAudio/MckSamplePacks"
+format = "github_tree"
+sha256 = ""
+size_mb = 50.0
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo: 'Creative Commons Legal Code / CC0 1.0 Universal'. README: 'I made recordings of my drum machines'. Only the TR8 (Roland TR-8 ACB) and RD6 (Behringer RD-6 analog) folders are bundled; DR5/RX5 are PCM-ROM machines whose ROM samples may carry the manufacturer's copyright, so they are left out."
+attribution = "Mck Drum Machines by Henri / MckAudio (CC0 1.0)"
+genres = ["Techno", "House", "Trap", "Hip-Hop", "EDM"]
+kinds = ["drums", "one-shots"]
+license_file = "LICENSE"
+default_category = "Drums"
+
+[pack.github]
+repo = "MckAudio/MckSamplePacks"
+rev = "5db40e8fe26785c256845a5bb38921b2654a887f"
+paths = ["TR8/BD/", "TR8/SD/", "TR8/HATS/", "TR8/PERC/", "TR8/TOMS/", "RD6/", "LICENSE", "TR8/README.md"]
+
+[[pack]]
+id = "lmms-sample-library"
+name = "LMMS Sample Library"
+author = "LMMS contributors"
+homepage = "https://github.com/LMMS/assets"
+format = "github_tree"
+sha256 = ""
+size_mb = 49.0
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo: 'CC0 1.0 Universal'. Samples/README.md: 'Samples must be CC0 ... Samples must be created/recorded by you.' Only the new CC0 'Samples/Sample library' is used, not the legacy LMMS data/samples."
+attribution = "LMMS Sample Library by the LMMS contributors (CC0 1.0)"
+genres = ["EDM", "Pop"]
+kinds = ["drums", "one-shots", "fx", "foley"]
+license_file = "LICENSE"
+strip_prefix = "Samples/Sample library/"
+
+[pack.github]
+repo = "LMMS/assets"
+rev = "bc09e0745c69c73bd6c3112122031e4963ce3876"
+paths = ["Samples/Sample library/", "LICENSE"]
+
+[[pack]]
+id = "sonic-pi-samples"
+name = "Sonic Pi Samples"
+author = "Sonic Pi (Sam Aaron) / freesound.org contributors / Arovane"
+homepage = "https://github.com/sonic-pi-net/sonic-pi/tree/main/etc/samples"
+format = "github_tree"
+sha256 = ""
+size_mb = 30.0
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE.md (Samples): 'All the bundled samples are individually licensed under a CC0 1.0 Universal Public Domain Dedication. They have been obtained from freesound.org'. etc/samples/README.md lists every original Freesound URL; arovane_* donated under CC0. The Amen/breakbeat loops (loop_amen*, loop_breakbeat) are excluded: the underlying recordings are not clearly public domain."
+attribution = "Sonic Pi sample set (CC0 1.0), from freesound.org contributors and Arovane"
+genres = ["Techno", "House", "Drum & Bass", "Ambient"]
+kinds = ["drums", "one-shots", "loops", "fx"]
+license_file = "etc/samples/README.md"
+strip_prefix = "etc/samples/"
+exclude = ["loop_amen", "loop_breakbeat"]
+
+[pack.github]
+repo = "sonic-pi-net/sonic-pi"
+rev = "622864a774e7866f6c4746b9b59a41064f9bc173"
+paths = ["etc/samples/"]
+
+[[pack]]
+id = "oga-retro-512"
+name = "The Essential Retro Video Game Sound Effects Collection"
+author = "Juhani Junkala (SubspaceAudio)"
+homepage = "https://opengameart.org/content/512-sound-effects-8-bit-style"
+download_url = "https://opengameart.org/sites/default/files/The%20Essential%20Retro%20Video%20Game%20Sound%20Effects%20Collection%20%5B512%20sounds%5D.zip"
+format = "zip"
+sha256 = ""
+size_mb = 20.6
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "OpenGameArt page, License(s) field: 'CC0' (links to creativecommons.org/publicdomain/zero/1.0/)."
+attribution = "Retro SFX collection by Juhani Junkala (CC0 1.0)"
+genres = ["Chiptune", "EDM"]
+kinds = ["fx", "one-shots"]
+default_category = "FX"
+
+[[pack]]
+id = "oga-retro-synth-50"
+name = "50 CC0 Retro Synth SFX"
+author = "rubberduck"
+homepage = "https://opengameart.org/content/50-cc0-retro-synth-sfx"
+download_url = "https://opengameart.org/sites/default/files/50-CC0-retro-synth-SFX.zip"
+format = "zip"
+sha256 = ""
+size_mb = 1.9
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "OpenGameArt page, License(s) field: 'CC0'."
+attribution = "50 Retro Synth SFX by rubberduck (CC0 1.0)"
+genres = ["Chiptune", "Synthwave"]
+kinds = ["fx", "one-shots"]
+default_category = "FX"
+
+[[pack]]
+id = "oga-sfx-100"
+name = "100 CC0 SFX"
+author = "rubberduck"
+homepage = "https://opengameart.org/content/100-cc0-sfx"
+download_url = "https://opengameart.org/sites/default/files/100-CC0-SFX_0.zip"
+format = "zip"
+sha256 = ""
+size_mb = 2.9
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "OpenGameArt page, License(s) field: 'CC0'."
+attribution = "100 SFX by rubberduck (CC0 1.0)"
+genres = ["EDM"]
+kinds = ["fx", "one-shots"]
+default_category = "FX"
+
+[[pack]]
+id = "kenney-digital-sfx"
+name = "Digital Sound Effects (lasers, phasers, space)"
+author = "Kenney"
+homepage = "https://opengameart.org/content/63-digital-sound-effects-lasers-phasers-space-etc"
+download_url = "https://opengameart.org/sites/default/files/Digital_SFX_Set.zip"
+format = "zip"
+sha256 = ""
+size_mb = 1.1
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "OpenGameArt page, License(s) field: 'CC0' (uploader: kenney; kenney.nl also states 'Creative Commons CC0')."
+attribution = "Digital SFX by Kenney (www.kenney.nl, CC0 1.0)"
+genres = ["EDM", "Chiptune"]
+kinds = ["fx", "one-shots"]
+default_category = "FX"
+
+[[pack]]
+id = "karoryfer-caveman-cosmonaut"
+name = "Caveman Cosmonaut"
+author = "Karoryfer Samples"
+homepage = "https://github.com/sfzinstruments/karoryfer.caveman-cosmonaut"
+download_url = "https://github.com/sfzinstruments/karoryfer.caveman-cosmonaut/releases/download/v1.001/Karoryfer.Caveman_Cosmonaut.v1.001.zip"
+format = "zip"
+sha256 = ""
+size_mb = 97.5
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo: 'Creative Commons Legal Code / CC0 1.0 Universal'. shop.karoryfer.com/pages/free-samples: 'All our free sample libraries are under a Creative Commons Zero license.'"
+attribution = "Caveman Cosmonaut by Karoryfer Samples (CC0 1.0)"
+genres = ["Synthwave", "EDM", "Techno"]
+kinds = ["instruments", "synths"]
+default_category = "Synths"
+
+[[pack]]
+id = "karoryfer-string-cyborgs"
+name = "String Cyborgs"
+author = "Karoryfer Samples"
+homepage = "https://github.com/sfzinstruments/karoryfer.string-cyborgs"
+download_url = "https://github.com/sfzinstruments/karoryfer.string-cyborgs/releases/download/v1.001/Karoryfer.String_Cyborgs.v1.001.zip"
+format = "zip"
+sha256 = ""
+size_mb = 63.8
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo: 'CC0 1.0 Universal'. Karoryfer free-samples page: all free libraries CC0."
+attribution = "String Cyborgs by Karoryfer Samples (CC0 1.0)"
+genres = ["Ambient", "Cinematic", "EDM"]
+kinds = ["instruments", "pads"]
+default_category = "Synths"
+default_subcategory = "Pads"
+
+[[pack]]
+id = "karoryfer-cowsynth"
+name = "Cowsynth"
+author = "Karoryfer Samples"
+homepage = "https://github.com/sfzinstruments/karoryfer.cowsynth"
+download_url = "https://github.com/sfzinstruments/karoryfer.cowsynth/releases/download/v1.001/Karoryfer.Cowsynth.v1.001.zip"
+format = "zip"
+sha256 = ""
+size_mb = 14.1
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo: 'CC0 1.0 Universal'. Karoryfer free-samples page: all free libraries CC0."
+attribution = "Cowsynth by Karoryfer Samples (CC0 1.0)"
+genres = ["EDM", "Ambient"]
+kinds = ["instruments", "synths"]
+default_category = "Synths"
+
+[[pack]]
+id = "salamander-grand-piano"
+name = "Salamander Grand Piano V3"
+author = "Alexander Holm"
+homepage = "https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html"
+download_url = "https://freepats.zenvoid.org/Piano/SalamanderGrandPiano/SalamanderGrandPianoV3+20161209_44khz16bit.tar.xz"
+format = "tar_xz"
+sha256 = ""
+size_mb = 412.3
+license = "CC-BY-3.0"
+license_url = "https://creativecommons.org/licenses/by/3.0/"
+redistributable = true
+license_evidence = "freepats.zenvoid.org acoustic-grand-piano page: 'Creative Commons Attribution 3.0 license.' The archive README states the same license."
+attribution = "Salamander Grand Piano V3 by Alexander Holm, licensed under CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/). Packaged by FreePats."
+genres = ["Pop", "Cinematic", "Lo-Fi"]
+kinds = ["instruments", "piano"]
+default_category = "Instruments"
+default_subcategory = "Piano"
+
+[[pack]]
+id = "upright-piano-kw"
+name = "Upright Piano KW"
+author = "FreePats (Roberto Gordo Saez)"
+homepage = "https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html"
+download_url = "https://freepats.zenvoid.org/Piano/UprightPianoKW/UprightPianoKW-SFZ+FLAC-20220221.7z"
+format = "7z"
+sha256 = ""
+size_mb = 33.3
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "freepats.zenvoid.org acoustic-grand-piano page: 'Published under the terms of the Creative Commons CC0 1.0 public domain dedication.'"
+attribution = "Upright Piano KW by FreePats (CC0 1.0)"
+genres = ["Lo-Fi", "Pop"]
+kinds = ["instruments", "piano"]
+default_category = "Instruments"
+default_subcategory = "Piano"
+
+[[pack]]
+id = "vsco2-ce-orchestra"
+name = "VS Chamber Orchestra 2: Community Edition (selection)"
+author = "Versilian Studios (Sam Gossner, Simon Dalzell)"
+homepage = "https://vis.versilstudios.net/vsco-community.html"
+format = "github_tree"
+sha256 = ""
+size_mb = 361.0
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE in repo at tag 1.1.0: 'CC0 1.0 Universal'. Official page: 'The library is under a Creative Commons 0 (i.e. public domain) license.' The full library is 2.3 GB; a selection is bundled (violin section, harp, French horn, clarinet, tuned percussion)."
+attribution = "VS Chamber Orchestra: Community Edition by Versilian Studios (CC0 1.0)"
+genres = ["Cinematic", "Pop"]
+kinds = ["instruments", "orchestral"]
+license_file = "LICENSE"
+default_category = "Instruments"
+
+[pack.github]
+repo = "sgossner/VSCO-2-CE"
+rev = "28092772094b2d9f1148d84cea97f4545b8c687d"
+paths = [
+  "Strings/Violin Section/", "Strings/Harp/", "Brass/F Horn/", "Woodwinds/Clarinet/",
+  "Percussion/Timpani/", "Percussion/Glock/", "Percussion/Marimba/", "Percussion/Xylo/",
+  "ViolinEnsSusVib.sfz", "ViolinEnsPizz.sfz", "ViolinEnsSpic.sfz", "ViolinEnsTrem.sfz",
+  "Harp.sfz", "FHornSus.sfz", "FHornStac.sfz", "ClarinetSus.sfz", "ClarinetStac.sfz",
+  "Timpani.sfz", "Glockenspiel.sfz", "Marimba.sfz", "Xylophone.sfz", "LICENSE", "README.md",
+]
+
+# ---------------------------------------------------------------------------
+# Content Hub: link-only sample packs (not redistributable, or too large)
+# ---------------------------------------------------------------------------
+
+[[hub]]
+id = "hub-99sounds"
+name = "99Sounds free libraries"
+author = "99Sounds"
+kind = "sample_pack"
+homepage = "https://99sounds.org/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free to use in your music; 'You do not have the right to sell or redistribute (even for free) the audio files' (99sounds.org/license)."
+genres = ["Cinematic", "EDM"]
+kinds = ["fx", "drums", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-cymatics-free"
+name = "Cymatics free packs"
+author = "Cymatics"
+kind = "sample_pack"
+homepage = "https://cymatics.fm/pages/free-download-vault"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Royalty-free in your productions; email sign-up; no redistribution."
+genres = ["Trap", "EDM", "Hip-Hop", "Lo-Fi", "Reggaeton"]
+kinds = ["drums", "loops", "one-shots", "presets"]
+formats = ["WAV", "MIDI"]
+requires_account = true
+
+[[hub]]
+id = "hub-bpb-free-samples"
+name = "Bedroom Producers Blog free samples"
+author = "Bedroom Producers Blog"
+kind = "sample_pack"
+homepage = "https://bedroomproducersblog.com/free-samples/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Curated freebies; each pack keeps its creator's terms, which usually forbid redistribution."
+genres = ["EDM", "Hip-Hop", "Lo-Fi", "House"]
+kinds = ["drums", "loops", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-producer-spot"
+name = "Producer Spot free sample packs"
+author = "Producer Spot"
+kind = "sample_pack"
+homepage = "https://www.producerspot.com/download-free-samples-loops-sounds-packs"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Royalty-free in music; no redistribution."
+genres = ["EDM", "House", "Techno"]
+kinds = ["drums", "loops", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-splice-free"
+name = "Splice free sounds"
+author = "Splice"
+kind = "sample_pack"
+homepage = "https://splice.com/sounds/free"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free account; samples cleared for use in your music only."
+genres = ["Trap", "Reggaeton", "Pop", "House", "Lo-Fi"]
+kinds = ["drums", "loops", "one-shots", "vocals"]
+formats = ["WAV"]
+requires_account = true
+
+[[hub]]
+id = "hub-bandlab-sounds"
+name = "BandLab Sounds"
+author = "BandLab"
+kind = "sample_pack"
+homepage = "https://www.bandlab.com/sounds/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free account; royalty-free use in your music."
+genres = ["Trap", "Reggaeton", "Dembow", "Lo-Fi", "Pop", "Afrobeats"]
+kinds = ["drums", "loops", "one-shots", "vocals"]
+formats = ["WAV"]
+requires_account = true
+
+[[hub]]
+id = "hub-samplefocus"
+name = "SampleFocus"
+author = "SampleFocus"
+kind = "sample_pack"
+homepage = "https://samplefocus.com/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Community samples, free account, royalty-free use."
+genres = ["Trap", "Hip-Hop", "Reggaeton", "EDM"]
+kinds = ["one-shots", "loops"]
+formats = ["WAV", "MP3"]
+requires_account = true
+
+[[hub]]
+id = "hub-looperman"
+name = "Looperman"
+author = "Looperman Ltd"
+kind = "sample_pack"
+homepage = "https://www.looperman.com/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "User-uploaded loops free to use in music; scraping and redistribution are banned by the terms."
+genres = ["Hip-Hop", "Trap", "Reggaeton", "EDM"]
+kinds = ["loops", "vocals"]
+formats = ["WAV", "MP3"]
+requires_account = true
+
+[[hub]]
+id = "hub-sonniss-gdc"
+name = "Sonniss GDC Game Audio Bundles"
+author = "Sonniss"
+kind = "sample_pack"
+homepage = "https://sonniss.com/gameaudiogdc"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Royalty-free and commercially usable in productions; the files themselves may not be redistributed; no AI training."
+genres = ["Cinematic"]
+kinds = ["fx", "foley", "atmos"]
+formats = ["WAV"]
+description = "Tens of GB of professional sound effects per yearly bundle."
+
+[[hub]]
+id = "hub-reverb-drum-machines"
+name = "Reverb Drum Machines"
+author = "Reverb"
+kind = "sample_pack"
+homepage = "https://reverb.com/software/samples/reverb-drum-machines"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free, royalty-free in music; no redistribution."
+genres = ["House", "Techno", "Hip-Hop", "Lo-Fi"]
+kinds = ["drums", "one-shots"]
+formats = ["WAV"]
+description = "Classic drum machines (808, 909, LinnDrum, SP-1200…) sampled."
+
+[[hub]]
+id = "hub-legowelt"
+name = "Legowelt sample packs"
+author = "Legowelt"
+kind = "sample_pack"
+homepage = "https://www.legowelt.org/samples/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free to use in music; redistribution not granted."
+genres = ["Techno", "House", "Electro"]
+kinds = ["drums", "one-shots", "synths"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-goldbaby"
+name = "Goldbaby free stuff"
+author = "Goldbaby"
+kind = "sample_pack"
+homepage = "https://www.goldbaby.co.nz/freestuff.html"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free for music production; no redistribution."
+genres = ["Lo-Fi", "Hip-Hop", "House"]
+kinds = ["drums", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-sampleradar"
+name = "MusicRadar SampleRadar"
+author = "MusicRadar"
+kind = "sample_pack"
+homepage = "https://www.musicradar.com/news/tech/free-music-samples-royalty-free-loops-hits-and-multis-to-download-sampleradar"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Royalty-free in music; no redistribution."
+genres = ["Reggaeton", "Trap", "House", "Techno", "Pop", "Drum & Bass"]
+kinds = ["drums", "loops", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-ghosthack-free"
+name = "Ghosthack free sample packs"
+author = "Ghosthack"
+kind = "sample_pack"
+homepage = "https://www.ghosthack.de/free_sample_packs/"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Email sign-up; royalty-free in music; no redistribution."
+genres = ["EDM", "Trap", "Techno"]
+kinds = ["drums", "loops", "one-shots", "fx"]
+formats = ["WAV"]
+requires_account = true
+
+[[hub]]
+id = "hub-samples-from-mars-free"
+name = "Samples From Mars free packs"
+author = "Samples From Mars"
+kind = "sample_pack"
+homepage = "https://www.samplesfrommars.com/collections/free"
+license = "Royalty-Free-No-Redistribution"
+license_summary = "Free checkout; use in music; no redistribution."
+genres = ["Hip-Hop", "House", "Techno"]
+kinds = ["drums", "one-shots"]
+formats = ["WAV"]
+requires_account = true
+
+[[hub]]
+id = "hub-freesound"
+name = "Freesound"
+author = "Music Technology Group (UPF)"
+kind = "sample_pack"
+homepage = "https://freesound.org/"
+license = "Mixed (CC0 / CC-BY / CC-BY-NC per sound)"
+license_summary = "Per-sound licenses; login required to download. Filter by CC0 to find sounds you may reuse freely."
+genres = ["EDM", "Ambient", "Cinematic"]
+kinds = ["fx", "one-shots", "loops", "foley"]
+formats = ["WAV", "FLAC", "OGG"]
+requires_account = true
+
+[[hub]]
+id = "hub-clipabay-drum-kit"
+name = "Clipabay Free Drum Kit"
+author = "Black Ribbon Studios (Clipabay)"
+kind = "sample_pack"
+homepage = "https://clipabay.com/free-drum-kit"
+license = "CC0-1.0"
+license_summary = "LICENSE.txt in the zip says CC0, but the publisher and the provenance of the sounds could not be verified (files dated 2026-11-09). Kept as a link until verified."
+genres = ["Trap", "Hip-Hop", "House"]
+kinds = ["drums", "808s", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-tr808-fischer"
+name = "TR-808 samples (Michael Fischer)"
+author = "Michael Fischer / Technopolis (repackaged by TidalCycles)"
+kind = "sample_pack"
+homepage = "https://github.com/tidalcycles/sounds-tr808-fischer"
+license = "Unclear"
+license_summary = "Repository says CC0, but the metadata credits '(c) Michael Fischer / Technopolis' and the original 1994 readme only says 'absolutely free'. Not bundled until the author confirms."
+genres = ["Hip-Hop", "Trap", "Electro", "House"]
+kinds = ["drums", "808s", "one-shots"]
+formats = ["WAV"]
+
+[[hub]]
+id = "hub-virtuosity-drums"
+name = "Virtuosity Drums"
+author = "Karoryfer Samples"
+kind = "instrument"
+homepage = "https://github.com/sfzinstruments/virtuosity_drums"
+download_page = "https://github.com/sfzinstruments/virtuosity_drums/releases"
+license = "CC0-1.0"
+redistributable = true
+license_summary = "CC0, but 1.2 GB: offered as an optional download instead of bundled."
+genres = ["Jazz", "Pop", "Funk"]
+kinds = ["drums", "instruments"]
+formats = ["SFZ", "FLAC"]
+
+[[hub]]
+id = "hub-big-rusty-drums"
+name = "Big Rusty Drums"
+author = "Karoryfer Samples"
+kind = "instrument"
+homepage = "https://github.com/sfzinstruments/karoryfer.big-rusty-drums"
+download_page = "https://github.com/sfzinstruments/karoryfer.big-rusty-drums/releases"
+license = "CC0-1.0"
+redistributable = true
+license_summary = "CC0, 620 MB: optional download."
+genres = ["Rock", "Hip-Hop", "Lo-Fi"]
+kinds = ["drums", "instruments"]
+formats = ["SFZ", "FLAC"]
+
+[[hub]]
+id = "hub-osiris-piano"
+name = "Osiris Piano"
+author = "Versilian Studios + Karoryfer"
+kind = "instrument"
+homepage = "https://shop.karoryfer.com/pages/free-osiris-piano"
+download_page = "https://github.com/sfzinstruments/Osiris_Piano/releases"
+license = "CC0-1.0"
+redistributable = true
+license_summary = "CC0, 459 MB: optional second piano."
+genres = ["Pop", "Cinematic", "Lo-Fi"]
+kinds = ["piano", "instruments"]
+formats = ["SFZ", "FLAC"]
+
+[[hub]]
+id = "hub-vsco2-ce-full"
+name = "VS Chamber Orchestra 2: Community Edition (full)"
+author = "Versilian Studios"
+kind = "instrument"
+homepage = "https://vis.versilstudios.net/vsco-community.html"
+download_page = "https://github.com/sgossner/VSCO-2-CE"
+license = "CC0-1.0"
+redistributable = true
+license_summary = "CC0, 2.3 GB: the factory bank includes a selection; the full library is optional."
+genres = ["Cinematic"]
+kinds = ["orchestral", "instruments"]
+formats = ["SFZ", "WAV"]
+
+[[hub]]
+id = "hub-vcsl"
+name = "Versilian Community Sample Library (VCSL)"
+author = "Versilian Studios"
+kind = "instrument"
+homepage = "https://github.com/sgossner/VCSL"
+license = "CC0-1.0"
+redistributable = true
+license_summary = "CC0, about 4 GB of world, ethnic, FM and acoustic instruments."
+genres = ["Cinematic", "World"]
+kinds = ["instruments", "percussion"]
+formats = ["SFZ", "WAV"]
+
+[[hub]]
+id = "hub-drumgizmo-kits"
+name = "DrumGizmo drum kits"
+author = "DrumGizmo"
+kind = "instrument"
+homepage = "https://drumgizmo.org/wiki/doku.php?id=kits"
+license = "CC-BY-4.0"
+redistributable = true
+license_summary = "CC BY 4.0 (credit required), but 2.4 to 5.6 GB per kit: optional download."
+genres = ["Rock", "Pop"]
+kinds = ["drums", "instruments"]
+formats = ["WAV", "DrumGizmo"]
+
+[[hub]]
+id = "hub-virtual-playing-orchestra"
+name = "Virtual Playing Orchestra"
+author = "Paul Battersby"
+kind = "instrument"
+homepage = "https://virtualplaying.com/virtual-playing-orchestra/"
+license = "Mixed (CC-BY-SA / CC Sampling+ / CC0)"
+license_summary = "Mixed licenses including share-alike and Sampling Plus; the author asks that it be given away for free. Link only."
+genres = ["Cinematic"]
+kinds = ["orchestral", "instruments"]
+formats = ["SFZ", "WAV"]
+
+# ---------------------------------------------------------------------------
+# Content Hub: free plugins (never bundled; the user installs them)
+# ---------------------------------------------------------------------------
+
+[[hub]]
+id = "plugin-vital"
+name = "Vital"
+author = "Matt Tytel"
+kind = "plugin"
+homepage = "https://vital.audio/"
+license = "Proprietary-Freeware"
+license_summary = "Free tier of a freemium binary (account required); the source is GPL-3.0."
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos", "linux"]
+requires_account = true
+genres = ["EDM", "Future Bass", "Dubstep", "Pop"]
+kinds = ["synth"]
+description = "Spectral-warping wavetable synth."
+
+[[hub]]
+id = "plugin-surge-xt"
+name = "Surge XT"
+author = "Surge Synth Team"
+kind = "plugin"
+homepage = "https://surge-synthesizer.github.io/"
+license = "GPL-3.0-or-later"
+formats = ["VST3", "CLAP", "AU", "LV2"]
+os = ["windows", "macos", "linux"]
+genres = ["EDM", "Techno", "Ambient"]
+kinds = ["synth"]
+description = "Hybrid synth with a huge preset library."
+
+[[hub]]
+id = "plugin-dexed"
+name = "Dexed"
+author = "Pascal Gauthier (asb2m10)"
+kind = "plugin"
+homepage = "https://asb2m10.github.io/dexed/"
+license = "GPL-3.0"
+formats = ["VST3", "CLAP", "AU", "LV2"]
+os = ["windows", "macos", "linux"]
+genres = ["Synthwave", "Pop", "House"]
+kinds = ["synth"]
+description = "DX7 FM synthesizer emulation."
+
+[[hub]]
+id = "plugin-obxd"
+name = "OB-Xd"
+author = "discoDSP / reales"
+kind = "plugin"
+homepage = "https://www.discodsp.com/obxd/"
+download_page = "https://github.com/reales/OB-Xd"
+license = "Proprietary-Freeware"
+license_summary = "2.x free for any use (source GPL-3 up to 2.11); the free 3.x edition is non-commercial."
+formats = ["VST3", "AU"]
+os = ["windows", "macos", "linux"]
+genres = ["Synthwave", "House", "Pop"]
+kinds = ["synth"]
+description = "Oberheim OB-X style virtual analog."
+
+[[hub]]
+id = "plugin-tyrell-n6"
+name = "Tyrell N6"
+author = "u-he"
+kind = "plugin"
+homepage = "https://u-he.com/products/tyrelln6/"
+license = "Proprietary-Freeware"
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos", "linux"]
+genres = ["House", "Synthwave", "Lo-Fi"]
+kinds = ["synth"]
+description = "Juno-style analog synth."
+
+[[hub]]
+id = "plugin-spitfire-labs"
+name = "Spitfire LABS"
+author = "Spitfire Audio"
+kind = "plugin"
+homepage = "https://labs.spitfireaudio.com/"
+license = "Proprietary-Freeware"
+license_summary = "Free instruments; Spitfire account and app required."
+formats = ["VST3", "AU"]
+os = ["windows", "macos"]
+requires_account = true
+genres = ["Cinematic", "Lo-Fi", "Pop"]
+kinds = ["instrument"]
+description = "Free sampled instruments: pianos, strings, textures."
+
+[[hub]]
+id = "plugin-valhalla-supermassive"
+name = "Valhalla Supermassive"
+author = "Valhalla DSP"
+kind = "plugin"
+homepage = "https://valhalladsp.com/shop/reverb/valhalla-supermassive/"
+license = "Proprietary-Freeware"
+formats = ["VST3", "AU"]
+os = ["windows", "macos"]
+kinds = ["effect", "reverb", "delay"]
+description = "Huge reverbs and delays."
+
+[[hub]]
+id = "plugin-tal-noisemaker"
+name = "TAL-NoiseMaker"
+author = "TAL Software"
+kind = "plugin"
+homepage = "https://tal-software.com/products/tal-noisemaker"
+license = "Proprietary-Freeware"
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos", "linux"]
+genres = ["EDM", "House", "Trap"]
+kinds = ["synth"]
+description = "Three-oscillator virtual analog synth."
+
+[[hub]]
+id = "plugin-kilohearts-essentials"
+name = "Kilohearts Essentials"
+author = "Kilohearts"
+kind = "plugin"
+homepage = "https://kilohearts.com/products/kilohearts_essentials"
+license = "Proprietary-Freeware"
+license_summary = "Free; account and installer required."
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos"]
+requires_account = true
+kinds = ["effect"]
+description = "30+ snap-in effects (EQ, compressor, delay, distortion…)."
+
+[[hub]]
+id = "plugin-odin2"
+name = "Odin 2"
+author = "TheWaveWarden"
+kind = "plugin"
+homepage = "https://thewavewarden.com/pages/odin-2"
+license = "GPL-3.0"
+formats = ["VST3", "CLAP", "AU", "LV2"]
+os = ["windows", "macos", "linux"]
+genres = ["EDM", "Techno"]
+kinds = ["synth"]
+description = "Semi-modular hybrid synth."
+
+[[hub]]
+id = "plugin-decent-sampler"
+name = "Decent Sampler"
+author = "Decent Samples"
+kind = "plugin"
+homepage = "https://www.decentsamples.com/product/decent-sampler-plugin/"
+license = "Proprietary-Freeware"
+formats = ["VST3", "AU"]
+os = ["windows", "macos", "linux"]
+kinds = ["sampler"]
+description = "Player for .dspreset sample libraries."
+
+[[hub]]
+id = "plugin-sforzando"
+name = "sforzando"
+author = "Plogue"
+kind = "plugin"
+homepage = "https://www.plogue.com/products/sforzando.html"
+license = "Proprietary-Freeware"
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos"]
+kinds = ["sampler"]
+description = "Reference SFZ player; loads the SFZ instruments in the factory bank."
+
+[[hub]]
+id = "plugin-sfizz"
+name = "sfizz"
+author = "SFZTools"
+kind = "plugin"
+homepage = "https://sfz.tools/sfizz/"
+license = "BSD-2-Clause"
+formats = ["VST3", "AU", "LV2"]
+os = ["windows", "macos", "linux"]
+kinds = ["sampler"]
+description = "Open-source SFZ player."
+
+[[hub]]
+id = "plugin-mfreefxbundle"
+name = "MFreeFXBundle"
+author = "MeldaProduction"
+kind = "plugin"
+homepage = "https://www.meldaproduction.com/MFreeFXBundle"
+license = "Proprietary-Freeware"
+formats = ["VST3", "AU"]
+os = ["windows", "macos"]
+kinds = ["effect"]
+description = "37 free mixing and creative effects."
+
+[[hub]]
+id = "plugin-tdr-nova"
+name = "TDR Nova"
+author = "Tokyo Dawn Labs"
+kind = "plugin"
+homepage = "https://www.tokyodawn.net/tdr-nova/"
+license = "Proprietary-Freeware"
+formats = ["VST3", "AU"]
+os = ["windows", "macos", "linux"]
+kinds = ["effect", "eq"]
+description = "Parallel dynamic EQ."
+
+[[hub]]
+id = "plugin-airwindows"
+name = "Airwindows Consolidated"
+author = "Chris Johnson (Airwindows)"
+kind = "plugin"
+homepage = "https://www.airwindows.com/"
+license = "MIT"
+formats = ["VST3", "CLAP", "AU"]
+os = ["windows", "macos", "linux"]
+kinds = ["effect"]
+description = "Hundreds of small, high-quality effects in one plugin."
+
+[[hub]]
+id = "plugin-dragonfly-reverb"
+name = "Dragonfly Reverb"
+author = "Michael Willis"
+kind = "plugin"
+homepage = "https://michaelwillis.github.io/dragonfly-reverb/"
+license = "GPL-3.0"
+formats = ["VST3", "CLAP", "LV2"]
+os = ["windows", "macos", "linux"]
+kinds = ["effect", "reverb"]
+description = "Hall, room, plate and early-reflection reverbs."
+
+[[hub]]
+id = "plugin-cardinal"
+name = "Cardinal"
+author = "DISTRHO"
+kind = "plugin"
+homepage = "https://cardinal.kx.studio/"
+license = "GPL-3.0"
+formats = ["VST3", "CLAP", "AU", "LV2"]
+os = ["windows", "macos", "linux"]
+kinds = ["synth", "effect", "modular"]
+description = "VCV Rack modular as a plugin."

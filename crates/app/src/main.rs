@@ -1,2 +1,62 @@
-fn main() {}
+//! AI-Track: the desktop app (GPUI). It only paints and wires things up; the
+//! project model, engine, plugins, library and AI live in their own crates and
+//! reach the UI through `bridge`.
 
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
+mod actions;
+mod assets;
+mod bridge;
+mod demo;
+mod icons;
+mod motion;
+mod paint;
+mod state;
+mod theme;
+mod views;
+mod widgets;
+mod workspace;
+
+use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
+
+fn main() {
+    let platform = gpui_platform::current_platform(false);
+    gpui::Application::with_platform(platform).with_assets(assets::Assets).run(|cx: &mut App| {
+        assets::load_fonts(cx);
+        actions::bind(cx);
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
+        let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(1024.), px(640.))),
+                app_id: Some("dev.aitrack.daw".into()),
+                // The app draws its own title bar (transport lives in it). On
+                // Windows the drag areas hit-test as the caption, so snapping
+                // and double-click maximise stay native.
+                app_owns_titlebar_drag: cfg!(target_os = "macos"),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("AI-Track".into()),
+                    appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
+                    traffic_light_position: cfg!(target_os = "macos")
+                        .then(|| point(px(14.), px((theme::TOP_BAR_H - 14.) / 2.))),
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let ws = cx.new(|cx| workspace::Workspace::new(demo::project(), bridge::Bridges::stubs(), cx));
+                ws.update(cx, |ws, cx| ws.focus.focus(window, cx));
+                window.activate_window();
+                ws
+            },
+        )
+        .expect("open the AI-Track window");
+        cx.activate(true);
+    });
+}

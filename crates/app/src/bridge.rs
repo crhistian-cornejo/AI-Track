@@ -1,0 +1,850 @@
+//! The boundary between the interface and the rest of AI-Track.
+//!
+//! The UI talks to the audio engine, the plugin catalogue, the sample
+//! library and the AI features only through these traits. Each has a stub
+//! that returns demo data (and fakes a playing transport and moving meters),
+//! so every view can be exercised before the real crates are wired in. To
+//! wire one, implement the trait in a small adapter and hand it to
+//! [`Bridges`] in `main.rs`.
+
+use aitrack_dsp::ParamInfo;
+use aitrack_model::{Key, PluginFormat, Project, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+// ───────────────────────────── Engine ─────────────────────────────
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TransportState {
+    pub playing: bool,
+    pub recording: bool,
+    pub looping: bool,
+    pub metronome: bool,
+    /// Song position in ticks.
+    pub position: Tick,
+}
+
+/// Peak levels, linear 0..=1 (1 = 0 dBFS), already ballistically smoothed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeterLevel {
+    pub left: f32,
+    pub right: f32,
+}
+
+impl MeterLevel {
+    pub fn max(&self) -> f32 {
+        self.left.max(self.right)
+    }
+}
+
+/// What a session slot is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// Playing since `since` (song ticks).
+    Playing { scene: SceneId, since: Tick },
+    /// Launched, waiting for the launch quantisation.
+    Queued { scene: SceneId },
+}
+
+pub trait EngineBridge {
+    fn play(&mut self);
+    fn stop(&mut self);
+    fn toggle_record(&mut self);
+    fn set_looping(&mut self, on: bool);
+    fn set_metronome(&mut self, on: bool);
+    fn locate(&mut self, tick: Tick);
+    fn transport(&self) -> TransportState;
+    /// A new snapshot of the project after an edit (the engine compiles it off the audio thread).
+    fn update_project(&mut self, project: &Project);
+    /// Per-track peak meters, including the Main track.
+    fn meter(&self, track: TrackId) -> MeterLevel;
+    /// DSP load, 0..=1.
+    fn cpu_load(&self) -> f32;
+    fn launch_clip(&mut self, track: TrackId, scene: SceneId);
+    fn launch_scene(&mut self, scene: SceneId);
+    fn stop_track(&mut self, track: TrackId);
+    fn slot_state(&self, track: TrackId) -> Option<SlotState>;
+}
+
+/// Fake engine: the position follows the wall clock at the project tempo and
+/// wraps in the loop; meters are a deterministic function of time.
+pub struct StubEngine {
+    state: TransportState,
+    started: Option<(Instant, Tick)>,
+    bpm: f64,
+    loop_region: Option<(Tick, Tick)>,
+    tracks: Vec<(TrackId, TrackKind, bool)>,
+    slots: BTreeMap<TrackId, SlotState>,
+    clip_slots: BTreeMap<TrackId, Vec<SceneId>>,
+}
+
+impl Default for StubEngine {
+    fn default() -> Self {
+        Self {
+            state: TransportState { metronome: false, looping: true, ..Default::default() },
+            started: None,
+            bpm: 120.,
+            loop_region: None,
+            tracks: Vec::new(),
+            slots: BTreeMap::new(),
+            clip_slots: BTreeMap::new(),
+        }
+    }
+}
+
+impl StubEngine {
+    fn now_tick(&self) -> Tick {
+        let Some((at, from)) = self.started else { return self.state.position };
+        let elapsed = at.elapsed().as_secs_f64();
+        let mut tick = from + (elapsed * self.bpm / 60. * PPQ as f64) as Tick;
+        if self.state.looping {
+            if let Some((a, b)) = self.loop_region {
+                if b > a && tick >= b {
+                    tick = a + (tick - a) % (b - a);
+                }
+            }
+        }
+        tick
+    }
+
+    fn bar(&self) -> Tick {
+        4 * PPQ
+    }
+
+    fn next_bar(&self) -> Tick {
+        let t = self.now_tick();
+        (t / self.bar() + 1) * self.bar()
+    }
+}
+
+impl EngineBridge for StubEngine {
+    fn play(&mut self) {
+        if !self.state.playing {
+            self.state.playing = true;
+            self.started = Some((Instant::now(), self.state.position));
+            // Queued clips start immediately on play.
+            let pos = self.state.position;
+            for s in self.slots.values_mut() {
+                if let SlotState::Queued { scene } = *s {
+                    *s = SlotState::Playing { scene, since: pos };
+                }
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.state.playing {
+            self.state.position = self.now_tick();
+            self.state.playing = false;
+            self.state.recording = false;
+            self.started = None;
+        } else {
+            // A second stop returns to the start and stops the clips (Ableton).
+            self.state.position = 0;
+            self.slots.clear();
+        }
+    }
+
+    fn toggle_record(&mut self) {
+        self.state.recording = !self.state.recording;
+    }
+
+    fn set_looping(&mut self, on: bool) {
+        self.state.position = self.now_tick();
+        if self.state.playing {
+            self.started = Some((Instant::now(), self.state.position));
+        }
+        self.state.looping = on;
+    }
+
+    fn set_metronome(&mut self, on: bool) {
+        self.state.metronome = on;
+    }
+
+    fn locate(&mut self, tick: Tick) {
+        self.state.position = tick.max(0);
+        if self.state.playing {
+            self.started = Some((Instant::now(), self.state.position));
+        }
+    }
+
+    fn transport(&self) -> TransportState {
+        TransportState { position: self.now_tick(), ..self.state }
+    }
+
+    fn update_project(&mut self, project: &Project) {
+        let bpm = project.tempo.initial_bpm();
+        if (bpm - self.bpm).abs() > 1e-9 && self.state.playing {
+            self.state.position = self.now_tick();
+            self.started = Some((Instant::now(), self.state.position));
+        }
+        self.bpm = bpm;
+        self.loop_region = project.loop_region;
+        self.tracks = project.tracks.iter().map(|t| (t.id, t.kind, t.mute)).collect();
+        self.clip_slots = project
+            .tracks
+            .iter()
+            .map(|t| (t.id, t.session_slots.keys().copied().collect()))
+            .collect();
+    }
+
+    fn meter(&self, track: TrackId) -> MeterLevel {
+        if !self.state.playing {
+            return MeterLevel::default();
+        }
+        let muted = self.tracks.iter().find(|(id, ..)| *id == track).is_none_or(|(_, kind, mute)| {
+            *mute || matches!(kind, TrackKind::Folder | TrackKind::Vca)
+        });
+        if muted {
+            return MeterLevel::default();
+        }
+        let tick = self.now_tick() as f32;
+        let beat = tick / PPQ as f32;
+        let seed = (track.0 % 7) as f32;
+        // A kick-like envelope per beat plus a slower swell, different per track.
+        let env = (-(beat.fract()) * (3. + seed * 0.6)).exp();
+        let swell = 0.5 + 0.5 * (beat * 0.37 + seed).sin();
+        let base = 0.35 + 0.25 * swell + 0.35 * env;
+        let l = (base * (0.92 + 0.08 * (beat * 3.1 + seed).sin())).clamp(0., 1.);
+        let r = (base * (0.92 + 0.08 * (beat * 2.7 + seed * 1.3).cos())).clamp(0., 1.);
+        MeterLevel { left: l * 0.95, right: r * 0.95 }
+    }
+
+    fn cpu_load(&self) -> f32 {
+        if self.state.playing {
+            let t = self.now_tick() as f32 / PPQ as f32;
+            0.18 + 0.04 * (t * 0.9).sin()
+        } else {
+            0.03
+        }
+    }
+
+    fn launch_clip(&mut self, track: TrackId, scene: SceneId) {
+        let state = if self.state.playing {
+            // Quantised to the next bar; the stub starts it right away but
+            // counts from the bar line so the progress ring stays in phase.
+            let _ = self.next_bar();
+            SlotState::Playing { scene, since: (self.now_tick() / self.bar()) * self.bar() }
+        } else {
+            SlotState::Queued { scene }
+        };
+        self.slots.insert(track, state);
+    }
+
+    fn launch_scene(&mut self, scene: SceneId) {
+        let tracks: Vec<TrackId> = self
+            .clip_slots
+            .iter()
+            .filter(|(_, scenes)| scenes.contains(&scene))
+            .map(|(t, _)| *t)
+            .collect();
+        for t in tracks {
+            self.launch_clip(t, scene);
+        }
+    }
+
+    fn stop_track(&mut self, track: TrackId) {
+        self.slots.remove(&track);
+    }
+
+    fn slot_state(&self, track: TrackId) -> Option<SlotState> {
+        self.slots.get(&track).copied()
+    }
+}
+
+// ───────────────────────────── Plugins ─────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DeviceCategory {
+    Instrument,
+    Drums,
+    Dynamics,
+    Eq,
+    Filter,
+    Space,
+    Distortion,
+    Modulation,
+    Utility,
+    Rack,
+}
+
+impl DeviceCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instrument => "Instruments",
+            Self::Drums => "Drums",
+            Self::Dynamics => "Dynamics",
+            Self::Eq => "EQ",
+            Self::Filter => "Filter",
+            Self::Space => "Reverb & Delay",
+            Self::Distortion => "Distortion",
+            Self::Modulation => "Modulation",
+            Self::Utility => "Utility",
+            Self::Rack => "Racks",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    /// Stock plugin id, as in `DeviceKind::Stock { plugin_id }` (e.g. `"fx.eq"`).
+    pub id: &'static str,
+    pub name: &'static str,
+    pub category: DeviceCategory,
+    pub tags: &'static [&'static str],
+    pub params: Vec<ParamInfo>,
+    pub is_instrument: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalPlugin {
+    pub uid: String,
+    pub name: String,
+    pub vendor: String,
+    pub format: PluginFormat,
+    pub path: PathBuf,
+    pub is_instrument: bool,
+}
+
+pub trait PluginCatalog {
+    fn stock_devices(&self) -> &[DeviceInfo];
+    fn external_plugins(&self) -> &[ExternalPlugin];
+    fn device(&self, id: &str) -> Option<&DeviceInfo> {
+        self.stock_devices().iter().find(|d| d.id == id)
+    }
+}
+
+pub struct StubCatalog {
+    stock: Vec<DeviceInfo>,
+    external: Vec<ExternalPlugin>,
+}
+
+const WAVES: &[&str] = &["Saw", "Square", "Sine", "Wavetable"];
+const FILTERS: &[&str] = &["LP 24", "LP 12", "BP", "HP"];
+
+fn p(id: u32, name: &'static str, min: f32, max: f32, default: f32) -> ParamInfo {
+    ParamInfo::new(id, name, min, max, default)
+}
+
+impl Default for StubCatalog {
+    fn default() -> Self {
+        use DeviceCategory::*;
+        let synth = vec![
+            p(0, "Osc A", 0., 3., 0.).short("Osc A").choices(WAVES),
+            p(1, "Osc B", 0., 3., 1.).short("Osc B").choices(WAVES),
+            p(2, "Detune", 0., 100., 12.).unit("ct").short("Detune"),
+            p(3, "Cutoff", 20., 20_000., 2_400.).unit("Hz").log().short("Cutoff"),
+            p(4, "Resonance", 0., 100., 18.).unit("%").short("Reso"),
+            p(5, "Filter", 0., 3., 0.).choices(FILTERS),
+            p(6, "Env Amount", -100., 100., 35.).unit("%").short("Env"),
+            p(7, "Attack", 0.1, 5_000., 4.).unit("ms").log().short("Attack"),
+            p(8, "Decay", 1., 5_000., 320.).unit("ms").log().short("Decay"),
+            p(9, "Sustain", 0., 100., 60.).unit("%").short("Sustain"),
+            p(10, "Release", 1., 8_000., 280.).unit("ms").log().short("Release"),
+            p(11, "Volume", -60., 6., -6.).unit("dB").short("Volume"),
+        ];
+        let sampler = vec![
+            p(0, "Start", 0., 100., 0.).unit("%"),
+            p(1, "Transpose", -24., 24., 0.).unit("st").short("Pitch"),
+            p(2, "Attack", 0.1, 2_000., 1.).unit("ms").log(),
+            p(3, "Release", 1., 4_000., 120.).unit("ms").log(),
+            p(4, "Cutoff", 20., 20_000., 20_000.).unit("Hz").log(),
+            p(5, "Volume", -60., 6., 0.).unit("dB"),
+        ];
+        let eq = vec![
+            p(0, "Low", -18., 18., 0.).unit("dB"),
+            p(1, "Low Freq", 20., 500., 90.).unit("Hz").log().short("L Freq"),
+            p(2, "Mid", -18., 18., 0.).unit("dB"),
+            p(3, "Mid Freq", 200., 8_000., 1_200.).unit("Hz").log().short("M Freq"),
+            p(4, "High", -18., 18., 0.).unit("dB"),
+            p(5, "High Freq", 2_000., 20_000., 8_000.).unit("Hz").log().short("H Freq"),
+            p(6, "Output", -18., 18., 0.).unit("dB"),
+        ];
+        let comp = vec![
+            p(0, "Threshold", -60., 0., -18.).unit("dB").short("Thresh"),
+            p(1, "Ratio", 1., 20., 4.).power(0.5),
+            p(2, "Attack", 0.05, 200., 10.).unit("ms").log(),
+            p(3, "Release", 5., 2_000., 120.).unit("ms").log(),
+            p(4, "Knee", 0., 24., 6.).unit("dB"),
+            p(5, "Makeup", 0., 24., 0.).unit("dB"),
+            p(6, "Mix", 0., 100., 100.).unit("%"),
+        ];
+        let limiter = vec![
+            p(0, "Ceiling", -12., 0., -0.3).unit("dB"),
+            p(1, "Gain", 0., 24., 0.).unit("dB"),
+            p(2, "Release", 1., 1_000., 60.).unit("ms").log(),
+            p(3, "Lookahead", 0.5, 5., 1.5).unit("ms").short("Look"),
+        ];
+        let reverb = vec![
+            p(0, "Size", 0., 100., 55.).unit("%"),
+            p(1, "Decay", 100., 20_000., 2_400.).unit("ms").log(),
+            p(2, "Pre-delay", 0., 250., 18.).unit("ms").short("Pre"),
+            p(3, "Damping", 0., 100., 40.).unit("%").short("Damp"),
+            p(4, "Width", 0., 100., 100.).unit("%"),
+            p(5, "Mix", 0., 100., 30.).unit("%"),
+        ];
+        let delay = vec![
+            p(0, "Time", 1., 2_000., 375.).unit("ms").log(),
+            p(1, "Feedback", 0., 100., 38.).unit("%").short("Fdbk"),
+            p(2, "Low Cut", 20., 2_000., 200.).unit("Hz").log().short("Lo Cut"),
+            p(3, "High Cut", 1_000., 20_000., 8_000.).unit("Hz").log().short("Hi Cut"),
+            p(4, "Ping-Pong", 0., 1., 1.).choices(&["Off", "On"]).short("Ping"),
+            p(5, "Mix", 0., 100., 25.).unit("%"),
+        ];
+        let saturator = vec![
+            p(0, "Drive", 0., 36., 6.).unit("dB"),
+            p(1, "Shape", 0., 3., 0.).choices(&["Soft", "Tape", "Tube", "Fold"]),
+            p(2, "Tone", -100., 100., 0.).unit("%"),
+            p(3, "Output", -24., 6., 0.).unit("dB"),
+            p(4, "Mix", 0., 100., 100.).unit("%"),
+        ];
+        let filter = vec![
+            p(0, "Cutoff", 20., 20_000., 1_000.).unit("Hz").log(),
+            p(1, "Resonance", 0., 100., 20.).unit("%").short("Reso"),
+            p(2, "Type", 0., 3., 0.).choices(FILTERS),
+            p(3, "Drive", 0., 24., 0.).unit("dB"),
+            p(4, "Mix", 0., 100., 100.).unit("%"),
+        ];
+        let chorus = vec![
+            p(0, "Rate", 0.01, 10., 0.6).unit("Hz").log(),
+            p(1, "Depth", 0., 100., 40.).unit("%"),
+            p(2, "Feedback", 0., 100., 10.).unit("%").short("Fdbk"),
+            p(3, "Mix", 0., 100., 50.).unit("%"),
+        ];
+        let utility = vec![
+            p(0, "Gain", -36., 36., 0.).unit("dB"),
+            p(1, "Width", 0., 200., 100.).unit("%"),
+            p(2, "Pan", -100., 100., 0.).unit("%"),
+            p(3, "Mono", 0., 1., 0.).choices(&["Off", "On"]),
+        ];
+        let stock = vec![
+            DeviceInfo { id: "instrument.wavetable", name: "Wavetable Synth", category: Instrument, tags: &["synth", "poly", "lead", "pad"], params: synth.clone(), is_instrument: true },
+            DeviceInfo { id: "instrument.bass", name: "Mono Bass", category: Instrument, tags: &["synth", "mono", "bass"], params: synth, is_instrument: true },
+            DeviceInfo { id: "instrument.sampler", name: "Sampler", category: Instrument, tags: &["sampler", "keys"], params: sampler.clone(), is_instrument: true },
+            DeviceInfo { id: "instrument.drum_sampler", name: "Drum Sampler", category: Drums, tags: &["drums", "one-shot"], params: sampler, is_instrument: true },
+            DeviceInfo { id: "fx.eq", name: "EQ Eight", category: Eq, tags: &["eq", "tone"], params: eq, is_instrument: false },
+            DeviceInfo { id: "fx.compressor", name: "Compressor", category: Dynamics, tags: &["dynamics", "glue"], params: comp, is_instrument: false },
+            DeviceInfo { id: "fx.limiter", name: "Limiter", category: Dynamics, tags: &["master", "loudness"], params: limiter, is_instrument: false },
+            DeviceInfo { id: "fx.reverb", name: "Reverb", category: Space, tags: &["space", "hall", "plate"], params: reverb, is_instrument: false },
+            DeviceInfo { id: "fx.delay", name: "Echo Delay", category: Space, tags: &["delay", "echo"], params: delay, is_instrument: false },
+            DeviceInfo { id: "fx.saturator", name: "Saturator", category: Distortion, tags: &["drive", "warmth"], params: saturator, is_instrument: false },
+            DeviceInfo { id: "fx.filter", name: "Auto Filter", category: Filter, tags: &["filter", "sweep"], params: filter, is_instrument: false },
+            DeviceInfo { id: "fx.chorus", name: "Chorus", category: Modulation, tags: &["width", "chorus"], params: chorus, is_instrument: false },
+            DeviceInfo { id: "fx.utility", name: "Utility", category: Utility, tags: &["gain", "width"], params: utility, is_instrument: false },
+            DeviceInfo { id: "rack.instrument", name: "Instrument Rack", category: Rack, tags: &["rack", "macros"], params: Vec::new(), is_instrument: true },
+            DeviceInfo { id: "rack.drum", name: "Drum Rack", category: Rack, tags: &["rack", "drums", "pads"], params: Vec::new(), is_instrument: true },
+            DeviceInfo { id: "rack.audio", name: "Audio Effect Rack", category: Rack, tags: &["rack", "macros"], params: Vec::new(), is_instrument: false },
+        ];
+        let ext = |name: &str, vendor: &str, format, inst| ExternalPlugin {
+            uid: format!("{vendor}.{name}").to_lowercase().replace(' ', "-"),
+            name: name.into(),
+            vendor: vendor.into(),
+            format,
+            path: PathBuf::from(match format {
+                PluginFormat::Vst3 => format!("C:/Program Files/Common Files/VST3/{name}.vst3"),
+                PluginFormat::Clap => format!("C:/Program Files/Common Files/CLAP/{name}.clap"),
+            }),
+            is_instrument: inst,
+        };
+        let external = vec![
+            ext("Surge XT", "Surge Synth Team", PluginFormat::Clap, true),
+            ext("Vital", "Vital Audio", PluginFormat::Vst3, true),
+            ext("Dexed", "Digital Suburban", PluginFormat::Vst3, true),
+            ext("OTT", "Xfer Records", PluginFormat::Vst3, false),
+            ext("Valhalla Supermassive", "Valhalla DSP", PluginFormat::Vst3, false),
+            ext("Airwindows Consolidated", "Airwindows", PluginFormat::Clap, false),
+            ext("Chow Tape Model", "Chowdhury DSP", PluginFormat::Clap, false),
+        ];
+        Self { stock, external }
+    }
+}
+
+impl PluginCatalog for StubCatalog {
+    fn stock_devices(&self) -> &[DeviceInfo] {
+        &self.stock
+    }
+    fn external_plugins(&self) -> &[ExternalPlugin] {
+        &self.external
+    }
+}
+
+// ───────────────────────────── Library ─────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryFolder {
+    /// Stable path-like id, e.g. `"categories/drums/kicks"`.
+    pub id: String,
+    pub name: String,
+    pub children: Vec<LibraryFolder>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryItem {
+    pub id: u64,
+    pub name: String,
+    pub path: PathBuf,
+    /// e.g. "Kick", "Bass Loop", "Vocal".
+    pub category: String,
+    pub key: Option<Scale>,
+    pub bpm: Option<f32>,
+    /// Seconds.
+    pub duration: f32,
+    pub is_loop: bool,
+}
+
+pub trait LibraryBridge {
+    /// Virtual folders (Categories, Keys, Genres…), top level first.
+    fn folders(&self) -> &[LibraryFolder];
+    /// Items in a virtual folder (and its sub-folders).
+    fn items(&self, folder: &str) -> Vec<LibraryItem>;
+    /// Free-text search, optionally restricted to a key (compatible keys first).
+    fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem>;
+}
+
+pub struct StubLibrary {
+    folders: Vec<LibraryFolder>,
+    items: Vec<(Vec<String>, LibraryItem)>,
+}
+
+fn folder(id: &str, name: &str, children: Vec<LibraryFolder>) -> LibraryFolder {
+    LibraryFolder { id: id.into(), name: name.into(), children }
+}
+
+impl Default for StubLibrary {
+    fn default() -> Self {
+        let cats = [
+            ("drums", "Drums", &["Kicks", "Snares", "Claps", "Hats", "Percussion"][..]),
+            ("bass", "Bass", &["One-shots", "Loops"][..]),
+            ("synths", "Synths", &["Leads", "Pads", "Plucks"][..]),
+            ("vocals", "Vocals", &["Chops", "Phrases"][..]),
+            ("fx", "FX", &["Risers", "Impacts", "Atmos"][..]),
+        ];
+        let categories = folder(
+            "categories",
+            "Categories",
+            cats.iter()
+                .map(|(id, name, subs)| {
+                    folder(
+                        &format!("categories/{id}"),
+                        name,
+                        subs.iter()
+                            .map(|s| folder(&format!("categories/{id}/{}", s.to_lowercase()), s, vec![]))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        let key_names = ["A minor", "C major", "D minor", "E minor", "F major", "G minor"];
+        let keys = folder(
+            "keys",
+            "Keys",
+            key_names.iter().map(|k| folder(&format!("keys/{}", k.replace(' ', "-").to_lowercase()), k, vec![])).collect(),
+        );
+        let genres = folder(
+            "genres",
+            "Genres",
+            ["House", "Techno", "Pop", "Reggaeton", "Drum & Bass", "Lo-fi"]
+                .iter()
+                .map(|g| folder(&format!("genres/{}", g.to_lowercase().replace([' ', '&'], "")), g, vec![]))
+                .collect(),
+        );
+        let folders = vec![categories, keys, genres];
+
+        let am = Scale::new(Key(9), ScaleKind::Minor);
+        let cmaj = Scale::new(Key(0), ScaleKind::Major);
+        let dm = Scale::new(Key(2), ScaleKind::Minor);
+        let em = Scale::new(Key(4), ScaleKind::Minor);
+        let fmaj = Scale::new(Key(5), ScaleKind::Major);
+        let gm = Scale::new(Key(7), ScaleKind::Minor);
+        type Row = (&'static str, &'static str, &'static str, Option<Scale>, Option<f32>, f32, bool, &'static str);
+        let rows: &[Row] = &[
+            ("Kick Punchy 01", "drums/kicks", "Kick", Some(am), None, 0.42, false, "house"),
+            ("Kick Deep Sub", "drums/kicks", "Kick", Some(dm), None, 0.61, false, "techno"),
+            ("Kick Analog 909", "drums/kicks", "Kick", None, None, 0.38, false, "techno"),
+            ("Kick Dark Rumble", "drums/kicks", "Kick", Some(am), None, 0.88, false, "techno"),
+            ("Kick Reggaeton Thump", "drums/kicks", "Kick", Some(gm), None, 0.45, false, "reggaeton"),
+            ("Snare Crack", "drums/snares", "Snare", None, None, 0.31, false, "pop"),
+            ("Snare Room Tight", "drums/snares", "Snare", None, None, 0.27, false, "house"),
+            ("Clap Wide Stack", "drums/claps", "Clap", None, None, 0.35, false, "house"),
+            ("Clap Vinyl", "drums/claps", "Clap", None, None, 0.29, false, "lofi"),
+            ("Hat Closed Tick", "drums/hats", "Hat", None, None, 0.08, false, "techno"),
+            ("Hat Open Sizzle", "drums/hats", "Hat", None, None, 0.52, false, "house"),
+            ("Hat Loop 16th", "drums/hats", "Hat Loop", None, Some(128.), 7.5, true, "house"),
+            ("Perc Dembow Loop", "drums/percussion", "Perc Loop", None, Some(95.), 10.1, true, "reggaeton"),
+            ("Shaker Groove", "drums/percussion", "Perc Loop", None, Some(124.), 7.74, true, "house"),
+            ("Bass Reese A", "bass/one-shots", "Bass", Some(am), None, 1.6, false, "drumbass"),
+            ("Bass Sub Pluck", "bass/one-shots", "Bass", Some(em), None, 0.9, false, "pop"),
+            ("Bass Rolling Loop Am", "bass/loops", "Bass Loop", Some(am), Some(128.), 7.5, true, "techno"),
+            ("Bass Offbeat Loop Dm", "bass/loops", "Bass Loop", Some(dm), Some(124.), 7.74, true, "house"),
+            ("Lead Supersaw Am", "synths/leads", "Lead", Some(am), Some(128.), 3.75, true, "house"),
+            ("Lead Square Hook", "synths/leads", "Lead", Some(cmaj), Some(120.), 4.0, true, "pop"),
+            ("Pad Warm Analog Am", "synths/pads", "Pad", Some(am), None, 6.2, false, "lofi"),
+            ("Pad Glass F", "synths/pads", "Pad", Some(fmaj), None, 8.0, false, "pop"),
+            ("Pluck Bell C", "synths/plucks", "Pluck", Some(cmaj), None, 1.1, false, "pop"),
+            ("Pluck Chord Loop Am", "synths/plucks", "Pluck Loop", Some(am), Some(128.), 7.5, true, "house"),
+            ("Vocal Chop Hey", "vocals/chops", "Vocal", Some(am), None, 0.6, false, "house"),
+            ("Vocal Chop Ooh Gm", "vocals/chops", "Vocal", Some(gm), None, 1.2, false, "reggaeton"),
+            ("Vocal Phrase Night", "vocals/phrases", "Vocal Loop", Some(am), Some(128.), 7.5, true, "pop"),
+            ("Riser White 8 Bars", "fx/risers", "Riser", None, Some(128.), 15.0, true, "techno"),
+            ("Impact Low Boom", "fx/impacts", "Impact", Some(am), None, 3.2, false, "techno"),
+            ("Atmos Rain Tape", "fx/atmos", "Atmos", None, None, 12.0, false, "lofi"),
+        ];
+        let items = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (name, cat, category, key, bpm, dur, is_loop, genre))| {
+                let mut tags = vec![format!("categories/{cat}"), format!("genres/{genre}")];
+                if let Some(k) = key {
+                    tags.push(format!("keys/{}", k.display().replace(' ', "-").to_lowercase()));
+                }
+                (
+                    tags,
+                    LibraryItem {
+                        id: i as u64 + 1,
+                        name: (*name).into(),
+                        path: PathBuf::from(format!("Library/{cat}/{name}.wav")),
+                        category: (*category).into(),
+                        key: *key,
+                        bpm: *bpm,
+                        duration: *dur,
+                        is_loop: *is_loop,
+                    },
+                )
+            })
+            .collect();
+        Self { folders, items }
+    }
+}
+
+impl LibraryBridge for StubLibrary {
+    fn folders(&self) -> &[LibraryFolder] {
+        &self.folders
+    }
+
+    fn items(&self, folder: &str) -> Vec<LibraryItem> {
+        self.items
+            .iter()
+            .filter(|(tags, _)| tags.iter().any(|t| t == folder || t.starts_with(&format!("{folder}/"))))
+            .map(|(_, item)| item.clone())
+            .collect()
+    }
+
+    fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
+        let q = query.trim().to_lowercase();
+        let mut out: Vec<LibraryItem> = self
+            .items
+            .iter()
+            .map(|(_, i)| i)
+            .filter(|i| {
+                q.is_empty() || i.name.to_lowercase().contains(&q) || i.category.to_lowercase().contains(&q)
+            })
+            .filter(|i| key.is_none_or(|k| i.key.is_none_or(|ik| compatible(ik, k))))
+            .cloned()
+            .collect();
+        // Exact key matches first.
+        out.sort_by_key(|i| (i.key != key, i.name.clone()));
+        out
+    }
+}
+
+/// Same key, or the relative major/minor.
+fn compatible(a: Scale, b: Scale) -> bool {
+    a.mask() == b.mask()
+}
+
+// ───────────────────────────── AI ─────────────────────────────
+
+pub type JobId = u64;
+
+/// A note detected from audio, before it gets project ids.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetectedNote {
+    pub key: u8,
+    pub start: Tick,
+    pub length: Tick,
+    pub velocity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AiEvent {
+    Progress { job: JobId, label: String, fraction: f32 },
+    MidiReady { job: JobId, source_name: String, notes: Vec<DetectedNote> },
+    StemsReady { job: JobId, stems: Vec<(String, PathBuf)> },
+    /// A chat reply from the connected assistant.
+    Reply { text: String },
+    /// The assistant wants to edit the project; the UI stages it with
+    /// `History::propose` so the user can accept or discard it.
+    Proposal { label: String, agent: String, commands: Vec<aitrack_model::Command> },
+    Failed { job: JobId, message: String },
+}
+
+pub trait AiBridge {
+    fn extract_midi(&mut self, path: &Path) -> JobId;
+    fn split_stems(&mut self, path: &Path) -> JobId;
+    /// Send a chat message; replies and proposals arrive through [`poll`](Self::poll).
+    fn chat(&mut self, text: &str, project: &Project);
+    /// Drain finished work and progress. The UI calls this on a timer only
+    /// while [`busy`](Self::busy) is true.
+    fn poll(&mut self) -> Vec<AiEvent>;
+    fn busy(&self) -> bool;
+}
+
+struct StubJob {
+    id: JobId,
+    kind: StubJobKind,
+    started: Instant,
+    reported: f32,
+}
+
+enum StubJobKind {
+    Midi(String),
+    Stems(PathBuf),
+    Chat(String),
+}
+
+#[derive(Default)]
+pub struct StubAi {
+    jobs: Vec<StubJob>,
+    next: JobId,
+}
+
+impl StubAi {
+    fn push(&mut self, kind: StubJobKind) -> JobId {
+        self.next += 1;
+        self.jobs.push(StubJob { id: self.next, kind, started: Instant::now(), reported: 0. });
+        self.next
+    }
+}
+
+impl AiBridge for StubAi {
+    fn extract_midi(&mut self, path: &Path) -> JobId {
+        let name = path.file_stem().map_or("Audio".into(), |s| s.to_string_lossy().into_owned());
+        self.push(StubJobKind::Midi(name))
+    }
+
+    fn split_stems(&mut self, path: &Path) -> JobId {
+        self.push(StubJobKind::Stems(path.to_path_buf()))
+    }
+
+    fn chat(&mut self, text: &str, _project: &Project) {
+        self.push(StubJobKind::Chat(text.to_owned()));
+    }
+
+    fn poll(&mut self) -> Vec<AiEvent> {
+        let mut out = Vec::new();
+        let mut finished = Vec::new();
+        for job in &mut self.jobs {
+            let secs = job.started.elapsed().as_secs_f32();
+            let total = match job.kind {
+                StubJobKind::Midi(_) => 1.6,
+                StubJobKind::Stems(_) => 3.2,
+                StubJobKind::Chat(_) => 0.9,
+            };
+            let f = (secs / total).min(1.);
+            if f < 1. {
+                if f - job.reported >= 0.04 && !matches!(job.kind, StubJobKind::Chat(_)) {
+                    job.reported = f;
+                    let label = match job.kind {
+                        StubJobKind::Midi(_) => "Extracting MIDI",
+                        _ => "Splitting stems",
+                    };
+                    out.push(AiEvent::Progress { job: job.id, label: label.into(), fraction: f });
+                }
+                continue;
+            }
+            finished.push(job.id);
+            match &job.kind {
+                StubJobKind::Midi(name) => {
+                    // A plausible A-minor vocal line.
+                    let line = [(69, 0, 2), (72, 2, 2), (71, 4, 1), (69, 5, 3), (67, 8, 2), (64, 10, 2), (65, 12, 2), (64, 14, 2)];
+                    let notes = line
+                        .iter()
+                        .map(|&(key, s, l)| DetectedNote {
+                            key,
+                            start: s * PPQ / 2,
+                            length: l * PPQ / 2,
+                            velocity: 0.78,
+                        })
+                        .collect();
+                    out.push(AiEvent::MidiReady { job: job.id, source_name: format!("{name} (MIDI)"), notes });
+                }
+                StubJobKind::Stems(path) => {
+                    let stem = |s: &str| (s.to_owned(), path.with_extension(format!("{}.wav", s.to_lowercase())));
+                    out.push(AiEvent::StemsReady {
+                        job: job.id,
+                        stems: vec![stem("Vocals"), stem("Drums"), stem("Bass"), stem("Other")],
+                    });
+                }
+                StubJobKind::Chat(text) => out.push(AiEvent::Reply {
+                    text: format!(
+                        "Stub assistant: I'd answer \"{}\" once a real agent is connected over MCP. Meanwhile, try the actions below.",
+                        text.chars().take(80).collect::<String>()
+                    ),
+                }),
+            }
+        }
+        self.jobs.retain(|j| !finished.contains(&j.id));
+        out
+    }
+
+    fn busy(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+}
+
+/// All bridges the UI uses, boxed so real implementations can replace the stubs.
+pub struct Bridges {
+    pub engine: Box<dyn EngineBridge>,
+    pub plugins: Box<dyn PluginCatalog>,
+    pub library: Box<dyn LibraryBridge>,
+    pub ai: Box<dyn AiBridge>,
+}
+
+impl Bridges {
+    pub fn stubs() -> Self {
+        Self {
+            engine: Box::<StubEngine>::default(),
+            plugins: Box::<StubCatalog>::default(),
+            library: Box::<StubLibrary>::default(),
+            ai: Box::<StubAi>::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_engine_plays_and_stops() {
+        let mut e = StubEngine::default();
+        let p = Project::new("t");
+        e.update_project(&p);
+        assert!(!e.transport().playing);
+        e.play();
+        assert!(e.transport().playing);
+        e.stop();
+        assert!(!e.transport().playing);
+        e.stop();
+        assert_eq!(e.transport().position, 0);
+    }
+
+    #[test]
+    fn library_filters_by_folder_and_key() {
+        let lib = StubLibrary::default();
+        assert!(!lib.items("categories/drums/kicks").is_empty());
+        assert!(lib.items("categories/drums").len() >= lib.items("categories/drums/kicks").len());
+        let am = Scale::new(Key(9), ScaleKind::Minor);
+        let found = lib.search("", Some(am));
+        assert!(found.iter().all(|i| i.key.is_none_or(|k| k.mask() == am.mask())));
+        assert!(lib.search("kick", None).iter().all(|i| i.name.to_lowercase().contains("kick") || i.category == "Kick"));
+    }
+
+    #[test]
+    fn catalog_has_params_for_effects() {
+        let c = StubCatalog::default();
+        assert!(c.device("fx.eq").is_some_and(|d| !d.params.is_empty()));
+        assert!(!c.external_plugins().is_empty());
+    }
+}

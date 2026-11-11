@@ -12,6 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 aitrack-model.workspace = true
+aitrack-dsp.workspace = true
+# The manifest gives the window per-monitor DPI awareness on Windows.
+gpui = { workspace = true, features = ["windows-manifest"] }
+gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

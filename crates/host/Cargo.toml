@@ -1,0 +1,13 @@
+[package]
+name = "aitrack-host"
+description = "VST3 and CLAP plugin hosting, scanning and caching."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aitrack-dsp.workspace = true
+
+[lints]
+workspace = true

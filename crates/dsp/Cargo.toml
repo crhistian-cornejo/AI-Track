@@ -1,0 +1,12 @@
+[package]
+name = "aitrack-dsp"
+description = "AI-Track DSP foundation: Processor trait, buffers, events, parameters and primitives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

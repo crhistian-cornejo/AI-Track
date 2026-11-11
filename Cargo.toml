@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/model",
+  "crates/dsp",
+  "crates/stock",
+  "crates/engine",
+  "crates/host",
+  "crates/library",
+  "crates/ai",
+  "crates/app",
+  "xtask",
+]
+exclude = [
+  "reference",
+  "vendor/gpui-pre",
+  "vendor/gpui-pre-apple",
+  "vendor/gpui-pre-linux",
+  "vendor/gpui-pre-macos",
+  "vendor/gpui-pre-windows",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/crhistian-cornejo/AI-Track"
+rust-version = "1.90"
+
+[workspace.dependencies]
+# Internal crates
+aitrack-model = { path = "crates/model" }
+aitrack-dsp = { path = "crates/dsp" }
+aitrack-stock = { path = "crates/stock" }
+aitrack-engine = { path = "crates/engine" }
+aitrack-host = { path = "crates/host" }
+aitrack-library = { path = "crates/library" }
+aitrack-ai = { path = "crates/ai" }
+
+# Shared third-party crates (pin here, use `.workspace = true` in members)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rtrb = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# GPUI: Zed's framework, the same pinned + patched snapshot monoBOT uses.
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false }
+
+[patch.crates-io]
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+# Small, fast release binaries.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "unwind" # plugin hosts need unwinding to contain panics
+
+# Fast iteration builds that still run DSP at a usable speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

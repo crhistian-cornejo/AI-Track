@@ -1,0 +1,19 @@
+# Repositorios de referencia (solo estudio, nunca se versionan)
+/reference/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Downloaded content (fetched by cargo xtask soundbank / model manager)
+/content/soundbank/packs/
+/content/soundbank/.cache/
+/models/
+

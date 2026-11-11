@@ -1,0 +1,13 @@
+[package]
+name = "aitrack-stock"
+description = "Stock instruments and effects with factory presets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aitrack-dsp.workspace = true
+
+[lints]
+workspace = true

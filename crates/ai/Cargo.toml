@@ -1,0 +1,13 @@
+[package]
+name = "aitrack-ai"
+description = "Audio-to-MIDI, stem separation, key/BPM detection and the model manager."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aitrack-model.workspace = true
+
+[lints]
+workspace = true

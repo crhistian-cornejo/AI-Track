@@ -1,0 +1,38 @@
+AI-Track — third-party notices
+==============================
+
+AI-Track is licensed under the MIT License (see LICENSE). It includes or
+depends on the following third-party work.
+
+GPUI
+----
+vendor/gpui-pre, vendor/gpui-pre-apple, vendor/gpui-pre-linux,
+vendor/gpui-pre-macos and vendor/gpui-pre-windows contain gpui-pre 0.3.9
+(Zed snapshot 93d745668805029476e6d7fbb19652116fed51de), Zed Industries'
+GPU-accelerated UI framework, as patched by the monoBOT project to remove the
+unused screen-capture dependency. Licensed under Apache-2.0.
+Copyright 2022 - 2025 Zed Industries, Inc.
+License text: vendor/gpui-pre/LICENSE-APACHE
+
+futureboard-studio
+------------------
+Modules marked "Adapted from futureboard-studio" are derived from
+https://github.com/futureboard/futureboard-studio, licensed under MIT.
+Copyright (c) 2026 Ariz Kamizuki, Futureboard Studio.
+
+Design references (ideas only, no code)
+---------------------------------------
+vibez, Lemon-Studio and Pro-Wave (GPL-3.0) were studied for architecture
+ideas. No code from them is included.
+
+Trademarks
+----------
+VST is a trademark of Steinberg Media Technologies GmbH. CLAP is an open
+standard by free-audio. Ableton, FL Studio, Logic Pro, Pro Tools, FabFilter
+and Waves are trademarks of their respective owners; AI-Track is not
+affiliated with or endorsed by them.
+
+Bundled sound content
+---------------------
+Each pack in the sound bank keeps its own license and attribution file; see
+content/soundbank/manifest.toml and content/soundbank/ATTRIBUTION.md.

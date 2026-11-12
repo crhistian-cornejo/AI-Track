@@ -121,6 +121,11 @@ pub struct Workspace {
     pub menu: Option<Menu>,
     /// View state of the visual device editors.
     pub fx: views::device_ui::UiState,
+    /// View state of the sample editor (the Clip tab for an audio clip).
+    #[allow(dead_code)] // Read once the sample editor is filled in.
+    pub sample: views::sample_editor::UiState,
+    /// Waveform peaks for the audio clips on screen.
+    pub waves: crate::waveform::WaveformCache,
     /// The meter strip under the top bar.
     pub meters: views::meters::MeterStrip,
     /// CPU and memory of this process, for the status bar.
@@ -267,6 +272,8 @@ impl Workspace {
             drag: None,
             menu: None,
             fx: views::device_ui::UiState::default(),
+            sample: Default::default(),
+            waves: Default::default(),
             meters: views::meters::MeterStrip::default(),
             usage: crate::usage::Usage::default(),
             project_path: None,
@@ -383,6 +390,7 @@ impl Workspace {
         changed |= (self.usage.cpu - cpu).abs() >= 0.005 || self.usage.memory.abs_diff(mem) >= 4 * 1024 * 1024;
         changed |= self.b.plugins.poll();
         changed |= self.b.library.poll();
+        changed |= self.waves.poll();
         if let Some(r) = self.b.library.organize_result() {
             self.organize.running = false;
             self.organize.preview = None;
@@ -1572,19 +1580,7 @@ pub fn audio_track_commands(
         },
         Command::AddClip {
             id: clip,
-            clip: Box::new(Clip {
-                name: name.into(),
-                color,
-                source: src,
-                offset: 0,
-                length,
-                looping: None,
-                gain_db: 0.,
-                envelopes: Vec::new(),
-                launch: LaunchSettings::default(),
-                muted: false,
-                scale: None,
-            }),
+            clip: Box::new(Clip::new(name, color, src, length)),
         },
         Command::PlaceClip { track, placement: Placement { id: s.project.alloc_placement_id(), clip, start, lane: 0 } },
     ]
@@ -1613,7 +1609,7 @@ impl Render for Workspace {
         }
         self.meters.tick(self.b.engine.as_mut(), self.s.selected_track);
         let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
-        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() {
+        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) {
             window.request_animation_frame();
         }
         self.fx.sample_rate = f64::from(self.b.engine.audio_config().sample_rate.max(8_000));
@@ -1655,6 +1651,7 @@ impl Render for Workspace {
         let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
         let fx_capture = views::device_ui::capture(self, cx);
+        let sample_capture = views::sample_editor::capture(self, cx);
         let fx_overlay = views::device_ui::overlay(self, cx);
         let meter_strip = views::meters::render(self, cx);
         let meter_layers = views::meters::overlay(self, cx);
@@ -1812,6 +1809,7 @@ impl Render for Workspace {
             .children(modal)
             .children(capture)
             .children(fx_capture)
+            .children(sample_capture)
             .children(fx_overlay)
             .children(meter_layers)
             .children(menu)

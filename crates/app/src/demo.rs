@@ -94,19 +94,7 @@ impl Builder {
 
     fn clip(&mut self, name: &str, color: usize, src: SourceId, length: Tick, loop_len: Option<Tick>) -> ClipId {
         let id = self.p.alloc_clip_id();
-        let clip = Clip {
-            name: name.into(),
-            color: Color::palette(color),
-            source: src,
-            offset: 0,
-            length,
-            looping: loop_len.map(|l| LoopRegion { start: 0, end: l }),
-            gain_db: 0.,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        };
+        let clip = Clip { looping: loop_len.map(|l| LoopRegion { start: 0, end: l }), ..Clip::new(name, Color::palette(color), src, length) };
         self.run(Command::AddClip { id, clip: Box::new(clip) });
         id
     }

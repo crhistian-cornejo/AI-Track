@@ -771,8 +771,8 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
             ws.s.selected_placement = Some((track, pid));
             ws.s.select_clip(Some(clip));
             if e.click_count >= 2 {
-                let tab = if ws.s.clip_notes(clip).is_some() { crate::state::BottomTab::PianoRoll } else { crate::state::BottomTab::Devices };
-                ws.set_tab(tab, cx);
+                // The Clip tab: piano roll for notes, sample editor for audio.
+                ws.set_tab(crate::state::BottomTab::PianoRoll, cx);
                 return;
             }
             let right_edge = (start + length) as f32 * ppt;
@@ -824,19 +824,7 @@ fn create_clip(ws: &mut Workspace, track: TrackId, start: Tick) {
     let src = ws.s.project.alloc_source_id();
     let clip = ws.s.project.alloc_clip_id();
     let pl = ws.s.project.alloc_placement_id();
-    let c = Clip {
-        name: "New Clip".into(),
-        color,
-        source: src,
-        offset: 0,
-        length: BAR,
-        looping: None,
-        gain_db: 0.,
-        envelopes: Vec::new(),
-        launch: LaunchSettings::default(),
-        muted: false,
-        scale: None,
-    };
+    let c = Clip::new("New Clip", color, src, BAR);
     if ws.s.edit("Add clip", vec![
         Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource::default())) },
         Command::AddClip { id: clip, clip: Box::new(c) },

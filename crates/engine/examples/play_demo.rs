@@ -45,19 +45,7 @@ fn demo_project(quiet: bool) -> (Project, TrackId) {
     let cid = p.alloc_clip_id();
     p.clips.insert(
         cid,
-        Clip {
-            name: "Chords".into(),
-            color: Color::palette(3),
-            source: sid,
-            offset: 0,
-            length: 16 * PPQ,
-            looping: Some(LoopRegion { start: 0, end: 16 * PPQ }),
-            gain_db: 0.0,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        },
+        Clip { looping: Some(LoopRegion { start: 0, end: 16 * PPQ }), ..Clip::new("Chords", Color::palette(3), sid, 16 * PPQ) },
     );
     let pid = p.alloc_placement_id();
     t.arrangement.push(Placement { id: pid, clip: cid, start: 0, lane: 0 });

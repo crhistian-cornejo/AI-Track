@@ -458,22 +458,10 @@ impl CompiledClip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aitrack_model::{Color, LaunchSettings, LoopRegion, Note, NoteId, SourceId};
+    use aitrack_model::{Color, LoopRegion, Note, NoteId, SourceId};
 
     fn clip(offset: Tick, length: Tick, looping: Option<(Tick, Tick)>) -> Clip {
-        Clip {
-            name: "c".into(),
-            color: Color(0),
-            source: SourceId(1),
-            offset,
-            length,
-            looping: looping.map(|(start, end)| LoopRegion { start, end }),
-            gain_db: 0.0,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        }
+        Clip { offset, looping: looping.map(|(start, end)| LoopRegion { start, end }), ..Clip::new("c", Color(0), SourceId(1), length) }
     }
 
     fn notes() -> NoteSource {

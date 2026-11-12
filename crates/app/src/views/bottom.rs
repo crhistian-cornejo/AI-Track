@@ -1,5 +1,6 @@
 //! The bottom panel: a resizable, collapsible dock with four tabs (Devices,
-//! Piano Roll, Step Sequencer, Mixer) and the active tab's tools.
+//! Clip, Step Sequencer, Mixer) and the active tab's tools. The Clip tab is
+//! the piano roll for a notes clip and the sample editor for an audio clip.
 
 use crate::icons::{Icon, icon};
 use crate::motion;
@@ -7,6 +8,7 @@ use crate::state::{BottomTab, Snap, Tool};
 use crate::theme::*;
 use crate::widgets::{self, label};
 use crate::workspace::{Drag, MenuKind, Workspace};
+use aitrack_model::Source;
 use gpui::{
     AnimationExt, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
@@ -46,6 +48,9 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     // What the panel is showing, on the right of the tab strip.
     let track = ws.s.selected_track.and_then(|t| ws.s.project.track(t)).map(|t| (t.name.clone(), t.color));
     let clip = ws.s.selected_clip.and_then(|c| ws.s.project.clips.get(&c)).map(|c| (c.name.clone(), c.color));
+    // The Clip tab edits the selected clip: audio in the sample editor, notes in the piano roll.
+    let audio_clip = ws.s.selected_clip.and_then(|c| ws.s.project.clips.get(&c)).is_some_and(|c| matches!(ws.s.project.sources.get(&c.source), Some(Source::Audio(_))));
+    let piano = tab == BottomTab::PianoRoll && !audio_clip;
     let context = match tab {
         BottomTab::PianoRoll => clip.clone(),
         BottomTab::Steps => ws.s.step_clip().and_then(|(_, c)| ws.s.project.clips.get(&c)).map(|c| (c.name.clone(), c.color)),
@@ -65,7 +70,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(label(crate::paint::fit(&name, 96., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
         })
         .child(div().flex_1());
-    if tab == BottomTab::PianoRoll && ws.bottom_open {
+    if piano && ws.bottom_open {
         bar = bar.child(piano_tools(ws, cx));
     }
     bar = bar.child(
@@ -83,6 +88,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let body = if ws.bottom_open {
         let content = match tab {
             BottomTab::Devices => crate::views::devices::render(ws, window, cx),
+            BottomTab::PianoRoll if audio_clip => crate::views::sample_editor::render(ws, window, cx),
             BottomTab::PianoRoll => crate::views::piano_roll::render(ws, window, cx),
             BottomTab::Steps => crate::views::steps::render(ws, window, cx),
             BottomTab::Mixer => crate::views::mixer::render(ws, window, cx),

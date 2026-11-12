@@ -563,20 +563,9 @@ impl AppState {
         }
         let Some((track, id)) = self.selected_placement else { return false };
         let Some(place) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id)).cloned() else { return false };
-        let Some(clip) = self.project.clips.get(&place.clip).cloned() else { return false };
-        let mut cmds = Vec::new();
-        let mut copy = clip.clone();
-        // MIDI clips get their own notes so editing the copy leaves the original alone.
-        if let Some(Source::Notes(n)) = self.project.sources.get(&clip.source).cloned() {
-            let source = self.project.alloc_source_id();
-            let notes = n.notes.iter().map(|x| Note { id: self.project.alloc_note_id(), ..x.clone() }).collect();
-            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
-            copy.source = source;
-        }
-        let new_clip = self.project.alloc_clip_id();
-        let new_place = self.project.alloc_placement_id();
-        cmds.push(Command::AddClip { id: new_clip, clip: Box::new(copy) });
-        cmds.push(Command::PlaceClip { track, placement: Placement { id: new_place, clip: new_clip, start: place.start + clip.length, lane: place.lane } });
+        let Some(length) = self.project.clips.get(&place.clip).map(|c| c.length) else { return false };
+        // An independent copy: MIDI clips get their own notes, audio shares the file.
+        let Some((cmds, new_place)) = aitrack_model::ops::duplicate_placement(&mut self.project, track, id, place.start + length) else { return false };
         self.seal();
         let ok = self.edit("Duplicate clip", cmds);
         self.seal();
@@ -989,19 +978,7 @@ impl AppState {
             Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) },
             Command::AddClip {
                 id: clip,
-                clip: Box::new(Clip {
-                    name: name.into(),
-                    color,
-                    source: src,
-                    offset: 0,
-                    length,
-                    looping: None,
-                    gain_db: 0.,
-                    envelopes: Vec::new(),
-                    launch: LaunchSettings::default(),
-                    muted: false,
-                    scale: None,
-                }),
+                clip: Box::new(Clip::new(name, color, src, length)),
             },
         ];
         if let Some(scene) = self.project.scenes.first() {

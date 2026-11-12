@@ -40,6 +40,7 @@ pub enum Drag {
     Fader { track: TrackId, last_y: f32, pos: f32, travel: f32 },
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
+    BrowserResize { start_x: f32, start_w: f32 },
     Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
     Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
     Audition { track: TrackId, key: Option<u8> },
@@ -127,6 +128,8 @@ pub struct Workspace {
     pub project_path: Option<std::path::PathBuf>,
     pub bottom_h: f32,
     pub bottom_open: bool,
+    /// Width of the browser sidebar (drag its right edge).
+    pub browser_w: f32,
     pub browser_open: bool,
     pub ai_open: bool,
     pub search: Entity<TextInput>,
@@ -245,6 +248,7 @@ impl Workspace {
             project_path: None,
             bottom_h: 300.,
             bottom_open: true,
+            browser_w: BROWSER_W,
             browser_open: true,
             // Closed at start: the arrangement gets the room; the Assistant button opens it.
             ai_open: false,
@@ -617,6 +621,9 @@ impl Workspace {
                 *last_y = y;
                 *bpm = (*bpm + dy * if e.modifiers.shift { 0.05 } else { 0.5 }).clamp(20., 999.);
                 self.s.set_tempo(*bpm);
+            }
+            Drag::BrowserResize { start_x, start_w } => {
+                self.browser_w = (*start_w + f32::from(e.position.x) - *start_x).clamp(200., 520.);
             }
             Drag::BottomResize { start_y, start_h } => {
                 self.bottom_h = (*start_h + (*start_y - y)).clamp(180., 640.);

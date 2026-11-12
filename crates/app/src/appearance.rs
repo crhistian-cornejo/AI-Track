@@ -81,6 +81,9 @@ pub struct Appearance {
     pub meter: MeterStyle,
     pub knob: KnobStyle,
     pub reduced_motion: bool,
+    /// Show the Project tab (tracks, scenes, files) in the browser.
+    #[serde(default)]
+    pub project_tab: bool,
 }
 
 impl Default for Appearance {
@@ -101,6 +104,7 @@ impl Default for Appearance {
             meter: MeterStyle::Zones,
             knob: KnobStyle::Arc,
             reduced_motion: false,
+            project_tab: false,
         }
     }
 }

@@ -50,24 +50,26 @@ fn section(title: &'static str, count: usize) -> Div {
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let weak = cx.entity().downgrade();
     let tab = ws.s.browser_tab;
-    let index = match tab {
-        BrowserTab::Library => 0,
-        BrowserTab::Plugins => 1,
-        BrowserTab::Project => 2,
-    };
+    // The Project tab is optional (Preferences → Appearance); without it the
+    // browser is just sounds and devices.
+    let with_project = ws.look.app.project_tab;
+    let tab = if tab == BrowserTab::Project && !with_project { BrowserTab::Library } else { tab };
+    let order: &[BrowserTab] = if with_project { &[BrowserTab::Library, BrowserTab::Plugins, BrowserTab::Project] } else { &[BrowserTab::Library, BrowserTab::Plugins] };
+    let index = order.iter().position(|t| *t == tab).unwrap_or(0);
     let on_tab: widgets::OnSelect = Rc::new(move |i, _, cx| {
         let _ = weak.update(cx, |this, cx| {
-            this.s.browser_tab = [BrowserTab::Library, BrowserTab::Plugins, BrowserTab::Project][i];
+            let with_project = this.look.app.project_tab;
+            this.s.browser_tab = match i {
+                1 => BrowserTab::Plugins,
+                2 if with_project => BrowserTab::Project,
+                _ => BrowserTab::Library,
+            };
             cx.notify();
         });
     });
-    let tabs = widgets::segmented(
-        "browser-tabs",
-        &[(Some(Icon::Sample), "Library"), (Some(Icon::Plug), "Plugins"), (Some(Icon::Folder), "Project")],
-        index,
-        (BROWSER_W - 2. * SP2 - 6.) / 3.,
-        on_tab,
-    );
+    let width = ws.browser_w;
+    let all = [(Some(Icon::Sample), "Library"), (Some(Icon::Plug), "Plugins"), (Some(Icon::Folder), "Project")];
+    let tabs = widgets::segmented("browser-tabs", &all[..order.len()], index, (width - 2. * SP2 - 6.) / order.len() as f32, on_tab);
     let body = match tab {
         BrowserTab::Library => library(ws, cx),
         BrowserTab::Plugins => plugins(ws, cx),
@@ -75,7 +77,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     };
     div()
         .flex_none()
-        .w(px(BROWSER_W))
+        .w(px(width))
+        .relative()
         .h_full()
         .flex()
         .flex_col()
@@ -86,6 +89,31 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .overflow_hidden()
         .child(div().p(px(SP2)).pb(px(0.)).flex().flex_col().gap(px(SP2)).child(tabs).child(ws.search.clone()))
         .child(crate::motion::fade_in(gpui::ElementId::Name(format!("browser-{index}").into()), div().flex_1().min_h(px(0.)).flex().flex_col().child(body)))
+        .child(
+            // Drag the right edge to resize; double-click for the default width.
+            div()
+                .id("browser-grip")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(5.))
+                .cursor_ew_resize()
+                .hover(|s| s.bg(accent_alpha(0.5)))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if e.click_count >= 2 {
+                            this.browser_w = BROWSER_W;
+                            cx.notify();
+                        } else {
+                            let start_w = this.browser_w;
+                            this.begin_drag(crate::workspace::Drag::BrowserResize { start_x: f32::from(e.position.x), start_w }, cx);
+                        }
+                    }),
+                ),
+        )
         .into_any_element()
 }
 
@@ -209,8 +237,8 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             .flex()
             .flex_col()
             .gap(px(2.))
-            .child(label(crate::paint::fit(&scan.message, BROWSER_W - 32., TEXT_XS), TEXT_XS, pal.muted))
-            .child(widgets::hbar(scan.fraction, BROWSER_W - 2. * SP3, 3., pal.accent))
+            .child(label(crate::paint::fit(&scan.message, ws.browser_w - 32., TEXT_XS), TEXT_XS, pal.muted))
+            .child(widgets::hbar(scan.fraction, ws.browser_w - 2. * SP3, 3., pal.accent))
     });
     div()
         .flex_1()
@@ -238,7 +266,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         } else {
             list.into_any_element()
         })
-        .child(div().flex_none().px(px(SP3)).py(px(SP1)).border_t_1().border_color(border()).child(label(crate::paint::fit(&status, BROWSER_W - 24., TEXT_XS), TEXT_XS, pal.faint)))
+        .child(div().flex_none().px(px(SP3)).py(px(SP1)).border_t_1().border_color(border()).child(label(crate::paint::fit(&status, ws.browser_w - 24., TEXT_XS), TEXT_XS, pal.faint)))
         .into_any_element()
 }
 

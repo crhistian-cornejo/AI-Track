@@ -848,6 +848,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         .child(section_title("LAYOUT & TYPE"))
         .child(form_row("UI scale", Some("80–150 %".into()), look_stepper("ui-scale", format!("{:.0}%", a.ui_scale * 100.), cx, |a, d| a.ui_scale = ((a.ui_scale + d * 0.1) * 10.).round().clamp(8., 15.) / 10.)))
         .child(form_row("Density", None, seg("density", &[(Density::Compact, "Compact"), (Density::Comfortable, "Comfortable")], a.density, 104., cx, |a, v| a.density = v)))
+        .child(form_row("Project tab", Some("Tracks, scenes and files in the browser".into()), switch("project-tab", a.project_tab).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.project_tab = !a.project_tab)))))
         .child(form_row("Corner radius", None, look_stepper("radius", format!("{:.0}%", a.radius * 100.), cx, |a, d| a.radius = (a.radius + d * 0.25).clamp(0., 2.))))
         .child(form_row("Font size", None, look_stepper("font-size", format!("{:.0} px", a.font_size), cx, |a, d| a.font_size = (a.font_size + d).clamp(10., 16.))))
         .child(section_title("DISPLAY STYLES"))

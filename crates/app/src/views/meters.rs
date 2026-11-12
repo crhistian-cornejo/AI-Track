@@ -494,13 +494,15 @@ fn paint_spectrogram(window: &mut Window, r: Rect, s: &Snap) {
     let first = GRAM_COLS - s.gram.len();
     let ramp = |v: u8| -> Hsla {
         let t = f32::from(v) / 255.;
-        // Quiet → loud: well, second accent, hot, bright.
-        if t < 0.45 {
-            mix(pal.well, pal.accent2, t / 0.45)
+        // Quiet → loud as a heat map built from theme tokens: the well, a
+        // violet between the second accent and record red, red, then amber.
+        let violet = mix(pal.accent2, pal.record, 0.55);
+        if t < 0.5 {
+            mix(pal.well, violet, ((t - 0.27) / 0.23).clamp(0., 1.))
         } else if t < 0.75 {
-            mix(pal.accent2, pal.meter_high, (t - 0.45) / 0.3)
+            mix(violet, pal.record, (t - 0.5) / 0.25)
         } else {
-            mix(pal.meter_high, pal.meter_mid, (t - 0.75) / 0.25)
+            mix(pal.record, pal.meter_mid, (t - 0.75) / 0.25)
         }
     };
     for (i, col) in s.gram.iter().enumerate() {

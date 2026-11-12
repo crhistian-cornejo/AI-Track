@@ -283,7 +283,39 @@ impl Workspace {
             this.chat_log.extend(proposal_entry(&s, id));
         }
         this.s = s;
+        this.apply_dev_view();
         this
+    }
+
+    /// Development aid for visual checks without touching the keyboard:
+    /// `AITRACK_DEV_VIEW=devices,meters,play,big,track=Bass` opens the app in
+    /// that state. Unknown words are ignored; unset, nothing happens.
+    fn apply_dev_view(&mut self) {
+        let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
+        for word in spec.split(',').map(str::trim) {
+            match word {
+                "devices" => self.s.bottom_tab = BottomTab::Devices,
+                "piano" => self.s.bottom_tab = BottomTab::PianoRoll,
+                "steps" => self.s.bottom_tab = BottomTab::Steps,
+                "mixer" => self.s.bottom_tab = BottomTab::Mixer,
+                "meters" => self.meters.open = true,
+                "tall" => self.bottom_h = 460.,
+                "no-ai" => self.ai_open = false,
+                "no-browser" => self.browser_open = false,
+                "play" => self.b.engine.play(),
+                "big" => {
+                    let ids: Vec<_> = self.s.project.tracks.iter().flat_map(|t| t.devices.iter().map(|d| d.id)).collect();
+                    self.fx.big.extend(ids);
+                }
+                _ => {
+                    if let Some(name) = word.strip_prefix("track=")
+                        && let Some(t) = self.s.project.tracks.iter().find(|t| t.name.eq_ignore_ascii_case(name))
+                    {
+                        self.s.selected_track = Some(t.id);
+                    }
+                }
+            }
+        }
     }
 
     // ── Engine sync & frames ──

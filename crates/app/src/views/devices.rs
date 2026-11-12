@@ -10,7 +10,7 @@ use crate::widgets::{self, badge, icon_chip, knob, knob_cell, label, mono};
 use crate::workspace::{Drag, KnobTarget, MenuKind, Workspace};
 use aitrack_model::{Device, DeviceId, DeviceKind, MACRO_COUNT, PluginFormat, Rack, RackKind, TrackId};
 use gpui::{
-    AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    AnyElement, AppContext, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     Stateful, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 
@@ -23,8 +23,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         return empty("Select a track to see its devices.");
     };
     let mut row = div().h_full().flex().gap(px(SP2)).p(px(SP2));
-    for d in &track.devices {
-        row = row.child(card(ws, track.id, d, cx));
+    for (index, d) in track.devices.iter().enumerate() {
+        row = row.child(card(ws, track.id, index, d, cx));
     }
     let tid = track.id;
     row = row.child(
@@ -44,6 +44,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             .border_color(border_strong())
             .cursor_pointer()
             .hover(|s| s.bg(hover()))
+            // Dropping a device here sends it to the end of the chain.
+            .drag_over::<DraggedDevice>(|s, _, _, _| s.border_color(accent()))
+            .on_drop(cx.listener(move |this, d: &DraggedDevice, _, cx| {
+                move_device(this, d.id, tid, usize::MAX);
+                cx.notify();
+            }))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 let at = e.position();
                 this.open_menu(MenuKind::AddDevice(tid), point(at.x - px(116.), at.y - px(260.)), cx);
@@ -52,6 +58,53 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             .child(label("Add device", TEXT_SM, pal.muted)),
     );
     div().id("device-chain").size_full().overflow_x_scroll().child(row).into_any_element()
+}
+
+/// A device being dragged along its chain. The order of a chain is the
+/// order the signal passes through it, so moving a device changes the sound.
+#[derive(Clone, Debug)]
+pub struct DraggedDevice {
+    pub id: DeviceId,
+    pub name: String,
+}
+
+impl gpui::Render for DraggedDevice {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pal = p();
+        div()
+            .px(px(SP2))
+            .h(px(TAB_BAR_H))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .rounded(px(r_md()))
+            .bg(pal.raised)
+            .border_1()
+            .border_color(accent())
+            .shadow_lg()
+            .child(icon(Icon::Device, 12., pal.accent))
+            .child(label(self.name.clone(), TEXT_SM, pal.text))
+    }
+}
+
+/// Dropping a dragged device on a card moves it to that card's place.
+fn droppable(shell: Stateful<Div>, track: TrackId, index: usize, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    shell.drag_over::<DraggedDevice>(|s, _, _, _| s.border_color(accent())).on_drop(cx.listener(move |this, d: &DraggedDevice, _, cx| {
+        move_device(this, d.id, track, index);
+        cx.notify();
+    }))
+}
+
+/// Move a device to `index` of `track`'s chain (one undo step). `index` is
+/// the place it ends up in, counted after it has left its old place.
+pub fn move_device(ws: &mut Workspace, id: DeviceId, track: TrackId, index: usize) {
+    let Some(chain) = ws.s.project.track(track).map(|t| &t.devices) else { return };
+    let last = chain.len().saturating_sub(1);
+    let index = index.min(last);
+    if chain.iter().position(|d| d.id == id) == Some(index) || !chain.iter().any(|d| d.id == id) {
+        return;
+    }
+    ws.s.edit("Move device", vec![aitrack_model::Command::MoveDevice { id, to: aitrack_model::command::DeviceSlot::Track { track, index } }]);
 }
 
 pub fn empty(text: &'static str) -> AnyElement {
@@ -74,7 +127,7 @@ fn card_shell(id: DeviceId, enabled: bool) -> Stateful<Div> {
         .overflow_hidden()
 }
 
-fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspace>) -> AnyElement {
+fn card(ws: &mut Workspace, track: TrackId, index: usize, d: &Device, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let id = d.id;
     let enabled = d.enabled;
@@ -120,8 +173,9 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             cx.notify();
         }));
     if collapsed {
-        return card_shell(id, enabled)
+        return droppable(card_shell(id, enabled), track, index, cx)
             .w(px(40.))
+            .on_drag(DraggedDevice { id, name: d.name.clone() }, |d: &DraggedDevice, _, _, cx| cx.new(|_| d.clone()))
             .items_center()
             .py(px(SP2))
             .gap(px(SP2))
@@ -133,6 +187,9 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
     let has_presets = matches!(&d.kind, DeviceKind::Stock { plugin_id } if !ws.b.plugins.presets(plugin_id).is_empty());
     let preset_name = d.preset.clone().unwrap_or_else(|| "Presets".into());
     let header = div()
+        .id(("device-header", id.0 as usize))
+        .cursor_grab()
+        .on_drag(DraggedDevice { id, name: d.name.clone() }, |d: &DraggedDevice, _, _, cx| cx.new(|_| d.clone()))
         .flex_none()
         .h(px(TAB_BAR_H + SP1))
         .px(px(SP2))
@@ -213,7 +270,7 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             crate::views::device_ui::editor(ws, plugin_id, &dev, d, cx)
         }
     };
-    card_shell(id, enabled).child(header).child(div().flex_1().child(body)).into_any_element()
+    droppable(card_shell(id, enabled), track, index, cx).child(header).child(div().flex_1().child(body)).into_any_element()
 }
 
 /// The slot a device sits in on `track`'s top-level chain.

@@ -42,6 +42,39 @@ pub(crate) struct ProcNode {
     pub is_instrument: bool,
     /// Display data (`Processor::meter`) for the UI.
     pub meter: Arc<DeviceMeter>,
+    /// Which sidechain buffer (see [`CompiledGraph::side`]) this device listens to.
+    pub sidechain: Option<usize>,
+}
+
+/// The sidechain signals available to the devices of one track.
+pub(crate) struct SideIn<'a> {
+    /// One buffer per source track: the block being processed when the
+    /// source comes earlier in the graph, otherwise the previous one.
+    pub bufs: &'a [AudioBuffer],
+    /// The frames of the current chunk, copied out for the device.
+    pub scratch: &'a mut AudioBuffer,
+    /// Where the current chunk starts inside the segment.
+    pub offset: usize,
+}
+
+impl SideIn<'_> {
+    /// The chunk of sidechain `slot` that lines up with a device buffer of
+    /// `frames` frames, or `None` when this track has no sidechain scratch.
+    fn chunk(&mut self, slot: usize, frames: usize) -> Option<&AudioBuffer> {
+        let src = self.bufs.get(slot)?;
+        if self.scratch.capacity() < frames || self.scratch.channels() < 2 {
+            return None;
+        }
+        self.scratch.set_frames(frames);
+        for ch in 0..2 {
+            let from = src.channel(ch.min(src.channels().saturating_sub(1)));
+            let to = self.scratch.channel_mut(ch);
+            let have = from.len().saturating_sub(self.offset).min(frames);
+            to[..have].copy_from_slice(&from[self.offset..self.offset + have]);
+            to[have..].fill(0.0);
+        }
+        Some(&*self.scratch)
+    }
 }
 
 pub(crate) struct RackNode {
@@ -75,7 +108,7 @@ impl DeviceNode {
     }
 }
 
-fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64) {
+fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>) {
     for d in devs {
         match d {
             DeviceNode::Proc(p) => {
@@ -88,13 +121,15 @@ fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Eve
                 if p.is_instrument {
                     buf.clear();
                 }
-                let mut ctx = ProcessContext { sample_rate: sr, buffer: buf, sidechain: None, events, transport: tr };
+                let frames = buf.frames();
+                let sidechain = p.sidechain.and_then(|slot| side.chunk(slot, frames));
+                let mut ctx = ProcessContext { sample_rate: sr, buffer: buf, sidechain, events, transport: tr };
                 proc.process(&mut ctx);
                 p.proc.publish_latency(proc.latency());
             }
             DeviceNode::Rack(r) => {
                 if r.enabled.load(Ordering::Relaxed) {
-                    r.process(buf, events, tr, sr);
+                    r.process(buf, events, tr, sr, side);
                 }
             }
             DeviceNode::Missing(_) => {}
@@ -121,7 +156,7 @@ impl RackNode {
         }
     }
 
-    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64) {
+    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>) {
         let n = buf.frames();
         self.input.set_frames(n);
         self.input.copy_from(buf);
@@ -136,7 +171,7 @@ impl RackNode {
             }
             c.buf.set_frames(n);
             c.buf.copy_from(&self.input);
-            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr);
+            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side);
             c.delay.process(&mut c.buf);
             let (gl, gr) = c.gain;
             if buf.channels() >= 2 && c.buf.channels() >= 2 {
@@ -347,6 +382,12 @@ pub(crate) struct TrackNode {
     pub tap: Option<Box<TapNode>>,
     /// The UI's analysis ring, fed while it asks for this track.
     pub analysis: Option<Arc<AnalysisTap>>,
+    /// Where this track's post-device signal is published for devices on
+    /// other tracks that sidechain from it.
+    pub side_out: Option<usize>,
+    /// Scratch for the sidechain chunk handed to this track's devices
+    /// (empty when none of them has a sidechain source).
+    pub side_scratch: AudioBuffer,
 }
 
 /// Captures a track's post-fader signal for stem export, delayed so it lines
@@ -404,6 +445,9 @@ pub struct CompiledGraph {
     pub(crate) tempo: TempoMap,
     pub(crate) tracks: Vec<TrackNode>,
     pub(crate) inputs: Vec<AudioBuffer>,
+    /// Sidechain buffers: the post-device, pre-fader signal of every track
+    /// some device listens to.
+    pub(crate) side: Vec<AudioBuffer>,
     pub(crate) out_bus: AudioBuffer,
     pub(crate) out_acc: MeterAcc,
     /// Sorted `(id, index)` for lookups on the audio thread.
@@ -625,7 +669,7 @@ impl CompiledGraph {
     pub(crate) fn process_segment(&mut self, io: &mut SegmentIo<'_>) {
         let n = io.frames;
         let sr = self.sample_rate;
-        let Self { tracks, inputs, out_bus, tempo, scenes, out_acc, .. } = self;
+        let Self { tracks, inputs, side, out_bus, tempo, scenes, out_acc, .. } = self;
         let ctx = TimeCtx { tempo, sr, seg_start: io.seg_start };
         let t0 = ctx.tick_of(io.seg_start);
         let t1 = ctx.tick_of(io.seg_start + n as i64);
@@ -667,7 +711,7 @@ impl CompiledGraph {
             if !t.carries_audio() {
                 continue;
             }
-            process_track(t, i, &ctx, &*io, &transport, inputs, out_bus, scenes.len());
+            process_track(t, i, &ctx, &*io, &transport, inputs, side, out_bus, scenes.len());
         }
 
         out_acc.add(out_bus);
@@ -693,6 +737,7 @@ fn process_track(
     io: &SegmentIo<'_>,
     transport: &Transport,
     inputs: &mut [AudioBuffer],
+    side: &mut [AudioBuffer],
     out_bus: &mut AudioBuffer,
     scene_count: usize,
 ) {
@@ -749,7 +794,8 @@ fn process_track(
 
     // Device chain.
     if t.param_autos.is_empty() {
-        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr);
+        let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: 0 };
+        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si);
     } else {
         let mut a = 0;
         while a < n {
@@ -769,12 +815,21 @@ fn process_track(
             let mut tr = *transport;
             tr.position_samples = lo + a as i64;
             tr.position_beats = ctx.tick_of(lo + a as i64) / PPQ as f64;
-            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr);
+            let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: a };
+            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr, &mut si);
             for ch in 0..t.buf.channels().min(t.chunk_buf.channels()) {
                 t.buf.channel_mut(ch)[a..b].copy_from_slice(t.chunk_buf.channel(ch));
             }
             a = b;
         }
+    }
+    // Publish this track's signal (after its devices, before its fader) for
+    // the devices that sidechain from it.
+    if let Some(slot) = t.side_out
+        && let Some(out) = side.get_mut(slot)
+    {
+        out.set_frames(n);
+        out.copy_from(&t.buf);
     }
 
     // Pre-fader sends, fader, post-fader sends, all at control rate.

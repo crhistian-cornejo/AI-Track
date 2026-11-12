@@ -23,6 +23,8 @@ use aitrack_model::{Device, DeviceKind};
 pub const TEST_SYNTH: &str = "test.synth";
 pub const TEST_GAIN: &str = "test.gain";
 pub const TEST_LATENCY: &str = "test.latency";
+/// Replaces its input with its sidechain input (silence when unconnected).
+pub const TEST_KEY: &str = "test.key";
 
 /// Creates the built-in test nodes for `Stock { plugin_id: "test.*" }` devices.
 pub struct FallbackFactory;
@@ -33,6 +35,7 @@ impl ProcessorFactory for FallbackFactory {
         match plugin_id.as_str() {
             TEST_SYNTH => Some(Box::new(TestSynth::new())),
             TEST_GAIN => Some(Box::new(TestGain::new())),
+            TEST_KEY => Some(Box::new(TestKey::new())),
             TEST_LATENCY => {
                 let latency = device
                     .state
@@ -314,6 +317,54 @@ impl Processor for TestGain {
 }
 
 // ───────────────────────────── Latency ─────────────────────────────
+
+/// A probe for sidechain routing: its output is whatever arrives on its
+/// sidechain input.
+pub struct TestKey {
+    info: PluginInfo,
+}
+
+impl TestKey {
+    pub fn new() -> Self {
+        Self {
+            info: PluginInfo {
+                id: TEST_KEY,
+                name: "Test Key",
+                vendor: "AI-Track",
+                category: Category::Effect,
+                tags: &["test"],
+                params: Vec::new(),
+                inputs: 2,
+                outputs: 2,
+                has_sidechain: true,
+            },
+        }
+    }
+}
+
+impl Default for TestKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Processor for TestKey {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+    fn prepare(&mut self, _: f64, _: usize) {}
+    fn reset(&mut self) {}
+    fn process(&mut self, ctx: &mut ProcessContext<'_>) {
+        match ctx.sidechain {
+            Some(sc) => ctx.buffer.copy_from(sc),
+            None => ctx.buffer.clear(),
+        }
+    }
+    fn set_param(&mut self, _: u32, _: f32) {}
+    fn get_param(&self, _: u32) -> f32 {
+        0.0
+    }
+}
 
 /// Delays its input by a fixed number of samples and reports it as latency.
 pub struct TestLatency {

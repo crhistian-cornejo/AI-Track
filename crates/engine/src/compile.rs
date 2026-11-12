@@ -146,6 +146,9 @@ struct DevCx<'a, 'b> {
     overrides: HashMap<DeviceId, BTreeMap<u32, f32>>,
     handles: HashMap<DeviceId, Handle>,
     warnings: Vec<String>,
+    /// Sidechain buffer of each source track, and the track being compiled.
+    side_slots: &'a HashMap<TrackId, usize>,
+    track: TrackId,
 }
 
 fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>, u32) {
@@ -200,6 +203,7 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                             init_params: r.init_params,
                             is_instrument: r.is_instrument,
                             meter: r.meter,
+                            sidechain: d.sidechain.filter(|s| *s != dc.track).and_then(|s| dc.side_slots.get(&s).copied()),
                         }));
                     }
                     None => {
@@ -271,27 +275,70 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         }
     }
 
-    // Topological order (Kahn), stable in project order.
-    let mut indeg = vec![0usize; tracks.len()];
-    for s in &succ {
-        for &j in s {
-            indeg[j] += 1;
+    // Sidechain: a device that listens to another track needs that track
+    // processed first. These edges only shape the order; they add nothing
+    // to a track's input and nothing to delay compensation.
+    let mut side_src: Vec<Vec<usize>> = vec![Vec::new(); tracks.len()];
+    for (i, t) in tracks.iter().enumerate() {
+        if !t.kind.carries_audio() {
+            continue;
         }
+        let mut sources = Vec::new();
+        aitrack_model::visit_devices(&t.devices, &mut |d| {
+            if let Some(&j) = d.sidechain.and_then(|s| index.get(&s))
+                && j != i
+                && tracks[j].kind.carries_audio()
+                && !sources.contains(&j)
+            {
+                sources.push(j);
+            }
+        });
+        side_src[i] = sources;
     }
-    let mut queue: VecDeque<usize> = (0..tracks.len()).filter(|&i| indeg[i] == 0).collect();
-    let mut order = Vec::with_capacity(tracks.len());
-    while let Some(i) = queue.pop_front() {
-        order.push(i);
-        for &j in &succ[i] {
-            indeg[j] -= 1;
-            if indeg[j] == 0 {
-                queue.push_back(j);
+    let mut side_slots: HashMap<TrackId, usize> = HashMap::new();
+    for &j in side_src.iter().flatten() {
+        let next = side_slots.len();
+        side_slots.entry(tracks[j].id).or_insert(next);
+    }
+
+    // Topological order (Kahn), stable in project order.
+    let topo = |succ: &[Vec<usize>]| -> (Vec<usize>, Vec<usize>) {
+        let mut indeg = vec![0usize; tracks.len()];
+        for s in succ {
+            for &j in s {
+                indeg[j] += 1;
             }
         }
+        let mut queue: VecDeque<usize> = (0..tracks.len()).filter(|&i| indeg[i] == 0).collect();
+        let mut order = Vec::with_capacity(tracks.len());
+        while let Some(i) = queue.pop_front() {
+            order.push(i);
+            for &j in &succ[i] {
+                indeg[j] -= 1;
+                if indeg[j] == 0 {
+                    queue.push_back(j);
+                }
+            }
+        }
+        (order, indeg)
+    };
+    let mut with_sidechains = succ.clone();
+    for (i, sources) in side_src.iter().enumerate() {
+        for &j in sources {
+            with_sidechains[j].push(i);
+        }
     }
+    let (mut order, _) = topo(&with_sidechains);
     if order.len() != tracks.len() {
-        let cyc: Vec<TrackId> = (0..tracks.len()).filter(|&i| indeg[i] > 0).map(|i| tracks[i].id).collect();
-        return Err(CompileError::Cycle(cyc));
+        // A sidechain that closes a loop with the routing (a track listening
+        // to something it feeds) cannot be ordered: it hears the previous block.
+        let (routed, indeg) = topo(&succ);
+        if routed.len() != tracks.len() {
+            let cyc: Vec<TrackId> = (0..tracks.len()).filter(|&i| indeg[i] > 0).map(|i| tracks[i].id).collect();
+            return Err(CompileError::Cycle(cyc));
+        }
+        warnings.push("a sidechain loops back through the routing; it reacts one block late".to_owned());
+        order = routed;
     }
     // Non-audio tracks (VCA/Folder) first so VCAs are evaluated before members.
     order.sort_by_key(|&i| tracks[i].kind.carries_audio());
@@ -357,7 +404,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         for (i, t) in tracks.iter().enumerate() {
             let mut overrides = HashMap::new();
             collect_macro_overrides(&t.devices, &mut overrides);
-            let mut dc = DevCx { cx: &mut *cx, overrides, handles: HashMap::new(), warnings: Vec::new() };
+            let mut dc = DevCx { cx: &mut *cx, overrides, handles: HashMap::new(), warnings: Vec::new(), side_slots: &side_slots, track: t.id };
             let (nodes, lat) = if t.kind.carries_audio() { compile_devices(&t.devices, &mut dc) } else { (Vec::new(), 0) };
             warnings.append(&mut dc.warnings);
             chain_lat[i] = lat;
@@ -579,6 +626,8 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                 })
             }),
             analysis: cx.analysis.clone().filter(|_| t.kind.carries_audio()),
+            side_out: side_slots.get(&t.id).copied(),
+            side_scratch: AudioBuffer::new(2, if side_src[i].is_empty() { 0 } else { max }),
         });
     }
     let tracks_out: Vec<TrackNode> = nodes.into_iter().map(|n| n.expect("every track placed")).collect();
@@ -594,6 +643,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         tempo,
         tracks: tracks_out,
         inputs,
+        side: (0..side_slots.len()).map(|_| AudioBuffer::new(2, max)).collect(),
         out_bus: AudioBuffer::new(2, max),
         out_acc: MeterAcc::default(),
         track_lookup,

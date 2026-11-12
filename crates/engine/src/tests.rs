@@ -499,6 +499,75 @@ fn processors_survive_recompiles() {
     assert!(!Arc::ptr_eq(&p1, &proc_of(&g3).0));
 }
 
+// ───────────────────────────── Sidechain ─────────────────────────────
+
+/// A synth track playing one note, and a second track whose only device
+/// outputs its sidechain input, listening to the first.
+fn keyed(listener_first: bool) -> (P, TrackId, TrackId, DeviceId) {
+    let mut b = P::new(120.0);
+    let listener = if listener_first { Some(b.track(TrackKind::Audio, "listener")) } else { None };
+    let (source, _) = b.synth_track("source");
+    let listener = listener.unwrap_or_else(|| b.track(TrackKind::Audio, "listener"));
+    let key = b.device(listener, crate::fallback::TEST_KEY, &[], None);
+    b.p.device_mut(key).unwrap().sidechain = Some(source);
+    let clip = b.notes(&[(60, 0, PPQ)], 2 * PPQ, None);
+    b.place(source, clip, PPQ);
+    (b, source, listener, key)
+}
+
+#[test]
+fn a_device_hears_the_track_it_is_sidechained_from() {
+    for listener_first in [false, true] {
+        let (mut b, source, listener, key) = keyed(listener_first);
+        // What the source sounds like on its own.
+        b.t(listener).mute = true;
+        let alone = render(&b.p, (0, 4 * PPQ));
+        assert!(peak(alone.channel(0)) > 0.05);
+        // Mute the source's fader: only the listener is heard, and it carries
+        // the source's signal, sample for sample (the tap is before the fader
+        // and the source is processed first whatever the track order).
+        b.t(listener).mute = false;
+        b.t(source).mute = true;
+        let keyed_out = render(&b.p, (0, 4 * PPQ));
+        for (i, (a, k)) in alone.channel(0).iter().zip(keyed_out.channel(0)).enumerate() {
+            assert!((a - k).abs() < 1e-6, "listener_first={listener_first} sample {i}: {a} vs {k}");
+        }
+        // Disconnected, the probe is silent.
+        b.p.device_mut(key).unwrap().sidechain = None;
+        assert!(peak(render(&b.p, (0, 4 * PPQ)).channel(0)) < 1e-6);
+    }
+}
+
+#[test]
+fn sidechain_follows_automation_chunks_and_survives_a_routing_loop() {
+    // With parameter automation the chain runs in control-rate chunks; the
+    // sidechain must be cut into the same chunks.
+    let (mut b, source, listener, _) = keyed(false);
+    let gain = b.device(listener, TEST_GAIN, &[(0, 0.5)], None);
+    let mut lane = AutomationLane::new(AutomationTarget::DeviceParam { device: gain, param: 0 });
+    lane.insert(AutomationPoint { tick: 0, value: 0.5, curve: 0.0 });
+    lane.insert(AutomationPoint { tick: 4 * PPQ, value: 0.5, curve: 0.0 });
+    b.t(listener).automation.push(lane);
+    b.t(listener).mute = true;
+    let alone = render(&b.p, (0, 4 * PPQ));
+    b.t(listener).mute = false;
+    b.t(source).mute = true;
+    let keyed_out = render(&b.p, (0, 4 * PPQ));
+    for (i, (a, k)) in alone.channel(0).iter().zip(keyed_out.channel(0)).enumerate() {
+        assert!((a - k).abs() < 1e-6, "sample {i}: {a} vs {k}");
+    }
+    // A track that listens to the group it plays into cannot come after it:
+    // the graph still compiles and says the sidechain is one block late.
+    let mut b = P::new(120.0);
+    let group = b.track(TrackKind::Group, "group");
+    let (inner, _) = b.synth_track("inner");
+    b.t(inner).output = Output::Track(group);
+    let key = b.device(inner, crate::fallback::TEST_KEY, &[], None);
+    b.p.device_mut(key).unwrap().sidechain = Some(group);
+    let g = compile_plain(&b.p).expect("a sidechain loop is not a routing error");
+    assert!(g.warnings().iter().any(|w| w.contains("one block late")));
+}
+
 // ───────────────────────────── Audio clips ─────────────────────────────
 
 #[test]

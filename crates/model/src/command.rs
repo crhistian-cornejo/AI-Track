@@ -108,6 +108,8 @@ pub enum Command {
     MoveDevice { id: DeviceId, to: DeviceSlot },
     SetParam { device: DeviceId, param: u32, value: Option<f32> },
     SetDeviceEnabled { device: DeviceId, enabled: bool },
+    /// Connect a device's sidechain input to a track (or disconnect it).
+    SetSidechain { device: DeviceId, source: Option<TrackId> },
     SetDeviceState { device: DeviceId, state: Option<Vec<u8>>, preset: Option<String> },
     RenameDevice { device: DeviceId, name: String },
 
@@ -166,6 +168,7 @@ impl Command {
             MoveDevice { .. } => "Move device",
             SetParam { .. } => "Change parameter",
             SetDeviceEnabled { .. } => "Toggle device",
+            SetSidechain { .. } => "Route sidechain",
             SetDeviceState { .. } => "Load preset",
             RenameDevice { .. } => "Rename device",
             AddChain { .. } => "Add chain",
@@ -428,6 +431,18 @@ impl Command {
                     None => d.params.remove(&param),
                 };
                 Ok(SetParam { device, param, value: old })
+            }
+            SetSidechain { device, source } => {
+                if let Some(t) = source {
+                    if p.track(t).is_none() {
+                        return Err(CommandError::TrackNotFound(t));
+                    }
+                    if p.device_track(device) == Some(t) {
+                        return Err(CommandError::Invalid("a device cannot be sidechained from its own track".into()));
+                    }
+                }
+                let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
+                Ok(SetSidechain { device, source: std::mem::replace(&mut d.sidechain, source) })
             }
             SetDeviceEnabled { device, enabled } => {
                 let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;

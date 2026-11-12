@@ -258,18 +258,20 @@ flowchart TD
 
 Cada fase termina con un criterio de salida verificable. Las duraciones dependen del tamaño del equipo y no se estiman aquí.
 
-| Fase | Alcance | Criterio de salida |
-|---|---|---|
-| **F0 · Prototipos de riesgo** | (a) toolkit UI propio vs GPUI con 10 000 clips; (b) motor mínimo + `cpal` + MMCSS/workgroups; (c) cargar un VST3 y un CLAP en sandbox con editor embebido en ambos SO; (d) clack vs truce con Utility + EQ; (e) medir tamaño de binario | Decisiones de UI y framework de plugins tomadas con números; latencia de sandbox medida a 64 muestras |
-| **F1 · Núcleo** | `model`, `time`, `undo`, `project`, Command API, motor por bloques con PDC y automatización precisa, transporte, export offline | Proyecto de prueba se renderiza bit-exact; test de cero asignaciones en verde |
-| **F2 · MVP de producción** | Arrangement, Session básica, Piano Roll con escala y ghost notes, Drum Rack con step sequencer, cadena de dispositivos, mixer con sends, hosting VST3 + CLAP, sampler + synth propios, warp, clip gain, bounce | Se puede producir un track completo de principio a fin |
-| **F3 · Profundidad** | Racks con macros y variaciones, envolventes de clip, follow actions, herramientas completas del Piano Roll, Folder/VCA, comping, freeze, suite completa de efectos | Paridad de workflow con las referencias en lo esencial |
-| **F4 · Librería inteligente** | Escaneo, análisis DSP, CLAP, carpetas virtuales por Key/Tipo, organización en disco con undo | 10 000 samples analizados sin afectar al audio |
-| **F5 · IA conectada** | Servidor MCP, modo API key, adaptadores headless (Claude Code, Droid, Codex), propuestas con aceptar/descartar | Un agente crea un bajo en escala y se deshace en 1 paso |
-| **F6 · IA musical** | Audio→MIDI, detección de acordes, Chord Track, motor de teoría para generar MIDI | — |
-| **F7 · Extra** | VST2 (si se aprueba), AU, stems (si la licencia se resuelve), asistente de mezcla/mastering, MPE, Ableton Link | — |
+**Estado al 2026-11-11** (rama `main`, 343 tests en verde, clippy limpio). Leyenda: ✅ completa · 🟡 parcial · ⬜ sin empezar. Dentro de cada fase, ✔ = hecho y ✘ = falta.
 
-**Distribución desde F2:** CI con builds firmados para macOS (universal) y Windows, `cargo-deny`, tests golden de audio, fuzzing del host de plugins.
+| Estado | Fase | Alcance | Criterio de salida |
+|---|---|---|---|
+| 🟡 | **F0 · Prototipos de riesgo** | ✔ UI: decidido GPUI (sin el benchmark de 10 000 clips) · ✔ motor + `cpal` + MMCSS (✘ audio workgroups de macOS) · ✔ VST3 y CLAP en sandbox en Windows (14 µs por bloque) · ✘ editor embebido (se abre en ventana propia) · ✘ macOS sin ejecutar · ✘ clack vs truce · ✘ medir tamaño de binario | Decisiones de UI y framework de plugins tomadas con números; latencia de sandbox medida a 64 muestras |
+| ✅ | **F1 · Núcleo** | ✔ `model`, tempo map con rampas, undo/redo, Command API · ✔ motor por bloques con PDC y automatización precisa a la muestra · ✔ transporte · ✔ render y export offline (WAV 16/24/32f, MP3 320, stems) | ✔ Renders golden y test de cero asignaciones en verde |
+| 🟡 | **F2 · MVP de producción** | ✔ Arrangement, Session, Piano Roll con escala y ghost notes, Drum Rack con step sequencer, cadena de dispositivos, mixer con sends, hosting VST3 + CLAP, sampler + synth propios, clip gain, export · ✘ **guardar/abrir proyecto desde la app** · ✘ **grabar audio/MIDI a disco** · ✘ warp con preservación de tono (solo repitch) · ✘ streaming de disco | Se puede producir un track completo de principio a fin |
+| 🟡 | **F3 · Profundidad** | ✔ Racks con 16 macros (✘ UI de variaciones) · ✔ follow actions básicas · ✔ suite completa de efectos (15 dispositivos, 202 presets) · ✔ Folder/VCA (✘ VCA anidados) · ✘ envolventes de clip en el motor · ✘ Chop/Arp/Strum/Randomize del Piano Roll · ✘ comping · ✘ freeze · ✘ EQ de fase lineal · ✘ motor multinúcleo | Paridad de workflow con las referencias en lo esencial |
+| 🟡 | **F4 · Librería inteligente** | ✔ escaneo incremental + vigilancia de cambios · ✔ análisis DSP (tonalidad, BPM, tipo) · ✔ carpetas virtuales por Key/Tipo/BPM/Género · ✔ organización en disco con undo · ✔ banco CC0 de 2 641 samples + Content Hub · ✘ búsqueda por texto/similitud con CLAP · ✘ prueba con 10 000 samples | 10 000 samples analizados sin afectar al audio |
+| 🟡 | **F5 · IA conectada** | ✔ propuestas con aceptar/descartar como 1 paso de undo · ✘ servidor MCP · ✘ modo API key · ✘ adaptadores headless (Claude Code, Droid, Codex) · ✘ chat real | Un agente crea un bajo en escala y se deshace en 1 paso |
+| 🟡 | **F6 · IA musical** | ✔ audio→MIDI (basic-pitch, mono, batería) · ✔ detección de acordes · ✔ motor de teoría (progresiones, bajos, arpegios, patrones de batería) · ✘ Chord Track en la interfaz | — |
+| 🟡 | **F7 · Extra** | ✔ stems: pipeline Demucs completo y salida WAV (✘ sin ejecutar con el modelo real: la red bloquea Hugging Face) · ✘ asistente de mezcla/mastering · ✘ MPE completo · ✘ Ableton Link · ✘ AU · VST2 descartado | — |
+
+**Distribución:** ⬜ CI con builds firmados para macOS (universal) y Windows, `cargo-deny` en CI, fuzzing del host de plugins. Los tests golden de audio ya existen (✔).
 
 ---
 

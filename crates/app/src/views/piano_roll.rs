@@ -5,14 +5,14 @@
 
 use crate::bridge::SlotState;
 use crate::paint::{self, at};
-use crate::state::{BAR, Tool};
+use crate::state::Tool;
 use crate::theme::*;
 use crate::widgets::label;
 use crate::workspace::{Drag, Workspace};
 use aitrack_model::*;
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    ScrollDelta, ScrollWheelEvent, Styled, TextAlign, Window, canvas, div, px,
+    ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div, px,
 };
 use std::collections::BTreeSet;
 
@@ -35,6 +35,18 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let view = ws.s.piano;
     let ppt = view.px_per_beat / PPQ as f32;
     let selected: BTreeSet<NoteId> = ws.s.selected_notes.clone();
+    let audition_track = ws.audition_track();
+    let active_keys: BTreeSet<u8> = audition_track
+        .map(|track| (0..=127).filter(|key| ws.audition.pressed(track, *key)).collect())
+        .unwrap_or_default();
+    let velocity_text = {
+        let chosen: Vec<_> = notes.iter().filter(|n| selected.contains(&n.id)).collect();
+        if chosen.is_empty() {
+            "1–127".to_string()
+        } else {
+            format!("{}", (chosen.iter().map(|n| n.velocity).sum::<f32>() / chosen.len() as f32 * 127.).round() as u8)
+        }
+    };
     let color = clip.color;
     let snap_px = ws.s.snap.ticks() as f32 * ppt;
     let marquee = match &ws.drag {
@@ -109,7 +121,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let pc = key % 12;
                 let black = matches!(pc, 1 | 3 | 6 | 8 | 10);
                 let in_scale = mask & (1 << pc) != 0;
-                let fill = if black { pal.key_black } else { pal.key_white };
+                let fill = if active_keys.contains(&(key as u8)) { pal.accent } else if black { pal.key_black } else { pal.key_white };
                 let w = if black { KEYS_W * 0.62 } else { KEYS_W - 1. };
                 window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h - 1.), fill));
                 if in_scale && scale.is_some() {
@@ -249,7 +261,6 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     .size_full();
 
     let name = clip.name.clone();
-    let bars = len / BAR;
     div()
         .size_full()
         .flex()
@@ -267,7 +278,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
-                .child(div().w(px(KEYS_W)).h_full().child(keyboard))
+                .child(
+                    div().id("piano-keyboard").w(px(KEYS_W)).h_full().cursor_pointer().child(keyboard)
+                        .tooltip(crate::widgets::tip("Click and drag to audition notes", None))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            if e.first_mouse { return }
+                            if let Some(track) = this.audition_track() {
+                                let key = this.piano_pos(e.position).1 as u8;
+                                this.press_audition(crate::audition::MOUSE, track, key, cx);
+                                this.begin_drag(Drag::Audition { track, key: Some(key) }, cx);
+                            }
+                        }))
+                        .on_scroll_wheel(cx.listener(on_wheel)),
+                )
                 .child(
                     div()
                         .id("piano-grid")
@@ -287,6 +310,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .flex()
                 .child(
                     div()
+                        .id("piano-velocity-label")
                         .w(px(KEYS_W))
                         .h_full()
                         .bg(pal.surface)
@@ -298,7 +322,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         .items_center()
                         .justify_center()
                         .child(label("VEL", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
-                        .child(label(format!("{bars} bar{}", if bars == 1 { "" } else { "s" }), TEXT_XS, pal.faint))
+                        .child(label(velocity_text, TEXT_XS, pal.text))
+                        .tooltip(crate::widgets::tip("Velocity: drag a marker or Ctrl + drag a note; Shift for fine adjustment", None))
                         .child(label(crate::paint::fit(&name, KEYS_W - 4., TEXT_XS), TEXT_XS, pal.faint)),
                 )
                 .child(
@@ -340,6 +365,14 @@ fn grid_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, right: bool, 
     }
     match hit {
         Some(n) => {
+            if e.modifiers.control || e.modifiers.secondary() {
+                if !ws.s.selected_notes.contains(&n.id) {
+                    ws.s.selected_notes = [n.id].into();
+                }
+                let originals = selected_notes(ws, clip);
+                ws.begin_drag(Drag::Velocity { clip, originals, last_y: f32::from(e.position.y), lane_h: 160., delta: 0. }, cx);
+                return;
+            }
             if e.click_count >= 2 {
                 ws.s.delete_notes(clip, vec![n.id]);
                 cx.notify();
@@ -358,14 +391,16 @@ fn grid_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, right: bool, 
             let ppt = ws.s.piano.px_per_beat / PPQ as f32;
             let resize = (n.end() - tick) as f32 * ppt < 6.;
             let originals = selected_notes(ws, clip);
-            ws.begin_drag(Drag::Notes { clip, originals, origin: (tick, key), resize, applied: (0, 0) }, cx);
+            let preview = ws.preview_note(n.key, cx);
+            ws.begin_drag(Drag::Notes { clip, originals, origin: (tick, key), resize, applied: (0, 0), preview }, cx);
         }
         None if ws.s.tool == Tool::Draw && !e.modifiers.shift => {
             if let Some(id) = ws.s.draw_note(clip, key as u8, tick) {
                 let originals = ws.s.clip_notes(clip).map(|(_, n)| n.notes.iter().filter(|n| n.id == id).cloned().collect()).unwrap_or_default();
                 // Keep the drawn note under the mouse while dragging (FL-style).
                 ws.drag = None;
-                ws.drag = Some(Drag::Notes { clip, originals, origin: (tick, key), resize: false, applied: (0, 0) });
+                let preview = ws.preview_note(key as u8, cx);
+                ws.drag = Some(Drag::Notes { clip, originals, origin: (tick, key), resize: false, applied: (0, 0), preview });
                 cx.notify();
             }
         }
@@ -386,17 +421,21 @@ fn velocity_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, cx: &mut 
     let x = f32::from(e.position.x - b.origin.x) + ws.s.piano.scroll_x;
     let ppt = ws.s.piano.px_per_beat / PPQ as f32;
     let Some((_, src)) = ws.s.clip_notes(clip) else { return };
+    let y = f32::from(e.position.y - b.origin.y);
+    let lane_h = f32::from(b.size.height) - 8.;
     let hit = src
         .notes
         .iter()
-        .map(|n| ((n.start as f32 * ppt - x).abs(), n.clone()))
-        .filter(|(d, _)| *d < 8.)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, n)| n);
+        .map(|n| ((n.start as f32 * ppt - x).abs(), (4. + lane_h * (1. - n.velocity) - y).abs(), n.clone()))
+        .filter(|(dx, _, _)| *dx < 8.)
+        .min_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)))
+        .map(|(_, _, n)| n);
     let Some(n) = hit else { return };
-    let originals = if ws.s.selected_notes.contains(&n.id) { selected_notes(ws, clip) } else { vec![n] };
-    let lane_h = f32::from(b.size.height) - 8.;
-    ws.begin_drag(Drag::Velocity { clip, originals, start_y: f32::from(e.position.y), lane_h }, cx);
+    if !ws.s.selected_notes.contains(&n.id) {
+        ws.s.selected_notes = [n.id].into();
+    }
+    let originals = selected_notes(ws, clip);
+    ws.begin_drag(Drag::Velocity { clip, originals, last_y: f32::from(e.position.y), lane_h, delta: 0. }, cx);
 }
 
 fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Workspace>) {

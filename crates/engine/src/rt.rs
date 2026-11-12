@@ -38,6 +38,7 @@ pub(crate) enum RtCommand {
     StopAllClips,
     BackToArrangement,
     SetMidiTarget(Option<TrackId>),
+    SendMidiTo(TrackId, MidiMessage),
     SetGlobalQuantize(Quantize),
 }
 
@@ -383,6 +384,14 @@ impl AudioProcessor {
                 RtCommand::SetCountIn(bars) => self.count_in_bars = bars,
                 RtCommand::SetRecording(on) => self.recording = on,
                 RtCommand::SetMidiTarget(t) => self.midi_target = t,
+                RtCommand::SendMidiTo(track, msg) => {
+                    if let Some(g) = &mut self.graph
+                        && let Some(t) = g.track_index(track)
+                        && let Some(event) = msg.to_event()
+                    {
+                        g.push_live(t, event);
+                    }
+                }
                 RtCommand::SetGlobalQuantize(q) => self.global_quantize = q,
                 RtCommand::LaunchClip(track, scene) => {
                     let now = self.now_ticks();

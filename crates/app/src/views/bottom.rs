@@ -22,17 +22,19 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             let t = BottomTab::ALL[i];
             if this.s.bottom_tab == t && this.bottom_open {
                 this.bottom_open = false;
+                this.release_audition(cx);
                 cx.notify();
             } else {
                 this.set_tab(t, cx);
             }
         });
     });
+    let tab_width = if tab == BottomTab::PianoRoll && f32::from(window.viewport_size().width) < 1400. { 84. } else { 112. };
     let tabs = widgets::segmented(
         "bottom-tabs",
         &[(Some(Icon::Device), "Devices"), (Some(Icon::Piano), "Piano Roll"), (Some(Icon::Steps), "Steps"), (Some(Icon::Mixer), "Mixer")],
         tab.index(),
-        112.,
+        tab_width,
         on_tab,
     );
 
@@ -54,7 +56,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .child(tabs)
         .child(div().w(px(SP2)))
         .when_some(context, |d, (name, color)| {
-            d.child(div().size(px(8.)).rounded_full().bg(track_color(color))).child(label(name, TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
+            d.child(div().size(px(8.)).rounded_full().bg(track_color(color)))
+                .child(label(crate::paint::fit(&name, 96., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
         })
         .child(div().flex_1());
     if tab == BottomTab::PianoRoll && ws.bottom_open {
@@ -65,6 +68,9 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             .tooltip(widgets::tip(if ws.bottom_open { "Collapse panel" } else { "Expand panel" }, None))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.bottom_open = !this.bottom_open;
+                if !this.bottom_open {
+                    this.release_audition(cx);
+                }
                 cx.notify();
             })),
     );
@@ -132,6 +138,50 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(SP1))
+        .child(
+            widgets::icon_button("pr-preview", Icon::Headphones, ws.piano_preview)
+                .tooltip(widgets::tip("Audition notes when drawing or moving them", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.piano_preview = !this.piano_preview;
+                    if !this.piano_preview {
+                        this.release_audition(cx);
+                    }
+                    cx.notify();
+                })),
+        )
+        .child(
+            widgets::icon_button("pr-keyboard", Icon::Keyboard, ws.piano_keyboard)
+                .tooltip(widgets::tip("Computer keyboard: A W S E D F T G Y H U J K O L P", None))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.piano_keyboard = !this.piano_keyboard;
+                    if !this.piano_keyboard {
+                        this.release_audition(cx);
+                    } else {
+                        this.focus.focus(window, cx);
+                    }
+                    cx.notify();
+                })),
+        )
+        .child(
+            widgets::icon_button("pr-octave-down", Icon::Minus, false)
+                .tooltip(widgets::tip("Lower keyboard octave", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.release_audition(cx);
+                    this.piano_octave = this.piano_octave.saturating_sub(1);
+                    cx.notify();
+                })),
+        )
+        .child(label(format!("C{}", ws.piano_octave), TEXT_SM, pal.text))
+        .child(
+            widgets::icon_button("pr-octave-up", Icon::Add, false)
+                .tooltip(widgets::tip("Raise keyboard octave", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.release_audition(cx);
+                    this.piano_octave = (this.piano_octave + 1).min(9);
+                    cx.notify();
+                })),
+        )
+        .child(widgets::divider_v(16.))
         .child(widgets::segmented("pr-tool", &[(Some(Icon::Cursor), ""), (Some(Icon::Pencil), "")], if ws.s.tool == Tool::Select { 0 } else { 1 }, 32., on_tool))
         .child(div().w(px(SP1)))
         .child(

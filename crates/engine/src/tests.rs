@@ -731,6 +731,34 @@ fn live_midi_reaches_armed_track() {
 }
 
 #[test]
+fn targeted_live_midi_reaches_only_its_track_without_changing_external_routing() {
+    let mut b = P::new(120.0);
+    let (first, _) = b.synth_track("first");
+    let (second, _) = b.synth_track("second");
+    b.t(first).arm = true;
+    let (h, proc_) = Engine::new(EngineConfig::headless(SR), Arc::new(FallbackFactory)).unwrap();
+    let mut proc_ = proc_.unwrap();
+    h.update_project(&b.p);
+    h.flush();
+    let mut buf = AudioBuffer::new(2, 256);
+    proc_.process_planar(&mut buf);
+    assert!(h.send_midi_to(second, MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(h.meters(second).unwrap().peak[0] > 0.1);
+    assert!(h.meters(first).unwrap().peak[0] < 1e-6);
+    assert!(h.send_midi_to(second, MidiMessage::note_off(0, 60)));
+    proc_.process_planar(&mut buf);
+    proc_.process_planar(&mut buf);
+    assert!(peak(buf.channel(0)) < 1e-6);
+    assert!(h.send_midi_to(TrackId(u64::MAX), MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(peak(buf.channel(0)) < 1e-6);
+    assert!(h.send_midi(MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(h.meters(first).unwrap().peak[0] > 0.1);
+}
+
+#[test]
 fn metronome_clicks_on_beats() {
     let b = P::new(120.0);
     let (h, proc_) = Engine::new(EngineConfig::headless(SR), Arc::new(FallbackFactory)).unwrap();
@@ -877,6 +905,7 @@ fn audio_thread_never_allocates() {
     h.flush();
     h.launch_scene(scene);
     h.send_midi(MidiMessage::note_on(0, 64, 90));
+    h.send_midi_to(ids[1], MidiMessage::note_on(0, 67, 90));
     h.seek(3 * PPQ);
     assert_eq!(run(&mut proc_, &mut buf, &mut interleaved, 400), 0, "graph swap, launches, MIDI, seek");
     {

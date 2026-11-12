@@ -13,6 +13,19 @@ path = "src/main.rs"
 [dependencies]
 aitrack-model.workspace = true
 aitrack-dsp.workspace = true
+aitrack-engine.workspace = true
+aitrack-stock.workspace = true
+aitrack-host.workspace = true
+aitrack-ai.workspace = true
+aitrack-library.workspace = true
+rtrb.workspace = true
+# Browser preview voice on the default output (Apache-2.0).
+cpal = "0.18"
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+# Reads WAV headers of imported audio and stems (MIT OR Apache-2.0).
+hound = "3.5"
 # The manifest gives the window per-monitor DPI awareness on Windows.
 gpui = { workspace = true, features = ["windows-manifest"] }
 gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }

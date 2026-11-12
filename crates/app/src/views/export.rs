@@ -112,6 +112,11 @@ impl Workspace {
             self.toast(e, cx);
             return;
         }
+        if options.format == ExportFormat::Mp3
+            && let Err(e) = self.b.engine.mp3_available() {
+                self.toast(e, cx);
+                return;
+            }
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::unbounded::<ExportProgress>();
         let flag = cancel.clone();
@@ -190,6 +195,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let running = e.running.as_ref().map(|r| r.progress.clone());
     let options = ws.export_options(cx);
     let valid = options.validate();
+    let mp3_err = if mp3 { ws.b.engine.mp3_available().err() } else { None };
 
     let format_control = div()
         .flex()
@@ -202,7 +208,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }))
         .when(stems, |d| d.child(label("Stems are always WAV", TEXT_SM, pal.faint)));
     let quality: AnyElement = if mp3 {
-        div().flex().items_center().gap(px(SP2)).child(widgets::badge("320 kbps CBR", pal.accent2)).child(label("MP3 is always exported at the highest bitrate", TEXT_SM, pal.faint)).into_any_element()
+        div().flex().flex_col().gap(px(SP1)).child(div().flex().items_center().gap(px(SP2)).child(widgets::badge("320 kbps CBR", pal.accent2)).child(label("MP3 is always exported at the highest bitrate", TEXT_SM, pal.faint))).when_some(mp3_err.clone(), |d, e| d.child(div().max_w(px(420.)).text_size(px(fs(TEXT_SM))).text_color(pal.record).child(e))).into_any_element()
     } else {
         seg("exp-depth", &["16-bit · dither", "24-bit", "32-bit float"], depth_index, 112., cx, |ws, i| ws.export.depth = [WavDepth::Int16Dithered, WavDepth::Int24, WavDepth::Float32][i])
     };
@@ -259,13 +265,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             .child(match &valid {
                 Err(msg) => label(*msg, TEXT_SM, pal.record).into_any_element(),
                 Ok(()) => match &ws.export.last {
+                    Some(l) if l.error.is_some() => label(format!("Last export failed: {}", l.error.clone().unwrap_or_default()), TEXT_SM, pal.record).into_any_element(),
                     Some(l) if !l.cancelled && l.error.is_none() => label(format!("Last export: {}", l.files.first().map_or(String::new(), |f| f.display().to_string())), TEXT_SM, pal.play).into_any_element(),
                     _ => label(summary(&options), TEXT_SM, pal.muted).into_any_element(),
                 },
             })
             .child(div().flex_1())
             .child(text_button("exp-close", "Close", None, false).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
-            .child(text_button("exp-go", "Export", Some(Icon::Send), true).when(valid.is_err(), |d| d.opacity(0.5)).on_click(cx.listener(|this, _, _, cx| this.start_export(cx))))
+            .child(text_button("exp-go", "Export", Some(Icon::Send), true).when(valid.is_err() || mp3_err.is_some(), |d| d.opacity(0.5)).on_click(cx.listener(|this, _, _, cx| this.start_export(cx))))
             .into_any_element(),
     };
 

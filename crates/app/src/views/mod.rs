@@ -7,6 +7,7 @@ pub mod bottom;
 pub mod browser;
 pub mod devices;
 pub mod export;
+pub mod hub;
 pub mod menus;
 pub mod mixer;
 pub mod piano_roll;

@@ -1,15 +1,15 @@
 //! The browser: the smart library (virtual folders by category, key and
 //! genre), plugins (stock, VST3, CLAP) and the project's own contents.
 
-use crate::bridge::{LibraryFolder, LibraryItem};
+use crate::bridge::LibraryFolder;
 use crate::icons::{Icon, icon};
 use crate::state::BrowserTab;
 use crate::theme::*;
 use crate::widgets::{self, badge, label, mono};
-use crate::workspace::Workspace;
+use crate::workspace::{DraggedSample, MenuKind, Workspace};
 use aitrack_model::{PluginFormat, Scale, ScaleKind, TrackKind};
 use gpui::{
-    AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, Stateful,
+    AnyElement, AppContext as _, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Stateful,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, uniform_list,
 };
 use std::rc::Rc;
@@ -92,14 +92,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
 fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let query = ws.query.trim().to_owned();
-    let (title, items): (String, Vec<LibraryItem>) = if query.is_empty() {
-        let name = find_folder(ws.b.library.folders(), &ws.library_folder).map_or("Library".to_owned(), |f| f.name.clone());
-        (name, ws.b.library.items(&ws.library_folder))
+    let title = if !query.is_empty() {
+        format!("Results for “{query}”")
+    } else if ws.library_matches {
+        let key = ws.s.project.scale.map_or("any key".to_owned(), |s| s.display());
+        format!("Matches {key} · {:.0} BPM", ws.s.project.tempo.initial_bpm())
     } else {
-        (format!("Results for “{query}”"), ws.b.library.search(&query, None))
+        find_folder(ws.b.library.folders(), &ws.library_folder).map_or("Library".to_owned(), |f| f.name.clone())
     };
+    let items = ws.library_view();
+    let scan = ws.b.library.scan_status();
+    let status = ws.b.library.status();
     let mut tree = div().flex().flex_col().px(px(SP1));
-    if query.is_empty() {
+    if query.is_empty() && !ws.library_matches {
         let folders = ws.b.library.folders().to_vec();
         for f in &folders {
             tree = folder_rows(ws, tree, f, 0, cx);
@@ -116,19 +121,47 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 let it = &list_items[i];
                 let pal = p();
                 let in_key = it.key.zip(project_key).is_some_and(|(a, b)| a.mask() == b.mask());
-                let name = it.name.clone();
+                let item = it.clone();
+                let fav_item = it.clone();
                 let weak = weak.clone();
-                row(("lib-item", it.id as usize), false)
+                let weak_fav = weak.clone();
+                let weak_menu = weak.clone();
+                row(("lib-item", i), false)
                     .mx(px(SP1))
                     .child(icon(if it.is_loop { Icon::Loop } else { Icon::Waveform }, 14., if in_key { pal.accent } else { pal.muted }))
                     .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(label(it.name.clone(), TEXT_MD, pal.text)))
                     .when_some(it.key, |d, k| d.child(badge(short_key(k), if in_key { pal.accent } else { pal.muted })))
                     .when_some(it.bpm, |d, b| d.child(badge(format!("{b:.0}"), pal.solo)))
                     .child(mono(format!("{:.1}s", it.duration), TEXT_XS, pal.faint).w(px(32.)).flex().justify_end())
-                    .tooltip(widgets::tip_owned(format!("{} · {}", it.category, it.path.display())))
-                    .on_click(move |_, _, cx| {
-                        let name = name.clone();
-                        let _ = weak.update(cx, |this, cx| this.toast(format!("Preview: {name}"), cx));
+                    .child(
+                        div()
+                            .id(("fav", i))
+                            .child(icon(Icon::Star, 12., if it.favorite { pal.solo } else { content(0.2) }))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = weak_fav.update(cx, |this, cx| {
+                                    this.b.library.set_favorite(fav_item.id, !fav_item.favorite);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .tooltip(widgets::tip_owned(format!("{} · {}\nClick to preview, double-click or drag to add", it.category, it.path.display())))
+                    .on_drag(DraggedSample(it.clone()), |d: &DraggedSample, _, _, cx| cx.new(|_| d.clone()))
+                    .on_mouse_down(MouseButton::Right, move |e: &MouseDownEvent, _, cx| {
+                        let at = e.position;
+                        let _ = weak_menu.update(cx, |this, cx| this.open_menu(MenuKind::LibraryContext, at, cx));
+                    })
+                    .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _, cx| {
+                        let double = e.click_count >= 2;
+                        let item = item.clone();
+                        let _ = weak.update(cx, |this, cx| {
+                            if double {
+                                this.b.engine.preview(None);
+                                this.add_sample_clip(&item, None, None, cx);
+                            } else {
+                                this.b.engine.preview(Some(&item.path));
+                            }
+                        });
                     })
             })
             .collect::<Vec<_>>()
@@ -136,13 +169,58 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     .flex_1()
     .min_h(px(0.));
 
+    let matches_on = ws.library_matches;
+    let toolbar = div()
+        .px(px(SP2))
+        .pt(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .child(
+            div()
+                .id("lib-matches")
+                .h(px(22.))
+                .px(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .rounded(px(r_md()))
+                .cursor_pointer()
+                .bg(if matches_on { accent_alpha(0.18) } else { content(0.06) })
+                .hover(|s| s.bg(content(0.12)))
+                .child(icon(Icon::Sparkles, 12., if matches_on { pal.accent } else { pal.muted }))
+                .child(label("Matches project", TEXT_XS, if matches_on { pal.text } else { pal.muted }))
+                .tooltip(widgets::tip("Ranked for the project key and tempo", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.library_matches = !this.library_matches;
+                    cx.notify();
+                })),
+        )
+        .child(div().flex_1())
+        .child(widgets::icon_button("lib-add-folder", Icon::Add, false).tooltip(widgets::tip("Add a folder to the library", None)).on_click(cx.listener(|this, _, _, cx| this.pick_library_folder(cx))))
+        .child(widgets::icon_button("lib-menu", Icon::More, false).tooltip(widgets::tip("Library actions", None)).on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+            let at = e.position();
+            this.open_menu(MenuKind::LibraryContext, gpui::point(at.x - px(180.), at.y + px(12.)), cx);
+        })));
+    let scan_row = scan.running.then(|| {
+        div()
+            .px(px(SP3))
+            .pt(px(SP1))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(label(crate::paint::fit(&scan.message, BROWSER_W - 32., TEXT_XS), TEXT_XS, pal.muted))
+            .child(widgets::hbar(scan.fraction, BROWSER_W - 2. * SP3, 3., pal.accent))
+    });
     div()
         .flex_1()
         .min_h(px(0.))
         .flex()
         .flex_col()
-        .when(query.is_empty(), |d| {
-            d.child(div().id("folder-tree").max_h(px(300.)).overflow_y_scroll().pt(px(SP2)).child(tree)).child(div().mx(px(SP3)).my(px(SP1)).child(widgets::divider_h()))
+        .child(toolbar)
+        .children(scan_row)
+        .when(query.is_empty() && !matches_on, |d| {
+            d.child(div().id("folder-tree").max_h(px(220.)).overflow_y_scroll().pt(px(SP2)).child(tree)).child(div().mx(px(SP3)).my(px(SP1)).child(widgets::divider_h()))
         })
         .child(
             div()
@@ -160,6 +238,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         } else {
             list.into_any_element()
         })
+        .child(div().flex_none().px(px(SP3)).py(px(SP1)).border_t_1().border_color(border()).child(label(crate::paint::fit(&status, BROWSER_W - 24., TEXT_XS), TEXT_XS, pal.faint)))
         .into_any_element()
 }
 
@@ -177,7 +256,11 @@ fn folder_rows(ws: &Workspace, mut tree: Div, f: &LibraryFolder, depth: usize, c
         "categories" => Icon::FolderTree,
         "keys" => Icon::MusicNote,
         "genres" => Icon::Globe,
-        _ if f.id.starts_with("keys/") => Icon::MusicNote,
+        "camelot" => Icon::Refresh,
+        "bpm" => Icon::Gauge,
+        "packs" => Icon::Layers,
+        "favorites" => Icon::Star,
+        _ if f.id.starts_with("keys/") || f.id.starts_with("camelot/") => Icon::MusicNote,
         _ => if open { Icon::FolderOpen } else { Icon::Folder },
     };
     tree = tree.child(
@@ -190,7 +273,8 @@ fn folder_rows(ws: &Workspace, mut tree: Div, f: &LibraryFolder, depth: usize, c
                 }),
             )
             .child(icon(top_icon, 14., if selected { pal.accent } else { pal.muted }))
-            .child(label(f.name.clone(), TEXT_MD, if selected { pal.text } else { pal.muted }).when(depth == 0, |l| l.font_weight(FontWeight::MEDIUM)))
+            .child(label(f.name.clone(), TEXT_MD, if selected { pal.text } else { pal.muted }).when(depth == 0, |l| l.font_weight(FontWeight::MEDIUM)).flex_1())
+            .when(f.count > 0, |d| d.child(mono(f.count.to_string(), TEXT_XS, pal.faint)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.expanded.remove(&id) {
                     this.expanded.insert(id.clone());

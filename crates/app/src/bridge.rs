@@ -3,9 +3,9 @@
 //! The UI talks to the audio engine, the plugin catalogue, the sample
 //! library and the AI features only through these traits. Each has a stub
 //! that returns demo data (and fakes a playing transport and moving meters),
-//! so every view can be exercised before the real crates are wired in. To
-//! wire one, implement the trait in a small adapter and hand it to
-//! [`Bridges`] in `main.rs`.
+//! so every view can be exercised without the real crates. The adapters over
+//! the real crates live in `crate::real`; `AITRACK_STUBS=1` runs the app on
+//! the stubs.
 
 use aitrack_dsp::ParamInfo;
 use aitrack_model::{Key, PluginFormat, Project, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
@@ -74,6 +74,45 @@ pub trait EngineBridge {
     /// Render in the background; `progress` runs on the render thread and
     /// returns `false` to cancel.
     fn export(&mut self, options: ExportOptions, project: &Project, progress: ProgressFn);
+    /// Why MP3 export cannot run (LAME missing), shown in the dialog.
+    fn mp3_available(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    // ── Per-frame and housekeeping (UI thread) ──
+    /// Once per painted frame: read transport, meters, CPU and clip states.
+    fn tick(&mut self) {}
+    /// On a short timer even while idle: main-thread plugin work (loading,
+    /// editor housekeeping). Returns true when the UI should repaint.
+    fn idle(&mut self) -> bool {
+        false
+    }
+    /// A non-blocking problem to show above the workspace (no audio device…).
+    fn banner(&self) -> Option<String> {
+        None
+    }
+    fn dismiss_banner(&mut self) {}
+    /// Short status-bar text ("WASAPI · 48 kHz · 256").
+    fn status_label(&self) -> String {
+        "Engine: stub".into()
+    }
+
+    // ── Hosted plugins ──
+    /// Open a VST3/CLAP device's editor window (main thread).
+    fn open_editor(&mut self, _device: aitrack_model::DeviceId) -> Result<(), String> {
+        Err("Plugin windows need the real engine".into())
+    }
+    /// Run third-party plugins out of process (applies to newly loaded instances).
+    fn sandbox_plugins(&self) -> bool {
+        false
+    }
+    fn set_sandbox_plugins(&mut self, _on: bool) {}
+    /// Audition an audio file at a low level (`None` stops).
+    fn preview(&mut self, _path: Option<&Path>) {}
+    /// Plugin load failures and similar, drained by the UI as toasts.
+    fn take_messages(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Fake engine: the position follows the wall clock at the project tempo and
@@ -558,11 +597,45 @@ pub struct ExternalPlugin {
     pub is_instrument: bool,
 }
 
+/// A factory preset of a stock device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetInfo {
+    /// Factory path, `plugin/Category/Name.json`.
+    pub path: String,
+    pub category: String,
+    pub name: String,
+}
+
+/// Plugin folder scan progress.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScanStatus {
+    pub running: bool,
+    pub fraction: f32,
+    pub message: String,
+}
+
 pub trait PluginCatalog {
     fn stock_devices(&self) -> &[DeviceInfo];
     fn external_plugins(&self) -> &[ExternalPlugin];
     fn device(&self, id: &str) -> Option<&DeviceInfo> {
         self.stock_devices().iter().find(|d| d.id == id)
+    }
+    /// Factory presets of a stock device, sorted by category then name.
+    fn presets(&self, _plugin_id: &str) -> Vec<PresetInfo> {
+        Vec::new()
+    }
+    /// A preset's display name and normalised parameter values.
+    fn load_preset(&self, path: &str) -> Result<(String, BTreeMap<u32, f32>), String> {
+        Err(format!("no preset {path}"))
+    }
+    /// Scan the VST3/CLAP folders again in the background.
+    fn rescan(&mut self) {}
+    fn scan_status(&self) -> ScanStatus {
+        ScanStatus::default()
+    }
+    /// Pick up background scan results; true when the list changed.
+    fn poll(&mut self) -> bool {
+        false
     }
 }
 
@@ -727,6 +800,8 @@ pub struct LibraryFolder {
     /// Stable path-like id, e.g. `"categories/drums/kicks"`.
     pub id: String,
     pub name: String,
+    /// Samples inside (0 when unknown).
+    pub count: u64,
     pub children: Vec<LibraryFolder>,
 }
 
@@ -742,6 +817,33 @@ pub struct LibraryItem {
     /// Seconds.
     pub duration: f32,
     pub is_loop: bool,
+    pub favorite: bool,
+}
+
+/// A Content Hub entry (or a bundled pack) as the hub page lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HubItem {
+    pub name: String,
+    pub author: String,
+    /// "Sample pack", "Instrument", "Plugin" or "Included".
+    pub kind: String,
+    pub license: String,
+    pub license_summary: String,
+    pub redistributable: bool,
+    pub url: String,
+    pub description: String,
+}
+
+/// What "Organize on disk" would do, shown before anything moves.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrganizePreview {
+    pub dest: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub duplicates: usize,
+    pub moves: bool,
+    /// Target folder → number of files (largest first, a few).
+    pub folders: Vec<(String, usize)>,
 }
 
 pub trait LibraryBridge {
@@ -751,6 +853,51 @@ pub trait LibraryBridge {
     fn items(&self, folder: &str) -> Vec<LibraryItem>;
     /// Free-text search, optionally restricted to a key (compatible keys first).
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem>;
+    /// Samples ranked for the project's key and tempo.
+    fn recommend(&self, scale: Option<Scale>, _bpm: f64) -> Vec<LibraryItem> {
+        self.search("", scale)
+    }
+    /// Where the library comes from and how big it is.
+    fn status(&self) -> String {
+        "Demo library".into()
+    }
+    /// Index a folder into the user library (scanned in the background).
+    fn add_folder(&mut self, _path: &Path) -> Result<(), String> {
+        Err("The demo library cannot index folders".into())
+    }
+    fn rescan(&mut self) {}
+    fn cancel_scan(&mut self) {}
+    fn scan_status(&self) -> ScanStatus {
+        ScanStatus::default()
+    }
+    /// Pick up scan progress and results; true when the UI should repaint.
+    fn poll(&mut self) -> bool {
+        false
+    }
+    fn set_favorite(&mut self, _id: u64, _on: bool) {}
+    fn mark_used(&mut self, _id: u64) {}
+    /// Content Hub entries and the bundled packs.
+    fn hub(&self) -> Vec<HubItem> {
+        Vec::new()
+    }
+    /// Plan copying (or moving) `items` into `dest`, by key or by category.
+    fn plan_organize(&mut self, _items: &[u64], _dest: &Path, _by_key: bool, _move_files: bool) -> Result<OrganizePreview, String> {
+        Err("Organizing needs the real library".into())
+    }
+    /// Run the last plan in the background; the result arrives through `organize_result`.
+    fn execute_organize(&mut self) -> Result<(), String> {
+        Err("Nothing planned".into())
+    }
+    /// A finished organize run (`Ok(summary)`), taken once.
+    fn organize_result(&mut self) -> Option<Result<String, String>> {
+        None
+    }
+    fn can_undo_organize(&self) -> bool {
+        false
+    }
+    fn undo_organize(&mut self) -> Result<String, String> {
+        Err("Nothing to undo".into())
+    }
 }
 
 pub struct StubLibrary {
@@ -759,7 +906,7 @@ pub struct StubLibrary {
 }
 
 fn folder(id: &str, name: &str, children: Vec<LibraryFolder>) -> LibraryFolder {
-    LibraryFolder { id: id.into(), name: name.into(), children }
+    LibraryFolder { id: id.into(), name: name.into(), count: 0, children }
 }
 
 impl Default for StubLibrary {
@@ -860,6 +1007,7 @@ impl Default for StubLibrary {
                         bpm: *bpm,
                         duration: *dur,
                         is_loop: *is_loop,
+                        favorite: false,
                     },
                 )
             })
@@ -928,11 +1076,65 @@ pub enum AiEvent {
     /// `History::propose` so the user can accept or discard it.
     Proposal { label: String, agent: String, commands: Vec<aitrack_model::Command> },
     Failed { job: JobId, message: String },
+    Analyzed { job: JobId, path: PathBuf, analysis: AudioAnalysis },
+}
+
+/// Result of analysing an audio file.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioAnalysis {
+    pub key: Option<Scale>,
+    pub bpm: Option<f64>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+}
+
+/// Which audio-to-MIDI engine to run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MidiMode {
+    /// basic-pitch (polyphonic, downloads a small model).
+    #[default]
+    Polyphonic,
+    Monophonic,
+    Drums,
+}
+
+impl MidiMode {
+    pub const ALL: [MidiMode; 3] = [MidiMode::Polyphonic, MidiMode::Monophonic, MidiMode::Drums];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Polyphonic => "Poly",
+            Self::Monophonic => "Mono",
+            Self::Drums => "Drums",
+        }
+    }
+}
+
+/// What the user must see and accept before a model is downloaded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelNotice {
+    pub model: String,
+    pub name: String,
+    /// Download size in bytes, when known.
+    pub size: Option<u64>,
+    pub license: String,
+    pub source: String,
+    pub notice: Option<String>,
 }
 
 pub trait AiBridge {
-    fn extract_midi(&mut self, path: &Path) -> JobId;
+    /// Audio to MIDI; notes are timed at `bpm`.
+    fn extract_midi(&mut self, path: &Path, mode: MidiMode, bpm: f64) -> JobId;
     fn split_stems(&mut self, path: &Path) -> JobId;
+    /// The stem model's licence notice while it still has to be accepted.
+    fn stem_license(&self) -> Option<ModelNotice> {
+        None
+    }
+    fn accept_license(&mut self, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Key / BPM / format analysis of an audio file.
+    fn analyze(&mut self, path: &Path) -> JobId;
     /// Send a chat message; replies and proposals arrive through [`poll`](Self::poll).
     fn chat(&mut self, text: &str, project: &Project);
     /// Drain finished work and progress. The UI calls this on a timer only
@@ -954,6 +1156,7 @@ enum StubJobKind {
     /// The reply text and, when the message names a track, a proposal.
     Chat(String, Option<(String, Vec<aitrack_model::Command>)>),
     Fail(String),
+    Analyze(PathBuf),
 }
 
 #[derive(Default)]
@@ -971,7 +1174,11 @@ impl StubAi {
 }
 
 impl AiBridge for StubAi {
-    fn extract_midi(&mut self, path: &Path) -> JobId {
+    fn analyze(&mut self, path: &Path) -> JobId {
+        self.push(StubJobKind::Analyze(path.to_path_buf()))
+    }
+
+    fn extract_midi(&mut self, path: &Path, _mode: MidiMode, _bpm: f64) -> JobId {
         match path.file_stem() {
             Some(s) => self.push(StubJobKind::Midi(s.to_string_lossy().into_owned())),
             None => self.push(StubJobKind::Fail("no audio file".into())),
@@ -1008,7 +1215,7 @@ impl AiBridge for StubAi {
                 StubJobKind::Midi(_) => 1.6,
                 StubJobKind::Stems(_) => 3.2,
                 StubJobKind::Chat(..) => 0.9,
-                StubJobKind::Fail(_) => 0.3,
+                StubJobKind::Fail(_) | StubJobKind::Analyze(_) => 0.3,
             };
             let f = (secs / total).min(1.);
             if f < 1. {
@@ -1057,6 +1264,7 @@ impl AiBridge for StubAi {
                     }
                 }
                 StubJobKind::Fail(message) => out.push(AiEvent::Failed { job: job.id, message: message.clone() }),
+                StubJobKind::Analyze(path) => out.push(AiEvent::Analyzed { job: job.id, path: path.clone(), analysis: AudioAnalysis::default() }),
             }
         }
         self.jobs.retain(|j| !finished.contains(&j.id));

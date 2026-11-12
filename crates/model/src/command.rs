@@ -341,10 +341,10 @@ impl Command {
                 if !p.scenes.iter().any(|s| s.id == scene) {
                     return Err(CommandError::SceneNotFound(scene));
                 }
-                if let Some(c) = clip {
-                    if !p.clips.contains_key(&c) {
-                        return Err(CommandError::ClipNotFound(c));
-                    }
+                if let Some(c) = clip
+                    && !p.clips.contains_key(&c)
+                {
+                    return Err(CommandError::ClipNotFound(c));
                 }
                 let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
                 let old = match clip {

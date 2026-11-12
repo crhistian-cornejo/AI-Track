@@ -19,6 +19,8 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::Snap => snap_menu(ws, cx),
         MenuKind::PianoTools => tools_menu(cx),
         MenuKind::AddDevice(track) => device_menu(ws, *track, cx),
+        MenuKind::Presets(device) => preset_menu(ws, *device, cx)?,
+        MenuKind::LibraryContext => library_menu(ws, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
     })
 }
@@ -158,6 +160,83 @@ fn device_menu(ws: &mut Workspace, track: aitrack_model::TrackId, cx: &mut Conte
         )));
     }
     div().id("device-menu-scroll").max_h(px(520.)).overflow_y_scroll().child(card).into_any_element()
+}
+
+/// The device's factory presets by category; picking one sets every
+/// parameter (one undo step).
+fn preset_menu(ws: &mut Workspace, device: aitrack_model::DeviceId, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let d = ws.s.project.device(device)?;
+    let aitrack_model::DeviceKind::Stock { plugin_id } = &d.kind else { return None };
+    let current = d.preset.clone();
+    let presets = ws.b.plugins.presets(plugin_id);
+    let mut card = widgets::menu_card("preset-menu", 232.);
+    let mut last: Option<String> = None;
+    for (i, pr) in presets.into_iter().enumerate() {
+        if last.as_deref() != Some(pr.category.as_str()) {
+            card = card.child(menu_header(pr.category.to_uppercase()));
+            last = Some(pr.category.clone());
+        }
+        let on = current.as_deref() == Some(pr.name.as_str());
+        let path = pr.path.clone();
+        card = card.child(menu_item(("preset", i), None, pr.name.clone(), None, on).on_click(cx.listener(move |this, _, _, cx| {
+            this.menu = None;
+            match this.b.plugins.load_preset(&path) {
+                Ok((name, params)) => {
+                    if this.s.load_preset(device, &name, &params) {
+                        this.toast(format!("Loaded {name}"), cx);
+                    }
+                }
+                Err(e) => this.toast(e, cx),
+            }
+            cx.notify();
+        })));
+    }
+    Some(div().id("preset-menu-scroll").max_h(px(480.)).overflow_y_scroll().child(card).into_any_element())
+}
+
+fn library_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let scanning = ws.b.library.scan_status().running;
+    let can_undo = ws.b.library.can_undo_organize();
+    widgets::menu_card("library-menu", 232.)
+        .child(menu_header("LIBRARY"))
+        .child(menu_item("lib-add", Some(Icon::FolderOpen), "Add folder…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.pick_library_folder(cx);
+        })))
+        .child(if scanning {
+            menu_item("lib-cancel", Some(Icon::X), "Cancel scan", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                this.b.library.cancel_scan();
+                cx.notify();
+            }))
+        } else {
+            menu_item("lib-rescan", Some(Icon::Refresh), "Rescan my folders", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                this.b.library.rescan();
+                cx.notify();
+            }))
+        })
+        .child(widgets::divider_h())
+        .child(menu_item("lib-organize", Some(Icon::FolderTree), "Organize on disk…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.organize = crate::workspace::OrganizeUi { items: this.library_view().iter().map(|i| i.id).collect(), ..Default::default() };
+            this.open_modal(crate::views::prefs::Modal::Organize, cx);
+        })))
+        .when(can_undo, |d| {
+            d.child(menu_item("lib-undo-org", Some(Icon::Undo), "Undo last organize", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                let msg = match this.b.library.undo_organize() {
+                    Ok(m) | Err(m) => m,
+                };
+                this.toast(msg, cx);
+            })))
+        })
+        .child(widgets::divider_h())
+        .child(menu_item("lib-hub", Some(Icon::Globe), "Content Hub…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.open_modal(crate::views::prefs::Modal::ContentHub, cx);
+        })))
+        .into_any_element()
 }
 
 fn sig_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {

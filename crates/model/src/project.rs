@@ -531,6 +531,7 @@ pub struct Device {
     pub kind: DeviceKind,
     pub enabled: bool,
     /// Normalised (0..=1) parameter values by parameter id.
+    #[serde(deserialize_with = "param_map::deserialize")]
     pub params: BTreeMap<u32, f32>,
     /// Opaque plugin state (VST3/CLAP chunk or stock preset), base64 in JSON.
     #[serde(default, with = "opt_bytes")]
@@ -746,6 +747,31 @@ pub enum AutomationTarget {
     Tempo,
 }
 
+/// Parameter maps keyed by id. JSON object keys are strings; serde turns them
+/// back into `u32` when it reads the map directly, but not when the map is
+/// buffered inside an internally tagged enum (the devices of a rack chain go
+/// through `DeviceKind`), so accept both forms.
+mod param_map {
+    use serde::{Deserialize, Deserializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    #[derive(Deserialize, PartialEq, Eq, Hash)]
+    #[serde(untagged)]
+    enum Key {
+        Num(u32),
+        Text(String),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<u32, f32>, D::Error> {
+        HashMap::<Key, f32>::deserialize(d)?
+            .into_iter()
+            .map(|(k, v)| match k {
+                Key::Num(n) => Ok((n, v)),
+                Key::Text(s) => s.parse().map(|n| (n, v)).map_err(|_| serde::de::Error::custom(format!("bad parameter id {s:?}"))),
+            })
+            .collect()
+    }
+}
 /// `Option<Vec<u8>>` as base64 so project JSON stays readable.
 mod opt_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -811,6 +837,21 @@ mod opt_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rack_chain_device_params_round_trip() {
+        let mut p = Project::new("Test");
+        let mut inner = Device::stock(p.alloc_device_id(), "instrument.drum", "Kick");
+        inner.params.insert(3, 0.25);
+        let mut rack = Rack::new(RackKind::Drum);
+        let mut chain = Chain::new("Kick", Color(0));
+        chain.devices.push(inner);
+        rack.chains.push(chain);
+        let mut d = Device::stock(p.alloc_device_id(), "rack.drum", "Drum Rack");
+        d.kind = DeviceKind::Rack(rack);
+        let back: Device = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back, d);
+    }
 
     #[test]
     fn new_project_has_main_and_scenes() {

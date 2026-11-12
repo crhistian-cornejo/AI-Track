@@ -668,7 +668,7 @@ pub fn menu_item(id: impl Into<ElementId>, i: Option<Icon>, text: impl Into<Shar
         .when(checked, |d| d.child(icon(Icon::Check, 14., pal.accent)))
 }
 
-pub fn menu_header(text: &'static str) -> Div {
+pub fn menu_header(text: impl Into<SharedString>) -> Div {
     div().h(px(24.)).px(px(SP2)).flex().items_center().child(label(text, TEXT_XS, p().faint).font_weight(FontWeight::MEDIUM))
 }
 

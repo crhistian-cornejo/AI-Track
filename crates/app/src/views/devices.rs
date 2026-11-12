@@ -130,6 +130,8 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             .child(icon(ic, 14., pal.muted))
             .into_any_element();
     }
+    let has_presets = matches!(&d.kind, DeviceKind::Stock { plugin_id } if !ws.b.plugins.presets(plugin_id).is_empty());
+    let preset_name = d.preset.clone().unwrap_or_else(|| "Presets".into());
     let header = div()
         .flex_none()
         .h(px(TAB_BAR_H + SP1))
@@ -142,6 +144,27 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
         .child(power)
         .child(icon(ic, 14., pal.muted))
         .child(label(d.name.clone(), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD).flex_1())
+        .when(has_presets, |h| {
+            h.child(
+                div()
+                    .id(("presets", id.0 as usize))
+                    .h(px(20.))
+                    .px(px(SP2))
+                    .flex()
+                    .items_center()
+                    .gap(px(SP1))
+                    .rounded(px(r_sm()))
+                    .bg(content(0.06))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.12)))
+                    .child(label(crate::paint::fit(&preset_name, 96., TEXT_XS), TEXT_XS, pal.muted))
+                    .child(icon(Icon::ChevronDown, 10., pal.faint))
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                        let at = e.position();
+                        this.open_menu(MenuKind::Presets(id), point(at.x - px(8.), at.y + px(12.)), cx);
+                    })),
+            )
+        })
         .child(badge(kind_label, pal.muted))
         .child(fold)
         .child(
@@ -164,13 +187,17 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             .child(label(vendor.clone(), TEXT_SM, pal.muted))
             .child(label(crate::paint::fit(&path.display().to_string(), 208., TEXT_XS), TEXT_XS, pal.faint))
             .child(div().h(px(SP2)))
-            .child(widgets::text_button(("open-editor", id.0 as usize), "Open plugin editor", Some(Icon::Device), false).on_click(cx.listener(|this, _, _, cx| {
-                this.toast("Plugin windows arrive with aitrack-host", cx);
+            .child(widgets::text_button(("open-editor", id.0 as usize), "Open plugin editor", Some(Icon::Device), false).on_click(cx.listener(move |this, _, _, cx| {
+                if let Err(e) = this.b.engine.open_editor(id) {
+                    this.toast(e, cx);
+                }
             })))
             .into_any_element(),
         DeviceKind::Stock { plugin_id } => {
             let params = ws.b.plugins.device(plugin_id).map(|i| i.params.clone()).unwrap_or_default();
-            let cols = params.len().div_ceil(2).max(3);
+            // Big synths get a third row so their card stays scrollable, not endless.
+            let rows = if params.len() > 16 { 3 } else { 2 };
+            let cols = params.len().div_ceil(rows).max(3);
             let mut grid = div().w(px(cols as f32 * CELL_W + 2. * SP2)).p(px(SP2)).flex().flex_wrap().gap_y(px(SP3));
             for info in params {
                 let value = d.params.get(&info.id).copied().unwrap_or_else(|| info.default_normalized());

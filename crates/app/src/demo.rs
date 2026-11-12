@@ -29,10 +29,29 @@ impl Builder {
         id
     }
 
-    fn device(&mut self, track: TrackId, plugin: &str, name: &str, params: &[(u32, f32)]) -> DeviceId {
+    /// A stock device loaded with a factory preset (`Category/Name` inside
+    /// the plugin's bank), then `overrides` by parameter name (normalised).
+    fn stock(&mut self, plugin: &str, name: &str, preset: Option<&str>, overrides: &[(&str, f32)]) -> Device {
         let id = self.p.alloc_device_id();
         let mut d = Device::stock(id, plugin, name);
-        d.params = params.iter().copied().collect();
+        if let Some(preset) = preset {
+            let p = aitrack_stock::presets::load(format!("{plugin}/{preset}.json")).unwrap_or_else(|e| panic!("demo preset {plugin}/{preset}: {e}"));
+            d.params = p.params.iter().filter_map(|(k, v)| Some((k.parse().ok()?, *v))).collect();
+            d.preset = Some(p.name);
+        }
+        if !overrides.is_empty() {
+            let proc = aitrack_stock::create(plugin).unwrap_or_else(|| panic!("demo device {plugin}"));
+            for (pname, v) in overrides {
+                let info = proc.info().params.iter().find(|i| i.name == *pname).unwrap_or_else(|| panic!("{plugin} has no param {pname}"));
+                d.params.insert(info.id, *v);
+            }
+        }
+        d
+    }
+
+    fn device(&mut self, track: TrackId, plugin: &str, name: &str, preset: Option<&str>, overrides: &[(&str, f32)]) -> DeviceId {
+        let d = self.stock(plugin, name, preset, overrides);
+        let id = d.id;
         let index = self.p.track(track).map_or(0, |t| t.devices.len());
         self.run(Command::AddDevice { slot: command::DeviceSlot::Track { track, index }, device: Box::new(d) });
         id
@@ -90,16 +109,17 @@ impl Builder {
     }
 }
 
-/// GM drum map notes used by the demo drum rack.
+/// Notes of the demo drum rack, named after the stock drum sampler's
+/// built-in kit (note 36 = pad 1).
 pub const DRUM_PADS: [(&str, u8); 8] = [
     ("Kick", 36),
     ("Snare", 38),
     ("Clap", 39),
     ("Closed Hat", 42),
     ("Open Hat", 46),
-    ("Perc", 37),
+    ("Rim", 37),
     ("Tom", 45),
-    ("Ride", 51),
+    ("808", 51),
 ];
 
 pub fn project() -> Project {
@@ -152,11 +172,13 @@ pub fn project() -> Project {
     // ── Devices ──
     let rack_id = b.p.alloc_device_id();
     let mut rack = Rack::new(RackKind::Drum);
+    // One drum sampler per pad; each only receives its own note, which
+    // triggers the matching pad of the built-in kit (36 = pad 1 …).
     for (i, (name, note)) in DRUM_PADS.iter().enumerate() {
         let mut chain = Chain::new(*name, Color::palette(i));
         chain.note = Some(*note);
         chain.key_range = (*note, *note);
-        chain.devices.push(Device::stock(b.p.alloc_device_id(), "instrument.drum_sampler", format!("{name} Sampler")));
+        chain.devices.push(b.stock("instrument.drum", &format!("{name} Sampler"), Some("Kits/House Kit"), &[]));
         rack.chains.push(chain);
     }
     for (i, name) in ["Punch", "Decay", "Tone", "Room", "Swing", "Drive", "Width", "Volume"].iter().enumerate() {
@@ -166,25 +188,26 @@ pub fn project() -> Project {
     let mut rack_dev = Device::stock(rack_id, "rack.drum", "Drum Rack");
     rack_dev.kind = DeviceKind::Rack(rack);
     b.run(Command::AddDevice { slot: command::DeviceSlot::Track { track: drums, index: 0 }, device: Box::new(rack_dev) });
-    b.device(drums, "fx.compressor", "Glue Comp", &[(0, 0.68), (1, 0.32), (5, 0.18)]);
-    b.device(drums, "fx.saturator", "Saturator", &[(0, 0.2)]);
+    b.device(drums, "fx.compressor", "Glue Comp", Some("Bus/Drum Bus Glue"), &[]);
+    b.device(drums, "fx.saturator", "Saturator", Some("Warmth/Gentle Glue"), &[]);
 
-    b.device(bass, "instrument.bass", "Mono Bass", &[(3, 0.42), (4, 0.3), (6, 0.66)]);
-    b.device(bass, "fx.eq", "EQ Eight", &[(0, 0.6), (4, 0.42)]);
-    b.device(bass, "fx.compressor", "Compressor", &[(0, 0.6)]);
+    b.device(bass, "instrument.wavetable", "Bass Synth", Some("Bass/House Organ Bass"), &[]);
+    b.device(bass, "fx.eq", "EQ", Some("Bass/Bass Focus"), &[]);
+    b.device(bass, "fx.compressor", "Compressor", Some("Bass/Bass Control"), &[]);
 
-    b.device(lead, "instrument.wavetable", "Wavetable Synth", &[(2, 0.3), (3, 0.7), (4, 0.25)]);
-    b.device(lead, "fx.delay", "Echo Delay", &[(1, 0.45), (5, 0.3)]);
-    let pad_synth = b.device(pad, "instrument.wavetable", "Wavetable Synth", &[(0, 0.66), (3, 0.35), (7, 0.7), (10, 0.75)]);
-    b.device(pad, "fx.chorus", "Chorus", &[]);
-    b.device(pad, "fx.reverb", "Reverb", &[(5, 0.5)]);
-    b.device(vocals, "fx.eq", "EQ Eight", &[(1, 0.5), (2, 0.56)]);
-    b.device(vocals, "fx.compressor", "Compressor", &[(0, 0.55), (1, 0.4)]);
-    b.device(reverb, "fx.reverb", "Hall", &[(0, 0.7), (1, 0.62), (5, 1.0)]);
-    b.device(delay, "fx.delay", "Ping Pong", &[(0, 0.55), (5, 1.0)]);
+    b.device(lead, "instrument.wavetable", "Lead Synth", Some("Lead/Supersaw Lead"), &[]);
+    b.device(lead, "fx.delay", "Delay", Some("Synced/Dotted Eighth"), &[]);
+    let pad_synth = b.device(pad, "instrument.wavetable", "Pad Synth", Some("Pad/Warm Pad"), &[]);
+    b.device(pad, "fx.chorus", "Chorus", Some("Chorus/Wide Ensemble"), &[]);
+    b.device(pad, "fx.eq", "EQ", Some("Mixing/Pad Cleanup"), &[]);
+    b.device(vocals, "fx.eq", "EQ", Some("Vocals/Vocal Air"), &[]);
+    b.device(vocals, "fx.compressor", "Compressor", Some("Vocals/Vocal Leveler"), &[]);
+    // Returns run fully wet.
+    b.device(reverb, "fx.reverb", "Hall", Some("Halls/Big Hall"), &[("Mix", 1.0)]);
+    b.device(delay, "fx.delay", "Ping Pong", Some("Synced/Eighth Ping-Pong"), &[("Mix", 1.0)]);
     let main = b.p.main_track().id;
-    b.device(main, "fx.eq", "EQ Eight", &[]);
-    b.device(main, "fx.limiter", "Limiter", &[(1, 0.2)]);
+    b.device(main, "fx.eq", "EQ", Some("Mastering/Master Polish"), &[]);
+    b.device(main, "fx.limiter", "Limiter", Some("Mastering/Transparent"), &[]);
 
     // ── Clips ──
     let q = PPQ / 4; // a sixteenth
@@ -279,7 +302,8 @@ pub fn project() -> Project {
     b.place(vocals, vox, &[4, 16]);
 
     // ── Automation ──
-    b.automate(pad, AutomationTarget::DeviceParam { device: pad_synth, param: 3 }, &[(0, 0.2), (32, 0.55), (64, 0.85), (72, 0.3)]);
+    let cutoff = aitrack_stock::instrument::wavetable::p::CUTOFF;
+    b.automate(pad, AutomationTarget::DeviceParam { device: pad_synth, param: cutoff }, &[(0, 0.45), (32, 0.62), (64, 0.8), (72, 0.5)]);
     b.automate(lead, AutomationTarget::Volume, &[(32, 0.6), (48, 0.85), (60, 0.85), (64, 0.5)]);
     b.automate(drums, AutomationTarget::Pan, &[(32, 0.5), (64, 0.5)]);
 
@@ -306,5 +330,41 @@ mod tests {
         // Round-trips through JSON like a saved project.
         let back = Project::from_json(&p.to_json().unwrap()).unwrap();
         assert_eq!(back.tracks.len(), p.tracks.len());
+    }
+
+    #[test]
+    fn every_demo_device_is_a_real_stock_device() {
+        fn check(d: &Device) {
+            match &d.kind {
+                DeviceKind::Stock { plugin_id } => assert!(aitrack_stock::create(plugin_id).is_some(), "{plugin_id} is not a stock device"),
+                DeviceKind::Rack(r) => r.chains.iter().flat_map(|c| &c.devices).for_each(check),
+                DeviceKind::Plugin { .. } => panic!("the demo uses stock devices only"),
+            }
+        }
+        project().tracks.iter().flat_map(|t| &t.devices).for_each(check);
+    }
+
+    /// The drop section (drums, bass, lead and the pad entering) through
+    /// the real stock devices: audible and below 0 dBFS.
+    #[test]
+    fn demo_renders_music_below_full_scale() {
+        let p = project();
+        let audio = aitrack_engine::render_offline(&p, &crate::real::plugins::StockFactory, (12 * BAR, 20 * BAR), 48_000., 512).expect("render");
+        let mut peak = 0f32;
+        let mut sum = 0f64;
+        let mut n = 0usize;
+        for ch in 0..audio.channels() {
+            for &s in audio.channel(ch) {
+                assert!(s.is_finite());
+                peak = peak.max(s.abs());
+                sum += (s as f64) * (s as f64);
+                n += 1;
+            }
+        }
+        let rms = (sum / n.max(1) as f64).sqrt();
+        eprintln!("demo render: peak {:.2} dBFS, rms {:.1} dBFS", 20. * peak.log10(), 20. * rms.log10());
+        assert!(n > 48_000 * 2 * 10, "render too short: {n} samples");
+        assert!(rms > 0.01, "demo is (nearly) silent: rms {rms}");
+        assert!(peak < 1.0, "demo clips: peak {peak}");
     }
 }

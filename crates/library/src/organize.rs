@@ -380,8 +380,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn setup() -> (tempfile::TempDir, Library, PathBuf) {
+        // Roots are stored canonical (macOS: /var is /private/var), so build the paths from there.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("in");
+        let root = dir.path().canonicalize().unwrap().join("in");
         for (rel, dur) in [
             ("PackA/Kick 1.wav", 0.3),
             ("PackB/Kick 1.wav", 0.4), // same name, different content
@@ -434,7 +435,7 @@ mod tests {
     #[test]
     fn move_updates_index_and_undo_restores() {
         let (dir, lib, root) = setup();
-        let dest = dir.path().join("ByCat");
+        let dest = dir.path().canonicalize().unwrap().join("ByCat");
         let plan = lib.plan_organize(&[], &dest, OrganizeLayout::ByCategory, OrganizeMode::Move).unwrap();
         let j = plan.execute(&lib).unwrap();
         assert!(!root.join("PackA/Pad C#maj.wav").exists());

@@ -116,26 +116,6 @@ pub fn sized_icon_button(id: impl Into<ElementId>, i: Icon, active: bool, side: 
         .child(icon(i, glyph, if active { pal.accent } else { pal.muted }))
 }
 
-/// A transport button: filled with `on_color` while on.
-pub fn transport_button(id: impl Into<ElementId>, i: Icon, on: bool, on_color: Hsla) -> Stateful<Div> {
-    let pal = p();
-    div()
-        .id(id)
-        .flex_none()
-        .size(px(32.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(r_lg()))
-        .cursor_pointer()
-        .bg(if on { with_alpha(on_color, 0.18) } else { pal.raised })
-        .border_1()
-        .border_color(if on { with_alpha(on_color, 0.55) } else { border() })
-        .hover(|s| s.border_color(border_strong()))
-        .active(|s| s.bg(pressed()))
-        .child(icon(i, 16., if on { on_color } else { pal.text }))
-}
-
 /// A labelled button with an optional leading icon.
 pub fn text_button(id: impl Into<ElementId>, text: impl Into<SharedString>, i: Option<Icon>, primary: bool) -> Stateful<Div> {
     let pal = p();

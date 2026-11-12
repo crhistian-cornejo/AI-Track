@@ -21,6 +21,7 @@ pub mod geom;
 
 use crate::actions::{ArrangeFit, ArrangeZoomIn, ArrangeZoomOut, DeleteSelection, Escape, SelectAll, SplitClip, ToggleDrawTool};
 use crate::bridge::SlotState;
+use crate::gesture::{self, Wheel};
 use crate::grid::{self, GridSpec};
 use crate::icons::Icon;
 use crate::state::BottomTab;
@@ -34,7 +35,7 @@ use edit::{Gesture, Placed, Snapshot};
 use geom::{Axis, Hit, Layout, RULER, TimeBase};
 use gpui::{
     AnyElement, Bounds, Context, CursorStyle, DispatchPhase, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, ScrollDelta, ScrollWheelEvent, Stateful,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Pixels, Point, ScrollWheelEvent, Stateful,
     StatefulInteractiveElement, Styled, Window, canvas, div, prelude::FluentBuilder, px,
 };
 use std::cell::Cell;
@@ -575,22 +576,36 @@ pub fn capture(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement
     )
 }
 
+/// Two-finger pan with the trackpad's pixel deltas (either axis moves
+/// time: the editor has no vertical scroll), Cmd/Ctrl + wheel zooms around
+/// the pointer.
 fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Workspace>) {
     let Some(f) = Frame::of(ws) else { return };
-    let d = match e.delta {
-        ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
-        ScrollDelta::Lines(l) => (l.x * 40., l.y * 40.),
-    };
     let (x, _) = local(ws, e.position);
-    let axis = if e.modifiers.secondary() || e.modifiers.control {
-        // Around the pointer; a notch is about a third closer.
-        let (min, max) = f.zoom_limits(ws.sample.max_zoom);
-        f.layout.axis.zoomed(x, 2f64.powf(f64::from(d.1) / 100.), min, max)
-    } else {
-        f.layout.axis.scrolled(-(if d.0.abs() > d.1.abs() { d.0 } else { d.1 }))
+    let axis = match gesture::wheel(e) {
+        Wheel::Zoom { factor } => {
+            let (min, max) = f.zoom_limits(ws.sample.max_zoom);
+            f.layout.axis.zoomed(x, f64::from(factor), min, max)
+        }
+        Wheel::Pan { dx, dy } => f.layout.axis.scrolled(-pan_amount(dx, dy)),
     };
     ws.sample.axis = Some(axis.clamped(f.layout.w, f.end));
     cx.stop_propagation();
+    cx.notify();
+}
+
+/// The horizontal move of a pan: sideways swipes as they are, vertical ones
+/// (a mouse wheel) when they dominate.
+fn pan_amount(dx: f32, dy: f32) -> f32 {
+    if dx.abs() >= dy.abs() { dx } else { dy }
+}
+
+/// Pinch zooms around the pinch.
+fn on_pinch(ws: &mut Workspace, e: &PinchEvent, _: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(f) = Frame::of(ws) else { return };
+    let (x, _) = local(ws, e.position);
+    let (min, max) = f.zoom_limits(ws.sample.max_zoom);
+    ws.sample.axis = Some(f.layout.axis.zoomed(x, f64::from(gesture::pinch_factor(e)), min, max).clamped(f.layout.w, f.end));
     cx.notify();
 }
 
@@ -927,7 +942,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                         cx.notify();
                     }
                 }))
-                .on_scroll_wheel(cx.listener(on_wheel)),
+                .on_scroll_wheel(cx.listener(on_wheel))
+                .on_pinch(cx.listener(on_pinch)),
         )
         .into_any_element()
 }
@@ -950,6 +966,13 @@ mod tests {
         assert_eq!(cursor_for(Some(Hit::Point(2)), true, false), CursorStyle::ClosedHand);
         assert_eq!(cursor_for(Some(Hit::Body), false, false), CursorStyle::IBeam);
         assert_eq!(cursor_for(None, false, true), CursorStyle::Crosshair);
+    }
+
+    #[test]
+    fn pans_follow_the_dominant_axis() {
+        assert_eq!(pan_amount(12., 3.), 12.);
+        assert_eq!(pan_amount(-1., 40.), 40.);
+        assert_eq!(pan_amount(0., 0.), 0.);
     }
 
     #[test]

@@ -12,7 +12,68 @@ use crate::error::{LibraryError, Result};
 use crate::parse::KeyHint;
 use crate::taxonomy::{Category, SampleKind};
 
-pub const SCHEMA_VERSION: i32 = 1;
+/// 2: absolute roots are stored with symlinks resolved (see [`stored_root_path`]).
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// The form a root is stored in. An absolute path that exists is stored with
+/// its symlinks resolved, because the OS reports canonical paths to the
+/// watcher (on macOS `/var` is `/private/var`), and a root stored through a
+/// link would never match them. Relative paths (the portable factory library)
+/// and paths that do not exist yet are kept as given.
+pub(crate) fn stored_root_path(path: &Path) -> String {
+    let real = path
+        .is_absolute()
+        .then(|| path.canonicalize().ok())
+        .flatten()
+        .map(strip_verbatim)
+        .unwrap_or_else(|| path.to_path_buf());
+    real.to_string_lossy().replace('\\', "/")
+}
+
+/// `path` in the form roots are stored in, for comparing against them. Unlike
+/// [`stored_root_path`] this also copes with paths that no longer exist (a
+/// deleted sample): the deepest ancestor that exists is canonicalized and the
+/// missing tail is appended unchanged.
+pub(crate) fn normalize_for_roots(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            let mut out = strip_verbatim(real);
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// `canonicalize` returns `\\?\C:\…` on Windows; the verbatim prefix is not
+/// how roots are written, so it is dropped.
+#[cfg(windows)]
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    p
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -298,6 +359,16 @@ impl Library {
         Ok(lib)
     }
 
+    /// Opens an existing database without writing to it (no schema setup):
+    /// the factory sound bank as a re-analysis source.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        Ok(Self { conn, db_path: Some(std::path::absolute(path)?) })
+    }
+
     fn init(&self) -> Result<()> {
         self.conn.busy_timeout(std::time::Duration::from_secs(10))?;
         if self.db_path.is_some() {
@@ -307,6 +378,9 @@ impl Library {
         self.conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.conn.execute_batch(SCHEMA)?;
         let v: i32 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if v < 2 {
+            self.canonicalize_stored_roots()?;
+        }
         if v < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -340,7 +414,7 @@ impl Library {
     /// Adds a folder to index. A relative path is stored relative to the
     /// database folder (used by the portable factory library).
     pub fn add_root(&self, path: impl AsRef<Path>, kind: RootKind) -> Result<RootId> {
-        let stored = path.as_ref().to_string_lossy().replace('\\', "/");
+        let stored = stored_root_path(path.as_ref());
         self.conn.execute(
             "INSERT INTO roots(path, kind, added_at) VALUES(?1, ?2, ?3)
              ON CONFLICT(path) DO UPDATE SET kind = excluded.kind",
@@ -350,6 +424,30 @@ impl Library {
             .conn
             .query_row("SELECT id FROM roots WHERE path = ?1", [&stored], |r| r.get(0))?;
         Ok(RootId(id))
+    }
+
+    /// Schema 2 migration: roots stored through a symlink (or any non-canonical
+    /// absolute path) are rewritten to their real path. A root whose real path
+    /// is already a root is left as it is.
+    fn canonicalize_stored_roots(&self) -> Result<()> {
+        for r in self.roots()? {
+            if !Path::new(&r.stored_path).is_absolute() {
+                continue;
+            }
+            let real = stored_root_path(Path::new(&r.stored_path));
+            if real == r.stored_path {
+                continue;
+            }
+            let taken: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM roots WHERE path = ?1)",
+                [&real],
+                |row| row.get(0),
+            )?;
+            if !taken {
+                self.conn.execute("UPDATE roots SET path = ?1 WHERE id = ?2", params![real, r.id.0])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn remove_root(&self, id: RootId) -> Result<()> {
@@ -397,6 +495,7 @@ impl Library {
 
     /// The root containing `path`, if any (longest match wins).
     pub fn root_for_path(&self, path: &Path) -> Result<Option<Root>> {
+        let path = normalize_for_roots(path);
         Ok(self
             .roots()?
             .into_iter()
@@ -514,7 +613,8 @@ impl Library {
     /// Looks a sample up by absolute path.
     pub fn find_by_path(&self, path: &Path) -> Result<Option<Sample>> {
         let Some(root) = self.root_for_path(path)? else { return Ok(None) };
-        let rel = rel_string(path.strip_prefix(&root.path).unwrap_or(path));
+        let path = normalize_for_roots(path);
+        let rel = rel_string(path.strip_prefix(&root.path).unwrap_or(&path));
         let sql = format!(
             "SELECT {SAMPLE_COLS} FROM samples s JOIN roots r ON r.id = s.root_id
              WHERE s.root_id = ?1 AND s.rel_path = ?2"
@@ -889,3 +989,59 @@ fn row_to_pack(r: &Row<'_>) -> rusqlite::Result<PackInfo> {
     })
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// `(real, link)` inside a canonical temp dir: `link` points at `real`.
+    fn real_and_link(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        symlink(&real, &link).unwrap();
+        (real, link)
+    }
+
+    #[test]
+    fn add_root_stores_the_real_path_behind_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = real_and_link(&dir);
+        let lib = Library::open_in_memory().unwrap();
+        let id = lib.add_root(&link, RootKind::User).unwrap();
+        assert_eq!(lib.root(id).unwrap().path, real);
+    }
+
+    #[test]
+    fn missing_and_relative_roots_are_stored_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet");
+        assert_eq!(stored_root_path(&missing), missing.to_string_lossy().replace('\\', "/"));
+        assert_eq!(stored_root_path(Path::new("factory/samples")), "factory/samples");
+    }
+
+    #[test]
+    fn schema_2_rewrites_roots_stored_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = real_and_link(&dir);
+        let db = dir.path().join("lib.db");
+        {
+            // A library as schema 1 left it: the root was stored through the link.
+            let lib = Library::open(&db).unwrap();
+            lib.connection()
+                .execute(
+                    "INSERT INTO roots(path, kind, added_at) VALUES(?1, 'user', 0)",
+                    [link.to_string_lossy().replace('\\', "/")],
+                )
+                .unwrap();
+            lib.connection().pragma_update(None, "user_version", 1).unwrap();
+        }
+        let lib = Library::open(&db).unwrap();
+        let roots = lib.roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, real);
+        let v: i32 = lib.connection().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+}

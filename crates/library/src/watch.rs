@@ -130,10 +130,13 @@ mod tests {
 
     #[test]
     fn picks_up_new_and_removed_files() {
+        // macOS: the temp dir lives under /var, a symlink to /private/var. The
+        // watcher reports canonical paths, so the stored root must be canonical too.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("watched");
+        let dir_path = dir.path().canonicalize().unwrap();
+        let root = dir_path.join("watched");
         std::fs::create_dir_all(&root).unwrap();
-        let db = dir.path().join("lib.db");
+        let db = dir_path.join("lib.db");
         Library::open(&db).unwrap().add_root(&root, RootKind::User).unwrap();
         let w = LibraryWatcher::start(db.clone(), Arc::new(BasicAnalyzer), Duration::from_millis(200)).unwrap();
         std::thread::sleep(Duration::from_millis(200));

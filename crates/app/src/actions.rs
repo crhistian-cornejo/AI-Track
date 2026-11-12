@@ -13,7 +13,6 @@ actions!(
         ToggleDrawTool,
         ToggleLoop,
         ToggleAssistant,
-        ToggleBrowser,
         SelectAll,
         TabDevices,
         TabPianoRoll,
@@ -55,6 +54,8 @@ actions!(
         ToggleDetail,
         ToggleDetailView,
         ShowMixer,
+        TogglePalette,
+        ToggleGroupFold,
         Quit,
     ]
 );
@@ -75,7 +76,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("b", ToggleDrawTool, Some(CTX)),
         KeyBinding::new(&format!("{m}-l"), ToggleLoop, Some("Workspace")),
         KeyBinding::new(&format!("{m}-i"), ToggleAssistant, Some("Workspace")),
-        KeyBinding::new(&format!("{m}-alt-b"), ToggleBrowser, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-k"), TogglePalette, Some("Workspace")),
         KeyBinding::new(&format!("{m}-a"), SelectAll, Some(CTX)),
         KeyBinding::new("1", TabDevices, Some(CTX)),
         KeyBinding::new("2", TabPianoRoll, Some(CTX)),

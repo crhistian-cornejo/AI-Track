@@ -1,7 +1,9 @@
 //! Mixer (Logic-style channel strips): input, inserts, sends, output, pan,
 //! fader with meter, mute/solo/arm and the name plate, for tracks, groups,
-//! returns and VCAs, with Main on the right. Every section has a fixed
-//! height so the strips line up row by row.
+//! returns and VCAs, with Main pinned on the right while the tracks scroll
+//! sideways. Every row has a fixed height so the strips line up; when the
+//! mixer is short whole rows go (see [`rows`]) and the fader and meter take
+//! what is left.
 
 use crate::icons::{Icon, icon};
 use crate::state::{db_to_fader, format_db};
@@ -34,7 +36,62 @@ fn slot(text: impl Into<gpui::SharedString>, active: bool, i: Option<Icon>) -> D
         .child(label(text, TEXT_XS, if active { pal.text } else { pal.faint }))
 }
 
-pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
+/// Which rows a strip shows and how tall its fader is, for a mixer of
+/// height `h` with `returns` return tracks. Rows go in order of how much
+/// they matter as the mixer gets shorter: inserts first, then the input,
+/// the sends, the output and finally pan, so the fader and the meter keep
+/// the room (as in Live's mixer, which hides sections when it is short).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rows {
+    pub input: bool,
+    pub inserts: usize,
+    pub sends: bool,
+    pub output: bool,
+    pub pan: bool,
+    pub fader_h: f32,
+}
+
+/// Space a strip's fixed parts need: row and strip padding, border, the
+/// name plate, mute/solo/arm and the dB readout, with the gaps between them.
+const FIXED_H: f32 = 2. * SP2 + 2. * SP1 + 2. + NAME_H + SLOT_H + DB_H + 3. * SP1;
+const NAME_H: f32 = 32.;
+const DB_H: f32 = 16.;
+const PAN_H: f32 = 44.;
+/// The fader never gets shorter than this.
+pub const FADER_MIN: f32 = 40.;
+const FADER_MAX: f32 = 360.;
+
+pub fn rows(h: f32, returns: usize) -> Rows {
+    let mut left = h - FIXED_H;
+    let mut r = Rows { input: false, inserts: 0, sends: false, output: false, pan: false, fader_h: 0. };
+    // (row height, fader room the row must leave) in the order rows come back.
+    let sends_h = returns as f32 * (SLOT_H + 2.) - 2.;
+    let mut fits = |need: f32, keep: f32| {
+        if need <= 0. {
+            return true;
+        }
+        if left - (need + SP1) >= keep {
+            left -= need + SP1;
+            true
+        } else {
+            false
+        }
+    };
+    r.pan = fits(PAN_H, 56.);
+    r.output = r.pan && fits(SLOT_H, 72.);
+    r.sends = r.output && returns > 0 && fits(sends_h, 80.);
+    let sends_ok = r.output && (returns == 0 || r.sends);
+    r.input = sends_ok && fits(SLOT_H, 96.);
+    if r.input {
+        while r.inserts < INSERTS && fits(SLOT_H + if r.inserts == 0 { 0. } else { 2. }, 112.) {
+            r.inserts += 1;
+        }
+    }
+    r.fader_h = left.clamp(FADER_MIN, FADER_MAX);
+    r
+}
+
+pub fn render(ws: &mut Workspace, _window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let order = |k: TrackKind| match k {
         TrackKind::Instrument | TrackKind::Audio | TrackKind::Group | TrackKind::Folder => 0,
         TrackKind::Return => 1,
@@ -44,21 +101,45 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let mut tracks: Vec<(usize, TrackId)> = ws.s.project.tracks.iter().enumerate().map(|(i, t)| (order(t.kind) * 1000 + i, t.id)).collect();
     tracks.sort();
     let returns: Vec<(TrackId, String)> = ws.s.project.tracks.iter().filter(|t| t.kind == TrackKind::Return).map(|t| (t.id, t.name.clone())).collect();
-    let fader_h = (ws.bottom_h - TAB_BAR_H - 316.).clamp(64., 360.);
-    let mut row = div().h_full().flex().gap(px(SP1)).p(px(SP2));
-    let mut last_group = 0;
+    // The section gives way to the arrangement on short windows.
+    let h = ws.mixer_h_fitted() - 2.;
+    let layout = rows(h, returns.len());
+    // Tracks scroll sideways; returns, VCAs and Main stay pinned on the right.
+    let mut scrolling = div().h_full().flex().gap(px(SP1)).p(px(SP2));
+    let mut pinned = div().flex_none().h_full().flex().gap(px(SP1)).p(px(SP2)).border_l_1().border_color(border());
+    let mut last_group = 1;
     for (k, id) in tracks {
         let group = k / 1000;
+        if group == 0 {
+            scrolling = scrolling.child(strip(ws, id, &returns, layout, cx));
+            continue;
+        }
         if group != last_group {
-            row = row.child(div().w(px(SP1)).h_full().flex().justify_center().child(div().w(px(1.)).h_full().bg(border())));
+            pinned = pinned.child(div().w(px(SP1)).h_full().flex().justify_center().child(div().w(px(1.)).h_full().bg(border())));
             last_group = group;
         }
-        row = row.child(strip(ws, id, &returns, fader_h, cx));
+        pinned = pinned.child(strip(ws, id, &returns, layout, cx));
     }
-    div().id("mixer-scroll").size_full().overflow_x_scroll().overflow_y_scroll().child(row).into_any_element()
+    div()
+        .size_full()
+        .flex()
+        .child(
+            div()
+                .id("mixer-scroll")
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                // Only the x axis scrolls, so a mouse wheel scrolls sideways too
+                // and a trackpad pans with its own pixel deltas.
+                .overflow_x_scroll()
+                .child(scrolling),
+        )
+        .child(pinned)
+        .into_any_element()
 }
 
-fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h: f32, cx: &mut Context<Workspace>) -> AnyElement {
+fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: Rows, cx: &mut Context<Workspace>) -> AnyElement {
+    let fader_h = rows.fader_h;
     let pal = p();
     let Some(t) = ws.s.project.track(id).cloned() else { return div().into_any_element() };
     let selected = ws.s.selected_track == Some(id);
@@ -79,7 +160,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
     };
     let mut inserts = div().flex().flex_col().gap(px(2.));
     let fx: Vec<&Device> = t.devices.iter().filter(|d| !d.is_instrument()).collect();
-    for i in 0..INSERTS {
+    for i in 0..rows.inserts {
         inserts = inserts.child(match fx.get(i) {
             Some(d) => slot(crate::paint::fit(&d.name, STRIP_W - 24., TEXT_XS), d.enabled, None),
             None if !is_vca => slot("", false, None),
@@ -156,25 +237,25 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
             this.s.selected_track = Some(id);
             cx.notify();
         }))
-        .child(slot(crate::paint::fit(&input, STRIP_W - 28., TEXT_XS), !is_vca, Some(Icon::Plug)))
-        .child(inserts)
-        .child(sends)
-        .child(slot(crate::paint::fit(&output, STRIP_W - 28., TEXT_XS), true, Some(Icon::Send)))
-        .child(
+        .when(rows.input, |d| d.child(slot(crate::paint::fit(&input, STRIP_W - 28., TEXT_XS), !is_vca, Some(Icon::Plug))))
+        .when(rows.inserts > 0, |d| d.child(inserts))
+        .when(rows.sends, |d| d.child(sends))
+        .when(rows.output, |d| d.child(slot(crate::paint::fit(&output, STRIP_W - 28., TEXT_XS), true, Some(Icon::Send))))
+        .when(rows.pan, |d| d.child(
             div()
-                .h(px(44.))
+                .h(px(PAN_H))
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap(px(SP2))
                 .when(!is_vca, |d| d.child(knob_control(("pan", id.0 as usize), (pan + 1.) / 2., true, true, KnobTarget::Pan { track: id }, cx)))
                 .child(mono(if is_vca { "—".into() } else { pan_text }, TEXT_XS, pal.muted).w(px(24.))),
-        )
-        .child(mono(format_db(t.volume_db), TEXT_SM, pal.text).flex().justify_center())
+        ))
+        .child(mono(format_db(t.volume_db), TEXT_SM, pal.text).h(px(DB_H)).flex().justify_center())
         .child(
             div()
                 .flex_1()
-                .min_h(px(fader_h))
+                .min_h(px(0.))
                 .flex()
                 .justify_center()
                 .gap(px(SP1))
@@ -206,7 +287,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], fader_h
         )
         .child(
             div()
-                .h(px(32.))
+                .h(px(NAME_H))
                 .px(px(SP1 + 2.))
                 .flex()
                 .flex_col()
@@ -230,5 +311,62 @@ fn kind_name(k: TrackKind) -> &'static str {
         TrackKind::Return => "Return",
         TrackKind::Vca => "VCA",
         TrackKind::Main => "Master",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tall_mixer_shows_every_row() {
+        let r = rows(520., 2);
+        assert!(r.input && r.sends && r.output && r.pan);
+        assert_eq!(r.inserts, INSERTS);
+        assert!(r.fader_h >= 112.);
+    }
+
+    #[test]
+    fn rows_go_in_order_as_the_mixer_shrinks() {
+        let mut last = rows(600., 2);
+        for h in (120..600).rev().step_by(4) {
+            let r = rows(h as f32, 2);
+            // Nothing comes back while shrinking, and pan is the last to go.
+            assert!(r.inserts <= last.inserts);
+            assert!(!r.input || last.input);
+            assert!(!r.sends || last.sends);
+            assert!(!r.output || last.output);
+            assert!(!r.pan || last.pan);
+            assert!(!r.sends || r.output);
+            assert!(r.inserts == 0 || r.input);
+            last = r;
+        }
+        let small = rows(160., 2);
+        assert!(!small.sends && small.inserts == 0);
+        assert!(small.fader_h >= FADER_MIN);
+    }
+
+    #[test]
+    fn the_strip_fits_its_height() {
+        for h in [200., 264., 320., 400., 520.] {
+            let r = rows(h, 3);
+            let mut used = FIXED_H + r.fader_h + SP1;
+            if r.pan {
+                used += PAN_H + SP1;
+            }
+            if r.output {
+                used += SLOT_H + SP1;
+            }
+            if r.input {
+                used += SLOT_H + SP1;
+            }
+            if r.sends {
+                used += 3. * (SLOT_H + 2.) - 2. + SP1;
+            }
+            if r.inserts > 0 {
+                used += r.inserts as f32 * (SLOT_H + 2.) - 2. + SP1;
+            }
+            assert!(used <= h + SP1 + 0.5 || r.fader_h == FADER_MIN, "{h}: {used}");
+        }
     }
 }

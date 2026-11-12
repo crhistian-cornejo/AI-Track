@@ -13,10 +13,10 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aitrack_library::hub::{ArchiveFormat, BundledPack, GithubSource, Manifest};
-use aitrack_library::{BasicAnalyzer, Library, PackInfo, RootKind, ScanOptions};
+use aitrack_library::{AiDetector, BasicAnalyzer, Library, PackInfo, ReanalyseOptions, ReanalyseStats, RootKind, ScanOptions};
 use anyhow::{Context, Result, anyhow, bail};
 use sha1::Digest as _;
 
@@ -31,6 +31,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut write_manifest = false;
     let mut index = true;
     let mut with_optional = false;
+    let mut analyse = Analyse { enabled: true, threads: 0 };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,6 +42,8 @@ pub fn run(args: &[String]) -> Result<()> {
             "--write-manifest" => write_manifest = true,
             "--no-index" => index = false,
             "--with-optional" => with_optional = true,
+            "--no-analyse" => analyse.enabled = false,
+            "--threads" => analyse.threads = it.next().ok_or_else(|| anyhow!("--threads needs a number"))?.parse()?,
             other => bail!("unknown option {other}"),
         }
     }
@@ -50,12 +53,12 @@ pub fn run(args: &[String]) -> Result<()> {
         "fetch" => {
             fetch(&paths, &manifest, &only, max_mb, write_manifest, with_optional)?;
             if index {
-                build_index(&paths, &Manifest::parse(&fs::read_to_string(&paths.manifest)?)?)?;
+                build_index(&paths, &Manifest::parse(&fs::read_to_string(&paths.manifest)?)?, analyse)?;
             }
             write_attribution(&paths, &manifest)
         }
         "verify" => verify(&paths, &manifest),
-        "index" => build_index(&paths, &manifest),
+        "index" => build_index(&paths, &manifest, analyse),
         "attribution" => write_attribution(&paths, &manifest),
         other => bail!("unknown soundbank command {other}"),
     }
@@ -67,6 +70,8 @@ struct Paths {
     packs: PathBuf,
     cache: PathBuf,
     db: PathBuf,
+    /// Key/BPM detections by file hash; survives `factory.db` rebuilds.
+    analysis_cache: PathBuf,
 }
 
 impl Paths {
@@ -81,6 +86,7 @@ impl Paths {
             packs: bank.join("packs"),
             cache: bank.join(".cache"),
             db: bank.join("factory.db"),
+            analysis_cache: bank.join(".cache").join("analysis.db"),
             bank,
         })
     }
@@ -762,7 +768,15 @@ fn verify(paths: &Paths, m: &Manifest) -> Result<()> {
 // index
 // ---------------------------------------------------------------------------
 
-fn build_index(paths: &Paths, m: &Manifest) -> Result<()> {
+/// Key/BPM analysis after the filename pass.
+#[derive(Clone, Copy, Debug)]
+struct Analyse {
+    enabled: bool,
+    /// 0 = one per core.
+    threads: usize,
+}
+
+fn build_index(paths: &Paths, m: &Manifest, analyse: Analyse) -> Result<()> {
     for ext in ["", "-wal", "-shm"] {
         let f = PathBuf::from(format!("{}{ext}", paths.db.display()));
         if f.exists() {
@@ -794,8 +808,53 @@ fn build_index(paths: &Paths, m: &Manifest) -> Result<()> {
         "factory.db: {} samples ({} errors), {} presets in {:.1} s",
         stats.added, stats.errors, stats.presets, start.elapsed().as_secs_f64()
     );
+    if analyse.enabled {
+        analyse_missing(&lib, &paths.analysis_cache, analyse.threads)?;
+    }
     lib.connection().execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
     print_stats(&lib)
+}
+
+/// Fills the key/BPM the file names did not give with `aitrack-ai`, on all
+/// cores, writing into `lib`. Detections are cached in `cache_db` by file
+/// hash, so re-indexing only decodes new or changed files.
+fn analyse_missing(lib: &Library, cache_db: &Path, threads: usize) -> Result<ReanalyseStats> {
+    let cache = Library::open(cache_db).with_context(|| format!("opening {}", cache_db.display()))?;
+    let start = Instant::now();
+    let mut last = Instant::now() - Duration::from_secs(1);
+    let stats = lib.reanalyse(
+        &cache,
+        &AiDetector,
+        &ReanalyseOptions { threads, write_samples: true, limit: None },
+        &mut |p| {
+            if p.current.is_some() && last.elapsed() < Duration::from_millis(250) {
+                return;
+            }
+            last = Instant::now();
+            let secs = start.elapsed().as_secs_f64().max(1e-3);
+            let rate = p.analysed as f64 / secs;
+            let left = p.total - p.done;
+            let eta = if rate > 0.0 { format!("{:.0} s left", left as f64 / rate) } else { String::from("…") };
+            eprint!(
+                "\r  analysing key/BPM {}/{} ({} cached, {:.1} files/s, {eta})   ",
+                p.done, p.total, p.cached, rate
+            );
+        },
+        &AtomicBool::new(false),
+    )?;
+    eprintln!();
+    println!(
+        "key/BPM: {} candidates, {} decoded, {} from cache, {} errors; wrote {} keys and {} tempos in {:.1} s",
+        stats.candidates,
+        stats.analysed,
+        stats.cached,
+        stats.errors,
+        stats.keys_written,
+        stats.bpms_written,
+        start.elapsed().as_secs_f64()
+    );
+    cache.connection().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(stats)
 }
 
 fn print_stats(lib: &Library) -> Result<()> {
@@ -859,6 +918,65 @@ mod tests {
         assert!(t.contains("id = \"a\"\nsha256 = \"abc\"\nsample_count = 12\nname"));
         assert!(t.contains("id = \"b\"\nsha256 = \"\"\n"));
         assert!(set_pack_field(text, "zzz", "sha256", "1").is_err());
+    }
+
+    /// Writes a mono 16-bit WAV from a sample function.
+    fn write_wav(path: &Path, rate: u32, secs: f64, f: impl Fn(f64) -> f32) {
+        let spec = aitrack_wav_spec(rate);
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..(secs * rate as f64) as u64 {
+            w.write_sample((f(i as f64 / rate as f64) * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn aitrack_wav_spec(rate: u32) -> hound::WavSpec {
+        hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int }
+    }
+
+    #[test]
+    fn index_analyses_missing_key_and_tempo_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let packs = dir.join("packs").join("Test");
+        fs::create_dir_all(&packs).unwrap();
+        // An A minor triad pad and a 120 BPM click loop, neither named with a key or tempo.
+        write_wav(&packs.join("Warm Pad.wav"), 22_050, 4.0, |t| {
+            [220.0, 261.63, 329.63].iter().map(|f| (t * f * std::f64::consts::TAU).sin() as f32 * 0.25).sum()
+        });
+        write_wav(&packs.join("Click Loop.wav"), 22_050, 8.0, |t| {
+            let ph = t % 0.5;
+            if ph < 0.01 { ((ph * 2000.0 * std::f64::consts::TAU).sin() * (1.0 - ph / 0.01) * 0.8) as f32 } else { 0.0 }
+        });
+        let lib = Library::open(dir.join("factory.db")).unwrap();
+        lib.add_root("packs", RootKind::Factory).unwrap();
+        lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let cache = dir.join(".cache").join("analysis.db");
+
+        let first = analyse_missing(&lib, &cache, 2).unwrap();
+        assert_eq!(first.candidates, 2, "{first:?}");
+        assert_eq!((first.analysed, first.cached, first.errors), (2, 0, 0));
+        let groove = lib.find_by_path(&packs.join("Click Loop.wav")).unwrap().unwrap();
+        let bpm = groove.bpm.expect("tempo from audio");
+        assert!((bpm - 120.0).abs() < 1.0, "{bpm}");
+        let src: String = lib
+            .connection()
+            .query_row("SELECT bpm_source FROM samples WHERE id=?1", [groove.id.0], |r| r.get(0))
+            .unwrap();
+        assert_eq!(src, "audio");
+
+        // A rebuilt factory.db starts empty but the cache answers.
+        drop(lib);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{ext}", dir.join("factory.db").display()));
+        }
+        let lib = Library::open(dir.join("factory.db")).unwrap();
+        lib.add_root("packs", RootKind::Factory).unwrap();
+        lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let second = analyse_missing(&lib, &cache, 2).unwrap();
+        assert_eq!(second.analysed, 0, "{second:?}");
+        assert_eq!(second.cached, second.candidates);
+        assert_eq!(lib.find_by_path(&packs.join("Click Loop.wav")).unwrap().unwrap().bpm, Some(bpm));
     }
 
     #[test]

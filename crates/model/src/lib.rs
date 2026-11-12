@@ -10,6 +10,7 @@
 //! headlessly.
 
 pub mod command;
+pub mod groups;
 pub mod history;
 pub mod ids;
 pub mod ops;

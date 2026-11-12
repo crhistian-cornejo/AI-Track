@@ -3,6 +3,7 @@
 //! automation, playhead). Only what is on screen is painted. What is done
 //! to a clip in its lane (fades, edges, copies) is in `views::arrange_clips`.
 
+use crate::gesture::{self, Wheel};
 use crate::icons::{Icon, icon};
 use crate::paint::{self, at};
 use crate::state::{AppState, Snap};
@@ -15,7 +16,7 @@ use crate::workspace::{Drag, MenuKind, Workspace};
 use aitrack_model::*;
 use gpui::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div,
+    PinchEvent, Pixels, Point, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div,
     point, prelude::FluentBuilder, px,
 };
 use gpui::{DispatchPhase, HitboxBehavior, MouseMoveEvent};
@@ -31,6 +32,8 @@ pub struct LaneRow {
     pub top: f32,
     pub h: f32,
     pub auto: Option<AutomationTarget>,
+    /// How many groups the track sits inside: the header indents by it.
+    pub depth: usize,
 }
 
 impl LaneRow {
@@ -48,13 +51,13 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
         if t.kind == TrackKind::Return {
             continue;
         }
-        if let Some(parent) = t.parent
-            && s.project.track(parent).is_some_and(|g| g.collapsed) {
-                continue;
-            }
+        // Inside a folded group, at any depth.
+        if groups::hidden(&s.project, t.id) {
+            continue;
+        }
         let auto = s.automation_shown.contains(&t.id).then(|| t.automation.first().map(|l| l.target)).flatten();
         let h = crate::theme::density(t.height.max(40.).round());
-        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, auto });
+        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, auto, depth: groups::depth(&s.project, t.id) });
         y += out.last().map_or(0., LaneRow::total);
     }
     out
@@ -145,6 +148,16 @@ struct ClipPaint {
     repeats: Vec<f32>,
 }
 
+/// What a group's lane shows: where each track inside it has clips, one
+/// thin bar per track in that track's colour (as in Live).
+struct GroupPaint {
+    y: f32,
+    h: f32,
+    color: Color,
+    /// Per member: its colour and its merged clip spans in pixels.
+    members: Vec<(Color, Vec<(f32, f32)>)>,
+}
+
 struct AutoPaint {
     y: f32,
     points: Vec<(f32, f32)>,
@@ -180,12 +193,27 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let mut clips = Vec::new();
     let mut autos = Vec::new();
     let mut lanes = Vec::new();
+    let mut group_lanes = Vec::new();
     for r in &rows {
         let Some(t) = ws.s.project.track(r.track) else { continue };
         let ry = r.top - view.scroll_y;
-        lanes.push((ry, r.h, t.color, r.auto.is_some(), ws.s.selected_track == Some(t.id)));
+        lanes.push((ry, r.h, t.color, r.auto.is_some(), ws.s.is_track_selected(t.id)));
         if ry > lane_h || ry + r.total() < 0. {
             continue;
+        }
+        if t.kind == TrackKind::Group {
+            let members = groups::member_spans(&ws.s.project, t.id)
+                .into_iter()
+                .filter_map(|(id, spans)| {
+                    let spans: Vec<(f32, f32)> = spans
+                        .into_iter()
+                        .filter(|(a, b)| *b >= t0 && *a <= t1)
+                        .map(|(a, b)| (a as f32 * px_per_tick - view.scroll_x, b as f32 * px_per_tick - view.scroll_x))
+                        .collect();
+                    Some((ws.s.project.track(id)?.color, spans))
+                })
+                .collect();
+            group_lanes.push(GroupPaint { y: ry, h: r.h, color: t.color, members });
         }
         for pl in &t.arrangement {
             let Some(c) = ws.s.project.clips.get(&pl.clip) else { continue };
@@ -279,6 +307,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             }
             // Grid: bars, beats and the subdivisions the zoom leaves room for.
             overlay.paint_grid(window, o, w, h, true);
+            for g in &group_lanes {
+                paint_group_lane(window, o, w, g);
+            }
             if let Some((a, bb)) = loop_px {
                 window.paint_quad(paint::fill_rect(at(o, a, 0., bb - a, h), accent_alpha(0.035)));
             }
@@ -367,7 +398,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let start = this.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), false);
             this.add_sample_clip(&d.0, row, Some(start), cx);
         }))
-        .on_scroll_wheel(cx.listener(on_wheel));
+        .on_scroll_wheel(cx.listener(on_wheel))
+        .on_pinch(cx.listener(on_pinch));
 
     // ── Track headers ──
     let mut headers = div().relative().w_full().top(px(-view.scroll_y)).flex().flex_col();
@@ -421,6 +453,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .overflow_hidden()
         .cursor_pointer()
         .child(ruler)
+        .on_pinch(cx.listener(on_pinch))
         .tooltip(widgets::tip("Click to place the insert marker · drag the top strip to set the loop", None))
         .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
             let b = this.regions.ruler.get();
@@ -574,6 +607,36 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     div().flex_none().flex().border_t_1().border_color(border_strong()).bg(pal.surface).child(headers).child(lanes).into_any_element()
 }
 
+/// A group's lane: a tint of the group's colour and, for each track inside
+/// it that has clips, a bar over the spans where it does. The bars share the
+/// lane's height, stacked in track order, at most 8 px each.
+fn paint_group_lane(window: &mut Window, o: Point<Pixels>, canvas_w: f32, g: &GroupPaint) {
+    window.paint_quad(paint::fill_rect(at(o, 0., g.y, canvas_w, g.h - 1.), with_alpha(track_color(g.color), 0.06)));
+    let n = g.members.len();
+    if n == 0 {
+        return;
+    }
+    let (top, room) = (g.y + 4., (g.h - 9.).max(2.));
+    let bar = (room / n as f32).clamp(1., 8.);
+    let used = bar * n as f32;
+    let y0 = top + ((room - used) / 2.).max(0.);
+    for (i, (color, spans)) in g.members.iter().enumerate() {
+        let y = y0 + i as f32 * bar;
+        if y + bar > g.y + g.h - 2. {
+            break;
+        }
+        let fill = clip_fill(*color);
+        for &(a, b) in spans {
+            let (a, b) = (a.max(-2.), b.min(canvas_w + 2.));
+            if b - a < 0.5 {
+                continue;
+            }
+            let r = if bar >= 4. { 2. } else { 0. };
+            window.paint_quad(paint::rrect(at(o, a, y + 0.5, (b - a).max(1.), (bar - 1.).max(1.)), r, with_alpha(fill, 0.9)));
+        }
+    }
+}
+
 /// One clip. `canvas_w` bounds what is worth drawing; `hot` is what the
 /// pointer is over (or a drag holds) when it is this clip.
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint, canvas_w: f32, hot: Option<Zone>) {
@@ -631,16 +694,25 @@ fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &Cli
     }
 }
 
+/// Thin rules at a track's left edge, one per group it sits in (outermost
+/// first), so the tree reads at a glance as in Live.
+fn group_rules(ws: &Workspace, id: TrackId) -> Vec<AnyElement> {
+    let mut outer: Vec<Color> = groups::ancestors(&ws.s.project, id).filter_map(|g| ws.s.project.track(g)).map(|g| g.color).collect();
+    outer.reverse();
+    outer.into_iter().take(4).map(|c| div().w(px(4.)).h_full().border_l_1().border_color(with_alpha(track_color(c), 0.8)).into_any_element()).collect()
+}
+
 fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let Some(t) = ws.s.project.track(r.track).cloned() else { return div().into_any_element() };
     let id = t.id;
-    let selected = ws.s.selected_track == Some(id);
+    let selected = ws.s.is_track_selected(id);
     let auto_on = ws.s.automation_shown.contains(&id);
     let has_auto = !t.automation.is_empty();
     let is_group = t.kind == TrackKind::Group;
     let (mute, solo, arm, collapsed) = (t.mute, t.solo, t.arm, t.collapsed);
-    let indent = if t.parent.is_some() { SP3 } else { 0. };
+    // One step per group the track is in, capped so deep trees keep their names.
+    let indent = SP3 * r.depth.min(4) as f32;
     let main = div()
         .id(("arr-head", id.0 as usize))
         .h(px(r.h))
@@ -649,17 +721,21 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
         .border_b_1()
         .border_color(border())
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.s.selected_track = Some(id);
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            let m = e.modifiers();
+            this.s.click_track(id, m.secondary(), m.shift);
             cx.notify();
         }))
         .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
+        // The groups around the track: one rule in each one's colour.
+        .children(group_rules(ws, id))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
                 .pl(px(SP2 + indent))
                 .pr(px(SP2))
+                .when(is_group, |d| d.bg(with_alpha(track_color(t.color), 0.10)))
                 .flex()
                 .flex_col()
                 .justify_center()
@@ -672,9 +748,19 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                         .when(is_group, |d| {
                             d.child(
                                 widgets::sized_icon_button(("fold", id.0 as usize), if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }, false, 16., 12.)
+                                    .tooltip(widgets::tip(if collapsed { "Unfold group" } else { "Fold group" }, None))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
+                                        this.s.seal();
                                         this.s.set_track(id, TrackProp::Collapsed(!collapsed));
+                                        this.s.seal();
+                                        // A track hidden by the fold cannot stay selected.
+                                        if let Some(sel) = this.s.selected_track
+                                            && sel != id
+                                            && groups::within(&this.s.project, sel, id)
+                                        {
+                                            this.s.click_track(id, false, false);
+                                        }
                                         cx.notify();
                                     })),
                             )
@@ -834,26 +920,68 @@ fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: 
     crate::editing::gestures::context_down(ws, row.track, tick, e, cx);
 }
 
+/// Two-finger pan moves both axes at once by the trackpad's pixel deltas;
+/// a mouse wheel scrolls vertically (Shift: sideways); Cmd/Ctrl + wheel
+/// zooms horizontally about the pointer.
 fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Workspace>) {
-    let d = match e.delta {
-        ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
-        ScrollDelta::Lines(l) => (l.x * 40., l.y * 40.),
-    };
-    let v = &mut ws.s.arrange;
-    if e.modifiers.secondary() || e.modifiers.control {
-        let b = ws.regions.arrange.get();
-        let mx = f32::from(e.position.x - b.origin.x).max(0.);
-        let tick_at = (mx + v.scroll_x) / v.px_per_beat;
-        v.px_per_beat = (v.px_per_beat * (1. + d.1 / 400.)).clamp(4., crate::nav::MAX_PX_PER_BEAT);
-        v.scroll_x = (tick_at * v.px_per_beat - mx).max(0.);
-    } else if e.modifiers.shift || d.0.abs() > d.1.abs() {
-        let dx = if d.0.abs() > d.1.abs() { d.0 } else { d.1 };
-        v.scroll_x = (v.scroll_x - dx).max(0.);
-    } else {
-        let total = total_height(&rows(&ws.s));
-        let view_h = f32::from(ws.regions.arrange.get().size.height);
-        let v = &mut ws.s.arrange;
-        v.scroll_y = (v.scroll_y - d.1).clamp(0., (total - view_h + 48.).max(0.));
+    match gesture::wheel(e) {
+        Wheel::Zoom { factor } => zoom_about(ws, e.position, factor),
+        Wheel::Pan { dx, dy } => {
+            let total = total_height(&rows(&ws.s));
+            let view_h = f32::from(ws.regions.arrange.get().size.height);
+            ws.s.arrange = pan(ws.s.arrange, dx, dy, total, view_h);
+        }
     }
     cx.notify();
+}
+
+/// Pinch: zoom horizontally about the pinch's centre.
+fn on_pinch(ws: &mut Workspace, e: &PinchEvent, _: &mut Window, cx: &mut Context<Workspace>) {
+    zoom_about(ws, e.position, gesture::pinch_factor(e));
+    cx.notify();
+}
+
+fn zoom_about(ws: &mut Workspace, at: Point<Pixels>, factor: f32) {
+    let b = ws.regions.arrange.get();
+    let anchor = f32::from(at.x - b.origin.x).clamp(0., f32::from(b.size.width).max(0.));
+    let v = &mut ws.s.arrange;
+    (v.scroll_x, v.px_per_beat) = gesture::zoom_anchored(v.scroll_x, v.px_per_beat, anchor, factor, crate::nav::MIN_PX_PER_BEAT, crate::nav::MAX_PX_PER_BEAT);
+}
+
+/// The view after a pan of `(dx, dy)` content pixels, kept inside the song
+/// on the left and the lanes vertically (`total` tall in a `view_h` view).
+fn pan(mut v: crate::state::ArrangeView, dx: f32, dy: f32, total: f32, view_h: f32) -> crate::state::ArrangeView {
+    v.scroll_x = (v.scroll_x - dx).max(0.);
+    v.scroll_y = (v.scroll_y - dy).clamp(0., (total - view_h + 48.).max(0.));
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ArrangeView;
+
+    #[test]
+    fn pan_moves_both_axes_and_stays_in_bounds() {
+        let v = ArrangeView { px_per_beat: 40., scroll_x: 100., scroll_y: 50. };
+        let n = pan(v, 30., -20., 1000., 400.);
+        assert_eq!((n.scroll_x, n.scroll_y), (70., 70.));
+        let n = pan(v, 500., 500., 1000., 400.);
+        assert_eq!((n.scroll_x, n.scroll_y), (0., 0.));
+        // Shorter than the view: no vertical scroll at all.
+        assert_eq!(pan(v, 0., -100., 100., 400.).scroll_y, 0.);
+    }
+
+    #[test]
+    fn nested_groups_indent_and_fold_at_any_depth() {
+        let mut s = AppState::new(Project::new("t"));
+        let ids: Vec<TrackId> = (0..2).filter_map(|_| s.add_track(TrackKind::Audio)).collect();
+        s.click_track(ids[0], false, false);
+        let inner = s.group_tracks().unwrap();
+        let outer = s.group_tracks().unwrap();
+        let depth = |s: &AppState, id| rows(s).iter().find(|r| r.track == id).map(|r| r.depth);
+        assert_eq!((depth(&s, outer), depth(&s, inner), depth(&s, ids[0]), depth(&s, ids[1])), (Some(0), Some(1), Some(2), Some(0)));
+        s.set_track(outer, TrackProp::Collapsed(true));
+        assert_eq!((depth(&s, outer), depth(&s, inner), depth(&s, ids[0])), (Some(0), None, None));
+    }
 }

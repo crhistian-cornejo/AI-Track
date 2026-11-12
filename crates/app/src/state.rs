@@ -24,20 +24,6 @@ pub enum BottomTab {
     Mixer,
 }
 
-impl BottomTab {
-    pub const ALL: [BottomTab; 4] = [Self::Devices, Self::PianoRoll, Self::Steps, Self::Mixer];
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BrowserTab {
-    Library,
-    Plugins,
-    Project,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -116,7 +102,6 @@ pub struct AppState {
     pub history: History,
     pub view: MainView,
     pub bottom_tab: BottomTab,
-    pub browser_tab: BrowserTab,
     pub tool: Tool,
     pub snap: Snap,
     pub selected_track: Option<TrackId>,
@@ -141,7 +126,6 @@ impl AppState {
             history: History::default(),
             view: MainView::Arrangement,
             bottom_tab: BottomTab::PianoRoll,
-            browser_tab: BrowserTab::Library,
             tool: Tool::Draw,
             snap: Snap::Adaptive,
             selected_track: first_track,
@@ -686,52 +670,6 @@ impl AppState {
             self.selected_track = Some(id);
             id
         })
-    }
-
-    /// Ctrl+G: put the selected track in a new group (which takes its colour
-    /// and its place in the list). A track that is already in a group is
-    /// grouped inside it.
-    pub fn group_selected(&mut self) -> Option<TrackId> {
-        let track = self.selected_track.and_then(|id| self.project.track(id)).filter(|t| t.kind.has_clips() || t.kind == TrackKind::Group)?.clone();
-        let index = self.project.track_index(track.id)?;
-        let id = self.project.alloc_track_id();
-        let mut group = Track::new(id, TrackKind::Group, "Group", track.color);
-        group.parent = track.parent;
-        group.output = track.output;
-        group.sends = track.sends.clone();
-        let cmds = vec![
-            Command::AddTrack { track: Box::new(group), index },
-            Command::SetTrack { id: track.id, change: TrackProp::Parent(Some(id)) },
-            Command::SetTrack { id: track.id, change: TrackProp::Output(Output::Track(id)) },
-        ];
-        self.seal();
-        let ok = self.edit("Group track", cmds);
-        self.seal();
-        ok.then_some(id)
-    }
-
-    /// Ctrl+Shift+G: dissolve the selected group (or the group the selected
-    /// track is in); its tracks go back to where the group was routed.
-    pub fn ungroup_selected(&mut self) -> bool {
-        let Some(sel) = self.selected_track.and_then(|id| self.project.track(id)) else { return false };
-        let Some(group) = (if sel.kind == TrackKind::Group { Some(sel.clone()) } else { sel.parent.and_then(|p| self.project.track(p)).cloned() }) else {
-            return false;
-        };
-        let mut cmds = Vec::new();
-        let mut first = None;
-        for t in self.project.tracks.iter().filter(|t| t.parent == Some(group.id)) {
-            first.get_or_insert(t.id);
-            cmds.push(Command::SetTrack { id: t.id, change: TrackProp::Parent(group.parent) });
-            cmds.push(Command::SetTrack { id: t.id, change: TrackProp::Output(group.output) });
-        }
-        cmds.push(Command::RemoveTrack { id: group.id });
-        self.seal();
-        let ok = self.edit("Ungroup tracks", cmds);
-        self.seal();
-        if ok {
-            self.selected_track = first.or(self.project.content_tracks().next().map(|t| t.id));
-        }
-        ok
     }
 
     /// Step sequencer: toggle a note of `key` in the step starting at `start`.
@@ -1296,11 +1234,11 @@ mod tests {
         assert!(s.project.track(bass).unwrap().sends.iter().any(|x| x.target == ret));
         // Group, then ungroup, the bass.
         s.selected_track = Some(bass);
-        let group = s.group_selected().unwrap();
+        let group = s.group_tracks().unwrap();
         let b = s.project.track(bass).unwrap();
         assert_eq!((b.parent, b.output), (Some(group), Output::Track(group)));
         assert_eq!(s.project.track_index(group).map(|i| i + 1), s.project.track_index(bass), "the group sits right above");
-        assert!(s.ungroup_selected());
+        assert!(s.ungroup_tracks());
         let b = s.project.track(bass).unwrap();
         assert_eq!((b.parent, b.output), (None, Output::Main));
         assert!(s.project.track(group).is_none());

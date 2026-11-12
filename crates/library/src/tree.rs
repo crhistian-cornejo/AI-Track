@@ -345,8 +345,9 @@ mod tests {
 
     #[test]
     fn tree_counts_and_listing() {
+        // Roots are stored canonical (macOS: /var is /private/var), so build the paths from there.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("lib");
+        let root = dir.path().canonicalize().unwrap().join("lib");
         for (rel, dur) in [
             ("Techno/Kicks/Kick 1.wav", 0.3),
             ("Techno/Kicks/Kick 2.wav", 0.3),

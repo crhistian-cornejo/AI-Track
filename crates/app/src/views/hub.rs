@@ -1,70 +1,23 @@
-//! The Content Hub (bundled packs and links to free packs, instruments and
-//! plugins, with their licences) and "Organize on disk" (plan preview →
+//! The Content Hub (bundled packs, optional packs installed in one click,
+//! and links to free packs, instruments and plugins, with their licences) and "Organize on disk" (plan preview →
 //! run → undo).
 
-use crate::bridge::HubItem;
 use crate::icons::{Icon, icon};
 use crate::theme::*;
-use crate::widgets::{self, badge, label, mono, section_title, text_button};
+use crate::widgets::{self, label, mono, section_title, text_button};
 use crate::workspace::Workspace;
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, StatefulInteractiveElement,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, StatefulInteractiveElement,
     Styled, div, prelude::FluentBuilder, px,
 };
 
-fn hub_card(i: usize, h: HubItem, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let url = h.url.clone();
-    div()
-        .p(px(SP3))
-        .gap(px(SP2))
-        .flex()
-        .flex_col()
-        .rounded(px(r_lg()))
-        .bg(pal.surface)
-        .border_1()
-        .border_color(border())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(SP2))
-                .child(label(h.name.clone(), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
-                .child(label(h.author.clone(), TEXT_SM, pal.faint).flex_1())
-                .child(badge(h.license.clone(), if h.redistributable { pal.play } else { pal.solo }))
-                .when(!url.is_empty(), |d| {
-                    d.child(text_button(("hub-open", i), "Open website", Some(Icon::Globe), false).on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))))
-                }),
-        )
-        .when(!h.license_summary.is_empty(), |d| d.child(label(h.license_summary.clone(), TEXT_SM, pal.muted)))
-        .when(!h.description.is_empty(), |d| d.child(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(h.description.clone())))
-        .into_any_element()
-}
-
 pub fn render_hub(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
-    let items = ws.b.library.hub();
-    let mut body = div().id("hub-body").max_h(px(620.)).overflow_y_scroll().px(px(SP6)).pb(px(SP4)).flex().flex_col().gap(px(SP2));
-    body = body.child(label(
-        "Bundled packs ship with AI-Track. Everything else downloads from its official page under its own licence; AI-Track never redistributes it.",
-        TEXT_SM,
-        pal.muted,
+    let mut body = div().id("hub-body").max_h(px(620.)).overflow_y_scroll().px(px(SP4)).pb(px(SP4)).flex().flex_col().gap(px(SP1));
+    body = body.child(div().px(px(SP2)).pb(px(SP2)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(
+        "Bundled packs ship with AI-Track. Optional packs download here and are added to your library when done. Everything else downloads from its official page under its own licence; AI-Track never redistributes it.",
     ));
-    let mut i = 0;
-    for (kind, title) in [("Included", "INCLUDED"), ("Sample pack", "SAMPLE PACKS"), ("Instrument", "INSTRUMENTS"), ("Plugin", "PLUGINS")] {
-        let group: Vec<HubItem> = items.iter().filter(|h| h.kind == kind).cloned().collect();
-        if group.is_empty() {
-            continue;
-        }
-        body = body.child(div().flex().items_center().gap(px(SP2)).child(section_title(title)).child(mono(group.len().to_string(), TEXT_XS, pal.faint)));
-        for h in group {
-            body = body.child(hub_card(i, h, cx));
-            i += 1;
-        }
-    }
-    if items.is_empty() {
-        body = body.child(label("The Content Hub needs the real library.", TEXT_MD, pal.faint));
-    }
+    body = body.children(crate::views::palette::pack_list(ws, cx));
     body.into_any_element()
 }
 
@@ -93,7 +46,7 @@ pub fn render_organize(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEl
     };
     let mut col = div().px(px(SP6)).pb(px(SP4)).flex().flex_col().gap(px(SP2));
     col = col
-        .child(label(format!("{} samples from the current browser view. Only your own samples are organized; the factory bank stays where it is.", o.items.len()), TEXT_SM, pal.muted))
+        .child(label(format!("{} samples from the last search. Only your own samples are organized; the factory bank stays where it is.", o.items.len()), TEXT_SM, pal.muted))
         .child(widgets::form_row("Layout", None, seg("org-layout", ["By category", "By key"], o.by_key as usize, cx, |ws, v| ws.organize.by_key = v)))
         .child(widgets::form_row("Mode", Some("Copy keeps the originals".into()), seg("org-mode", ["Copy", "Move"], o.move_files as usize, cx, |ws, v| ws.organize.move_files = v)))
         .child(widgets::form_row(

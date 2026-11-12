@@ -1,0 +1,28 @@
+[package]
+name = "aitrack-splice"
+description = "Opt-in Splice sample search over Splice's unofficial web API: query building, response parsing, previews and sign-in."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+# HTTP client (MIT OR Apache-2.0); the same version xtask already uses.
+ureq = { version = "3", features = ["platform-verifier"] }
+# PKCE (MIT OR Apache-2.0).
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+# Compressed waveform outlines (MIT OR Apache-2.0).
+flate2 = "1"
+# The sign-in token lives in the macOS Keychain / Windows Credential Manager
+# (MIT OR Apache-2.0).
+keyring.workspace = true
+
+[lints]
+workspace = true

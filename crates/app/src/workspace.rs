@@ -40,7 +40,6 @@ pub enum Drag {
     Fader { track: TrackId, last_y: f32, pos: f32, travel: f32 },
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
-    BrowserResize { start_x: f32, start_w: f32 },
     MixerResize { start_y: f32, start_h: f32 },
     Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
     Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
@@ -98,7 +97,6 @@ pub enum ProposalStatus {
 
 #[derive(Clone, Debug)]
 pub enum ChatEntry {
-    User(String),
     Assistant(String),
     Proposal { id: u64, label: String, origin: String, summary: Vec<String>, destructive: bool, status: ProposalStatus },
     Job { id: JobId, label: String, fraction: f32, done: bool },
@@ -141,22 +139,22 @@ pub struct Workspace {
     pub usage: crate::usage::Usage,
     /// The `.aitrack` file the project was opened from or saved to.
     pub project_path: Option<std::path::PathBuf>,
-    /// Which matches "Matches project" lists.
-    pub match_kind: MatchKind,
+    /// Height of the detail panel (drag its top edge: [`Workspace::begin_bottom_resize`]).
     pub bottom_h: f32,
     pub bottom_open: bool,
+    /// Window height at the last render, for clamping panel resizes.
+    pub window_h: f32,
+    /// The Cmd+K spotlight palette.
+    pub palette: views::palette::PaletteState,
     /// The mixer section between the arrangement and the detail panel.
     pub mixer_open: bool,
     pub mixer_h: f32,
-    /// Width of the browser sidebar (drag its right edge).
-    pub browser_w: f32,
-    pub browser_open: bool,
+    /// Set to open the palette on the first frame; only the dev view needs
+    /// it, everything with a window calls `views::palette::open`.
+    pub palette_pending: bool,
     pub ai_open: bool,
+    /// The palette's search field.
     pub search: Entity<TextInput>,
-    pub chat: Entity<TextInput>,
-    pub query: String,
-    pub library_folder: String,
-    pub expanded: BTreeSet<String>,
     pub chat_log: Vec<ChatEntry>,
     pub regions: Rc<Regions>,
     pub toast: Option<(String, Instant)>,
@@ -179,8 +177,6 @@ pub struct Workspace {
     analysis_jobs: std::collections::HashMap<JobId, SourceId>,
     /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
     midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
-    /// Browser filter: samples ranked for the project key and tempo.
-    pub library_matches: bool,
     pub organize: OrganizeUi,
     _housekeeping: Task<()>,
 }
@@ -197,14 +193,6 @@ pub struct OrganizeUi {
     pub result: Option<Result<String, String>>,
 }
 
-/// The kinds of sample "Matches project" can be narrowed to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MatchKind {
-    All,
-    Loops,
-    OneShots,
-}
-
 /// Whether a sample in `key` sits in a song in `song`: the same key or its
 /// relative major/minor (the same number on the Camelot wheel).
 pub fn keys_match(key: Scale, song: Scale) -> bool {
@@ -215,7 +203,7 @@ pub fn keys_match(key: Scale, song: Scale) -> bool {
     }
 }
 
-/// A sample dragged out of the browser.
+/// A sample dragged out of the palette.
 #[derive(Clone, Debug)]
 pub struct DraggedSample(pub LibraryItem);
 
@@ -240,22 +228,14 @@ impl Render for DraggedSample {
 
 impl Workspace {
     pub fn new(project: Project, bridges: Bridges, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextInput::new(cx, "Search samples, devices…", Some(Icon::Search)));
-        let chat = cx.new(|cx| TextInput::new(cx, "Ask the assistant…", Some(Icon::Sparkles)));
+        let search = cx.new(|cx| TextInput::new(cx, "Search samples, devices, presets and commands", Some(Icon::Search)));
         let export_name = cx.new(|cx| TextInput::new(cx, "File name", Some(Icon::File)));
         let look = views::prefs::Look::load(cx);
         let subs = vec![
             cx.subscribe(&search, |this, _, e: &InputEvent, cx| {
                 let (InputEvent::Changed(q) | InputEvent::Submit(q)) = e;
-                this.query = q.clone();
+                views::palette::set_query(this, q);
                 cx.notify();
-            }),
-            cx.subscribe(&chat, |this, input, e: &InputEvent, cx| {
-                if let InputEvent::Submit(text) = e
-                    && !text.trim().is_empty() {
-                        this.send_chat(text.trim().to_owned(), cx);
-                        input.update(cx, |i, cx| i.set_text("", cx));
-                    }
             }),
         ];
         // Main-thread plugin work, background scan results and engine
@@ -269,9 +249,6 @@ impl Workspace {
             }
         });
         let mut s = AppState::new(project);
-        let mut expanded = BTreeSet::new();
-        expanded.insert("categories".to_owned());
-        expanded.insert("categories/drums".to_owned());
         let mut this = Self {
             s: AppState::new(Project::new("")),
             b: bridges,
@@ -288,20 +265,16 @@ impl Workspace {
             meters: views::meters::MeterStrip::default(),
             usage: crate::usage::Usage::default(),
             project_path: None,
-            match_kind: MatchKind::All,
             bottom_h: 300.,
             bottom_open: true,
+            window_h: 920.,
+            palette: Default::default(),
             mixer_open: false,
             mixer_h: 264.,
-            browser_w: BROWSER_W,
-            browser_open: true,
+            palette_pending: false,
             // Closed at start: the arrangement gets the room; the Assistant button opens it.
             ai_open: false,
             search,
-            chat,
-            query: String::new(),
-            library_folder: "categories/drums/kicks".into(),
-            expanded,
             chat_log: Vec::new(),
             regions: Rc::new(Regions::default()),
             toast: None,
@@ -320,21 +293,12 @@ impl Workspace {
             midi_mode: MidiMode::default(),
             analysis_jobs: Default::default(),
             midi_jobs: Default::default(),
-            library_matches: false,
             organize: OrganizeUi::default(),
             _housekeeping: housekeeping,
         };
-        // Open on a folder that exists in this library.
-        if !folder_exists(this.b.library.folders(), &this.library_folder)
-            && let Some(f) = this.b.library.folders().iter().find(|f| f.count > 0)
-        {
-            let first = f.children.iter().find(|c| c.count > 0).unwrap_or(f);
-            this.expanded.insert(f.id.clone());
-            this.library_folder = first.id.clone();
-        }
         // Seed the assistant with a greeting and one reviewable proposal.
         this.chat_log.push(ChatEntry::Assistant(
-            "Hi! I can extract MIDI from audio, split stems and find samples in the project key. Edits I suggest show up here as proposals you accept or discard; each one is a single undo step.".into(),
+            "Hi! I can extract MIDI from audio, split stems and find samples in the project key. Edits I suggest show up here as proposals you accept or discard; each one is a single undo step. Type / to see every action.".into(),
         ));
         let roots = [33u8, 29, 36, 31];
         let notes: Vec<(u8, Tick, Tick, f32)> =
@@ -344,14 +308,24 @@ impl Workspace {
             this.chat_log.extend(proposal_entry(&s, id));
         }
         this.s = s;
+        // The saved assistant may be an agent CLI, which the AI bridge drives.
+        if let views::ai_panel::state::Backend::Agent(kind) = views::ai_panel::state::Backend::from_pref(&this.look.app.assistant_model) {
+            this.b.ai.set_agent(Some(kind));
+        }
         this.apply_dev_view();
+        // `slash` opens the assistant with its action menu showing.
+        if std::env::var("AITRACK_DEV_VIEW").is_ok_and(|v| v.split(',').any(|w| w.trim() == "slash")) {
+            this.ai_open = true;
+            let input = views::ai_panel::state::get(cx).read(cx).input.clone();
+            input.update(cx, |i, cx| i.set_text("/", cx));
+        }
         // The agent CLIs are looked up in the background; collect the result.
         this.ensure_ai_poll(cx);
         this
     }
 
     /// Development aid for visual checks without touching the keyboard:
-    /// `AITRACK_DEV_VIEW=devices,meters,play,big,track=Bass` opens the app in
+    /// `AITRACK_DEV_VIEW=devices,meters,play,big,track=Bass,group,slash` opens the app in
     /// that state. Unknown words are ignored; unset, nothing happens.
     fn apply_dev_view(&mut self) {
         let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
@@ -365,11 +339,30 @@ impl Workspace {
                 "tall" => self.bottom_h = 460.,
                 "no-ai" => self.ai_open = false,
                 "ai" => self.ai_open = true,
-                "no-browser" => self.browser_open = false,
+                // Open the palette, optionally on a tab: `palette=devices`.
+                "palette" => self.palette_pending = true,
+                "prefs=sounds" => self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Sounds)),
                 "play" => self.b.engine.play(),
+                // Put the selected track (`track=Name` first) in a new group.
+                "group" => {
+                    self.s.group_tracks();
+                }
                 "big" => {
                     let ids: Vec<_> = self.s.project.tracks.iter().flat_map(|t| t.devices.iter().map(|d| d.id)).collect();
                     self.fx.big.extend(ids);
+                }
+                _ if word.starts_with("palette=") => {
+                    self.palette_pending = true;
+                    self.palette.tab = match &word["palette=".len()..] {
+                        "samples" => views::palette::Tab::Samples,
+                        "key" => views::palette::Tab::InKey,
+                        "splice" => views::palette::Tab::Splice,
+                        "devices" => views::palette::Tab::Devices,
+                        "presets" => views::palette::Tab::Presets,
+                        "commands" => views::palette::Tab::Commands,
+                        "packs" => views::palette::Tab::Packs,
+                        _ => views::palette::Tab::All,
+                    };
                 }
                 _ => {
                     // `device=fx.shaper` appends a stock device to the selected track.
@@ -414,6 +407,7 @@ impl Workspace {
         changed |= self.b.plugins.poll();
         changed |= self.b.library.poll();
         changed |= self.waves.poll();
+        changed |= views::palette::poll(self, cx);
         if let Some(r) = self.b.library.organize_result() {
             self.organize.running = false;
             self.organize.preview = None;
@@ -572,11 +566,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_browser(&mut self, _: &ToggleBrowser, _: &mut Window, cx: &mut Context<Self>) {
-        self.browser_open = !self.browser_open;
-        cx.notify();
-    }
-
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         if self.s.select_all_clips() {
             cx.notify();
@@ -658,6 +647,12 @@ impl Workspace {
 
     // ── Drags ──
 
+    /// Start dragging the top edge of the detail panel from window y `y`.
+    pub fn begin_bottom_resize(&mut self, y: f32, cx: &mut Context<Self>) {
+        let start_h = self.bottom_h;
+        self.begin_drag(Drag::BottomResize { start_y: y, start_h }, cx);
+    }
+
     pub fn begin_drag(&mut self, drag: Drag, cx: &mut Context<Self>) {
         self.s.seal();
         self.drag = Some(drag);
@@ -706,11 +701,8 @@ impl Workspace {
             Drag::MixerResize { start_y, start_h } => {
                 self.mixer_h = (*start_h + (*start_y - f32::from(e.position.y))).clamp(160., 520.);
             }
-            Drag::BrowserResize { start_x, start_w } => {
-                self.browser_w = (*start_w + f32::from(e.position.x) - *start_x).clamp(200., 520.);
-            }
             Drag::BottomResize { start_y, start_h } => {
-                self.bottom_h = (*start_h + (*start_y - y)).clamp(180., 640.);
+                self.bottom_h = bottom_h_clamped(*start_h + (*start_y - y), self.window_h);
             }
             Drag::Notes { clip, originals, origin, resize, applied, preview } => {
                 let (tick, key) = self.piano_pos(e.position);
@@ -876,13 +868,6 @@ impl Workspace {
                 self.toast("Proposal applied — one undo step", cx);
             }
         }
-        cx.notify();
-    }
-
-    fn send_chat(&mut self, text: String, cx: &mut Context<Self>) {
-        self.chat_log.push(ChatEntry::User(text.clone()));
-        self.b.ai.chat(&text, &self.s.project);
-        self.ensure_ai_poll(cx);
         cx.notify();
     }
 
@@ -1078,29 +1063,11 @@ impl Workspace {
         .detach();
     }
 
-    /// The samples the browser currently lists (folder, search or matches).
+    /// The samples the palette last listed (Organize on disk works on them);
+    /// before any search, the library's search for everything.
     pub fn library_view(&self) -> Vec<LibraryItem> {
-        let q = self.query.trim();
-        if !q.is_empty() {
-            self.b.library.search(q, None)
-        } else if self.library_matches {
-            let scale = self.s.project.scale;
-            let mut items = self.b.library.recommend(scale, self.s.project.tempo.initial_bpm());
-            // Only what is in the song's key (or its relative major/minor).
-            if let Some(scale) = scale {
-                items.retain(|it| it.key.is_some_and(|k| keys_match(k, scale)));
-            }
-            match self.match_kind {
-                MatchKind::All => {}
-                MatchKind::Loops => items.retain(|it| it.is_loop),
-                MatchKind::OneShots => items.retain(|it| !it.is_loop),
-            }
-            // Loops first, then one-shots; inside each, by type and name.
-            items.sort_by(|a, b| b.is_loop.cmp(&a.is_loop).then_with(|| a.category.cmp(&b.category)).then_with(|| a.name.cmp(&b.name)));
-            items
-        } else {
-            self.b.library.items(&self.library_folder)
-        }
+        let items = self.palette.sample_items();
+        if items.is_empty() { self.b.library.search("", None) } else { items }
     }
 
     fn apply_analysis(&mut self, source: SourceId, a: &AudioAnalysis) {
@@ -1398,6 +1365,12 @@ impl Workspace {
 
     /// The mixer as its own section: every channel strip, always the same
     /// height, independent of what the detail panel shows.
+    /// The mixer section's height in the current window.
+    pub fn mixer_h_fitted(&self) -> f32 {
+        let bottom = if self.bottom_open { self.bottom_h } else { TAB_BAR_H + SP2 };
+        mixer_h_fitted(self.mixer_h, bottom, self.window_h)
+    }
+
     fn render_mixer_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.mixer_open {
             return None;
@@ -1430,7 +1403,7 @@ impl Workspace {
                 div()
                     .relative()
                     .flex_none()
-                    .h(px(self.mixer_h))
+                    .h(px(self.mixer_h_fitted()))
                     .bg(pane_bg(crate::appearance::Pane::Bottom))
                     .rounded(px(r_lg()))
                     .border_1()
@@ -1541,10 +1514,6 @@ impl Workspace {
     }
 }
 
-fn folder_exists(folders: &[crate::bridge::LibraryFolder], id: &str) -> bool {
-    folders.iter().any(|f| f.id == id || folder_exists(&f.children, id))
-}
-
 /// The chat card for a pending proposal.
 pub fn proposal_entry(s: &AppState, id: u64) -> Option<ChatEntry> {
     let p = s.history.proposals().iter().find(|p| p.id == id)?;
@@ -1639,8 +1608,17 @@ impl Render for Workspace {
             self.apply_look(window, animate, cx);
         }
         self.meters.tick(self.b.engine.as_mut(), self.s.selected_track);
+        self.window_h = f32::from(window.viewport_size().height);
+        // The dev view asks for the palette before there is a window.
+        if std::mem::take(&mut self.palette_pending) && !self.palette.open {
+            views::palette::open(self, window, cx);
+        }
+        // A dialog opened from the palette (its library menu) takes over.
+        if self.modal.is_some() && self.palette.open {
+            views::palette::close(self, window, cx);
+        }
         let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
-        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) {
+        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self) {
             window.request_animation_frame();
         }
         self.fx.sample_rate = f64::from(self.b.engine.audio_config().sample_rate.max(8_000));
@@ -1671,7 +1649,6 @@ impl Render for Workspace {
             .min_h(px(0.))
             .flex()
             .gap(px(SP1))
-            .when(self.browser_open, |d| d.child(views::browser::render(self, window, cx)))
             .child(center)
             .child(views::ai_panel::render(self, window, cx));
 
@@ -1689,6 +1666,7 @@ impl Render for Workspace {
         let toast = self.render_toast();
         let status = self.render_status(cx);
         let banner = self.render_banner(cx);
+        let palette = views::palette::render(self, window, cx);
 
         div()
             .id("workspace")
@@ -1706,23 +1684,16 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_draw))
             .on_action(cx.listener(Self::toggle_loop))
             .on_action(cx.listener(Self::toggle_ai))
-            .on_action(cx.listener(Self::toggle_browser))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(|this, _: &NewProject, window, cx| this.file_new(crate::project_io::Template::Empty, window, cx)))
             .on_action(cx.listener(|this, _: &OpenProject, window, cx| this.file_open(window, cx)))
             .on_action(cx.listener(|this, _: &SaveProject, _, cx| this.file_save(cx)))
             .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| this.file_save_as(None, cx)))
             .on_action(cx.listener(|this, _: &SplitClip, _, cx| this.split_clips(cx)))
-            .on_action(cx.listener(|this, _: &GroupTracks, _, cx| {
-                if this.s.group_selected().is_some() {
-                    cx.notify();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &UngroupTracks, _, cx| {
-                if this.s.ungroup_selected() {
-                    cx.notify();
-                }
-            }))
+            .on_action(cx.listener(|this, _: &GroupTracks, _, cx| crate::editing::group_selection(this, cx)))
+            .on_action(cx.listener(|this, _: &UngroupTracks, _, cx| crate::editing::ungroup_selection(this, cx)))
+            .on_action(cx.listener(|this, _: &ToggleGroupFold, _, cx| crate::editing::toggle_group_fold(this, cx)))
+            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| views::palette::toggle(this, window, cx)))
             .on_action(cx.listener(|this, _: &AddAudioTrack, _, cx| {
                 this.s.add_track(TrackKind::Audio);
                 cx.notify();
@@ -1795,6 +1766,10 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                if this.palette.open {
+                    views::palette::close(this, window, cx);
+                    return;
+                }
                 // A fade, trim or copy drag in the lanes is given up first.
                 if views::arrange_clips::cancel_drag(this) {
                     cx.notify();
@@ -1809,7 +1784,7 @@ impl Render for Workspace {
             }))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
                 // Clicking the workspace (outside a text field) takes the keys back.
-                if !this.focus.is_focused(window) && !this.search.read(cx).focus_handle(cx).is_focused(window) && !this.chat.read(cx).focus_handle(cx).is_focused(window) {
+                if !this.focus.is_focused(window) && !this.search.read(cx).focus_handle(cx).is_focused(window) && !views::ai_panel::state::input_focused(window, cx) {
                     this.focus.focus(window, cx);
                 }
             }))
@@ -1846,5 +1821,42 @@ impl Render for Workspace {
             .children(fx_overlay)
             .children(meter_layers)
             .children(menu)
+            .children(palette)
+    }
+}
+
+/// The detail panel's height: at least 160 px, at most 70 % of the window.
+pub fn bottom_h_clamped(h: f32, window_h: f32) -> f32 {
+    h.clamp(160., (window_h * 0.7).max(160.))
+}
+
+/// The arrangement keeps at least this much height when the mixer opens.
+const MIN_ARRANGE_H: f32 = 200.;
+
+/// The mixer section's height: `mixer_h`, shrunk (down to its compact
+/// 160 px) so the arrangement keeps `MIN_ARRANGE_H` above the detail panel.
+pub fn mixer_h_fitted(mixer_h: f32, bottom_h: f32, window_h: f32) -> f32 {
+    let room = window_h - TOP_BAR_H - STATUS_BAR_H - bottom_h - MIN_ARRANGE_H - 4. * SP1;
+    mixer_h.min(room).max(160.)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bottom_h_clamped, mixer_h_fitted};
+
+    #[test]
+    fn mixer_gives_way_to_the_arrangement_on_short_windows() {
+        assert_eq!(mixer_h_fitted(264., 300., 1200.), 264.);
+        let short = mixer_h_fitted(264., 300., 700.);
+        assert!((160. ..264.).contains(&short), "{short}");
+        assert_eq!(mixer_h_fitted(264., 460., 700.), 160., "never below the compact strip");
+    }
+
+    #[test]
+    fn bottom_panel_stays_between_160_px_and_70_percent() {
+        assert_eq!(bottom_h_clamped(50., 1000.), 160.);
+        assert_eq!(bottom_h_clamped(900., 1000.), 700.);
+        assert_eq!(bottom_h_clamped(400., 1000.), 400.);
+        assert_eq!(bottom_h_clamped(400., 100.), 160.);
     }
 }

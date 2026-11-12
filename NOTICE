@@ -14,6 +14,14 @@ unused screen-capture dependency. Licensed under Apache-2.0.
 Copyright 2022 - 2025 Zed Industries, Inc.
 License text: vendor/gpui-pre/LICENSE-APACHE
 
+splicerr
+--------
+crates/splice talks to Splice's unofficial web API. How that API works (the
+GraphQL endpoint and `assetsSearch` fields, the preview obfuscation) was
+learnt from https://github.com/Robert-K/splicerr (MIT License, Copyright (c)
+Robert-K). The query text and the code are AI-Track's own; the preview
+descrambler (crates/splice/src/descramble.rs) implements the same algorithm.
+
 futureboard-studio
 ------------------
 Parts of the following files follow the structure of code from

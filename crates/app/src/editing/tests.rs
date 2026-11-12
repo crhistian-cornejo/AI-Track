@@ -554,7 +554,7 @@ fn insert_midi_clip_rename_loop_and_deactivate() {
     assert_eq!(s.toggle_activator(0), Some(("Lead".to_owned(), false)));
     assert!(s.project.track(midi).unwrap().mute);
     assert_eq!(s.toggle_fold(), None, "only groups fold");
-    let group = s.group_selected().unwrap();
+    let group = s.group_tracks().unwrap();
     assert_eq!(s.toggle_fold(), Some(true));
     assert_eq!(s.selected_track, Some(group));
     assert!(!s.lane_tracks().contains(&midi), "a folded group hides its tracks");

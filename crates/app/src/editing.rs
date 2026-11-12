@@ -16,6 +16,7 @@
 
 mod clipboard;
 pub mod gestures;
+mod groups;
 pub mod menus;
 pub mod overlay;
 mod timeline;
@@ -85,6 +86,10 @@ pub struct EditState {
     /// Where the clip under the pointer was pressed: the insert marker goes
     /// there when the press ends without having dragged the clip.
     pub pressed: Option<Tick>,
+    /// The tracks picked with Cmd/Shift+click on their headers. Read it
+    /// through [`AppState::selected_tracks`], which also honours a plain
+    /// write to `AppState::selected_track`.
+    pub tracks: BTreeSet<TrackId>,
 }
 
 impl Default for EditState {
@@ -103,6 +108,7 @@ impl Default for EditState {
             zoom_stack: Vec::new(),
             drag_origin: Vec::new(),
             pressed: None,
+            tracks: BTreeSet::new(),
         }
     }
 }
@@ -484,5 +490,35 @@ impl AppState {
             self.selected_track = Some(track);
         }
         ok
+    }
+}
+
+// ── Group tracks (the GroupTracks / UngroupTracks / ToggleGroupFold actions) ──
+
+/// Cmd+G: put the selected tracks in a new group.
+pub fn group_selection(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Context<crate::workspace::Workspace>) {
+    if ws.s.group_tracks().is_some() {
+        cx.notify();
+    } else {
+        ws.toast("Select the tracks to group first", cx);
+    }
+}
+
+/// Cmd+Shift+G: dissolve the selected groups (or the group the selected
+/// track is in).
+pub fn ungroup_selection(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Context<crate::workspace::Workspace>) {
+    if ws.s.ungroup_tracks() {
+        cx.notify();
+    } else {
+        ws.toast("Only groups ungroup: select a group or a track inside one", cx);
+    }
+}
+
+/// Fold or unfold the selected group (or the group the selected track is in).
+pub fn toggle_group_fold(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Context<crate::workspace::Workspace>) {
+    if ws.s.toggle_fold().is_some() {
+        cx.notify();
+    } else {
+        ws.toast("Only groups fold: select a group or a track inside one", cx);
     }
 }

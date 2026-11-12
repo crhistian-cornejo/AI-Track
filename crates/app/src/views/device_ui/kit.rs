@@ -260,6 +260,23 @@ fn axis_of(ws: &Workspace, dev: &Dev, spec: Option<AxisSpec>, extent: f32) -> Op
     Some(Axis { param: spec.param, value: current(ws, dev.id, info), per_px: spec.per_frac / extent.max(1.) })
 }
 
+/// How much one wheel event moves a parameter (normalised). A mouse wheel
+/// moves a step per notch; a trackpad moves smoothly with its pixel delta
+/// (a 25 px swipe is one step). Stepped parameters move one choice per
+/// notch, or per 25 px of swipe. `None` when the event moves nothing.
+pub fn wheel_change(delta: ScrollDelta, stepped: bool, fine: bool, span: f32) -> Option<f32> {
+    const PX_PER_STEP: f32 = 25.;
+    let step = if stepped { 1. / span } else if fine { 0.008 } else { 0.04 };
+    let change = match delta {
+        ScrollDelta::Lines(l) if l.y.abs() >= 0.01 => l.y.signum() * step,
+        ScrollDelta::Pixels(p) if !stepped && f32::from(p.y).abs() >= 0.01 => f32::from(p.y) / PX_PER_STEP * step,
+        // Stepped parameters on a trackpad: one choice per long enough swipe event.
+        ScrollDelta::Pixels(p) if stepped && f32::from(p.y).abs() >= PX_PER_STEP / 5. => f32::from(p.y).signum() * step,
+        _ => return None,
+    };
+    Some(change)
+}
+
 /// A painted plot whose handles drag parameters. `paint` draws into the
 /// plot's rect (clipped to it); the handles themselves are part of that
 /// drawing, this only makes them interactive.
@@ -334,16 +351,14 @@ pub fn plot(
         let handle = nearest(&h, r.get(), e.position, 2. * GRAB).or_else(|| h.iter().find(|x| Some(x.index) == selected));
         let Some(spec) = handle.and_then(|x| x.alt) else { return };
         let Some(info) = d.info(spec.param) else { return };
-        let dy = match e.delta {
-            ScrollDelta::Lines(l) => l.y,
-            ScrollDelta::Pixels(p) => f32::from(p.y) / 20.,
-        };
-        if dy.abs() < 0.01 {
+        // Cmd/Ctrl + wheel is a zoom gesture: leave it to the view around.
+        if crate::gesture::is_zoom(e) {
             return;
         }
+        let stepped = matches!(info.scale, ParamScale::Stepped);
+        let Some(change) = wheel_change(e.delta, stepped, e.modifiers.shift, (info.max - info.min).max(1.)) else { return };
         cx.stop_propagation();
-        let step = if matches!(info.scale, ParamScale::Stepped) { 1. / (info.max - info.min).max(1.) } else if e.modifiers.shift { 0.008 } else { 0.04 };
-        let v = (current(this, d.id, info) + dy.signum() * step).clamp(0., 1.);
+        let v = (current(this, d.id, info) + change).clamp(0., 1.);
         set_gliding(this, d.id, &[(spec.param, v)]);
         cx.notify();
     });
@@ -674,5 +689,20 @@ mod tests {
         let (l, rest) = r.split_left(50.);
         assert_eq!((l.w, rest.x, rest.w), (50., 60., 150.));
         assert_eq!(r.inset(5.), Rect { x: 15., y: 25., w: 190., h: 90. });
+    }
+
+    #[test]
+    fn wheel_steps_are_per_notch_and_smooth_on_a_trackpad() {
+        use gpui::{point, px};
+        assert_eq!(wheel_change(ScrollDelta::Lines(point(0., 1.)), false, false, 1.), Some(0.04));
+        assert_eq!(wheel_change(ScrollDelta::Lines(point(0., -3.)), false, true, 1.), Some(-0.008));
+        // Five 5 px trackpad events move as much as one notch.
+        let small = wheel_change(ScrollDelta::Pixels(point(px(0.), px(5.))), false, false, 1.).unwrap();
+        assert!((small * 5. - 0.04).abs() < 1e-6);
+        assert_eq!(wheel_change(ScrollDelta::Pixels(point(px(0.), px(0.))), false, false, 1.), None);
+        // A stepped parameter moves a whole choice, and ignores tiny swipes.
+        assert_eq!(wheel_change(ScrollDelta::Lines(point(0., 1.)), true, false, 4.), Some(0.25));
+        assert_eq!(wheel_change(ScrollDelta::Pixels(point(px(0.), px(1.))), true, false, 4.), None);
+        assert_eq!(wheel_change(ScrollDelta::Pixels(point(px(0.), px(-9.))), true, false, 4.), Some(-0.25));
     }
 }

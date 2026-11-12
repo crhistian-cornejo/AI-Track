@@ -130,11 +130,7 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             ws.b.engine.set_metronome(on);
             ws.toast(if on { "Metronome on" } else { "Metronome off" }, cx);
         }
-        Cmd::FocusSearch => {
-            ws.browser_open = true;
-            let focus = ws.search.read(cx).focus_handle(cx);
-            focus.focus(window, cx);
-        }
+        Cmd::FocusSearch => crate::views::palette::open(ws, window, cx),
         Cmd::Fullscreen => window.toggle_fullscreen(),
         Cmd::ZoomToSelection => match ws.s.selection_span().filter(|(a, b)| b > a) {
             Some((start, end)) => {

@@ -4,24 +4,20 @@
 //! folder, found through [`find_factory_db`]) and the user's library in the
 //! app data folder, whose folders are scanned by a background
 //! [`ScanJob`] with [`AiAnalyzer`] (`aitrack-ai` key/BPM/category on top of
-//! the filename hints). The browser shows the merged virtual folders.
+//! the filename hints). The palette searches both.
 
 use crate::bridge::*;
-use aitrack_library::hub::HubKind;
 use aitrack_library::{
-    Analysis, Analyzer, BasicAnalyzer, Category, KeyFilter, KeyHint, KeyMatch, Library, Manifest, NameHints, OrganizeLayout,
-    OrganizeMode, OrganizePlan, RecommendQuery, RootKind, Sample, SampleId, ScanEvent, ScanJob, ScanOptions, SearchQuery, Source,
-    TreeNode, VirtualFolder,
+    AiDetector,
+    Analysis, Analyzer, BasicAnalyzer, Category, KeyFilter, KeyHint, KeyMatch, Library, NameHints, OrganizeLayout,
+    OrganizeMode, OrganizePlan, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, RecommendQuery, RootKind, Sample, SampleId, ScanEvent, ScanJob, ScanOptions, SearchQuery, Source,
 };
 use aitrack_model::Scale;
 use crossbeam_channel::{Receiver, unbounded};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Samples listed per folder (the browser is a virtual list, but the index can be huge).
-const LIST_LIMIT: usize = 2000;
 const FACTORY: usize = 0;
 const USER: usize = 1;
 
@@ -94,43 +90,6 @@ impl Analyzer for AiAnalyzer {
     }
 }
 
-fn slug(label: &str) -> String {
-    label.trim().to_lowercase().replace([' ', '/'], "-")
-}
-
-/// The top-level folders the browser shows.
-fn wanted(f: &VirtualFolder) -> bool {
-    matches!(
-        f,
-        VirtualFolder::Categories
-            | VirtualFolder::Keys
-            | VirtualFolder::CamelotWheel
-            | VirtualFolder::BpmRanges
-            | VirtualFolder::Genres
-            | VirtualFolder::Packs
-            | VirtualFolder::Favorites
-    )
-}
-
-/// Merge one library's tree into the browser folders (same label path = same folder).
-fn merge(into: &mut Vec<LibraryFolder>, nodes: &[TreeNode], parent: &str, map: &mut HashMap<String, VirtualFolder>) {
-    for n in nodes {
-        let id = if parent.is_empty() { slug(&n.label) } else { format!("{parent}/{}", slug(&n.label)) };
-        map.entry(id.clone()).or_insert_with(|| n.folder.clone());
-        let pos = match into.iter().position(|f| f.id == id) {
-            Some(i) => {
-                into[i].count += n.count;
-                i
-            }
-            None => {
-                into.push(LibraryFolder { id: id.clone(), name: n.label.clone(), count: n.count, children: Vec::new() });
-                into.len() - 1
-            }
-        };
-        merge(&mut into[pos].children, &n.children, &id, map);
-    }
-}
-
 fn item(lib: usize, s: &Sample) -> LibraryItem {
     let category = match (&s.category, &s.subcategory) {
         (Some(c), Some(sub)) => format!("{} · {sub}", c.as_str()),
@@ -154,8 +113,21 @@ fn split_id(id: u64) -> (usize, SampleId) {
     ((id >> 48) as usize, SampleId((id & ((1 << 48) - 1)) as i64))
 }
 
-struct Scan {
-    job: ScanJob,
+enum Scan {
+    /// Indexing the user's folders.
+    Folders(ScanJob),
+    /// Listening to samples without a key (factory bank read-only, results
+    /// cached in the user library).
+    Keys(ReanalyseJob),
+}
+
+impl Scan {
+    fn cancel(&self) {
+        match self {
+            Scan::Folders(j) => j.cancel(),
+            Scan::Keys(j) => j.cancel(),
+        }
+    }
 }
 
 pub struct RealLibrary {
@@ -163,9 +135,6 @@ pub struct RealLibrary {
     libs: [Option<Library>; 2],
     user_path: PathBuf,
     factory_path: Option<PathBuf>,
-    folders: Vec<LibraryFolder>,
-    map: HashMap<String, VirtualFolder>,
-    items_cache: RefCell<HashMap<String, Vec<LibraryItem>>>,
     search_cache: RefCell<Option<(String, Vec<LibraryItem>)>>,
     scan: Option<Scan>,
     status: ScanStatus,
@@ -197,9 +166,6 @@ impl RealLibrary {
             libs: [f, u],
             user_path: user,
             factory_path: factory,
-            folders: Vec::new(),
-            map: HashMap::new(),
-            items_cache: RefCell::default(),
             search_cache: RefCell::default(),
             scan: None,
             status: ScanStatus::default(),
@@ -214,21 +180,8 @@ impl RealLibrary {
         this
     }
 
+    /// The index changed: drop the cached results.
     fn refresh(&mut self) {
-        let mut folders = Vec::new();
-        let mut map = HashMap::new();
-        for lib in self.libs.iter().flatten() {
-            match lib.tree() {
-                Ok(tree) => {
-                    let top: Vec<TreeNode> = tree.into_iter().filter(|n| wanted(&n.folder)).collect();
-                    merge(&mut folders, &top, "", &mut map);
-                }
-                Err(e) => self.errors.push(format!("Library tree: {e}")),
-            }
-        }
-        self.folders = folders;
-        self.map = map;
-        self.items_cache.borrow_mut().clear();
         *self.search_cache.borrow_mut() = None;
     }
 
@@ -236,12 +189,21 @@ impl RealLibrary {
         let mut out = Vec::new();
         for (i, lib) in self.libs.iter().enumerate() {
             if let Some(lib) = lib
-                && let Ok(samples) = f(lib)
+                && let Ok(mut samples) = f(lib)
             {
+                self.fill_keys(&mut samples);
                 out.extend(samples.iter().map(|s| item(i, s)));
             }
         }
         out
+    }
+
+    /// Keys and tempos found by listening (cached in the user library) for
+    /// rows that have none, e.g. in the read-only factory bank.
+    fn fill_keys(&self, samples: &mut [Sample]) {
+        if let Some(user) = &self.libs[USER] {
+            let _ = user.fill_from_cache(samples);
+        }
     }
 
     fn lib(&self, id: u64) -> Option<(&Library, SampleId)> {
@@ -258,26 +220,12 @@ impl RealLibrary {
             return;
         }
         let job = ScanJob::spawn(self.user_path.clone(), self.analyzer.clone(), opts);
-        self.scan = Some(Scan { job });
+        self.scan = Some(Scan::Folders(job));
         self.status = ScanStatus { running: true, fraction: 0., message: "Scanning your folders…".into() };
     }
 }
 
 impl LibraryBridge for RealLibrary {
-    fn folders(&self) -> &[LibraryFolder] {
-        &self.folders
-    }
-
-    fn items(&self, folder: &str) -> Vec<LibraryItem> {
-        if let Some(v) = self.items_cache.borrow().get(folder) {
-            return v.clone();
-        }
-        let Some(vf) = self.map.get(folder).cloned() else { return Vec::new() };
-        let v = self.query(|l| l.list(&vf, LIST_LIMIT, 0));
-        self.items_cache.borrow_mut().insert(folder.to_owned(), v.clone());
-        v
-    }
-
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
         let cache_key = format!("{query}\u{1}{key:?}");
         if let Some((k, v)) = &*self.search_cache.borrow()
@@ -308,7 +256,9 @@ impl LibraryBridge for RealLibrary {
             if let Some(lib) = lib
                 && let Ok(recs) = lib.recommend(&q)
             {
-                ranked.extend(recs.iter().map(|r| (r.score, item(i, &r.sample))));
+                let mut samples: Vec<Sample> = recs.iter().map(|r| r.sample.clone()).collect();
+                self.fill_keys(&mut samples);
+                ranked.extend(recs.iter().zip(&samples).map(|(r, s)| (r.score, item(i, s))));
             }
         }
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -332,13 +282,13 @@ impl LibraryBridge for RealLibrary {
         if self.scan.is_some() {
             return Err("A scan is already running".into());
         }
-        // The factory bank was indexed from file names only; listen to it
-        // first, then to the user's folders on the next call.
-        let keyed = |l: &Option<Library>| l.as_ref().and_then(|l| l.count_keyed().ok()).unwrap_or(0);
-        let factory_pending = self.factory_path.is_some() && keyed(&self.libs[0]) * 2 < self.count(0);
-        let path = if factory_pending { self.factory_path.clone().expect("checked") } else { self.user_path.clone() };
-        let job = ScanJob::spawn(path, self.analyzer.clone(), ScanOptions { force: true, ..Default::default() });
-        self.scan = Some(Scan { job });
+        if self.libs[USER].is_none() {
+            return Err("The user library is not available".into());
+        }
+        // The factory bank stays untouched: what is found goes to the user
+        // library's cache, which listings and searches read back.
+        let job = ReanalyseJob::spawn_library(self.factory_path.clone(), self.user_path.clone(), Arc::new(AiDetector), ReanalyseOptions::default());
+        self.scan = Some(Scan::Keys(job));
         self.status = ScanStatus { running: true, fraction: 0., message: "Detecting keys…".into() };
         Ok(())
     }
@@ -359,7 +309,7 @@ impl LibraryBridge for RealLibrary {
 
     fn cancel_scan(&mut self) {
         if let Some(s) = &self.scan {
-            s.job.cancel();
+            s.cancel();
             self.status.message = "Cancelling…".into();
         }
     }
@@ -386,21 +336,45 @@ impl LibraryBridge for RealLibrary {
         }
         let Some(scan) = &self.scan else { return changed };
         let mut finished = false;
-        while let Ok(ev) = scan.job.events.try_recv() {
-            changed = true;
-            match ev {
-                ScanEvent::Progress(p) => {
-                    let name = p.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.status = ScanStatus { running: true, fraction: p.done as f32 / p.total.max(1) as f32, message: format!("Scanning {}/{} {name}", p.done, p.total) };
+        match scan {
+            Scan::Folders(job) => {
+                while let Ok(ev) = job.events.try_recv() {
+                    changed = true;
+                    match ev {
+                        ScanEvent::Progress(p) => {
+                            let name = p.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            self.status = ScanStatus { running: true, fraction: p.done as f32 / p.total.max(1) as f32, message: format!("Scanning {}/{} {name}", p.done, p.total) };
+                        }
+                        ScanEvent::Finished(s) => {
+                            let what = if s.cancelled { "Scan cancelled" } else { "Scan finished" };
+                            self.status = ScanStatus { running: false, fraction: 1., message: format!("{what}: {} added, {} updated, {} errors", s.added, s.updated, s.errors) };
+                            finished = true;
+                        }
+                        ScanEvent::Failed(e) => {
+                            self.status = ScanStatus { running: false, fraction: 0., message: format!("Scan failed: {e}") };
+                            finished = true;
+                        }
+                    }
                 }
-                ScanEvent::Finished(s) => {
-                    let what = if s.cancelled { "Scan cancelled" } else { "Scan finished" };
-                    self.status = ScanStatus { running: false, fraction: 1., message: format!("{what}: {} added, {} updated, {} errors", s.added, s.updated, s.errors) };
-                    finished = true;
-                }
-                ScanEvent::Failed(e) => {
-                    self.status = ScanStatus { running: false, fraction: 0., message: format!("Scan failed: {e}") };
-                    finished = true;
+            }
+            Scan::Keys(job) => {
+                while let Ok(ev) = job.events.try_recv() {
+                    changed = true;
+                    match ev {
+                        ReanalyseEvent::Progress(p) => {
+                            let what = if p.source == 0 && self.factory_path.is_some() { "factory sounds" } else { "your samples" };
+                            self.status = ScanStatus { running: true, fraction: p.done as f32 / p.total.max(1) as f32, message: format!("Detecting keys of {what} {}/{}", p.done, p.total) };
+                        }
+                        ReanalyseEvent::Finished(s) => {
+                            let what = if s.cancelled { "Key detection cancelled" } else { "Key detection finished" };
+                            self.status = ScanStatus { running: false, fraction: 1., message: format!("{what}: {} keys and {} tempos found, {} errors", s.keys_found, s.bpms_found, s.errors) };
+                            finished = true;
+                        }
+                        ReanalyseEvent::Failed(e) => {
+                            self.status = ScanStatus { running: false, fraction: 0., message: format!("Key detection failed: {e}") };
+                            finished = true;
+                        }
+                    }
                 }
             }
         }
@@ -423,41 +397,6 @@ impl LibraryBridge for RealLibrary {
         if let Some((lib, s)) = self.lib(id) {
             let _ = lib.mark_used(s);
         }
-    }
-
-    fn hub(&self) -> Vec<HubItem> {
-        let m = Manifest::bundled();
-        let mut out: Vec<HubItem> = m
-            .packs
-            .iter()
-            .filter(|p| !p.optional)
-            .map(|p| HubItem {
-                name: p.name.clone(),
-                author: p.author.clone(),
-                kind: "Included".into(),
-                license: p.license.clone(),
-                license_summary: if p.attribution.is_empty() { "Bundled with AI-Track".into() } else { p.attribution.clone() },
-                redistributable: true,
-                url: p.homepage.clone(),
-                description: p.notes.clone(),
-            })
-            .collect();
-        out.extend(m.hub.iter().map(|h| HubItem {
-            name: h.name.clone(),
-            author: h.author.clone(),
-            kind: match h.kind {
-                HubKind::SamplePack => "Sample pack",
-                HubKind::Instrument => "Instrument",
-                HubKind::Plugin => "Plugin",
-            }
-            .into(),
-            license: h.license.clone(),
-            license_summary: h.license_summary.clone(),
-            redistributable: h.redistributable,
-            url: if h.download_page.is_empty() { h.homepage.clone() } else { h.download_page.clone() },
-            description: h.description.clone(),
-        }));
-        out
     }
 
     fn plan_organize(&mut self, items: &[u64], dest: &Path, by_key: bool, move_files: bool) -> Result<OrganizePreview, String> {
@@ -526,7 +465,7 @@ mod tests {
 
     /// Needs the downloaded sound bank (main checkout); skipped elsewhere.
     #[test]
-    fn factory_bank_has_virtual_folders_search_and_recommendations() {
+    fn factory_bank_has_search_and_recommendations() {
         let Some(db) = bank() else {
             eprintln!("factory sound bank not present; skipped");
             return;
@@ -534,17 +473,11 @@ mod tests {
         let user = std::env::temp_dir().join(format!("aitrack-test-user-{}.db", std::process::id()));
         let lib = RealLibrary::open(Some(db), user.clone());
         assert!(lib.libs[FACTORY].is_some());
-        let names: Vec<&str> = lib.folders().iter().map(|f| f.name.as_str()).collect();
-        for want in ["Categories", "Keys", "Camelot", "BPM", "Genres", "Packs", "Favorites"] {
-            assert!(names.contains(&want), "missing {want} in {names:?}");
-        }
-        let drums = lib.items("categories/drums");
-        assert!(!drums.is_empty(), "no drums");
-        assert!(drums[0].path.is_file(), "factory roots resolve next to the db: {}", drums[0].path.display());
-        assert!(!lib.search("kick", None).is_empty());
+        let kicks = lib.search("kick", None);
+        assert!(!kicks.is_empty(), "no kicks");
+        assert!(kicks[0].path.is_file(), "factory roots resolve next to the db: {}", kicks[0].path.display());
         let am = Scale::new(aitrack_model::Key(9), aitrack_model::ScaleKind::Minor);
         assert!(!lib.recommend(Some(am), 128.).is_empty());
-        assert!(!lib.hub().is_empty());
         drop(lib);
         let _ = std::fs::remove_file(user);
     }

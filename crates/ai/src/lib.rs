@@ -20,6 +20,7 @@ pub mod dsp;
 mod error;
 pub mod features;
 pub mod key;
+pub mod llm;
 pub mod midi;
 pub mod models;
 pub mod progress;

@@ -7,6 +7,7 @@
 mod actions;
 mod commands;
 mod editing;
+mod gesture;
 mod keys;
 mod nav;
 mod audition;
@@ -49,7 +50,12 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
+        // `AITRACK_DEV_SIZE=1480x700` opens a window of that size (visual checks).
+        let (w, h) = std::env::var("AITRACK_DEV_SIZE")
+            .ok()
+            .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?))))
+            .unwrap_or((1480., 920.));
+        let bounds = Bounds::centered(None, size(px(w.max(1024.)), px(h.max(640.))), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

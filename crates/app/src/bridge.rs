@@ -884,16 +884,6 @@ impl PluginCatalog for StubCatalog {
 // ───────────────────────────── Library ─────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LibraryFolder {
-    /// Stable path-like id, e.g. `"categories/drums/kicks"`.
-    pub id: String,
-    pub name: String,
-    /// Samples inside (0 when unknown).
-    pub count: u64,
-    pub children: Vec<LibraryFolder>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct LibraryItem {
     pub id: u64,
     pub name: String,
@@ -906,20 +896,6 @@ pub struct LibraryItem {
     pub duration: f32,
     pub is_loop: bool,
     pub favorite: bool,
-}
-
-/// A Content Hub entry (or a bundled pack) as the hub page lists it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HubItem {
-    pub name: String,
-    pub author: String,
-    /// "Sample pack", "Instrument", "Plugin" or "Included".
-    pub kind: String,
-    pub license: String,
-    pub license_summary: String,
-    pub redistributable: bool,
-    pub url: String,
-    pub description: String,
 }
 
 /// What "Organize on disk" would do, shown before anything moves.
@@ -935,10 +911,6 @@ pub struct OrganizePreview {
 }
 
 pub trait LibraryBridge {
-    /// Virtual folders (Categories, Keys, Genres…), top level first.
-    fn folders(&self) -> &[LibraryFolder];
-    /// Items in a virtual folder (and its sub-folders).
-    fn items(&self, folder: &str) -> Vec<LibraryItem>;
     /// Free-text search, optionally restricted to a key (compatible keys first).
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem>;
     /// Samples ranked for the project's key and tempo.
@@ -970,10 +942,6 @@ pub trait LibraryBridge {
     }
     fn set_favorite(&mut self, _id: u64, _on: bool) {}
     fn mark_used(&mut self, _id: u64) {}
-    /// Content Hub entries and the bundled packs.
-    fn hub(&self) -> Vec<HubItem> {
-        Vec::new()
-    }
     /// Plan copying (or moving) `items` into `dest`, by key or by category.
     fn plan_organize(&mut self, _items: &[u64], _dest: &Path, _by_key: bool, _move_files: bool) -> Result<OrganizePreview, String> {
         Err("Organizing needs the real library".into())
@@ -995,140 +963,75 @@ pub trait LibraryBridge {
 }
 
 pub struct StubLibrary {
-    folders: Vec<LibraryFolder>,
-    items: Vec<(Vec<String>, LibraryItem)>,
-}
-
-fn folder(id: &str, name: &str, children: Vec<LibraryFolder>) -> LibraryFolder {
-    LibraryFolder { id: id.into(), name: name.into(), count: 0, children }
+    items: Vec<LibraryItem>,
 }
 
 impl Default for StubLibrary {
     fn default() -> Self {
-        let cats = [
-            ("drums", "Drums", &["Kicks", "Snares", "Claps", "Hats", "Percussion"][..]),
-            ("bass", "Bass", &["One-shots", "Loops"][..]),
-            ("synths", "Synths", &["Leads", "Pads", "Plucks"][..]),
-            ("vocals", "Vocals", &["Chops", "Phrases"][..]),
-            ("fx", "FX", &["Risers", "Impacts", "Atmos"][..]),
-        ];
-        let categories = folder(
-            "categories",
-            "Categories",
-            cats.iter()
-                .map(|(id, name, subs)| {
-                    folder(
-                        &format!("categories/{id}"),
-                        name,
-                        subs.iter()
-                            .map(|s| folder(&format!("categories/{id}/{}", s.to_lowercase()), s, vec![]))
-                            .collect(),
-                    )
-                })
-                .collect(),
-        );
-        let key_names = ["A minor", "C major", "D minor", "E minor", "F major", "G minor"];
-        let keys = folder(
-            "keys",
-            "Keys",
-            key_names.iter().map(|k| folder(&format!("keys/{}", k.replace(' ', "-").to_lowercase()), k, vec![])).collect(),
-        );
-        let genres = folder(
-            "genres",
-            "Genres",
-            ["House", "Techno", "Pop", "Reggaeton", "Drum & Bass", "Lo-fi"]
-                .iter()
-                .map(|g| folder(&format!("genres/{}", g.to_lowercase().replace([' ', '&'], "")), g, vec![]))
-                .collect(),
-        );
-        let folders = vec![categories, keys, genres];
-
         let am = Scale::new(Key(9), ScaleKind::Minor);
         let cmaj = Scale::new(Key(0), ScaleKind::Major);
         let dm = Scale::new(Key(2), ScaleKind::Minor);
         let em = Scale::new(Key(4), ScaleKind::Minor);
         let fmaj = Scale::new(Key(5), ScaleKind::Major);
         let gm = Scale::new(Key(7), ScaleKind::Minor);
-        type Row = (&'static str, &'static str, &'static str, Option<Scale>, Option<f32>, f32, bool, &'static str);
+        type Row = (&'static str, &'static str, &'static str, Option<Scale>, Option<f32>, f32, bool);
         let rows: &[Row] = &[
-            ("Kick Punchy 01", "drums/kicks", "Kick", Some(am), None, 0.42, false, "house"),
-            ("Kick Deep Sub", "drums/kicks", "Kick", Some(dm), None, 0.61, false, "techno"),
-            ("Kick Analog 909", "drums/kicks", "Kick", None, None, 0.38, false, "techno"),
-            ("Kick Dark Rumble", "drums/kicks", "Kick", Some(am), None, 0.88, false, "techno"),
-            ("Kick Reggaeton Thump", "drums/kicks", "Kick", Some(gm), None, 0.45, false, "reggaeton"),
-            ("Snare Crack", "drums/snares", "Snare", None, None, 0.31, false, "pop"),
-            ("Snare Room Tight", "drums/snares", "Snare", None, None, 0.27, false, "house"),
-            ("Clap Wide Stack", "drums/claps", "Clap", None, None, 0.35, false, "house"),
-            ("Clap Vinyl", "drums/claps", "Clap", None, None, 0.29, false, "lofi"),
-            ("Hat Closed Tick", "drums/hats", "Hat", None, None, 0.08, false, "techno"),
-            ("Hat Open Sizzle", "drums/hats", "Hat", None, None, 0.52, false, "house"),
-            ("Hat Loop 16th", "drums/hats", "Hat Loop", None, Some(128.), 7.5, true, "house"),
-            ("Perc Dembow Loop", "drums/percussion", "Perc Loop", None, Some(95.), 10.1, true, "reggaeton"),
-            ("Shaker Groove", "drums/percussion", "Perc Loop", None, Some(124.), 7.74, true, "house"),
-            ("Bass Reese A", "bass/one-shots", "Bass", Some(am), None, 1.6, false, "drumbass"),
-            ("Bass Sub Pluck", "bass/one-shots", "Bass", Some(em), None, 0.9, false, "pop"),
-            ("Bass Rolling Loop Am", "bass/loops", "Bass Loop", Some(am), Some(128.), 7.5, true, "techno"),
-            ("Bass Offbeat Loop Dm", "bass/loops", "Bass Loop", Some(dm), Some(124.), 7.74, true, "house"),
-            ("Lead Supersaw Am", "synths/leads", "Lead", Some(am), Some(128.), 3.75, true, "house"),
-            ("Lead Square Hook", "synths/leads", "Lead", Some(cmaj), Some(120.), 4.0, true, "pop"),
-            ("Pad Warm Analog Am", "synths/pads", "Pad", Some(am), None, 6.2, false, "lofi"),
-            ("Pad Glass F", "synths/pads", "Pad", Some(fmaj), None, 8.0, false, "pop"),
-            ("Pluck Bell C", "synths/plucks", "Pluck", Some(cmaj), None, 1.1, false, "pop"),
-            ("Pluck Chord Loop Am", "synths/plucks", "Pluck Loop", Some(am), Some(128.), 7.5, true, "house"),
-            ("Vocal Chop Hey", "vocals/chops", "Vocal", Some(am), None, 0.6, false, "house"),
-            ("Vocal Chop Ooh Gm", "vocals/chops", "Vocal", Some(gm), None, 1.2, false, "reggaeton"),
-            ("Vocal Phrase Night", "vocals/phrases", "Vocal Loop", Some(am), Some(128.), 7.5, true, "pop"),
-            ("Riser White 8 Bars", "fx/risers", "Riser", None, Some(128.), 15.0, true, "techno"),
-            ("Impact Low Boom", "fx/impacts", "Impact", Some(am), None, 3.2, false, "techno"),
-            ("Atmos Rain Tape", "fx/atmos", "Atmos", None, None, 12.0, false, "lofi"),
+            ("Kick Punchy 01", "drums/kicks", "Kick", Some(am), None, 0.42, false),
+            ("Kick Deep Sub", "drums/kicks", "Kick", Some(dm), None, 0.61, false),
+            ("Kick Analog 909", "drums/kicks", "Kick", None, None, 0.38, false),
+            ("Kick Dark Rumble", "drums/kicks", "Kick", Some(am), None, 0.88, false),
+            ("Kick Reggaeton Thump", "drums/kicks", "Kick", Some(gm), None, 0.45, false),
+            ("Snare Crack", "drums/snares", "Snare", None, None, 0.31, false),
+            ("Snare Room Tight", "drums/snares", "Snare", None, None, 0.27, false),
+            ("Clap Wide Stack", "drums/claps", "Clap", None, None, 0.35, false),
+            ("Clap Vinyl", "drums/claps", "Clap", None, None, 0.29, false),
+            ("Hat Closed Tick", "drums/hats", "Hat", None, None, 0.08, false),
+            ("Hat Open Sizzle", "drums/hats", "Hat", None, None, 0.52, false),
+            ("Hat Loop 16th", "drums/hats", "Hat Loop", None, Some(128.), 7.5, true),
+            ("Perc Dembow Loop", "drums/percussion", "Perc Loop", None, Some(95.), 10.1, true),
+            ("Shaker Groove", "drums/percussion", "Perc Loop", None, Some(124.), 7.74, true),
+            ("Bass Reese A", "bass/one-shots", "Bass", Some(am), None, 1.6, false),
+            ("Bass Sub Pluck", "bass/one-shots", "Bass", Some(em), None, 0.9, false),
+            ("Bass Rolling Loop Am", "bass/loops", "Bass Loop", Some(am), Some(128.), 7.5, true),
+            ("Bass Offbeat Loop Dm", "bass/loops", "Bass Loop", Some(dm), Some(124.), 7.74, true),
+            ("Lead Supersaw Am", "synths/leads", "Lead", Some(am), Some(128.), 3.75, true),
+            ("Lead Square Hook", "synths/leads", "Lead", Some(cmaj), Some(120.), 4.0, true),
+            ("Pad Warm Analog Am", "synths/pads", "Pad", Some(am), None, 6.2, false),
+            ("Pad Glass F", "synths/pads", "Pad", Some(fmaj), None, 8.0, false),
+            ("Pluck Bell C", "synths/plucks", "Pluck", Some(cmaj), None, 1.1, false),
+            ("Pluck Chord Loop Am", "synths/plucks", "Pluck Loop", Some(am), Some(128.), 7.5, true),
+            ("Vocal Chop Hey", "vocals/chops", "Vocal", Some(am), None, 0.6, false),
+            ("Vocal Chop Ooh Gm", "vocals/chops", "Vocal", Some(gm), None, 1.2, false),
+            ("Vocal Phrase Night", "vocals/phrases", "Vocal Loop", Some(am), Some(128.), 7.5, true),
+            ("Riser White 8 Bars", "fx/risers", "Riser", None, Some(128.), 15.0, true),
+            ("Impact Low Boom", "fx/impacts", "Impact", Some(am), None, 3.2, false),
+            ("Atmos Rain Tape", "fx/atmos", "Atmos", None, None, 12.0, false),
         ];
         let items = rows
             .iter()
             .enumerate()
-            .map(|(i, (name, cat, category, key, bpm, dur, is_loop, genre))| {
-                let mut tags = vec![format!("categories/{cat}"), format!("genres/{genre}")];
-                if let Some(k) = key {
-                    tags.push(format!("keys/{}", k.display().replace(' ', "-").to_lowercase()));
-                }
-                (
-                    tags,
-                    LibraryItem {
-                        id: i as u64 + 1,
-                        name: (*name).into(),
-                        path: PathBuf::from(format!("Library/{cat}/{name}.wav")),
-                        category: (*category).into(),
-                        key: *key,
-                        bpm: *bpm,
-                        duration: *dur,
-                        is_loop: *is_loop,
-                        favorite: false,
-                    },
-                )
+            .map(|(i, (name, cat, category, key, bpm, dur, is_loop))| LibraryItem {
+                id: i as u64 + 1,
+                name: (*name).into(),
+                path: PathBuf::from(format!("Library/{cat}/{name}.wav")),
+                category: (*category).into(),
+                key: *key,
+                bpm: *bpm,
+                duration: *dur,
+                is_loop: *is_loop,
+                favorite: false,
             })
             .collect();
-        Self { folders, items }
+        Self { items }
     }
 }
 
 impl LibraryBridge for StubLibrary {
-    fn folders(&self) -> &[LibraryFolder] {
-        &self.folders
-    }
-
-    fn items(&self, folder: &str) -> Vec<LibraryItem> {
-        self.items
-            .iter()
-            .filter(|(tags, _)| tags.iter().any(|t| t == folder || t.starts_with(&format!("{folder}/"))))
-            .map(|(_, item)| item.clone())
-            .collect()
-    }
-
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
         let q = query.trim().to_lowercase();
         let mut out: Vec<LibraryItem> = self
             .items
             .iter()
-            .map(|(_, i)| i)
             .filter(|i| {
                 q.is_empty() || i.name.to_lowercase().contains(&q) || i.category.to_lowercase().contains(&q)
             })
@@ -1486,10 +1389,8 @@ mod tests {
     }
 
     #[test]
-    fn library_filters_by_folder_and_key() {
+    fn library_filters_by_key() {
         let lib = StubLibrary::default();
-        assert!(!lib.items("categories/drums/kicks").is_empty());
-        assert!(lib.items("categories/drums").len() >= lib.items("categories/drums/kicks").len());
         let am = Scale::new(Key(9), ScaleKind::Minor);
         let found = lib.search("", Some(am));
         assert!(found.iter().all(|i| i.key.is_none_or(|k| k.mask() == am.mask())));

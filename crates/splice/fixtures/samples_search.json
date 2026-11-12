@@ -1,0 +1,62 @@
+{
+  "data": {
+    "assetsSearch": {
+      "items": [
+        {
+          "uuid": "8f1c0b7e-0000-4000-8000-000000000001",
+          "name": "late_night_bass/loops/LV_dark_bass_loop_124_Am.wav",
+          "asset_type_slug": "sample",
+          "tags": [
+            { "uuid": "tag-bass", "label": "bass", "__typename": "Tag" },
+            { "uuid": "tag-dark", "label": "dark", "__typename": "Tag" }
+          ],
+          "files": [
+            { "uuid": "f1", "name": "preview.mp3", "asset_file_type_slug": "preview_mp3", "url": "https://spliceproduction.s3.amazonaws.com/audio_samples/preview.mp3" },
+            { "uuid": "f2", "name": "waveform.json", "asset_file_type_slug": "waveform", "url": "https://spliceproduction.s3.amazonaws.com/audio_samples/waveform.json" }
+          ],
+          "parents": {
+            "items": [
+              {
+                "uuid": "pack-1",
+                "name": "Late Night Bass",
+                "permalink_slug": "late-night-bass",
+                "permalink_base_url": "https://splice.com/sounds/packs",
+                "files": [
+                  { "uuid": "c1", "asset_file_type_slug": "cover_image", "url": "https://spliceproduction.s3.amazonaws.com/packs/cover.jpg" }
+                ]
+              }
+            ]
+          },
+          "bpm": 124,
+          "key": "a",
+          "chord_type": "minor",
+          "duration": 7742,
+          "asset_category_slug": "loop",
+          "__typename": "SampleAsset"
+        },
+        {
+          "uuid": "8f1c0b7e-0000-4000-8000-000000000002",
+          "name": "Kick_Punchy_03.wav",
+          "tags": [{ "uuid": "tag-kick", "label": "kick" }],
+          "files": [
+            { "uuid": "f3", "asset_file_type_slug": "preview_mp3", "url": "https://spliceproduction.s3.amazonaws.com/audio_samples/kick.mp3" }
+          ],
+          "parents": { "items": [] },
+          "bpm": 0,
+          "key": null,
+          "chord_type": null,
+          "duration": 512,
+          "asset_category_slug": "oneshot"
+        }
+      ],
+      "tag_summary": [
+        { "count": 40, "tag": { "uuid": "tag-dark", "label": "dark" } },
+        { "count": 90, "tag": { "uuid": "tag-bass", "label": "bass" } },
+        { "count": 12, "tag": { "uuid": "tag-kick", "label": "kick" } },
+        { "count": 3, "tag": null }
+      ],
+      "pagination_metadata": { "currentPage": 1, "totalPages": 25 },
+      "response_metadata": { "records": 1234 }
+    }
+  }
+}

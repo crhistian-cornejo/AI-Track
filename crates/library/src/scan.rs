@@ -527,8 +527,9 @@ mod tests {
 
     #[test]
     fn scan_and_rescan_incremental() {
+        // Roots are stored canonical (macOS: /var is /private/var), so build the paths from there.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("Samples");
+        let root = dir.path().canonicalize().unwrap().join("Samples");
         let pack = root.join("Trap Pack");
         std::fs::create_dir_all(pack.join("Kicks")).unwrap();
         write_wav(&pack.join("Kicks/Hard 01.wav"), 44_100, 1, 0.2, 0.8);

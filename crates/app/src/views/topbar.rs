@@ -1,25 +1,73 @@
-//! The top bar doubles as the window's title bar: identity on the left, the
-//! transport cluster centred, view switch, CPU and the assistant on the right.
+//! The top bar doubles as the window's title bar and follows Live's control
+//! bar: one compact row of task groups split by thin dividers, read-outs in
+//! small recessed boxes, no branding.
+//!
+//! Left to right: window inset (macOS traffic lights), browser and file,
+//! project name (drag area) · Tap, tempo, signature, metronome · key ·
+//! position and transport · loop · (drag area) · CPU, panels, the
+//! Session/Arrangement switch and the assistant · Windows caption buttons.
 
 use crate::icons::{Icon, icon};
-use crate::state::{BAR, MainView};
+use crate::state::MainView;
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
 use crate::workspace::{Drag, MenuKind, Workspace};
 use aitrack_model::PPQ;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollDelta,
+    AnyElement, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollDelta,
     StatefulInteractiveElement, Styled, Window, WindowControlArea, div, point, prelude::FluentBuilder, px,
 };
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
+/// Room for the traffic lights (three 14 px buttons from x = 14, 6 px apart).
 #[cfg(target_os = "macos")]
-const LEFT_INSET: f32 = 80.;
+const LEFT_INSET: f32 = 76.;
 #[cfg(not(target_os = "macos"))]
-const LEFT_INSET: f32 = SP3;
+const LEFT_INSET: f32 = SP2;
 
 #[cfg(target_os = "windows")]
 const CAPTION_W: f32 = 46.;
+
+/// Where menus opened from the bar drop down.
+const MENU_Y: f32 = TOP_BAR_H - SP1;
+
+// ───────────────────────────── Tap tempo ─────────────────────────────
+
+/// A pause this long starts a new tap sequence.
+const TAP_RESET: Duration = Duration::from_secs(2);
+/// Taps averaged into the tempo.
+const TAP_WINDOW: usize = 8;
+
+thread_local! {
+    static TAPS: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The tempo implied by a run of taps: the mean interval of the latest
+/// ones. `None` until there are two taps.
+fn tap_bpm(taps: &[Instant]) -> Option<f64> {
+    let (first, last) = (taps.first()?, taps.last()?);
+    let n = taps.len().checked_sub(1).filter(|&n| n > 0)?;
+    let mean = last.duration_since(*first).as_secs_f64() / n as f64;
+    (mean > 0.).then(|| (60. / mean).clamp(20., 999.))
+}
+
+/// Records a tap at `now` and returns the new tempo, if any.
+fn tap(now: Instant) -> Option<f64> {
+    TAPS.with(|t| {
+        let mut taps = t.borrow_mut();
+        if taps.last().is_some_and(|&l| now.duration_since(l) > TAP_RESET) {
+            taps.clear();
+        }
+        taps.push(now);
+        let over = taps.len().saturating_sub(TAP_WINDOW);
+        taps.drain(..over);
+        tap_bpm(&taps)
+    })
+}
+
+// ───────────────────────────── Pieces ─────────────────────────────
 
 /// Empty title bar space: drags the window (and snaps/maximises natively).
 fn drag_area() -> Div {
@@ -38,20 +86,81 @@ fn drag_area() -> Div {
         })
 }
 
-fn field(id: &'static str, width: f32) -> gpui::Stateful<Div> {
+/// A read-out in a small recessed box, as Live's tempo and position fields.
+fn readout(id: &'static str, width: f32) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .flex_none()
         .w(px(width))
-        .h(px(32.))
+        .h(px(BAR_FIELD_H))
         .px(px(SP2))
         .flex()
         .items_center()
-        .rounded(px(r_lg()))
-        .bg(p().panel)
+        .justify_center()
+        .gap(px(SP1))
+        .rounded(px(r_sm()))
+        .bg(readout_bg())
         .border_1()
         .border_color(border())
 }
+
+/// A flat square toggle: tinted with `color` while on.
+fn toggle(id: &'static str, i: Icon, on: bool, color: Hsla) -> gpui::Stateful<Div> {
+    let pal = p();
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(BAR_FIELD_H))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(r_sm()))
+        .cursor_pointer()
+        .when(on, |d| d.bg(with_alpha(color, 0.18)))
+        .when(!on, |d| d.hover(|s| s.bg(hover())))
+        .active(|s| s.bg(pressed()))
+        .child(icon(i, 14., if on { color } else { pal.muted }))
+}
+
+/// A short text toggle (TAP), styled as a read-out box.
+fn text_toggle(id: &'static str, text: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(BAR_FIELD_H))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .rounded(px(r_sm()))
+        .border_1()
+        .border_color(border())
+        .cursor_pointer()
+        .hover(|s| s.bg(hover()).border_color(border_strong()))
+        .active(|s| s.bg(pressed()))
+        .child(label(text, TEXT_XS, p().muted).font_weight(FontWeight::SEMIBOLD))
+}
+
+fn separator() -> Div {
+    widgets::divider_v(20.).mx(px(SP1))
+}
+
+/// A run of controls with Live's tight spacing.
+fn group() -> Div {
+    div().flex_none().flex().items_center().gap(px(SP1))
+}
+
+fn cpu_color(load: f32) -> Hsla {
+    let pal = p();
+    if load > 0.8 {
+        pal.record
+    } else if load > 0.5 {
+        pal.meter_mid
+    } else {
+        pal.meter_low
+    }
+}
+
+// ───────────────────────────── Render ─────────────────────────────
 
 pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
@@ -62,132 +171,71 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let bpm = project.tempo.initial_bpm();
     let sig = project.tempo.signature_at(t.position);
     let scale = project.scale.map_or("No key".to_owned(), |s| s.display());
+    let has_key = project.scale.is_some();
     let camelot = project.scale.and_then(|s| s.camelot());
+    let name = if project.name.trim().is_empty() { "Untitled".to_owned() } else { project.name.clone() };
     let dirty = ws.s.history.is_dirty();
+    let load = ws.b.engine.cpu_load().clamp(0., 1.);
 
-    // The Session ⇄ Arrangement switch sits with the identity, balancing the bar.
-    let switch: widgets::OnSelect = {
-        let weak = cx.entity().downgrade();
-        Rc::new(move |i, _, cx| {
-            let _ = weak.update(cx, |this, cx| this.set_view(if i == 0 { MainView::Session } else { MainView::Arrangement }, cx));
-        })
-    };
-    let view_index = if ws.s.view == MainView::Session { 0 } else { 1 };
-    // ── Left: identity ──
-    // Only the identity and the empty stretch drag the window. Controls must
-    // sit outside the drag area: on Windows the system takes every click in
-    // it for moving the window, so a button inside never receives one.
+    // ── Left: browser, file, project name ──
+    // Controls must sit outside the drag areas: on Windows the system takes
+    // every click in one for moving the window, so a button inside never
+    // receives it.
     let left = div()
         .flex_1()
         .min_w(px(0.))
         .h_full()
         .overflow_hidden()
-        .gap(px(SP2))
         .flex()
         .items_center()
+        .gap(px(SP1))
+        .child(drag_area().flex_none().w(px(LEFT_INSET)))
         .child(
-            drag_area()
-                .flex_none()
-                .pl(px(LEFT_INSET))
-                .gap(px(SP2))
-                .flex()
-                .items_center()
-                .child(icon(Icon::Logo, 20., pal.accent))
-                .child(label("AI-Track", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-                .when(dirty, |d| d.child(div().size(px(6.)).rounded_full().bg(pal.accent))),
+            toggle("search", Icon::Search, ws.palette.open, pal.accent)
+                .tooltip(widgets::tip("Search sounds, devices and actions", Some("Ctrl+K")))
+                .on_click(cx.listener(|this, _, window, cx| crate::views::palette::toggle(this, window, cx))),
         )
         .child(
-            widgets::icon_button("file-menu", Icon::Folder, false)
+            toggle("file-menu", Icon::Folder, false, pal.accent)
                 .tooltip(widgets::tip("File: new, open, save, templates", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
-                    this.open_menu(crate::workspace::MenuKind::File, point(at.x - px(12.), at.y + px(18.)), cx);
+                    this.open_menu(MenuKind::File, point(at.x - px(12.), px(MENU_Y)), cx);
                 })),
         )
         .child(
-            widgets::icon_button("toggle-browser", Icon::PanelLeft, ws.browser_open)
-                .tooltip(widgets::tip("Browser", Some("Ctrl+Alt+B")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.browser_open = !this.browser_open;
-                    cx.notify();
-                })),
-        )
-        .child(
-            widgets::icon_button("toggle-bottom", Icon::PanelBottom, ws.bottom_open)
-                .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.bottom_open = !this.bottom_open;
-                    cx.notify();
-                })),
-        )
-        .child(
-            widgets::icon_button("toggle-mixer", Icon::Mixer, ws.mixer_open)
-                .tooltip(widgets::tip("Mixer", Some("Ctrl+Alt+M")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.mixer_open = !this.mixer_open;
-                    cx.notify();
-                })),
-        )
-        .child(div().w(px(SP1)))
-        .child(widgets::segmented(
-            "main-view",
-            &[(Some(Icon::Grid), "Session"), (Some(Icon::Timeline), "Arrange")],
-            view_index,
-            80.,
-            switch,
-        ))
-        .child(drag_area().flex_1());
+            // The project name is part of the drag area, as a window title.
+            drag_area()
+                .flex_1()
+                .min_w(px(0.))
+                .pl(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .overflow_hidden()
+                .child(label(name, TEXT_MD, pal.muted).font_weight(FontWeight::MEDIUM).truncate())
+                .when(dirty, |d| d.child(div().flex_none().size(px(6.)).rounded_full().bg(pal.accent))),
+        );
 
-    // ── Centre: transport ──
-    let transport = div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(SP2))
+    // ── Tempo, signature, metronome ──
+    let tempo = group()
         .child(
-            widgets::transport_button("play", Icon::Play, t.playing, pal.play)
-                .tooltip(widgets::tip("Play / Stop", Some("Space")))
-                .on_click(cx.listener(|this, _, window, cx| this.play_stop(&crate::actions::PlayStop, window, cx))),
-        )
-        .child(
-            widgets::transport_button("stop", Icon::Stop, false, pal.text)
-                .tooltip(widgets::tip("Stop (twice: return to start)", None))
-                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-        )
-        .child(
-            widgets::transport_button("record", Icon::Record, t.recording, pal.record)
-                .tooltip(widgets::tip("Record", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.b.engine.toggle_record();
+            text_toggle("tap", "TAP")
+                .tooltip(widgets::tip("Tap tempo — click in time", None))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                    if let Some(bpm) = tap(Instant::now()) {
+                        this.s.set_tempo(bpm);
+                        this.s.seal();
+                    }
                     cx.notify();
                 })),
         )
-        .child(div().w(px(SP1)))
+        // Drag vertically or scroll, Shift for fine steps.
         .child(
-            widgets::icon_button("loop", Icon::Loop, t.looping)
-                .tooltip(widgets::tip("Loop", Some("Ctrl+L")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let on = !this.b.engine.transport().looping;
-                    this.b.engine.set_looping(on);
-                    cx.notify();
-                })),
-        )
-        .child(
-            widgets::icon_button("metronome", Icon::Metronome, t.metronome)
-                .tooltip(widgets::tip("Metronome", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let on = !this.b.engine.transport().metronome;
-                    this.b.engine.set_metronome(on);
-                    cx.notify();
-                })),
-        )
-        .child(div().w(px(SP2)))
-        // BPM: drag vertically, scroll, shift for fine steps.
-        .child(
-            field("bpm", 96.)
-                .justify_between()
+            readout("bpm", 64.)
                 .cursor_ns_resize()
-                .tooltip(widgets::tip("Tempo — drag or scroll, Shift for fine", None))
+                .hover(|s| s.border_color(border_strong()))
+                .tooltip(widgets::tip("Tempo — drag or scroll, Shift for fine, double-click for 120", None))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
                     if e.click_count == 2 {
                         this.s.set_tempo(120.);
@@ -210,44 +258,111 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                         cx.notify();
                     }
                 }))
-                .child(mono(format!("{bpm:.2}"), TEXT_LG, pal.text))
-                .child(label("BPM", TEXT_XS, pal.faint).font_weight(FontWeight::MEDIUM)),
+                .child(mono(format!("{bpm:.2}"), TEXT_MD, pal.text)),
         )
         .child(
-            field("timesig", 56.)
-                .justify_center()
+            readout("timesig", 44.)
                 .cursor_pointer()
-                .hover(|s| s.bg(hover()))
+                .hover(|s| s.border_color(border_strong()))
                 .tooltip(widgets::tip("Time signature", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
-                    this.open_menu(MenuKind::TimeSignature, point(at.x - px(28.), px(TOP_BAR_H - 4.)), cx);
+                    this.open_menu(MenuKind::TimeSignature, point(at.x - px(24.), px(MENU_Y)), cx);
                 }))
-                .child(mono(format!("{}/{}", sig.numerator, sig.denominator), TEXT_LG, pal.text)),
+                .child(mono(format!("{}/{}", sig.numerator, sig.denominator), TEXT_MD, pal.text)),
         )
         .child(
-            field("position", 88.)
-                .justify_center()
-                .gap(px(SP1))
-                .tooltip(widgets::tip("Bars . Beats . Sixteenths", None))
-                .child(mono(format!("{bar}.{beat}.{sixteenth}"), TEXT_LG, if t.playing { pal.accent } else { pal.text })),
-        )
-        .child(
-            field("scale", 136.)
-                .gap(px(SP2))
-                .cursor_pointer()
-                .hover(|s| s.bg(hover()))
-                .tooltip(widgets::tip("Project key — drives piano roll, tools, samples and AI", None))
-                .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
-                    let at = e.position();
-                    this.open_menu(MenuKind::Scale, point(at.x - px(74.), px(TOP_BAR_H - 4.)), cx);
-                }))
-                .child(icon(Icon::MusicNote, 14., pal.accent))
-                .child(label(scale, TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
-                .when_some(camelot, |d, c| d.child(widgets::badge(c, pal.muted)))
-                .child(icon(Icon::ChevronDown, 12., pal.faint)),
+            toggle("metronome", Icon::Metronome, t.metronome, pal.accent)
+                .tooltip(widgets::tip("Metronome", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let on = !this.b.engine.transport().metronome;
+                    this.b.engine.set_metronome(on);
+                    cx.notify();
+                })),
         );
 
+    // ── Key and scale ──
+    let key = group().child(
+        readout("scale", 112.)
+            .justify_start()
+            .cursor_pointer()
+            .hover(|s| s.border_color(border_strong()))
+            .tooltip(widgets::tip("Project key — drives piano roll, tools, samples and AI", None))
+            .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+                let at = e.position();
+                this.open_menu(MenuKind::Scale, point(at.x - px(56.), px(MENU_Y)), cx);
+            }))
+            .child(icon(Icon::ScaleSnap, 12., if has_key { pal.accent } else { pal.faint }))
+            .child(
+                label(scale, TEXT_SM, if has_key { pal.text } else { pal.muted })
+                    .font_weight(FontWeight::MEDIUM)
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate(),
+            )
+            .when_some(camelot, |d, c| d.child(mono(c, TEXT_XS, pal.faint)))
+            .child(icon(Icon::ChevronDown, 10., pal.faint)),
+    );
+
+    // ── Position and transport ──
+    let transport = group()
+        .child(
+            readout("position", 72.)
+                .tooltip(widgets::tip("Arrangement position: bars . beats . sixteenths", None))
+                .child(mono(format!("{bar}. {beat}. {sixteenth}"), TEXT_MD, if t.playing { pal.accent } else { pal.text })),
+        )
+        .child(div().w(px(SP1)))
+        .child(
+            toggle("play", Icon::Play, t.playing, pal.play)
+                .tooltip(widgets::tip("Play / Stop", Some("Space")))
+                .on_click(cx.listener(|this, _, window, cx| this.play_stop(&crate::actions::PlayStop, window, cx))),
+        )
+        .child(
+            toggle("stop", Icon::Stop, false, pal.text)
+                .tooltip(widgets::tip("Stop (twice: return to start)", None))
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+        )
+        .child(
+            toggle("record", Icon::Record, t.recording, pal.record)
+                .tooltip(widgets::tip("Record", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.b.engine.toggle_record();
+                    cx.notify();
+                })),
+        );
+
+    // ── Loop ──
+    let looping = group().child(
+        toggle("loop", Icon::Loop, t.looping, pal.accent)
+            .tooltip(widgets::tip("Arrangement loop", Some("Ctrl+L")))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let on = !this.b.engine.transport().looping;
+                this.b.engine.set_looping(on);
+                cx.notify();
+            })),
+    );
+
+    let centre = div()
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .child(tempo)
+        .child(separator())
+        .child(key)
+        .child(separator())
+        .child(transport)
+        .child(separator())
+        .child(looping);
+
+    // ── Right: CPU, panels, view switch, assistant ──
+    let switch: widgets::OnSelect = {
+        let weak = cx.entity().downgrade();
+        Rc::new(move |i, _, cx| {
+            let _ = weak.update(cx, |this, cx| this.set_view(if i == 0 { MainView::Session } else { MainView::Arrangement }, cx));
+        })
+    };
+    let view_index = if ws.s.view == MainView::Session { 0 } else { 1 };
     let right = div()
         .flex_1()
         .min_w(px(0.))
@@ -255,12 +370,41 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .h_full()
         .flex()
         .items_center()
-        .gap(px(SP2))
+        .gap(px(SP1))
         .child(drag_area().flex_1())
-        // A short, quiet set: what you reach for while producing. Export lives
-        // in File, the theme in Preferences, the load read-outs in the status bar.
         .child(
-            widgets::icon_button("meters", Icon::Gauge, ws.meters.open)
+            div()
+                .id("cpu")
+                .flex_none()
+                .h(px(BAR_FIELD_H))
+                .px(px(SP1))
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .tooltip(widgets::tip("Audio engine load", None))
+                .child(label("CPU", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
+                .child(widgets::hbar(load, 24., 4., cpu_color(load)))
+                .child(div().w(px(24.)).flex().justify_end().child(mono(format!("{:.0}%", load * 100.), TEXT_XS, pal.muted))),
+        )
+        .child(separator())
+        .child(
+            toggle("toggle-bottom", Icon::PanelBottom, ws.bottom_open, pal.accent)
+                .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.bottom_open = !this.bottom_open;
+                    cx.notify();
+                })),
+        )
+        .child(
+            toggle("toggle-mixer", Icon::Mixer, ws.mixer_open, pal.accent)
+                .tooltip(widgets::tip("Mixer", Some("Ctrl+Alt+M")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mixer_open = !this.mixer_open;
+                    cx.notify();
+                })),
+        )
+        .child(
+            toggle("meters", Icon::Gauge, ws.meters.open, pal.accent)
                 .tooltip(widgets::tip("Meters: loudness, spectrum, stereo field", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.meters.toggle();
@@ -268,12 +412,23 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 })),
         )
         .child(
-            widgets::icon_button("preferences", Icon::Sliders, false)
+            toggle("preferences", Icon::Sliders, false, pal.accent)
                 .tooltip(widgets::tip("Preferences", Some("Ctrl+,")))
-                .on_click(cx.listener(|this, _, _, cx| this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx))),
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx)
+                })),
         )
+        .child(separator())
+        .child(widgets::segmented(
+            "main-view",
+            &[(Some(Icon::Grid), "Session"), (Some(Icon::Timeline), "Arrange")],
+            view_index,
+            76.,
+            switch,
+        ))
         .child(
-            widgets::icon_button("assistant", Icon::Sparkles, ws.ai_open)
+            // Our difference from Live: the only accent-coloured control here.
+            toggle("assistant", Icon::Sparkles, ws.ai_open, pal.accent)
                 .tooltip(widgets::tip("AI assistant", Some("Ctrl+I")))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.ai_open = !this.ai_open;
@@ -282,7 +437,6 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         )
         .child(div().flex_none().w(px(SP1)));
 
-    let _ = BAR;
     div()
         .relative()
         .flex_none()
@@ -292,8 +446,10 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .items_center()
         .gap(px(SP2))
         .bg(pane_bg(crate::appearance::Pane::TopBar))
+        .border_b_1()
+        .border_color(border())
         .child(left)
-        .child(transport)
+        .child(centre)
         .child(right)
         .children(caption_controls(window))
         .into_any_element()
@@ -344,4 +500,37 @@ fn caption_controls(window: &Window) -> Option<AnyElement> {
 #[cfg(not(target_os = "windows"))]
 fn caption_controls(_: &Window) -> Option<AnyElement> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tap_tempo_averages_intervals() {
+        let t0 = Instant::now();
+        let taps: Vec<Instant> = (0..4).map(|i| t0 + Duration::from_millis(500 * i)).collect();
+        let bpm = tap_bpm(&taps).unwrap();
+        assert!((bpm - 120.).abs() < 1e-6, "{bpm}");
+        assert_eq!(tap_bpm(&taps[..1]), None);
+        assert_eq!(tap_bpm(&[]), None);
+    }
+
+    #[test]
+    fn tap_tempo_resets_after_a_pause() {
+        let t0 = Instant::now();
+        assert_eq!(tap(t0), None);
+        assert!(tap(t0 + Duration::from_millis(400)).is_some());
+        // A long pause starts over.
+        assert_eq!(tap(t0 + Duration::from_secs(10)), None);
+        let bpm = tap(t0 + Duration::from_secs(10) + Duration::from_millis(1000)).unwrap();
+        assert!((bpm - 60.).abs() < 1e-6, "{bpm}");
+    }
+
+    #[test]
+    fn bar_sizes_sit_on_the_grid() {
+        const { assert!(BAR_FIELD_H < TOP_BAR_H) };
+        assert_eq!((TOP_BAR_H - BAR_FIELD_H) % 4., 0.);
+        assert_eq!(LEFT_INSET % 4., 0.);
+    }
 }

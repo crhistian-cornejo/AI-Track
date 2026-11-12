@@ -2,7 +2,7 @@
 
 > DAW de música electrónica escrito 100 % en Rust, con interfaz por GPU, para **macOS y Windows**, que aloja **VST3, CLAP y VST2**, trae plugins propios y tiene IA integrada (BYO-subscription + ML local).
 >
-> Fecha: 2026-11-11 · Basado en 6 investigaciones en [`docs/research/`](docs/research/).
+> Fecha: 2026-11-11 · Basado en 8 investigaciones en [`docs/research/`](docs/research/).
 
 | # | Informe | Tema |
 |---|---|---|
@@ -12,6 +12,8 @@
 | 04 | [Plugins y DSP](docs/research/04-plugins-dsp-fabfilter-waves.md) | FabFilter, Waves, algoritmos, suite propia |
 | 05 | [Stack técnico Rust](docs/research/05-rust-tech-stack.md) | UI GPU, audio, hosting, empaquetado, riesgos |
 | 06 | [Integración de IA](docs/research/06-ai-integration.md) | MCP, suscripciones, ML local, librería inteligente |
+| 07 | [Mezcla y mastering](docs/research/07-mezcla-mastering-plugins.md) | Plugins de mezcla y mastering |
+| 08 | [Manual de Ableton Live y control bar](docs/research/08-ableton-live-manual.md) | Estructura del manual, control bar de Live, titlebar de AI-Track |
 
 ---
 

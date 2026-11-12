@@ -1,4 +1,4 @@
-//! Preferences (Audio, Appearance) and the modal shell the Export dialog
+//! Preferences (Audio, Appearance, Sounds) and the modal shell the Export dialog
 //! shares. Appearance edits save immediately and cross-fade the theme;
 //! audio edits go to `EngineBridge::set_audio_config`.
 
@@ -22,6 +22,8 @@ use std::rc::Rc;
 pub enum PrefsPage {
     Audio,
     Appearance,
+    /// Sample sources for the palette: Content Hub, Splice (opt-in).
+    Sounds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +255,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
     let body = match page {
         PrefsPage::Audio => audio_page(ws, cx),
         PrefsPage::Appearance => appearance_page(ws, window, cx),
+        PrefsPage::Sounds => sounds_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
         let on = page == target;
@@ -285,11 +288,12 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .border_r_1()
                 .border_color(border())
                 .child(nav("nav-audio", Icon::Volume, "Audio", PrefsPage::Audio))
-                .child(nav("nav-look", Icon::Sparkles, "Appearance", PrefsPage::Appearance)),
+                .child(nav("nav-look", Icon::Sparkles, "Appearance", PrefsPage::Appearance))
+                .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds)),
         )
         .child(
             div()
-                .id(if page == PrefsPage::Audio { "audio-scroll" } else { "look-scroll" })
+                .id(match page { PrefsPage::Audio => "audio-scroll", PrefsPage::Appearance => "look-scroll", PrefsPage::Sounds => "sounds-scroll" })
                 .flex_1()
                 .min_w(px(0.))
                 .overflow_y_scroll()
@@ -298,6 +302,129 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .child(motion::fade_in(gpui::ElementId::Name(format!("page-{page:?}").into()), div().child(body))),
         )
         .into_any_element()
+}
+
+// ───────────────────────────── Sounds ─────────────────────────────
+
+/// A wrapping paragraph (labels stay on one line).
+fn para(text: &'static str, color: gpui::Hsla) -> Div {
+    div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(color).child(text)
+}
+
+/// Index the Splice desktop app's download folder into the library.
+fn index_splice_folder(ws: &mut Workspace, cx: &mut Context<Workspace>) {
+    match ws.palette.settings.splice_folder() {
+        Some(dir) if dir.is_dir() => match ws.b.library.add_folder(&dir) {
+            Ok(()) => ws.toast(format!("Indexing {}", dir.display()), cx),
+            Err(e) => ws.toast(e, cx),
+        },
+        Some(dir) => ws.toast(format!("No Splice folder at {} yet; choose it with “Folder…”", dir.display()), cx),
+        None => ws.toast("Choose the Splice folder first", cx),
+    }
+}
+
+fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    ws.palette.load();
+    let on = ws.palette.settings.splice;
+    let folder = ws.palette.settings.splice_folder().map_or("Not set".to_owned(), |d| d.display().to_string());
+    // Starts the Splice worker when on, so the stored sign-in is read (off this thread).
+    let (signed, signing) = ws.palette.splice_ui().map_or((None, false), |s| {
+        let _ = s.poll_sign_in();
+        (s.signed_in, s.signing_in)
+    });
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .child(section_title("CONTENT HUB"))
+        .child(para("Free packs: the bundled ones, optional ones AI-Track downloads and indexes for you, and links to packs and plugins you get from their official pages. Also in the search palette (⌘K → Packs).", pal.muted))
+        .child(form_row(
+            "Packs",
+            None,
+            text_button("open-hub", "Open Content Hub", Some(Icon::Package), false).on_click(cx.listener(|this, _, _, cx| this.open_modal(Modal::ContentHub, cx))),
+        ))
+        .child(section_title("SPLICE"))
+        .child(
+            div()
+                .p(px(SP3))
+                .rounded(px(r_md()))
+                .bg(content(0.04))
+                .border_1()
+                .border_color(border())
+                .child(para(
+                    "Uses Splice's unofficial web API (the one its website uses). It may change or stop working at any time, and it is not endorsed by Splice. Search and previews need no account; sounds you license with your Splice account land in your Splice folder, which AI-Track indexes. Sign-in happens on Splice's own page in your browser: AI-Track never asks for or stores your password, only a token in the system keychain.",
+                    pal.muted,
+                )),
+        )
+        .child(form_row(
+            "Search Splice",
+            Some("Adds a Splice section to the palette".into()),
+            switch("splice-on", on).on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.palette.settings.splice;
+                this.palette.set_splice(next);
+                if next {
+                    index_splice_folder(this, cx);
+                }
+                cx.notify();
+            })),
+        ));
+    if on {
+        col = col
+            .child(form_row(
+                "Splice folder",
+                Some("Where Splice saves your sounds".into()),
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(SP2))
+                    .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&folder, 260., TEXT_SM), TEXT_SM, pal.muted)))
+                    .child(text_button("splice-folder", "Folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
+                        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Splice folder".into()) });
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = rx.await
+                                && let Some(p) = paths.into_iter().next()
+                            {
+                                let _ = this.update(cx, |ws, cx| {
+                                    ws.palette.settings.splice_folder = Some(p);
+                                    ws.palette.settings.save();
+                                    index_splice_folder(ws, cx);
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    })))
+                    .child(text_button("splice-index", "Index now", Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| index_splice_folder(this, cx)))),
+            ))
+            .child(form_row(
+                "Account",
+                Some(match signed {
+                    Some(true) => "Signed in".into(),
+                    Some(false) => "Not signed in".into(),
+                    None => "Checking the keychain…".into(),
+                }),
+                if signed == Some(true) {
+                    text_button("splice-out", "Sign out", None, false).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(s) = this.palette.splice_ui() {
+                            s.sign_out();
+                        }
+                        cx.notify();
+                    }))
+                } else {
+                    text_button("splice-in", if signing { "Waiting for the browser…" } else { "Sign in with Splice" }, Some(Icon::Globe), true).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(s) = this.palette.splice_ui()
+                            && !s.signing_in
+                        {
+                            s.sign_in();
+                        }
+                        cx.notify();
+                    }))
+                },
+            ));
+    }
+    col.into_any_element()
 }
 
 // ───────────────────────────── Audio ─────────────────────────────
@@ -845,7 +972,6 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         .child(section_title("LAYOUT & TYPE"))
         .child(form_row("UI scale", Some("80–150 %".into()), look_stepper("ui-scale", format!("{:.0}%", a.ui_scale * 100.), cx, |a, d| a.ui_scale = ((a.ui_scale + d * 0.1) * 10.).round().clamp(8., 15.) / 10.)))
         .child(form_row("Density", None, seg("density", &[(Density::Compact, "Compact"), (Density::Comfortable, "Comfortable")], a.density, 104., cx, |a, v| a.density = v)))
-        .child(form_row("Project tab", Some("Tracks, scenes and files in the browser".into()), switch("project-tab", a.project_tab).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.project_tab = !a.project_tab)))))
         .child(form_row("Corner radius", None, look_stepper("radius", format!("{:.0}%", a.radius * 100.), cx, |a, d| a.radius = (a.radius + d * 0.25).clamp(0., 2.))))
         .child(form_row("Font size", None, look_stepper("font-size", format!("{:.0} px", a.font_size), cx, |a, d| a.font_size = (a.font_size + d).clamp(10., 16.))))
         .child(section_title("DISPLAY STYLES"))

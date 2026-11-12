@@ -4,6 +4,7 @@
 //! canvases; editing goes through `AppState` note commands.
 
 use crate::bridge::SlotState;
+use crate::gesture::{self, Wheel};
 use crate::paint::{self, at};
 use crate::state::Tool;
 use crate::theme::*;
@@ -12,7 +13,7 @@ use crate::workspace::{Drag, Workspace};
 use aitrack_model::*;
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div, px,
+    PinchEvent, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div, px,
 };
 use std::collections::BTreeSet;
 
@@ -266,7 +267,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                                 this.begin_drag(Drag::Audition { track, key: Some(key) }, cx);
                             }
                         }))
-                        .on_scroll_wheel(cx.listener(on_wheel)),
+                        .on_scroll_wheel(cx.listener(on_wheel))
+                        .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| on_pinch(this, e, true, cx))),
                 )
                 .child(
                     div()
@@ -277,7 +279,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         .child(grid)
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| grid_down(this, clip_id, e, false, cx)))
                         .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| grid_down(this, clip_id, e, true, cx)))
-                        .on_scroll_wheel(cx.listener(on_wheel)),
+                        .on_scroll_wheel(cx.listener(on_wheel))
+                        .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| on_pinch(this, e, false, cx))),
                 ),
         )
         .child(
@@ -311,7 +314,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         .cursor_ns_resize()
                         .child(velocity)
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| velocity_down(this, clip_id, e, cx)))
-                        .on_scroll_wheel(cx.listener(on_wheel)),
+                        .on_scroll_wheel(cx.listener(on_wheel))
+                        .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| on_pinch(this, e, false, cx))),
                 ),
         )
         .into_any_element()
@@ -420,26 +424,77 @@ fn velocity_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, cx: &mut 
     ws.begin_drag(Drag::Velocity { clip, originals, last_y: f32::from(e.position.y), lane_h, delta: 0. }, cx);
 }
 
+/// Zoom limits of the piano roll, in px per beat and px per row.
+const MIN_PX_PER_BEAT: f32 = 12.;
+const MAX_PX_PER_BEAT: f32 = 320.;
+const MIN_ROW: f32 = 6.;
+const MAX_ROW: f32 = 32.;
+
+/// The vertical scroll range of the key rows.
+fn max_scroll_y(row_h: f32, view_h: f32) -> f32 {
+    (128. * row_h - view_h).max(0.)
+}
+
+/// Two-finger pan on both axes with the trackpad's own pixel deltas (a
+/// mouse wheel scrolls rows, Shift + wheel sideways), Cmd/Ctrl + wheel
+/// zooms time around the pointer, Alt + wheel changes the row height.
 fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Workspace>) {
-    let d = match e.delta {
-        ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
-        ScrollDelta::Lines(l) => (l.x * 40., l.y * 40.),
-    };
     let b = ws.regions.piano.get();
+    let view_h = f32::from(b.size.height);
+    let anchor = f32::from(e.position.x - b.origin.x).max(0.);
     let v = &mut ws.s.piano;
-    if e.modifiers.secondary() || e.modifiers.control {
-        let mx = f32::from(e.position.x - b.origin.x).max(0.);
-        let beat_at = (mx + v.scroll_x) / v.px_per_beat;
-        v.px_per_beat = (v.px_per_beat * (1. + d.1 / 400.)).clamp(12., 320.);
-        v.scroll_x = (beat_at * v.px_per_beat - mx).max(0.);
-    } else if e.modifiers.alt {
-        v.row_h = (v.row_h + d.1.signum()).clamp(8., 24.);
-    } else if e.modifiers.shift || d.0.abs() > d.1.abs() {
-        let dx = if d.0.abs() > d.1.abs() { d.0 } else { d.1 };
-        v.scroll_x = (v.scroll_x - dx).max(0.);
+    match gesture::wheel(e) {
+        Wheel::Zoom { factor } => {
+            (v.scroll_x, v.px_per_beat) = gesture::zoom_anchored(v.scroll_x, v.px_per_beat, anchor, factor, MIN_PX_PER_BEAT, MAX_PX_PER_BEAT);
+        }
+        Wheel::Pan { dy, .. } if e.modifiers.alt => {
+            let anchor_y = f32::from(e.position.y - b.origin.y).max(0.);
+            zoom_rows(v, anchor_y, gesture::wheel_zoom_factor(dy), view_h);
+        }
+        Wheel::Pan { dx, dy } => {
+            v.scroll_x = (v.scroll_x - dx).max(0.);
+            v.scroll_y = (v.scroll_y - dy).clamp(0., max_scroll_y(v.row_h, view_h));
+        }
+    }
+    cx.stop_propagation();
+    cx.notify();
+}
+
+/// Change the row height around `anchor_y` (px from the top of the grid).
+fn zoom_rows(v: &mut crate::state::PianoView, anchor_y: f32, factor: f32, view_h: f32) {
+    let (y, row) = gesture::zoom_anchored(v.scroll_y, v.row_h, anchor_y, factor, MIN_ROW, MAX_ROW);
+    v.row_h = row;
+    v.scroll_y = y.min(max_scroll_y(row, view_h));
+}
+
+/// Pinch over the grid zooms time around the pinch; over the keyboard it
+/// zooms the rows.
+fn on_pinch(ws: &mut Workspace, e: &PinchEvent, rows: bool, cx: &mut Context<Workspace>) {
+    let b = ws.regions.piano.get();
+    let factor = gesture::pinch_factor(e);
+    let v = &mut ws.s.piano;
+    if rows {
+        zoom_rows(v, f32::from(e.position.y - b.origin.y).max(0.), factor, f32::from(b.size.height));
     } else {
-        let max = (128. * v.row_h - f32::from(b.size.height)).max(0.);
-        v.scroll_y = (v.scroll_y - d.1).clamp(0., max);
+        let anchor = f32::from(e.position.x - b.origin.x).max(0.);
+        (v.scroll_x, v.px_per_beat) = gesture::zoom_anchored(v.scroll_x, v.px_per_beat, anchor, factor, MIN_PX_PER_BEAT, MAX_PX_PER_BEAT);
     }
     cx.notify();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_zoom_keeps_the_key_under_the_pointer() {
+        let mut v = crate::state::PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 600. };
+        let key_at = (v.scroll_y + 100.) / v.row_h;
+        zoom_rows(&mut v, 100., 1.5, 300.);
+        assert_eq!(v.row_h, 18.);
+        assert!(((v.scroll_y + 100.) / v.row_h - key_at).abs() < 1e-3);
+        zoom_rows(&mut v, 100., 100., 300.);
+        assert_eq!(v.row_h, MAX_ROW);
+        assert!(v.scroll_y <= max_scroll_y(MAX_ROW, 300.));
+    }
 }

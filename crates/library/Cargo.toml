@@ -6,8 +6,13 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# `ai::AiDetector`: key/BPM from audio through `aitrack-ai` (pure DSP, no models).
+ai = ["dep:aitrack-ai"]
+
 [dependencies]
 aitrack-model.workspace = true
+aitrack-ai = { workspace = true, optional = true }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +25,14 @@ blake3 = "1.8"
 hound = "3.5"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "ogg", "vorbis", "mp3", "aiff", "adpcm"] }
 toml = "0.9"
+# Optional pack installs (`install`): the same crates xtask uses.
+ureq = { version = "3", features = ["platform-verifier"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+lzma-rs = "0.3"
+sevenz-rust2 = { version = "0.20", default-features = false, features = ["bzip2", "deflate", "ppmd", "util"] }
 
 [dev-dependencies]
 tempfile = "3"

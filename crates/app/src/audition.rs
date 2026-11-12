@@ -1,5 +1,7 @@
 use aitrack_model::TrackId;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const MOUSE: &str = "@mouse";
 pub const NOTE: &str = "@note";
@@ -74,9 +76,74 @@ impl Audition {
     }
 }
 
+/// Sample auditions from a result list (the Cmd+K palette): moving onto a
+/// row plays it, the same row is not restarted, and a key held down to
+/// scroll waits until it settles instead of starting a decode per row.
+#[derive(Debug, Default)]
+pub struct SampleAudition {
+    playing: Option<PathBuf>,
+    pending: Option<(PathBuf, Instant)>,
+}
+
+impl SampleAudition {
+    /// How long the selection must rest before a scrolled-to row plays.
+    pub const SETTLE: Duration = Duration::from_millis(90);
+
+    /// The selection moved onto `path`; with `immediate` it plays now.
+    pub fn select(&mut self, path: &Path, immediate: bool, now: Instant) -> Option<PathBuf> {
+        if self.playing.as_deref() == Some(path) {
+            self.pending = None;
+            return None;
+        }
+        if immediate {
+            self.pending = None;
+            self.playing = Some(path.to_owned());
+            return self.playing.clone();
+        }
+        self.pending = Some((path.to_owned(), now));
+        None
+    }
+
+    /// Called on a timer: the pending row once it has settled.
+    pub fn due(&mut self, now: Instant) -> Option<PathBuf> {
+        let (_, at) = self.pending.as_ref()?;
+        if now.duration_since(*at) < Self::SETTLE {
+            return None;
+        }
+        let (path, _) = self.pending.take()?;
+        self.playing = Some(path.clone());
+        Some(path)
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Stopped (palette closed, or a non-sample row selected).
+    pub fn stop(&mut self) -> bool {
+        self.pending = None;
+        self.playing.take().is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_audition_settles_and_dedupes() {
+        let mut a = SampleAudition::default();
+        let t0 = Instant::now();
+        assert_eq!(a.select(Path::new("a"), true, t0), Some(PathBuf::from("a")));
+        assert_eq!(a.select(Path::new("a"), true, t0), None, "already playing");
+        assert_eq!(a.select(Path::new("b"), false, t0), None);
+        assert_eq!(a.select(Path::new("c"), false, t0), None);
+        assert_eq!(a.due(t0 + Duration::from_millis(10)), None);
+        assert_eq!(a.due(t0 + SampleAudition::SETTLE), Some(PathBuf::from("c")), "only the last row plays");
+        assert!(!a.is_pending());
+        assert!(a.stop());
+        assert!(!a.stop());
+    }
 
     #[test]
     fn keyboard_mapping_respects_octaves_and_midi_range() {

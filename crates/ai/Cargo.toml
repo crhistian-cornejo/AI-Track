@@ -17,6 +17,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 crossbeam-channel.workspace = true
+# The assistant's API key (macOS Keychain / Windows Credential Manager).
+keyring.workspace = true
 
 # Decoding (MPL-2.0, file-level copyleft only; allowed by deny.toml).
 symphonia = { version = "0.5.5", default-features = false, features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis", "aac", "isomp4", "alac", "adpcm", "aiff"] }

@@ -264,6 +264,16 @@ fn library_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 cx.notify();
             }))
         })
+        .when(!scanning, |d| {
+            d.child(menu_item("lib-keys", Some(Icon::Wand), "Analyse keys of factory sounds", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                match this.b.library.detect_keys() {
+                    Ok(()) => this.toast("Listening for keys in the background…", cx),
+                    Err(e) => this.toast(e, cx),
+                }
+                cx.notify();
+            })))
+        })
         .child(widgets::divider_h())
         .child(menu_item("lib-organize", Some(Icon::FolderTree), "Organize on disk…", None, false).on_click(cx.listener(|this, _, _, cx| {
             this.menu = None;

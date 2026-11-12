@@ -8,6 +8,7 @@ members = [
   "crates/host",
   "crates/library",
   "crates/ai",
+  "crates/splice",
   "crates/app",
   "xtask",
 ]
@@ -36,6 +37,7 @@ aitrack-engine = { path = "crates/engine" }
 aitrack-host = { path = "crates/host" }
 aitrack-library = { path = "crates/library" }
 aitrack-ai = { path = "crates/ai" }
+aitrack-splice = { path = "crates/splice" }
 
 # Shared third-party crates (pin here, use `.workspace = true` in members)
 serde = { version = "1", features = ["derive"] }
@@ -47,6 +49,8 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 rtrb = "0.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Secrets in the macOS Keychain / Windows Credential Manager (MIT OR Apache-2.0).
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 # GPUI: Zed's framework, the same pinned + patched snapshot monoBOT uses.
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }

@@ -3,7 +3,9 @@
 //! `cargo xtask soundbank list`                       packs, licenses, download state
 //! `cargo xtask soundbank fetch [--only id] [--max-size-mb N] [--with-optional] [--write-manifest] [--no-index]`
 //! `cargo xtask soundbank verify`                     hashes, LICENSE files, file lists
-//! `cargo xtask soundbank index`                      rebuild content/soundbank/factory.db
+//! `cargo xtask soundbank index [--no-analyse] [--threads N]`
+//!                                                    rebuild content/soundbank/factory.db, then
+//!                                                    detect missing key/BPM from audio (cached)
 //! `cargo xtask soundbank attribution`                regenerate ATTRIBUTION.md
 
 mod soundbank;
@@ -17,7 +19,8 @@ fn main() -> Result<()> {
         _ => {
             eprintln!(
                 "usage: cargo xtask soundbank <list|fetch|verify|index|attribution> [options]\n\
-                 \n  fetch options: --only <id> (repeatable)  --max-size-mb <N>  --with-optional  --write-manifest  --no-index"
+                 \n  fetch options: --only <id> (repeatable)  --max-size-mb <N>  --with-optional  --write-manifest  --no-index\n\
+                 \n  index options: --no-analyse (skip key/BPM from audio)  --threads <N>"
             );
             bail!("unknown task")
         }

@@ -460,6 +460,34 @@ fn group_and_return_routing_sum_signals() {
 }
 
 #[test]
+fn nested_groups_from_group_commands_sum_into_main() {
+    // Built with the model's Cmd+G commands: x in an inner group inside an
+    // outer one. Each group passes its members through; muting the outer
+    // group silences the whole tree.
+    let mut b = P::new(120.0);
+    let (x, _) = b.synth_track("x");
+    let c = b.notes(&[(60, 0, PPQ)], PPQ, None);
+    b.place(x, c, 0);
+    let flat = render(&b.p, (0, PPQ));
+    let inner = b.p.alloc_track_id();
+    for cmd in aitrack_model::groups::group_commands(&b.p, &[x], inner).unwrap() {
+        cmd.apply(&mut b.p).unwrap();
+    }
+    let outer = b.p.alloc_track_id();
+    for cmd in aitrack_model::groups::group_commands(&b.p, &[inner], outer).unwrap() {
+        cmd.apply(&mut b.p).unwrap();
+    }
+    assert_eq!(b.p.track(x).unwrap().output, Output::Track(inner));
+    assert_eq!(b.p.track(inner).unwrap().output, Output::Track(outer));
+    let nested = render(&b.p, (0, PPQ));
+    let k = BEAT / 2;
+    assert!((nested.channel(0)[k] - flat.channel(0)[k]).abs() < 1e-4);
+    assert!(peak(&nested.channel(0)[..BEAT]) > 1e-3);
+    b.t(outer).mute = true;
+    assert!(peak(render(&b.p, (0, PPQ)).channel(0)) < 1e-6);
+}
+
+#[test]
 fn processors_survive_recompiles() {
     let mut b = P::new(120.0);
     let (t, _) = b.synth_track("x");

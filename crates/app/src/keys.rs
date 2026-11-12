@@ -234,9 +234,9 @@ pub static TABLE: &[Entry] = &[
     main("TabMixer", "Mixer (key 4)", "Show or hide the mixer.", C::Views, K, &["4"]),
     main("ShowMixer", "Mixer", "Show or hide the mixer.", C::Views, W, &["mod-alt-m"]),
     main("ToggleDetail", "Detail Panel", "Show or hide the bottom detail panel.", C::Views, W, &["mod-alt-l"]),
-    main("ToggleBrowser", "Browser", "Show or hide the browser.", C::Views, W, &["mod-alt-b"]),
+    main("TogglePalette", "Search", "Search samples, devices, presets, packs and commands; arrows audition, Enter adds to the selected track.", C::Views, W, &["mod-k"]),
     main("ToggleAssistant", "Assistant", "Show or hide the AI assistant.", C::Views, W, &["mod-i"]),
-    cmd(Cmd::FocusSearch, "Search Browser", "Open the browser and type in its search field.", C::Views, &["mod-f"]),
+    cmd(Cmd::FocusSearch, "Find", "Open the search palette.", C::Views, &["mod-f"]),
     cmd(Cmd::Fullscreen, "Full Screen", "Switch full screen on or off.", C::Views, &["f11"]),
     cmd(Cmd::Shortcuts, "Keyboard Shortcuts", "Search every command and its shortcut.", C::Views, &["mod-/", "?", "shift-/"]),
     // Project

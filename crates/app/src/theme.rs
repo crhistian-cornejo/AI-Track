@@ -25,12 +25,14 @@ pub const SP4: f32 = 16.;
 pub const SP6: f32 = 24.;
 
 // ── Fixed sizes (all multiples of 4) ──
-pub const TOP_BAR_H: f32 = 48.;
+/// The title/control bar: one compact row, as Live's control bar.
+pub const TOP_BAR_H: f32 = 40.;
+/// Read-out boxes and buttons in the control bar.
+pub const BAR_FIELD_H: f32 = 24.;
 pub const STATUS_BAR_H: f32 = 24.;
 pub const TAB_BAR_H: f32 = 32.;
 pub const CONTROL_H: f32 = 28.;
 pub const ROW_H: f32 = 28.;
-pub const BROWSER_W: f32 = 248.;
 pub const AI_PANEL_W: f32 = 320.;
 pub const TRACK_HEADER_W: f32 = 200.;
 pub const RULER_H: f32 = 28.;
@@ -587,6 +589,11 @@ pub fn pressed() -> Hsla {
     content(0.10)
 }
 
+/// The recessed "LCD" box behind control-bar read-outs (tempo, position…).
+pub fn readout_bg() -> Hsla {
+    p().well
+}
+
 pub fn accent() -> Hsla {
     p().accent
 }
@@ -607,10 +614,10 @@ pub fn with_alpha(mut c: Hsla, alpha: f32) -> Hsla {
 /// Panel background, translucent when the pane is set to glass over a background image.
 pub fn pane_bg(pane: crate::appearance::Pane) -> Hsla {
     let r = RT.with(|rt| (rt.borrow().resolved.glass.contains(&pane), rt.borrow().resolved.glass_alpha));
-    let base = match pane {
-        crate::appearance::Pane::TopBar => p().base,
-        _ => p().panel,
-    };
+    // The top bar shares the panel tone, as Live's control bar does, so its
+    // recessed read-outs stand out.
+    let _ = pane;
+    let base = p().panel;
     if r.0 { with_alpha(base, base.a * r.1) } else { base }
 }
 
@@ -640,6 +647,7 @@ pub fn clip_text(c: Color) -> Hsla {
 }
 
 /// Windows' own caption close-button red.
+#[cfg(target_os = "windows")]
 pub fn caption_close() -> Hsla {
     Rgba8::rgb(0xC42B1C).to_hsla()
 }
@@ -676,7 +684,7 @@ mod tests {
 
     #[test]
     fn sizes_sit_on_the_grid() {
-        for v in [TOP_BAR_H, STATUS_BAR_H, TAB_BAR_H, CONTROL_H, ROW_H, BROWSER_W, AI_PANEL_W, TRACK_HEADER_W, RULER_H, SESSION_COL_W, STRIP_W, SP1, SP2, SP3, SP4, SP6] {
+        for v in [TOP_BAR_H, BAR_FIELD_H, STATUS_BAR_H, TAB_BAR_H, CONTROL_H, ROW_H, AI_PANEL_W, TRACK_HEADER_W, RULER_H, SESSION_COL_W, STRIP_W, SP1, SP2, SP3, SP4, SP6] {
             assert_eq!(v % 4., 0., "{v} is off the 4 px grid");
         }
     }

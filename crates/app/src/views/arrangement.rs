@@ -479,7 +479,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 }))
                 .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
                 .child(icon(if is_main { Icon::Volume } else { Icon::Return }, 14., pal.muted))
-                .child(label(paint::fit(&t.name, TRACK_HEADER_W - 150., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
+                .child(label(paint::fit(&t.name, TRACK_HEADER_W - 118., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
                 .child(chip(("bus-m", id.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.s.set_track(id, TrackProp::Mute(!mute));
@@ -492,7 +492,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         cx.notify();
                     })))
                 })
-                .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted).w(px(34.)))
+                .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted))
                 .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
         );
         lanes = lanes.child(

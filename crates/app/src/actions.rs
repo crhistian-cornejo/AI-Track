@@ -22,6 +22,10 @@ actions!(
         Escape,
         OpenPreferences,
         ExportAudio,
+        SaveProjectAs,
+        SaveProject,
+        OpenProject,
+        NewProject,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -75,6 +79,11 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-+"), ZoomIn, Some("Workspace")),
         KeyBinding::new(&format!("{m}--"), ZoomOut, Some("Workspace")),
         KeyBinding::new(&format!("{m}-0"), ZoomReset, Some("Workspace")),
+        // File.
+        KeyBinding::new(&format!("{m}-n"), NewProject, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-o"), OpenProject, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-s"), SaveProject, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-shift-s"), SaveProjectAs, Some("Workspace")),
         // Live key commands for the selection.
         KeyBinding::new("up", NudgeUp, Some(CTX)),
         KeyBinding::new("down", NudgeDown, Some(CTX)),

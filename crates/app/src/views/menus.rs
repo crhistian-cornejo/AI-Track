@@ -22,7 +22,47 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::Presets(device) => preset_menu(ws, *device, cx)?,
         MenuKind::LibraryContext => library_menu(ws, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
+        MenuKind::File => file_menu(ws, cx),
     })
+}
+
+/// File: new from a template, open, save, export.
+fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    use crate::project_io::Template;
+    let mac = cfg!(target_os = "macos");
+    let key = |win: &'static str, mac_key: &'static str| Some(if mac { mac_key } else { win });
+    let file = ws.project_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    let mut card = widgets::menu_card("file-menu", 320.).child(menu_header("NEW"));
+    for (i, t) in Template::ALL.into_iter().enumerate() {
+        card = card.child(
+            div()
+                .child(menu_item(("file-new", i), Some(if t == Template::Empty { Icon::File } else { Icon::Layers }), t.label(), if t == Template::Empty { key("Ctrl+N", "⌘N") } else { None }, false).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.menu = None;
+                        this.file_new(t, window, cx);
+                    },
+                )))
+                .child(div().pl(px(SP6 + SP2)).pr(px(SP2)).pb(px(SP1)).child(label(t.hint(), TEXT_XS, p().faint))),
+        );
+    }
+    card.child(menu_header(file.map_or("PROJECT".to_owned(), |f| f.to_uppercase())))
+        .child(menu_item("file-open", Some(Icon::FolderOpen), "Open…", key("Ctrl+O", "⌘O"), false).on_click(cx.listener(|this, _, window, cx| {
+            this.menu = None;
+            this.file_open(window, cx);
+        })))
+        .child(menu_item("file-save", Some(Icon::Check), "Save", key("Ctrl+S", "⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.file_save(cx);
+        })))
+        .child(menu_item("file-save-as", Some(Icon::File), "Save as…", key("Ctrl+Shift+S", "⇧⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.file_save_as(None, cx);
+        })))
+        .child(menu_item("file-export", Some(Icon::Send), "Export audio…", key("Ctrl+Shift+E", "⇧⌘E"), false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.open_export(cx);
+        })))
+        .into_any_element()
 }
 
 fn scale_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {

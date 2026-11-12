@@ -57,6 +57,29 @@ impl Builder {
         id
     }
 
+    /// A drum rack on `track`: one drum sampler per pad, each receiving only
+    /// its own note, which triggers the matching pad of the built-in kit
+    /// (36 = pad 1 …), plus eight named macros.
+    fn drum_rack(&mut self, track: TrackId) -> DeviceId {
+        let rack_id = self.p.alloc_device_id();
+        let mut rack = Rack::new(RackKind::Drum);
+        for (i, (name, note)) in DRUM_PADS.iter().enumerate() {
+            let mut chain = Chain::new(*name, Color::palette(i));
+            chain.note = Some(*note);
+            chain.key_range = (*note, *note);
+            chain.devices.push(self.stock("instrument.drum", &format!("{name} Sampler"), Some("Kits/House Kit"), &[]));
+            rack.chains.push(chain);
+        }
+        for (i, name) in ["Punch", "Decay", "Tone", "Room", "Swing", "Drive", "Width", "Volume"].iter().enumerate() {
+            rack.macros[i].name = (*name).into();
+            rack.macros[i].value = [0.62, 0.4, 0.55, 0.22, 0.1, 0.35, 0.5, 0.8][i];
+        }
+        let mut rack_dev = Device::stock(rack_id, "rack.drum", "Drum Rack");
+        rack_dev.kind = DeviceKind::Rack(rack);
+        self.run(Command::AddDevice { slot: command::DeviceSlot::Track { track, index: 0 }, device: Box::new(rack_dev) });
+        rack_id
+    }
+
     fn notes(&mut self, name: &str, color: usize, notes: &[(u8, Tick, Tick, f32)], length: Tick, loop_len: Option<Tick>) -> ClipId {
         let src = self.p.alloc_source_id();
         let notes: Vec<Note> = notes
@@ -122,6 +145,68 @@ pub const DRUM_PADS: [(&str, u8); 8] = [
     ("808", 51),
 ];
 
+/// An empty project: only the Main track, 120 BPM, no key.
+pub fn empty() -> Project {
+    Project::new("Untitled")
+}
+
+/// A starting point for electronic music: tracks already grouped the way a
+/// mix is usually organised (Drums, Bass, Synths, Vocals, FX), two return
+/// buses fed by every track's sends, and a limiter on Main. No clips.
+pub fn electronic_starter() -> Project {
+    let mut b = Builder { p: Project::new("Untitled") };
+    b.run(Command::SetTempo { bpm: 126. });
+    b.run(Command::SetScale { scale: Some(Scale::new(Key(9), ScaleKind::Minor)) });
+    b.run(Command::SetLoop { region: Some((0, 8 * BAR)) });
+    let mut content = Vec::new();
+    let mut inside = |b: &mut Builder, group: TrackId, kind: TrackKind, name: &str, color: usize| {
+        let id = b.track(kind, name, color, |t| {
+            t.parent = Some(group);
+            t.output = Output::Track(group);
+        });
+        content.push(id);
+        id
+    };
+    let drums = b.track(TrackKind::Group, "Drums", 0, |_| {});
+    let kit = inside(&mut b, drums, TrackKind::Instrument, "Drum Rack", 0);
+    b.drum_rack(kit);
+    inside(&mut b, drums, TrackKind::Audio, "Percussion", 0);
+    b.device(drums, "fx.compressor", "Glue Comp", Some("Bus/Drum Bus Glue"), &[]);
+
+    let bass = b.track(TrackKind::Group, "Bass", 7, |_| {});
+    let sub = inside(&mut b, bass, TrackKind::Instrument, "Sub", 7);
+    b.device(sub, "instrument.wavetable", "Sub Synth", Some("Bass/House Organ Bass"), &[]);
+    let mid = inside(&mut b, bass, TrackKind::Instrument, "Mid Bass", 7);
+    b.device(mid, "instrument.wavetable", "Bass Synth", Some("Bass/House Organ Bass"), &[]);
+
+    let synths = b.track(TrackKind::Group, "Synths", 9, |_| {});
+    for (name, preset) in [("Lead", "Lead/Supersaw Lead"), ("Pad", "Pad/Warm Pad"), ("Pluck", "Lead/Supersaw Lead")] {
+        let t = inside(&mut b, synths, TrackKind::Instrument, name, 9);
+        b.device(t, "instrument.wavetable", &format!("{name} Synth"), Some(preset), &[]);
+    }
+
+    let vocals = b.track(TrackKind::Group, "Vocals", 3, |_| {});
+    inside(&mut b, vocals, TrackKind::Audio, "Lead Vocal", 3);
+    inside(&mut b, vocals, TrackKind::Audio, "Chops", 3);
+
+    let fx = b.track(TrackKind::Group, "FX", 11, |_| {});
+    inside(&mut b, fx, TrackKind::Audio, "Risers", 11);
+    inside(&mut b, fx, TrackKind::Audio, "Impacts", 11);
+
+    let reverb = b.track(TrackKind::Return, "A Reverb", 5, |t| t.volume_db = -6.);
+    let delay = b.track(TrackKind::Return, "B Delay", 6, |t| t.volume_db = -8.);
+    b.device(reverb, "fx.reverb", "Reverb", Some("Halls/Big Hall"), &[("Mix", 1.0)]);
+    b.device(delay, "fx.delay", "Delay", Some("Synced/Dotted Eighth"), &[("Mix", 1.0)]);
+    // Every track has its sends in place, turned all the way down.
+    for t in content {
+        let sends = [reverb, delay].map(|target| Send { target, level_db: -70., pre_fader: false }).to_vec();
+        b.run(Command::SetTrack { id: t, change: TrackProp::Sends(sends) });
+    }
+    let main = b.p.main_track().id;
+    b.device(main, "fx.limiter", "Limiter", Some("Mastering/Transparent"), &[]);
+    b.p
+}
+
 pub fn project() -> Project {
     let mut b = Builder { p: Project::new("Midnight Drive") };
     b.run(Command::SetTempo { bpm: 128. });
@@ -170,24 +255,7 @@ pub fn project() -> Project {
     }
 
     // ── Devices ──
-    let rack_id = b.p.alloc_device_id();
-    let mut rack = Rack::new(RackKind::Drum);
-    // One drum sampler per pad; each only receives its own note, which
-    // triggers the matching pad of the built-in kit (36 = pad 1 …).
-    for (i, (name, note)) in DRUM_PADS.iter().enumerate() {
-        let mut chain = Chain::new(*name, Color::palette(i));
-        chain.note = Some(*note);
-        chain.key_range = (*note, *note);
-        chain.devices.push(b.stock("instrument.drum", &format!("{name} Sampler"), Some("Kits/House Kit"), &[]));
-        rack.chains.push(chain);
-    }
-    for (i, name) in ["Punch", "Decay", "Tone", "Room", "Swing", "Drive", "Width", "Volume"].iter().enumerate() {
-        rack.macros[i].name = (*name).into();
-        rack.macros[i].value = [0.62, 0.4, 0.55, 0.22, 0.1, 0.35, 0.5, 0.8][i];
-    }
-    let mut rack_dev = Device::stock(rack_id, "rack.drum", "Drum Rack");
-    rack_dev.kind = DeviceKind::Rack(rack);
-    b.run(Command::AddDevice { slot: command::DeviceSlot::Track { track: drums, index: 0 }, device: Box::new(rack_dev) });
+    b.drum_rack(drums);
     b.device(drums, "fx.compressor", "Glue Comp", Some("Bus/Drum Bus Glue"), &[]);
     b.device(drums, "fx.saturator", "Saturator", Some("Warmth/Gentle Glue"), &[]);
 
@@ -306,6 +374,11 @@ pub fn project() -> Project {
     b.automate(pad, AutomationTarget::DeviceParam { device: pad_synth, param: cutoff }, &[(0, 0.45), (32, 0.62), (64, 0.8), (72, 0.5)]);
     b.automate(lead, AutomationTarget::Volume, &[(32, 0.6), (48, 0.85), (60, 0.85), (64, 0.5)]);
     b.automate(drums, AutomationTarget::Pan, &[(32, 0.5), (64, 0.5)]);
+
+    // A group and what is inside it read as one block of colour.
+    for c in crate::state::group_color_commands(&b.p, synths) {
+        b.run(c);
+    }
 
     b.p
 }

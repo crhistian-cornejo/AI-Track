@@ -914,6 +914,34 @@ pub fn format_db(db: f32) -> String {
 }
 
 
+/// Commands that give every track inside `group`, and the clips on them,
+/// the group's colour, so a group reads as one block (as grouped tracks do
+/// in Live). Empty when nothing would change.
+pub fn group_color_commands(p: &Project, group: TrackId) -> Vec<Command> {
+    let Some(color) = p.track(group).map(|g| g.color) else { return Vec::new() };
+    let mut out = Vec::new();
+    for t in p.tracks.iter().filter(|t| t.parent == Some(group)) {
+        if t.color != color {
+            out.push(Command::SetTrack { id: t.id, change: TrackProp::Color(color) });
+        }
+        let clips: BTreeSet<ClipId> = t.session_slots.values().copied().chain(t.arrangement.iter().map(|pl| pl.clip)).collect();
+        for id in clips {
+            if let Some(c) = p.clips.get(&id).filter(|c| c.color != color) {
+                out.push(Command::UpdateClip { id, clip: Box::new(Clip { color, ..c.clone() }) });
+            }
+        }
+        // Groups inside the group follow too.
+        if t.kind == TrackKind::Group {
+            let mut inner = p.clone();
+            if let Some(g) = inner.track_mut(t.id) {
+                g.color = color;
+            }
+            out.extend(group_color_commands(&inner, t.id));
+        }
+    }
+    out
+}
+
 /// A keyboard edit of the selection (see [`AppState::key_edit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyEdit {

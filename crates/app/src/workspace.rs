@@ -67,6 +67,8 @@ pub enum MenuKind {
     /// Library actions (right-click in the browser).
     LibraryContext,
     TimeSignature,
+    /// File: new from a template, open, save.
+    File,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +123,8 @@ pub struct Workspace {
     pub meters: views::meters::MeterStrip,
     /// CPU and memory of this process, for the status bar.
     pub usage: crate::usage::Usage,
+    /// The `.aitrack` file the project was opened from or saved to.
+    pub project_path: Option<std::path::PathBuf>,
     pub bottom_h: f32,
     pub bottom_open: bool,
     pub browser_open: bool,
@@ -238,6 +242,7 @@ impl Workspace {
             fx: views::device_ui::UiState::default(),
             meters: views::meters::MeterStrip::default(),
             usage: crate::usage::Usage::default(),
+            project_path: None,
             bottom_h: 300.,
             bottom_open: true,
             browser_open: true,
@@ -1278,6 +1283,20 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Swap the open project for `project`, with a fresh undo history.
+    pub fn replace_project(&mut self, project: Project, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.b.engine.stop();
+        self.b.engine.locate(0);
+        self.s = AppState::new(project);
+        self.project_path = path;
+        self.drag = None;
+        self.menu = None;
+        self.chat_log.retain(|e| !matches!(e, ChatEntry::Proposal { .. }));
+        self.synced_revision = None;
+        self.fx = views::device_ui::UiState::default();
+        cx.notify();
+    }
+
     /// An arrow-key edit of the selection (notes, or the selected clip).
     fn key_edit(&mut self, e: KeyEdit, cx: &mut Context<Self>) {
         if self.s.key_edit(e) {
@@ -1543,6 +1562,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_ai))
             .on_action(cx.listener(Self::toggle_browser))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(|this, _: &NewProject, window, cx| this.file_new(crate::project_io::Template::Empty, window, cx)))
+            .on_action(cx.listener(|this, _: &OpenProject, window, cx| this.file_open(window, cx)))
+            .on_action(cx.listener(|this, _: &SaveProject, _, cx| this.file_save(cx)))
+            .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| this.file_save_as(None, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-1, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(0, cx)))

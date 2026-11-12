@@ -98,6 +98,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .when(dirty, |d| d.child(div().size(px(6.)).rounded_full().bg(pal.accent))),
         )
         .child(
+            widgets::icon_button("file-menu", Icon::Folder, false)
+                .tooltip(widgets::tip("File: new, open, save, templates", None))
+                .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+                    let at = e.position();
+                    this.open_menu(crate::workspace::MenuKind::File, point(at.x - px(12.), at.y + px(18.)), cx);
+                })),
+        )
+        .child(
             widgets::icon_button("toggle-browser", Icon::PanelLeft, ws.browser_open)
                 .tooltip(widgets::tip("Browser", Some("Ctrl+Alt+B")))
                 .on_click(cx.listener(|this, _, _, cx| {

@@ -13,6 +13,7 @@ mod demo;
 mod icons;
 mod motion;
 mod paint;
+mod project_io;
 mod real;
 mod state;
 mod theme;

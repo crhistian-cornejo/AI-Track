@@ -291,6 +291,10 @@ impl EngineHandle {
         lock(&self.shared.virtual_midi).as_mut().is_some_and(|p| p.push(msg).is_ok())
     }
 
+    pub fn send_midi_to(&self, track: TrackId, msg: MidiMessage) -> bool {
+        self.send_rt(RtCommand::SendMidiTo(track, msg))
+    }
+
     pub fn is_playing(&self) -> bool {
         self.status.playing.load(Ordering::Relaxed)
     }

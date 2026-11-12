@@ -537,4 +537,55 @@ mod tests {
         let d = Device::stock(DeviceId(1), "fx.reverb", "Reverb");
         assert!(StockFactory.create(&d, 48_000., 256).is_some());
     }
+
+    #[test]
+    fn targeted_audition_plays_stock_synth_and_loaded_sampler() {
+        use aitrack_dsp::AudioBuffer;
+        use aitrack_engine::{Engine, EngineConfig, MidiMessage};
+        use aitrack_model::{Color, Project, Track, TrackKind};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = std::env::temp_dir().join(format!(
+            "aitrack-audition-{}-{}.wav",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut wav = hound::WavWriter::new(file, spec).unwrap();
+        for i in 0..8192 {
+            let sample = (i as f32 * std::f32::consts::TAU * 440. / 48_000.).sin() * 16_000.;
+            wav.write_sample(sample as i16).unwrap();
+        }
+        wav.finalize().unwrap();
+        let mut sampler = aitrack_stock::instrument::sampler::Sampler::new();
+        sampler.load_wav(path.to_str().unwrap()).unwrap();
+        let state = sampler.save_state();
+
+        for (plugin, state) in [("instrument.wavetable", None), ("instrument.sampler", Some(state))] {
+            let mut project = Project::new("audition");
+            let track_id = project.alloc_track_id();
+            let device_id = project.alloc_device_id();
+            let mut track = Track::new(track_id, TrackKind::Instrument, plugin, Color(0));
+            let mut device = Device::stock(device_id, plugin, plugin);
+            device.state = state;
+            track.devices.push(device);
+            project.tracks.push(track);
+            let (handle, processor) = Engine::new(EngineConfig::headless(48_000.), Arc::new(StockFactory)).unwrap();
+            let mut processor = processor.unwrap();
+            handle.update_project(&project);
+            handle.flush();
+            let mut buf = AudioBuffer::new(2, 256);
+            processor.process_planar(&mut buf);
+            assert!(handle.send_midi_to(track_id, MidiMessage::note_on(0, 60, 100)));
+            processor.process_planar(&mut buf);
+            assert!(buf.channel(0).iter().any(|s| s.abs() > 0.001), "{plugin} should sound");
+            assert!(handle.send_midi_to(track_id, MidiMessage::note_off(0, 60)));
+            for _ in 0..400 {
+                processor.process_planar(&mut buf);
+            }
+            assert!(buf.channel(0).iter().all(|s| s.abs() < 0.0001), "{plugin} should release");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

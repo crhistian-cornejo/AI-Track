@@ -384,6 +384,37 @@ impl CompiledClip {
             if data.warped { ctx.tick_of(n) - start as f64 } else { (n as f64 - start_exact) / spt }
         };
         let (l, r) = buf.stereo_mut();
+        // A clip at its native speed with no loop reads whole frames: playback
+        // is bit-identical to the file instead of an interpolated copy of it.
+        // A clip that starts at the very beginning of its file needs no fade-in:
+        // fading would soften the transient the file starts with.
+        let fade_in = self.offset != 0;
+        if !data.warped && self.looping.is_none() {
+            let start_i = start_exact.round() as i64;
+            let first_frame = (self.offset as f64 * spt).round() as i64 - start_i;
+            for k in lo.max(start_i)..hi {
+                if end_sample.is_some_and(|e| k as f64 >= e) {
+                    break;
+                }
+                let since = (k - start_i) as f64;
+                let mut g = self.gain;
+                if fade_in && since < FADE {
+                    g *= (since / FADE) as f32;
+                }
+                if let Some(e) = end_sample {
+                    let until = e - k as f64;
+                    if until < FADE {
+                        g *= (until / FADE).max(0.0) as f32;
+                    }
+                }
+                let idx = (k - ctx.seg_start) as usize;
+                let sl = audio.frame(0, first_frame + k);
+                let sr = if stereo { audio.frame(1, first_frame + k) } else { sl };
+                l[idx] += sl * g;
+                r[idx] += sr * g;
+            }
+            return;
+        }
         let mut n = lo;
         while n < hi {
             let chunk_end = (n + crate::automation::CONTROL_BLOCK as i64).min(hi);
@@ -404,7 +435,7 @@ impl CompiledClip {
                 let frame = data.source_frame(src, spt);
                 let mut g = self.gain;
                 let since = k as f64 - start_exact;
-                if since < FADE {
+                if fade_in && since < FADE {
                     g *= (since / FADE).max(0.0) as f32;
                 }
                 if let Some(e) = end_sample {

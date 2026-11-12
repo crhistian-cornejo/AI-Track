@@ -557,7 +557,84 @@ fn audio_clip_plays_with_gain_and_warp() {
         a.warp = warp;
     }
     let out = render_offline_with(&b.p, &FallbackFactory, (0, 4 * PPQ), SR, 256, samples).unwrap();
-    assert_eq!(first_nonzero(&out, 0), Some(BEAT + 500));
+    // The sinc interpolator rings a few samples around the impulse, so look
+    // for the peak rather than the first non-zero sample.
+    let ch = out.channel(0);
+    let peak = (0..ch.len()).max_by(|a, b| ch[*a].abs().total_cmp(&ch[*b].abs())).unwrap();
+    assert_eq!(peak, BEAT + 500);
+}
+
+#[test]
+fn unwarped_audio_clip_is_bit_exact() {
+    // 97 BPM puts the clip start on a fractional sample, which used to be
+    // read through an interpolator and lose high frequencies.
+    let mut b = P::new(97.0);
+    let t = b.track(TrackKind::Audio, "audio");
+    let mut seed = 0x2545_F491u32;
+    let data: Vec<f32> = (0..20_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        })
+        .collect();
+    let path = std::path::PathBuf::from("mem://noise.wav");
+    let samples = SampleCache::blocking();
+    samples.insert(path.clone(), Arc::new(DecodedAudio::from_planar(vec![data.clone()], 48_000)));
+    let sid = b.p.alloc_source_id();
+    b.p.sources.insert(
+        sid,
+        Source::Audio(AudioSource { path, hash: None, sample_rate: 48_000, channels: 1, frames: 20_000, warp: Warp::default(), key: None }),
+    );
+    let cid = b.p.alloc_clip_id();
+    b.p.clips.insert(
+        cid,
+        Clip {
+            name: "n".into(),
+            color: Color(0),
+            source: sid,
+            offset: 0,
+            length: 8 * PPQ,
+            looping: None,
+            gain_db: 0.0,
+            envelopes: Vec::new(),
+            launch: LaunchSettings::default(),
+            muted: false,
+            scale: None,
+        },
+    );
+    b.place(t, cid, PPQ);
+    let out = render_offline_with(&b.p, &FallbackFactory, (0, 4 * PPQ), SR, 256, samples).unwrap();
+    let start = b.p.tempo.tick_to_samples(PPQ, SR).round() as usize;
+    let got = &out.channel(0)[start..start + 20_000];
+    // No fade-in at the start of the file, and every sample identical.
+    for (i, (a, e)) in got.iter().zip(&data).enumerate() {
+        assert!((a - e).abs() < 1e-6, "sample {i}: {a} vs {e}");
+    }
+}
+
+#[test]
+fn fractional_reads_keep_the_top_octave() {
+    // A 15 kHz sine read half a sample off: linear interpolation would lose
+    // 5.6 dB here; the sinc interpolator must stay within 0.5 dB.
+    let sr = 48_000.0f64;
+    let data: Vec<f32> = (0..4096).map(|n| (std::f64::consts::TAU * 15_000.0 * n as f64 / sr).sin() as f32).collect();
+    let audio = DecodedAudio::from_planar(vec![data], 48_000);
+    let peak = (1000..3000).map(|n| audio.sample(0, n as f64 + 0.5).abs()).fold(0.0f32, f32::max);
+    let db = 20.0 * peak.log10();
+    assert!(db.abs() < 0.5, "15 kHz at a half-sample offset: {db:.2} dB");
+    // And it is accurate: compare against the true value of the sine.
+    for n in [1200usize, 1777, 2500] {
+        let t = n as f64 + 0.37;
+        let want = (std::f64::consts::TAU * 15_000.0 * t / sr).sin() as f32;
+        assert!((audio.sample(0, t) - want).abs() < 0.03, "at {t}");
+    }
+    // DC stays at unity for every phase.
+    let dc = DecodedAudio::from_planar(vec![vec![1.0; 256]], 48_000);
+    for k in 0..16 {
+        assert!((dc.sample(0, 100.0 + k as f64 / 16.0) - 1.0).abs() < 1e-4);
+    }
 }
 
 // ───────────────────────────── Session View ─────────────────────────────
@@ -653,6 +730,34 @@ fn live_midi_reaches_armed_track() {
     proc_.process_planar(&mut buf);
     proc_.process_planar(&mut buf);
     assert!(peak(buf.channel(0)) < 1e-6);
+}
+
+#[test]
+fn targeted_live_midi_reaches_only_its_track_without_changing_external_routing() {
+    let mut b = P::new(120.0);
+    let (first, _) = b.synth_track("first");
+    let (second, _) = b.synth_track("second");
+    b.t(first).arm = true;
+    let (h, proc_) = Engine::new(EngineConfig::headless(SR), Arc::new(FallbackFactory)).unwrap();
+    let mut proc_ = proc_.unwrap();
+    h.update_project(&b.p);
+    h.flush();
+    let mut buf = AudioBuffer::new(2, 256);
+    proc_.process_planar(&mut buf);
+    assert!(h.send_midi_to(second, MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(h.meters(second).unwrap().peak[0] > 0.1);
+    assert!(h.meters(first).unwrap().peak[0] < 1e-6);
+    assert!(h.send_midi_to(second, MidiMessage::note_off(0, 60)));
+    proc_.process_planar(&mut buf);
+    proc_.process_planar(&mut buf);
+    assert!(peak(buf.channel(0)) < 1e-6);
+    assert!(h.send_midi_to(TrackId(u64::MAX), MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(peak(buf.channel(0)) < 1e-6);
+    assert!(h.send_midi(MidiMessage::note_on(0, 60, 100)));
+    proc_.process_planar(&mut buf);
+    assert!(h.meters(first).unwrap().peak[0] > 0.1);
 }
 
 #[test]
@@ -873,6 +978,7 @@ fn audio_thread_never_allocates() {
     h.flush();
     h.launch_scene(scene);
     h.send_midi(MidiMessage::note_on(0, 64, 90));
+    h.send_midi_to(ids[1], MidiMessage::note_on(0, 67, 90));
     h.seek(3 * PPQ);
     assert_eq!(run(&mut proc_, &mut buf, &mut interleaved, 400), 0, "graph swap, launches, MIDI, seek");
     {

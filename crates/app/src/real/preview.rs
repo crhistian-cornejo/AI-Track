@@ -1,5 +1,5 @@
-//! A small preview voice for the browser: plays one file at a low level on
-//! the default output, in its own stream next to the engine's.
+//! A small preview voice for the browser: plays one file on the default
+//! output, in its own stream next to the engine's.
 //!
 //! Files are decoded and resampled on a worker thread. The callback swaps
 //! in the new voice from a wait-free queue and hands the old one back on
@@ -10,8 +10,9 @@ use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 
-/// About −18 dB: previews sit well under the mix.
-const GAIN: f32 = 0.125;
+/// −6 dB: close to how the sample will sound in a track, with headroom for
+/// files normalised to full scale.
+const GAIN: f32 = 0.5;
 /// Longest preview.
 const MAX_SECONDS: usize = 30;
 

@@ -317,6 +317,14 @@ impl EngineBridge for RealEngine {
             .collect();
     }
 
+    fn audition_note(&mut self, track: TrackId, key: u8, velocity: Option<u8>) -> bool {
+        let message = match velocity {
+            Some(v) => aitrack_engine::MidiMessage::note_on(0, key, v.clamp(1, 127)),
+            None => aitrack_engine::MidiMessage::note_off(0, key),
+        };
+        self.handle.send_midi_to(track, message)
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.frame.at).as_secs_f32().min(0.5);

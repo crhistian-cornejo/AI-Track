@@ -16,7 +16,7 @@ use crate::{actions::*, motion, views};
 use aitrack_model::*;
 use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, Task, Window, anchored,
+    KeyDownEvent, KeyUpEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, Task, Window, anchored,
     canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use gpui::{AppContext as _, StatefulInteractiveElement};
@@ -40,8 +40,9 @@ pub enum Drag {
     Fader { track: TrackId, last_y: f32, pos: f32, travel: f32 },
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
-    Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32) },
-    Velocity { clip: ClipId, originals: Vec<Note>, start_y: f32, lane_h: f32 },
+    Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
+    Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
+    Audition { track: TrackId, key: Option<u8> },
     Marquee { clip: ClipId, from: Point<Pixels>, to: Point<Pixels>, base: BTreeSet<NoteId> },
     Clip { track: TrackId, placement: PlacementId, start: Tick, grab_tick: Tick, applied: (Tick, TrackId) },
     ClipResize { clip: ClipId, length: Tick, grab_tick: Tick },
@@ -106,6 +107,10 @@ pub struct Workspace {
     pub s: AppState,
     pub b: Bridges,
     pub focus: FocusHandle,
+    pub audition: crate::audition::Audition,
+    pub piano_keyboard: bool,
+    pub piano_preview: bool,
+    pub piano_octave: u8,
     pub drag: Option<Drag>,
     pub menu: Option<Menu>,
     /// View state of the visual device editors.
@@ -220,6 +225,10 @@ impl Workspace {
             s: AppState::new(Project::new("")),
             b: bridges,
             focus: cx.focus_handle(),
+            audition: Default::default(),
+            piano_keyboard: false,
+            piano_preview: true,
+            piano_octave: 4,
             drag: None,
             menu: None,
             fx: views::device_ui::UiState::default(),
@@ -289,6 +298,7 @@ impl Workspace {
 
     /// Timer tick: plugin main-thread work, scan progress, engine messages.
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
+        self.audition.retry(|t, k, v| self.b.engine.audition_note(t, k, v));
         let mut changed = self.b.engine.idle();
         changed |= self.b.plugins.poll();
         changed |= self.b.library.poll();
@@ -316,7 +326,7 @@ impl Workspace {
 
     fn wants_frames(&mut self) -> bool {
         let t = self.b.engine.transport();
-        let live = t.playing;
+        let live = t.playing || self.audition.is_active();
         // One more frame after stopping so meters drop to rest.
         let was = self.meters_live;
         self.meters_live = live;
@@ -383,6 +393,9 @@ impl Workspace {
     }
 
     pub fn set_tab(&mut self, tab: BottomTab, cx: &mut Context<Self>) {
+        if tab != BottomTab::PianoRoll {
+            self.release_audition(cx);
+        }
         if self.s.bottom_tab != tab {
             self.s.bottom_tab = tab;
             self.tab_switch += 1;
@@ -458,6 +471,59 @@ impl Workspace {
         }
     }
 
+    pub fn audition_track(&self) -> Option<TrackId> {
+        let clip = self.s.selected_clip.filter(|c| self.s.clip_notes(*c).is_some())?;
+        self.s.selected_track.filter(|id| {
+            self.s.project.track(*id).is_some_and(|t| {
+                t.kind == TrackKind::Instrument
+                    && (t.session_slots.values().any(|c| *c == clip) || t.arrangement.iter().any(|p| p.clip == clip))
+            })
+        }).or_else(|| self.s.clip_track(clip).filter(|id| self.s.project.track(*id).is_some_and(|t| t.kind == TrackKind::Instrument)))
+    }
+
+    pub fn press_audition(&mut self, source: &str, track: TrackId, key: u8, cx: &mut Context<Self>) -> bool {
+        let ok = self.audition.press(source, track, key, |t, k, v| self.b.engine.audition_note(t, k, v));
+        if !ok {
+            self.toast("Cannot audition: check the audio device and instrument", cx);
+        }
+        cx.notify();
+        ok
+    }
+
+    pub fn preview_note(&mut self, key: u8, cx: &mut Context<Self>) -> Option<(TrackId, u8)> {
+        let track = self.piano_preview.then(|| self.audition_track()).flatten()?;
+        self.press_audition(crate::audition::NOTE, track, key, cx).then_some((track, key))
+    }
+
+    pub fn release_audition(&mut self, cx: &mut Context<Self>) {
+        self.audition.release_all(|t, k, v| self.b.engine.audition_note(t, k, v));
+        if matches!(self.drag, Some(Drag::Audition { .. })) {
+            self.drag = None;
+        }
+        cx.notify();
+    }
+
+    fn piano_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.piano_keyboard || !self.bottom_open || self.s.bottom_tab != BottomTab::PianoRoll
+            || self.modal.is_some() || !self.focus.is_focused(window) || e.keystroke.modifiers.modified()
+        {
+            return;
+        }
+        let Some(key) = crate::audition::keyboard_note(&e.keystroke.key, self.piano_octave) else { return };
+        let Some(track) = self.audition_track() else { return };
+        if !e.is_held {
+            self.press_audition(&e.keystroke.key, track, key, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn piano_key_up(&mut self, e: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.audition.release(&e.keystroke.key, |t, k, v| self.b.engine.audition_note(t, k, v)) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     // ── Drags ──
 
     pub fn begin_drag(&mut self, drag: Drag, cx: &mut Context<Self>) {
@@ -508,11 +574,18 @@ impl Workspace {
             Drag::BottomResize { start_y, start_h } => {
                 self.bottom_h = (*start_h + (*start_y - y)).clamp(180., 640.);
             }
-            Drag::Notes { clip, originals, origin, resize, applied } => {
+            Drag::Notes { clip, originals, origin, resize, applied, preview } => {
                 let (tick, key) = self.piano_pos(e.position);
                 let raw = tick - origin.0;
                 let dt = if self.s.snap == Snap::Off { raw } else { self.s.snap.round(raw) };
                 let dk = if *resize { 0 } else { key - origin.1 };
+                if let Some((track, previous)) = *preview {
+                    let next = (origin.1 + dk).clamp(0, 127) as u8;
+                    if next != previous {
+                        self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
+                        *preview = self.press_audition(crate::audition::NOTE, track, next, cx).then_some((track, next));
+                    }
+                }
                 if (dt, dk) != *applied {
                     *applied = (dt, dk);
                     if *resize {
@@ -522,9 +595,28 @@ impl Workspace {
                     }
                 }
             }
-            Drag::Velocity { clip, originals, start_y, lane_h } => {
-                let dv = (*start_y - y) / lane_h.max(1.);
-                self.s.set_velocity(*clip, originals, dv);
+            Drag::Velocity { clip, originals, last_y, lane_h, delta } => {
+                let dy = *last_y - y;
+                *last_y = y;
+                if dy != 0. {
+                    let next = velocity_delta(originals, *delta + dy / lane_h.max(1.) * fine);
+                    if next != *delta {
+                        *delta = next;
+                        self.s.set_velocity(*clip, originals, *delta);
+                    }
+                }
+            }
+            Drag::Audition { track, key } => {
+                let b = self.regions.piano.get();
+                let in_bounds = e.position.y >= b.top() && e.position.y < b.bottom();
+                let next = in_bounds.then(|| self.piano_pos(e.position).1 as u8);
+                if *key != next {
+                    self.audition.release(crate::audition::MOUSE, |t, k, v| self.b.engine.audition_note(t, k, v));
+                    if let Some(note) = next {
+                        self.press_audition(crate::audition::MOUSE, *track, note, cx);
+                    }
+                    *key = next;
+                }
             }
             Drag::Marquee { clip, from, to, base } => {
                 *to = e.position;
@@ -595,7 +687,16 @@ impl Workspace {
     }
 
     fn drag_end(&mut self, cx: &mut Context<Self>) {
-        if self.drag.take().is_some() {
+        if let Some(drag) = self.drag.take() {
+            match drag {
+                Drag::Audition { .. } => {
+                    self.audition.release(crate::audition::MOUSE, |t, k, v| self.b.engine.audition_note(t, k, v));
+                }
+                Drag::Notes { .. } => {
+                    self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
+                }
+                _ => {}
+            }
             self.s.seal();
             cx.notify();
         }
@@ -1240,6 +1341,14 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let audition_track = if self.bottom_open && self.s.bottom_tab == BottomTab::PianoRoll && self.modal.is_none() {
+            self.audition_track()
+        } else {
+            None
+        };
+        if !self.audition.matches_track(audition_track) {
+            self.release_audition(cx);
+        }
         self.sync_engine();
         self.b.engine.tick();
         if let Some(animate) = self.look.pending.take() {
@@ -1299,6 +1408,8 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::piano_key_down))
+            .on_key_up(cx.listener(Self::piano_key_up))
             .on_action(cx.listener(Self::play_stop))
             .on_action(cx.listener(Self::toggle_view))
             .on_action(cx.listener(Self::undo))

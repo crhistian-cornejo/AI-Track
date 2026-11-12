@@ -383,6 +383,8 @@ impl AppState {
     /// Set velocity of `originals` offset by `dv` (one coalesced drag).
     pub fn set_velocity(&mut self, clip: ClipId, originals: &[Note], dv: f32) -> bool {
         let Some((source, _)) = self.clip_notes(clip) else { return false };
+        if originals.is_empty() { return false }
+        let dv = velocity_delta(originals, dv);
         let notes = originals.iter().map(|n| Note { velocity: (n.velocity + dv).clamp(0.01, 1.), ..n.clone() }).collect();
         self.edit_coalesced("notes-velocity", "Change velocity", vec![Command::UpdateNotes { source, notes }])
     }
@@ -686,6 +688,13 @@ impl AppState {
     }
 }
 
+pub fn velocity_delta(originals: &[Note], delta: f32) -> f32 {
+    if originals.is_empty() { return 0. }
+    let lower = originals.iter().map(|n| 0.01 - n.velocity).fold(f32::NEG_INFINITY, f32::max);
+    let upper = originals.iter().map(|n| 1. - n.velocity).fold(f32::INFINITY, f32::min);
+    delta.clamp(lower, upper)
+}
+
 pub fn is_drum_track(t: &Track) -> bool {
     t.devices.iter().any(|d| matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Drum))
 }
@@ -808,6 +817,33 @@ mod tests {
         let n = s.clip_notes(clip).unwrap().1.notes.iter().find(|n| n.id == id).unwrap().clone();
         assert_eq!((n.start, n.key), (0, 60));
         assert_eq!(s.history.undo_label(), Some("Add note"));
+    }
+
+    #[test]
+    fn velocity_drag_preserves_relative_values_at_limits_and_undoes_once() {
+        let mut s = state();
+        let clip = lead_clip(&s);
+        let a = s.draw_note(clip, 60, 0).unwrap();
+        let b = s.draw_note(clip, 64, PPQ).unwrap();
+        let originals: Vec<_> = s.clip_notes(clip).unwrap().1.notes.iter()
+            .filter(|n| n.id == a || n.id == b)
+            .cloned()
+            .map(|mut n| { n.velocity = if n.id == a { 0.4 } else { 0.8 }; n })
+            .collect();
+        s.set_velocity(clip, &originals, 0.0);
+        s.seal();
+        s.set_velocity(clip, &originals, 0.1);
+        s.set_velocity(clip, &originals, 0.5);
+        s.seal();
+        let notes = &s.clip_notes(clip).unwrap().1.notes;
+        let a_velocity = notes.iter().find(|n| n.id == a).unwrap().velocity;
+        let b_velocity = notes.iter().find(|n| n.id == b).unwrap().velocity;
+        assert!((a_velocity - 0.6).abs() < 1e-5);
+        assert!((b_velocity - 1.0).abs() < 1e-5);
+        assert!(s.undo());
+        let notes = &s.clip_notes(clip).unwrap().1.notes;
+        assert!((notes.iter().find(|n| n.id == a).unwrap().velocity - 0.4).abs() < 1e-5);
+        assert!((notes.iter().find(|n| n.id == b).unwrap().velocity - 0.8).abs() < 1e-5);
     }
 
     #[test]

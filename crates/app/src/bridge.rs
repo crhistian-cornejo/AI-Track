@@ -59,6 +59,9 @@ pub trait EngineBridge {
     fn launch_scene(&mut self, scene: SceneId);
     fn stop_track(&mut self, track: TrackId);
     fn slot_state(&self, track: TrackId) -> Option<SlotState>;
+    fn audition_note(&mut self, _track: TrackId, _key: u8, _velocity: Option<u8>) -> bool {
+        false
+    }
 
     // ── Audio device (Preferences → Audio) ──
     fn audio_hosts(&self) -> Vec<AudioHost>;

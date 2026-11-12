@@ -22,6 +22,10 @@ pub struct RealAi {
     jobs: BTreeMap<JobId, (JobHandle, Kind)>,
     next: JobId,
     chat: StubAi,
+    agents: Vec<AgentStatus>,
+    detecting: Option<crossbeam_channel::Receiver<Vec<AgentStatus>>>,
+    agent: Option<AgentKind>,
+    asking: Vec<crossbeam_channel::Receiver<Result<String, String>>>,
 }
 
 fn manager() -> ModelManager {
@@ -36,7 +40,17 @@ fn stem_name(path: &Path) -> String {
 
 impl RealAi {
     pub fn new() -> Self {
-        Self { worker: Worker::new(manager(), 1), manager: manager(), jobs: BTreeMap::new(), next: 0, chat: StubAi::default() }
+        Self {
+            worker: Worker::new(manager(), 1),
+            manager: manager(),
+            jobs: BTreeMap::new(),
+            next: 0,
+            chat: StubAi::default(),
+            agents: Vec::new(),
+            detecting: Some(super::agents::detect_all()),
+            agent: None,
+            asking: Vec::new(),
+        }
     }
 
     fn submit(&mut self, job: Job, kind: Kind) -> JobId {
@@ -91,12 +105,52 @@ impl AiBridge for RealAi {
         self.submit(Job::Analyze { path: path.to_path_buf() }, Kind::Analyze(path.to_path_buf()))
     }
 
+    fn agents(&self) -> Vec<AgentStatus> {
+        self.agents.clone()
+    }
+
+    fn refresh_agents(&mut self) {
+        if self.detecting.is_none() {
+            self.detecting = Some(super::agents::detect_all());
+        }
+    }
+
+    fn agent(&self) -> Option<AgentKind> {
+        self.agent
+    }
+
+    fn set_agent(&mut self, agent: Option<AgentKind>) {
+        self.agent = agent.filter(|a| self.agents.iter().any(|s| s.kind == *a && s.installed));
+    }
+
     fn chat(&mut self, text: &str, project: &Project) {
-        self.chat.chat(text, project);
+        match self.agent {
+            // The user's own agent CLI answers, with the project as context.
+            Some(kind) => self.asking.push(super::agents::ask(kind, super::agents::project_context(project), text.to_owned())),
+            None => self.chat.chat(text, project),
+        }
     }
 
     fn poll(&mut self) -> Vec<AiEvent> {
         let mut out = self.chat.poll();
+        if let Some(rx) = &self.detecting
+            && let Ok(found) = rx.try_recv()
+        {
+            self.agents = found;
+            self.detecting = None;
+        }
+        self.asking.retain(|rx| match rx.try_recv() {
+            Ok(Ok(text)) => {
+                out.push(AiEvent::Reply { text });
+                false
+            }
+            Ok(Err(message)) => {
+                out.push(AiEvent::Reply { text: message });
+                false
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
+        });
         let mut finished = Vec::new();
         for (&id, (handle, kind)) in &self.jobs {
             while let Ok(ev) = handle.events.try_recv() {
@@ -142,7 +196,7 @@ impl AiBridge for RealAi {
     }
 
     fn busy(&self) -> bool {
-        !self.jobs.is_empty() || self.chat.busy()
+        !self.jobs.is_empty() || self.chat.busy() || !self.asking.is_empty() || self.detecting.is_some()
     }
 }
 

@@ -2,7 +2,7 @@
 //! progress and proposal cards (Accept / Discard through
 //! `History::accept` / `discard`), plus the built-in AI actions.
 
-use crate::bridge::{MidiMode, ModelNotice};
+use crate::bridge::{AgentKind, MidiMode, ModelNotice};
 use crate::icons::{Icon, icon};
 use crate::motion;
 use crate::theme::*;
@@ -30,7 +30,6 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .border_color(border())
         .child(icon(Icon::Sparkles, 16., pal.accent))
         .child(label("Assistant", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-        .child(badge("local", pal.muted))
         .child(div().flex_1())
         .child(widgets::icon_button("close-ai", Icon::X, false).tooltip(widgets::tip("Close", Some("Ctrl+I"))).on_click(cx.listener(|this, _, _, cx| {
             this.ai_open = false;
@@ -71,14 +70,28 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(div().flex_1().child(ws.chat.clone()))
         .child(widgets::icon_button("send-chat", Icon::Send, false).tooltip(widgets::tip("Send", Some("Enter"))));
 
+    // While the connected agent is working on an answer.
+    let thinking = ws.b.ai.agent().filter(|_| ws.b.ai.busy()).map(|a| {
+        div()
+            .flex_none()
+            .px(px(SP3))
+            .py(px(SP1))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .child(icon(Icon::Loader, 12., pal.accent))
+            .child(label(format!("{} is thinking…", a.name()), TEXT_XS, pal.muted))
+    });
     let body = div()
         .w(px(inner_w))
         .h_full()
         .flex()
         .flex_col()
         .child(header)
+        .child(agents_row(ws, cx))
         .child(actions)
         .child(div().id("chat-log").flex_1().min_h(px(0.)).overflow_y_scroll().child(log))
+        .children(thinking)
         .child(input);
 
     div()
@@ -92,6 +105,60 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(body)
         .with_spring("ai-panel-width", motion::spring(motion::PANEL_SPRING, target), |d, w| d.w(px(w.max(0.))))
         .into_any_element()
+}
+
+/// Who answers the chat: the built-in assistant, or the user's own agent
+/// CLI. AI-Track only runs the CLI the user installed and signed in to; it
+/// never handles an account or a key.
+fn agents_row(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let current = ws.b.ai.agent();
+    let chip = |id: usize, name: &'static str, on: bool, ready: bool| {
+        div()
+            .id(("agent", id))
+            .h(px(22.))
+            .px(px(SP2))
+            .flex()
+            .items_center()
+            .gap(px(SP1))
+            .rounded(px(r_md()))
+            .cursor_pointer()
+            .bg(if on { accent_alpha(0.18) } else { content(0.05) })
+            .hover(|s| s.bg(content(0.12)))
+            .child(div().size(px(6.)).rounded_full().bg(if ready { pal.play } else { content(0.25) }))
+            .child(label(name, TEXT_XS, if on { pal.text } else { pal.muted }))
+    };
+    let mut row = div().flex_none().px(px(SP3)).py(px(SP2)).flex().flex_wrap().items_center().gap(px(SP1)).border_b_1().border_color(border()).child(
+        chip(0, "Built-in", current.is_none(), true).tooltip(widgets::tip("The built-in assistant: runs on this computer", None)).on_click(cx.listener(|this, _, _, cx| {
+            this.b.ai.set_agent(None);
+            cx.notify();
+        })),
+    );
+    let found = ws.b.ai.agents();
+    for (i, kind) in AgentKind::ALL.into_iter().enumerate() {
+        let status = found.iter().find(|s| s.kind == kind);
+        let installed = status.is_some_and(|s| s.installed);
+        let tip = match status {
+            Some(s) if s.installed => format!("{} {} · uses your own sign-in; AI-Track never sees it", kind.name(), s.version),
+            Some(_) => format!("{} is not installed. Click for how to connect it.", kind.name()),
+            None => "Looking for it…".to_owned(),
+        };
+        row = row.child(chip(i + 1, kind.name(), current == Some(kind), installed).tooltip(widgets::tip_owned(tip)).on_click(cx.listener(move |this, _, _, cx| {
+            if installed {
+                this.b.ai.set_agent(Some(kind));
+                this.chat_log.push(ChatEntry::Assistant(format!(
+                    "Connected to {}. It answers with your project as context (tempo, key, tracks and devices). It cannot edit the project yet.",
+                    kind.name()
+                )));
+            } else {
+                this.chat_log.push(ChatEntry::Assistant(format!("{} Then click {} again. AI-Track only runs that program; it never sees your account.", kind.setup(), kind.name())));
+                this.b.ai.refresh_agents();
+                this.ensure_ai_poll(cx);
+            }
+            cx.notify();
+        })));
+    }
+    row.into_any_element()
 }
 
 /// Poly (basic-pitch) / Mono / Drums for "Extract MIDI".

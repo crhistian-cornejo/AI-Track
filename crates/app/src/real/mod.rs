@@ -3,6 +3,7 @@
 //! (`aitrack-stock`), hosted VST3/CLAP plugins (`aitrack-host`), the ML
 //! features (`aitrack-ai`) and the sample library (`aitrack-library`).
 
+pub mod agents;
 pub mod ai;
 pub mod engine;
 pub mod library;

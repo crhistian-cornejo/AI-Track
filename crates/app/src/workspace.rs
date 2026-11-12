@@ -326,6 +326,8 @@ impl Workspace {
         }
         this.s = s;
         this.apply_dev_view();
+        // The agent CLIs are looked up in the background; collect the result.
+        this.ensure_ai_poll(cx);
         this
     }
 
@@ -343,6 +345,7 @@ impl Workspace {
                 "meters" => self.meters.open = true,
                 "tall" => self.bottom_h = 460.,
                 "no-ai" => self.ai_open = false,
+                "ai" => self.ai_open = true,
                 "no-browser" => self.browser_open = false,
                 "play" => self.b.engine.play(),
                 "big" => {
@@ -1089,7 +1092,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn ensure_ai_poll(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn ensure_ai_poll(&mut self, cx: &mut Context<Self>) {
         if self.ai_poll.is_some() {
             return;
         }

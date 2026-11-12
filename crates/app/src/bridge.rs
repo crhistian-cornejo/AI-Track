@@ -1215,6 +1215,40 @@ pub struct ModelNotice {
     pub notice: Option<String>,
 }
 
+/// A coding agent the user has installed, used as the assistant's brain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentKind {
+    ClaudeCode,
+    Codex,
+}
+
+impl AgentKind {
+    pub const ALL: [AgentKind; 2] = [Self::ClaudeCode, Self::Codex];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+
+    /// How to get it, shown when it is not installed.
+    pub fn setup(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Install Claude Code (npm install -g @anthropic-ai/claude-code), then run `claude` once in a terminal and sign in with your own plan.",
+            Self::Codex => "Install the Codex CLI (npm install -g @openai/codex), then run `codex login` in a terminal and sign in with your own account.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatus {
+    pub kind: AgentKind,
+    pub installed: bool,
+    /// The CLI's version line, empty when it is not installed.
+    pub version: String,
+}
+
 pub trait AiBridge {
     /// Audio to MIDI; notes are timed at `bpm`.
     fn extract_midi(&mut self, path: &Path, mode: MidiMode, bpm: f64) -> JobId;
@@ -1228,6 +1262,17 @@ pub trait AiBridge {
     }
     /// Key / BPM / format analysis of an audio file.
     fn analyze(&mut self, path: &Path) -> JobId;
+    /// The agent CLIs found on this machine (empty until detection finishes).
+    fn agents(&self) -> Vec<AgentStatus> {
+        Vec::new()
+    }
+    /// Look for the agent CLIs again (after the user installs one).
+    fn refresh_agents(&mut self) {}
+    /// The agent that answers the chat; `None` is the built-in assistant.
+    fn agent(&self) -> Option<AgentKind> {
+        None
+    }
+    fn set_agent(&mut self, _agent: Option<AgentKind>) {}
     /// Send a chat message; replies and proposals arrive through [`poll`](Self::poll).
     fn chat(&mut self, text: &str, project: &Project);
     /// Drain finished work and progress. The UI calls this on a timer only

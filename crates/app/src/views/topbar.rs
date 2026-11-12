@@ -75,17 +75,28 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     };
     let view_index = if ws.s.view == MainView::Session { 0 } else { 1 };
     // ── Left: identity ──
-    let left = drag_area()
+    // Only the identity and the empty stretch drag the window. Controls must
+    // sit outside the drag area: on Windows the system takes every click in
+    // it for moving the window, so a button inside never receives one.
+    let left = div()
         .flex_1()
         .min_w(px(0.))
+        .h_full()
         .overflow_hidden()
-        .pl(px(LEFT_INSET))
         .gap(px(SP2))
         .flex()
         .items_center()
-        .child(icon(Icon::Logo, 20., pal.accent))
-        .child(label("AI-Track", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-        .when(dirty, |d| d.child(div().size(px(6.)).rounded_full().bg(pal.accent)))
+        .child(
+            drag_area()
+                .flex_none()
+                .pl(px(LEFT_INSET))
+                .gap(px(SP2))
+                .flex()
+                .items_center()
+                .child(icon(Icon::Logo, 20., pal.accent))
+                .child(label("AI-Track", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .when(dirty, |d| d.child(div().size(px(6.)).rounded_full().bg(pal.accent))),
+        )
         .child(
             widgets::icon_button("toggle-browser", Icon::PanelLeft, ws.browser_open)
                 .tooltip(widgets::tip("Browser", Some("Ctrl+Alt+B")))
@@ -96,7 +107,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         )
         .child(
             widgets::icon_button("toggle-bottom", Icon::PanelBottom, ws.bottom_open)
-                .tooltip(widgets::tip("Bottom panel", None))
+                .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.bottom_open = !this.bottom_open;
                     cx.notify();
@@ -109,7 +120,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             view_index,
             80.,
             switch,
-        ));
+        ))
+        .child(drag_area().flex_1());
 
     // ── Centre: transport ──
     let transport = div()

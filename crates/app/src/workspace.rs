@@ -239,7 +239,8 @@ impl Workspace {
             bottom_h: 300.,
             bottom_open: true,
             browser_open: true,
-            ai_open: true,
+            // Closed at start: the arrangement gets the room; the Assistant button opens it.
+            ai_open: false,
             search,
             chat,
             query: String::new(),
@@ -1269,6 +1270,13 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// An arrow-key edit of the selection (notes, or the selected clip).
+    fn key_edit(&mut self, e: KeyEdit, cx: &mut Context<Self>) {
+        if self.s.key_edit(e) {
+            cx.notify();
+        }
+    }
+
     /// Step the interface zoom by 10 % (`0` resets to 100 %), within 80–150 %.
     pub fn zoom_by(&mut self, step: i32, cx: &mut Context<Self>) {
         self.set_look(false, cx, |a| {
@@ -1530,6 +1538,48 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-1, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(0, cx)))
+            .on_action(cx.listener(|this, _: &NudgeUp, _, cx| this.key_edit(KeyEdit::Up, cx)))
+            .on_action(cx.listener(|this, _: &NudgeDown, _, cx| this.key_edit(KeyEdit::Down, cx)))
+            .on_action(cx.listener(|this, _: &NudgeLeft, _, cx| this.key_edit(KeyEdit::Left, cx)))
+            .on_action(cx.listener(|this, _: &NudgeRight, _, cx| this.key_edit(KeyEdit::Right, cx)))
+            .on_action(cx.listener(|this, _: &SemitoneUp, _, cx| this.key_edit(KeyEdit::SemitoneUp, cx)))
+            .on_action(cx.listener(|this, _: &SemitoneDown, _, cx| this.key_edit(KeyEdit::SemitoneDown, cx)))
+            .on_action(cx.listener(|this, _: &OctaveUp, _, cx| this.key_edit(KeyEdit::OctaveUp, cx)))
+            .on_action(cx.listener(|this, _: &OctaveDown, _, cx| this.key_edit(KeyEdit::OctaveDown, cx)))
+            .on_action(cx.listener(|this, _: &Longer, _, cx| this.key_edit(KeyEdit::Longer, cx)))
+            .on_action(cx.listener(|this, _: &Shorter, _, cx| this.key_edit(KeyEdit::Shorter, cx)))
+            .on_action(cx.listener(|this, _: &VelocityUp, _, cx| this.key_edit(KeyEdit::VelocityUp, cx)))
+            .on_action(cx.listener(|this, _: &VelocityDown, _, cx| this.key_edit(KeyEdit::VelocityDown, cx)))
+            .on_action(cx.listener(|this, _: &ToggleActive, _, cx| {
+                if let Some(done) = this.s.toggle_active() {
+                    this.toast(done, cx);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Duplicate, _, cx| {
+                if this.s.duplicate_selection() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetail, _, cx| {
+                this.bottom_open = !this.bottom_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetailView, _, cx| {
+                // Shift+Tab in Live: swap the detail view between devices and the clip.
+                let next = if this.s.bottom_tab == BottomTab::Devices { BottomTab::PianoRoll } else { BottomTab::Devices };
+                this.bottom_open = true;
+                this.set_tab(next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowMixer, _, cx| {
+                if this.bottom_open && this.s.bottom_tab == BottomTab::Mixer {
+                    this.bottom_open = false;
+                    cx.notify();
+                } else {
+                    this.bottom_open = true;
+                    this.set_tab(BottomTab::Mixer, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenPreferences, _, cx| this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Appearance), cx)))
             .on_action(cx.listener(|this, _: &ExportAudio, _, cx| this.open_export(cx)))
             .on_action(cx.listener(|this, _: &TabDevices, _, cx| this.set_tab(BottomTab::Devices, cx)))

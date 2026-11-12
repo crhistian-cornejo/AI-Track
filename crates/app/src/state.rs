@@ -434,6 +434,158 @@ impl AppState {
         count
     }
 
+    // ── Keyboard editing (the Live key commands) ──
+
+    fn grid(&self) -> Tick {
+        if self.snap == Snap::Off { PPQ / 4 } else { self.snap.ticks().max(1) }
+    }
+
+    /// The selected notes of the open clip, when the piano roll has the keys.
+    fn key_notes(&self) -> Option<(ClipId, SourceId, Vec<Note>)> {
+        let clip = self.selected_clip?;
+        let (source, n) = self.clip_notes(clip)?;
+        let sel: Vec<Note> = n.notes.iter().filter(|n| self.selected_notes.contains(&n.id)).cloned().collect();
+        (!sel.is_empty()).then_some((clip, source, sel))
+    }
+
+    /// Arrow-key editing of the selection, one undo step per press.
+    ///
+    /// Notes: ↑/↓ move by one step of the clip's scale (a semitone when there
+    /// is no scale; Alt forces a semitone), Shift+↑/↓ by an octave, ←/→ by
+    /// the grid, Shift+←/→ change the length, Ctrl+↑/↓ the velocity.
+    /// With no notes selected, ←/→ nudge the selected arrangement clip.
+    pub fn key_edit(&mut self, e: KeyEdit) -> bool {
+        let grid = self.grid();
+        if let Some((clip, source, sel)) = self.key_notes() {
+            let scale = self.clip_scale(Some(clip));
+            let first = sel.iter().map(|n| n.start).min().unwrap_or(0);
+            let notes: Vec<Note> = sel
+                .iter()
+                .map(|n| {
+                    let mut n = n.clone();
+                    match e {
+                        KeyEdit::Up | KeyEdit::Down => {
+                            let dir = if e == KeyEdit::Up { 1 } else { -1 };
+                            n.key = match scale {
+                                Some(s) => step_in_scale(s, n.key, dir),
+                                None => (n.key as i32 + dir).clamp(0, 127) as u8,
+                            };
+                        }
+                        KeyEdit::SemitoneUp => n.key = (n.key + 1).min(127),
+                        KeyEdit::SemitoneDown => n.key = n.key.saturating_sub(1),
+                        KeyEdit::OctaveUp => n.key = if n.key <= 115 { n.key + 12 } else { n.key },
+                        KeyEdit::OctaveDown => n.key = if n.key >= 12 { n.key - 12 } else { n.key },
+                        KeyEdit::Left => n.start -= grid.min(first),
+                        KeyEdit::Right => n.start += grid,
+                        KeyEdit::Longer => n.length += grid,
+                        KeyEdit::Shorter => n.length = (n.length - grid).max(grid.min(PPQ / 4)),
+                        KeyEdit::VelocityUp => n.velocity = (n.velocity + 0.08).min(1.),
+                        KeyEdit::VelocityDown => n.velocity = (n.velocity - 0.08).max(0.01),
+                    }
+                    n
+                })
+                .collect();
+            if notes == sel {
+                return false;
+            }
+            self.seal();
+            let label = match e {
+                KeyEdit::Left | KeyEdit::Right => "Move notes",
+                KeyEdit::Longer | KeyEdit::Shorter => "Resize notes",
+                KeyEdit::VelocityUp | KeyEdit::VelocityDown => "Change velocity",
+                _ => "Transpose notes",
+            };
+            let ok = self.edit(label, vec![Command::UpdateNotes { source, notes }]);
+            self.seal();
+            return ok;
+        }
+        if let (Some((track, id)), KeyEdit::Left | KeyEdit::Right) = (self.selected_placement, e) {
+            let Some(start) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id)).map(|p| p.start) else {
+                return false;
+            };
+            let to = if e == KeyEdit::Left { (start - grid).max(0) } else { start + grid };
+            if to == start {
+                return false;
+            }
+            self.seal();
+            let ok = self.move_placement(track, id, track, to);
+            self.seal();
+            return ok;
+        }
+        false
+    }
+
+    /// `0` in Live: deactivate or reactivate the selection. Notes when notes
+    /// are selected, otherwise the selected clip, otherwise the selected track.
+    pub fn toggle_active(&mut self) -> Option<&'static str> {
+        if let Some((_, source, sel)) = self.key_notes() {
+            let mute = sel.iter().any(|n| !n.muted);
+            let notes = sel.into_iter().map(|n| Note { muted: mute, ..n }).collect();
+            self.seal();
+            self.edit(if mute { "Deactivate notes" } else { "Activate notes" }, vec![Command::UpdateNotes { source, notes }]);
+            self.seal();
+            return Some(if mute { "Notes deactivated" } else { "Notes activated" });
+        }
+        let placed = self.selected_placement.and_then(|(t, id)| self.project.track(t)?.arrangement.iter().find(|p| p.id == id).map(|p| p.clip));
+        if let Some(id) = placed.or(self.selected_clip.filter(|_| self.bottom_tab == BottomTab::PianoRoll && self.selected_track.is_none()))
+            && let Some(clip) = self.project.clips.get(&id).cloned()
+        {
+            let muted = !clip.muted;
+            self.seal();
+            self.edit(if muted { "Deactivate clip" } else { "Activate clip" }, vec![Command::UpdateClip { id, clip: Box::new(Clip { muted, ..clip }) }]);
+            self.seal();
+            return Some(if muted { "Clip deactivated" } else { "Clip activated" });
+        }
+        let track = self.selected_track?;
+        let mute = !self.project.track(track)?.mute;
+        self.seal();
+        self.set_track(track, TrackProp::Mute(mute));
+        self.seal();
+        Some(if mute { "Track deactivated" } else { "Track activated" })
+    }
+
+    /// Ctrl+D: duplicate the selected notes right after themselves, or the
+    /// selected arrangement clip right after itself (as an independent copy).
+    pub fn duplicate_selection(&mut self) -> bool {
+        let grid = self.grid();
+        if let Some((_, source, sel)) = self.key_notes() {
+            let (first, last) = (sel.iter().map(|n| n.start).min().unwrap_or(0), sel.iter().map(Note::end).max().unwrap_or(0));
+            let span = ((last - first + grid - 1) / grid * grid).max(grid);
+            let copies: Vec<Note> = sel.iter().map(|n| Note { id: self.project.alloc_note_id(), start: n.start + span, ..n.clone() }).collect();
+            let ids: Vec<NoteId> = copies.iter().map(|n| n.id).collect();
+            self.seal();
+            let ok = self.edit("Duplicate notes", vec![Command::AddNotes { source, notes: copies }]);
+            self.seal();
+            if ok {
+                self.selected_notes = ids.into_iter().collect();
+            }
+            return ok;
+        }
+        let Some((track, id)) = self.selected_placement else { return false };
+        let Some(place) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id)).cloned() else { return false };
+        let Some(clip) = self.project.clips.get(&place.clip).cloned() else { return false };
+        let mut cmds = Vec::new();
+        let mut copy = clip.clone();
+        // MIDI clips get their own notes so editing the copy leaves the original alone.
+        if let Some(Source::Notes(n)) = self.project.sources.get(&clip.source).cloned() {
+            let source = self.project.alloc_source_id();
+            let notes = n.notes.iter().map(|x| Note { id: self.project.alloc_note_id(), ..x.clone() }).collect();
+            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
+            copy.source = source;
+        }
+        let new_clip = self.project.alloc_clip_id();
+        let new_place = self.project.alloc_placement_id();
+        cmds.push(Command::AddClip { id: new_clip, clip: Box::new(copy) });
+        cmds.push(Command::PlaceClip { track, placement: Placement { id: new_place, clip: new_clip, start: place.start + clip.length, lane: place.lane } });
+        self.seal();
+        let ok = self.edit("Duplicate clip", cmds);
+        self.seal();
+        if ok {
+            self.selected_placement = Some((track, new_place));
+        }
+        ok
+    }
+
     /// Step sequencer: toggle a note of `key` in the step starting at `start`.
     pub fn toggle_step(&mut self, clip: ClipId, key: u8, start: Tick, len: Tick) -> bool {
         let Some((source, n)) = self.clip_notes(clip) else { return false };
@@ -738,6 +890,40 @@ pub fn format_db(db: f32) -> String {
     if db <= -69.9 { "-inf".into() } else { format!("{db:+.1}") }
 }
 
+
+/// A keyboard edit of the selection (see [`AppState::key_edit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEdit {
+    Up,
+    Down,
+    SemitoneUp,
+    SemitoneDown,
+    OctaveUp,
+    OctaveDown,
+    Left,
+    Right,
+    Longer,
+    Shorter,
+    VelocityUp,
+    VelocityDown,
+}
+
+/// The next note of `scale` above (`dir` = 1) or below (`dir` = -1) `key`.
+/// A note outside the scale lands on the nearest scale note in that direction.
+pub fn step_in_scale(scale: Scale, key: u8, dir: i32) -> u8 {
+    let mut k = key as i32;
+    for _ in 0..12 {
+        k += dir;
+        if !(0..=127).contains(&k) {
+            return key;
+        }
+        if scale.contains(k as u8) {
+            return k as u8;
+        }
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,6 +953,83 @@ mod tests {
         assert!(s.selected_notes.is_empty(), "selection follows undo");
         assert!(s.redo());
         assert_eq!(s.clip_notes(clip).unwrap().1.notes.len(), before + 1);
+    }
+
+    #[test]
+    fn arrow_keys_edit_the_selected_notes_like_live() {
+        let mut s = state();
+        let clip = lead_clip(&s);
+        s.selected_clip = Some(clip);
+        // The demo is in A minor: A4 (69) is in the scale, A#4 (70) is not.
+        let id = s.draw_note(clip, 69, 0).unwrap();
+        let note = |s: &AppState| s.clip_notes(clip).unwrap().1.notes.iter().find(|n| n.id == id).unwrap().clone();
+        assert!(s.key_edit(KeyEdit::Up));
+        assert_eq!(note(&s).key, 71, "up moves to the next note of the scale (B), skipping A#");
+        assert!(s.key_edit(KeyEdit::SemitoneDown));
+        assert_eq!(note(&s).key, 70, "Alt moves a semitone");
+        assert!(s.key_edit(KeyEdit::Down));
+        assert_eq!(note(&s).key, 69, "an out-of-scale note lands on the scale");
+        assert!(s.key_edit(KeyEdit::OctaveUp));
+        assert_eq!(note(&s).key, 81);
+        let grid = s.snap.ticks();
+        assert!(s.key_edit(KeyEdit::Right));
+        assert_eq!(note(&s).start, grid);
+        assert!(s.key_edit(KeyEdit::Left) && s.key_edit(KeyEdit::Longer));
+        assert_eq!((note(&s).start, note(&s).length), (0, s.note_length + grid));
+        assert!(!s.key_edit(KeyEdit::Left), "cannot move before the clip start");
+        let v = note(&s).velocity;
+        assert!(s.key_edit(KeyEdit::VelocityDown));
+        assert!(note(&s).velocity < v);
+        // Each press is its own undo step.
+        assert_eq!(s.history.undo_label(), Some("Change velocity"));
+        assert!(s.undo());
+        assert_eq!(note(&s).velocity, v);
+    }
+
+    #[test]
+    fn zero_deactivates_and_ctrl_d_duplicates() {
+        let mut s = state();
+        let clip = lead_clip(&s);
+        s.selected_clip = Some(clip);
+        let id = s.draw_note(clip, 60, 0).unwrap();
+        let count = s.clip_notes(clip).unwrap().1.notes.len();
+        assert_eq!(s.toggle_active(), Some("Notes deactivated"));
+        assert!(s.clip_notes(clip).unwrap().1.notes.iter().find(|n| n.id == id).unwrap().muted);
+        assert_eq!(s.toggle_active(), Some("Notes activated"));
+        assert!(s.duplicate_selection());
+        let notes = &s.clip_notes(clip).unwrap().1.notes;
+        assert_eq!(notes.len(), count + 1);
+        let copy = notes.iter().find(|n| s.selected_notes.contains(&n.id)).unwrap();
+        assert_eq!((copy.key, copy.start), (60, s.note_length), "the copy follows the original and is selected");
+        // With no notes selected, 0 acts on the selected track.
+        s.selected_notes.clear();
+        let track = s.project.tracks.iter().find(|t| t.name == "Lead").unwrap().id;
+        s.selected_track = Some(track);
+        s.selected_placement = None;
+        assert_eq!(s.toggle_active(), Some("Track deactivated"));
+        assert!(s.project.track(track).unwrap().mute);
+    }
+
+    #[test]
+    fn duplicating_a_clip_makes_an_independent_copy() {
+        let mut s = state();
+        let (track, place) = s
+            .project
+            .tracks
+            .iter()
+            .find_map(|t| t.arrangement.first().filter(|_| t.kind == TrackKind::Instrument).map(|p| (t.id, p.clone())))
+            .expect("the demo has a MIDI clip in the arrangement");
+        let length = s.project.clips[&place.clip].length;
+        s.selected_notes.clear();
+        s.selected_placement = Some((track, place.id));
+        assert!(s.duplicate_selection());
+        let (_, new_id) = s.selected_placement.unwrap();
+        let t = s.project.track(track).unwrap();
+        let copy = t.arrangement.iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!(copy.start, place.start + length);
+        assert_ne!(s.project.clips[&copy.clip].source, s.project.clips[&place.clip].source, "its notes are its own");
+        assert!(s.undo());
+        assert!(s.project.track(track).unwrap().arrangement.iter().all(|p| p.id != new_id));
     }
 
     #[test]

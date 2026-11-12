@@ -39,6 +39,10 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
     let mut out = Vec::new();
     let mut y = 0.;
     for t in s.project.content_tracks() {
+        // Return tracks sit with Main in the pinned bus section at the bottom.
+        if t.kind == TrackKind::Return {
+            continue;
+        }
         if let Some(parent) = t.parent
             && s.project.track(parent).is_some_and(|g| g.collapsed) {
                 continue;
@@ -401,7 +405,93 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .flex_col()
         .child(div().flex_none().h(px(RULER_H)).flex().child(toolbar).child(ruler_el))
         .child(div().flex_1().min_h(px(0.)).flex().child(header_col).child(lanes_el))
+        .child(bus_section(ws, cx))
         .into_any_element()
+}
+
+/// Height of one row of the pinned bus section.
+const BUS_H: f32 = 28.;
+
+/// Return tracks and Main, pinned under the lanes so the whole signal path
+/// is always in view: tracks → returns → Main. Clicking one selects it, so
+/// its device chain (bus effects, mastering) opens in the Devices tab.
+fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let buses: Vec<aitrack_model::Track> =
+        ws.s.project.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Return | TrackKind::Main)).cloned().collect();
+    let mut headers = div().flex_none().w(px(TRACK_HEADER_W)).flex().flex_col().border_r_1().border_color(border());
+    let mut lanes = div().flex_1().min_w(px(0.)).flex().flex_col();
+    let mut letter = b'A';
+    for t in buses {
+        let id = t.id;
+        let is_main = t.kind == TrackKind::Main;
+        let selected = ws.s.selected_track == Some(id);
+        let (mute, solo) = (t.mute, t.solo);
+        let tag = if is_main {
+            "Main".to_owned()
+        } else {
+            letter += 1;
+            format!("{}", (letter - 1) as char)
+        };
+        let effects = t.devices.len();
+        headers = headers.child(
+            div()
+                .id(("bus-head", id.0 as usize))
+                .h(px(BUS_H))
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .pr(px(SP2))
+                .bg(if selected { pal.raised } else { pal.surface })
+                .border_b_1()
+                .border_color(border())
+                .cursor_pointer()
+                .tooltip(widgets::tip(if is_main { "Main output: every track and return ends here" } else { "Return bus: fed by the tracks' sends" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.s.selected_track = Some(id);
+                    cx.notify();
+                }))
+                .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
+                .child(icon(if is_main { Icon::Volume } else { Icon::Return }, 14., pal.muted))
+                .child(label(paint::fit(&t.name, TRACK_HEADER_W - 150., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
+                .child(chip(("bus-m", id.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.s.set_track(id, TrackProp::Mute(!mute));
+                    cx.notify();
+                })))
+                .when(!is_main, |d| {
+                    d.child(chip(("bus-s", id.0 as usize), "S", solo, pal.solo).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.s.set_track(id, TrackProp::Solo(!solo));
+                        cx.notify();
+                    })))
+                })
+                .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted).w(px(34.)))
+                .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
+        );
+        lanes = lanes.child(
+            div()
+                .h(px(BUS_H))
+                .px(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .bg(if selected { accent_alpha(0.05) } else { content(0.02) })
+                .border_b_1()
+                .border_color(border())
+                .child(widgets::badge(tag, track_color(t.color)))
+                .child(label(
+                    match effects {
+                        0 => "no effects".to_owned(),
+                        1 => "1 effect".to_owned(),
+                        n => format!("{n} effects"),
+                    },
+                    TEXT_XS,
+                    pal.faint,
+                )),
+        );
+    }
+    div().flex_none().flex().border_t_1().border_color(border_strong()).bg(pal.surface).child(headers).child(lanes).into_any_element()
 }
 
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint) {

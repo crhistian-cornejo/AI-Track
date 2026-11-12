@@ -1,12 +1,15 @@
 //! Arrangement View: ruler with loop brace, track headers, and one canvas
 //! that paints every lane (grid, clips with note minis or waveforms,
-//! automation, playhead). Only what is on screen is painted.
+//! automation, playhead). Only what is on screen is painted. What is done
+//! to a clip in its lane (fades, edges, copies) is in `views::arrange_clips`.
 
 use crate::icons::{Icon, icon};
 use crate::paint::{self, at};
-use crate::state::{AppState, BAR, Snap};
+use crate::state::{AppState, Snap};
 use crate::theme::*;
+use crate::views::arrange_clips::{self, ClipBox, Zone, draw::Wave};
 use crate::views::browser::kind_icon;
+use crate::views::sample_editor::geom::TimeBase;
 use crate::widgets::{self, chip, icon_chip, label, mono};
 use crate::workspace::{Drag, MenuKind, Workspace};
 use aitrack_model::*;
@@ -15,6 +18,8 @@ use gpui::{
     Pixels, Point, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, TextAlign, Window, canvas, div,
     point, prelude::FluentBuilder, px,
 };
+use gpui::{DispatchPhase, HitboxBehavior, MouseMoveEvent};
+use std::rc::Rc;
 
 const AUTO_H: f32 = 56.;
 const CLIP_HEAD: f32 = 14.;
@@ -114,10 +119,16 @@ fn target_name(ws: &Workspace, t: AutomationTarget) -> String {
 
 enum Body {
     Notes { notes: Vec<(u8, Tick, Tick)>, lo: u8, hi: u8, loop_len: Tick },
-    Audio { seed: u64 },
+    /// The decoded file (`None` while it is read, or when it cannot be) and
+    /// what shapes its level: gain, fades, volume envelope, offset and loop.
+    Audio { wave: Option<Wave>, shape: Clip },
 }
 
 struct ClipPaint {
+    id: PlacementId,
+    /// The clip's rectangle, its fades and where their handles are.
+    bx: ClipBox,
+    looping: bool,
     x: f32,
     w: f32,
     y: f32,
@@ -130,6 +141,8 @@ struct ClipPaint {
     offset: Tick,
     /// Deactivated with 0: drawn drained of colour.
     muted: bool,
+    /// Where a looping audio clip starts over, in pixels from its left edge.
+    repeats: Vec<f32>,
 }
 
 struct AutoPaint {
@@ -142,6 +155,13 @@ struct AutoPaint {
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    // Follow Playhead: turn the page when the playhead leaves the lanes.
+    if ws.s.ed.follow && ws.b.engine.transport().playing {
+        let width = f32::from(ws.regions.arrange.get().size.width);
+        if let Some(x) = crate::nav::follow(ws.s.arrange, ws.b.engine.transport().position, width) {
+            ws.s.arrange.scroll_x = x;
+        }
+    }
     let rows = rows(&ws.s);
     let view = ws.s.arrange;
     let ppb = view.px_per_beat;
@@ -153,6 +173,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let t1 = ((view.scroll_x + lane_w) / px_per_tick) as Tick;
     let song_end = ws.s.project.arrangement_end();
     let loop_region = ws.s.project.loop_region;
+    let selection = ws.s.selected_clip_ids();
+    let bpm = ws.s.project.tempo.initial_bpm();
 
     // ── Gather what the lane canvas paints ──
     let mut clips = Vec::new();
@@ -181,20 +203,35 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         loop_len: c.looping.map_or(c.length, |l| l.end - l.start).max(1),
                     }
                 }
-                _ => Body::Audio { seed: c.source.0 },
+                Some(Source::Audio(file)) => {
+                    // Decoded in the background: flat until the peaks arrive.
+                    let wave = ws.waves.peaks(&file.path).map(|peaks| {
+                        let base = TimeBase { sample_rate: f64::from(peaks.sample_rate().max(1)), ..TimeBase::of(file, bpm) };
+                        Wave { frames_per_tick: base.tick_to_frame(1.), peaks }
+                    });
+                    Body::Audio { wave, shape: arrange_clips::draw::shape_of(c) }
+                }
+                None => Body::Audio { wave: None, shape: arrange_clips::draw::shape_of(c) },
             };
+            let audio = matches!(body, Body::Audio { .. });
+            // Notes draw their own repeats; audio gets a notch at each one.
+            let repeats = if matches!(body, Body::Audio { .. }) { crate::editing::overlay::loop_repeats(c, px_per_tick) } else { Vec::new() };
             clips.push(ClipPaint {
+                id: pl.id,
+                bx: ClipBox::of(c, audio, pl.start, ry, r.h, px_per_tick, view.scroll_x),
+                looping: c.looping.is_some_and(|l| l.end > l.start),
                 x: pl.start as f32 * px_per_tick - view.scroll_x,
                 w: c.length as f32 * px_per_tick,
                 y: ry + 2.,
                 h: r.h - 4.,
                 color: c.color,
                 name: c.name.clone(),
-                selected: ws.s.selected_placement.is_some_and(|(_, id)| id == pl.id),
+                selected: selection.contains(&pl.id),
                 body,
                 px_per_tick,
                 offset: c.offset,
                 muted: c.muted,
+                repeats,
             });
         }
         if let Some(target) = r.auto
@@ -207,14 +244,26 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 });
             }
     }
+    // The grid, the insert marker and the time selection.
+    let lane_rects: Vec<(TrackId, f32, f32)> = rows.iter().map(|r| (r.track, r.top - view.scroll_y, r.h)).collect();
+    let overlay = crate::editing::overlay::Overlay::arrange(&ws.s, &lane_rects);
+    let ruler_overlay = overlay.clone();
     let playhead = transport.position as f32 * px_per_tick - view.scroll_x;
     let loop_px = loop_region.map(|(a, b)| (a as f32 * px_per_tick - view.scroll_x, b as f32 * px_per_tick - view.scroll_x));
     let end_px = song_end as f32 * px_per_tick - view.scroll_x;
 
+    // What is under the pointer is worked out while painting, from these.
+    let boxes: Rc<[ClipBox]> = clips.iter().map(|c| c.bx).collect();
+    let held = arrange_clips::held(ws);
+    let copying = arrange_clips::copying(ws);
+    let idle = ws.drag.is_none();
     let regions = ws.regions.clone();
     let lane_canvas = canvas(
-        move |b, _, _| regions.arrange.set(b),
-        move |b, _, window, cx| {
+        move |b, window, _| {
+            regions.arrange.set(b);
+            window.insert_hitbox(b, HitboxBehavior::Normal)
+        },
+        move |b, hitbox, window, cx| {
             let o = b.origin;
             let w = f32::from(b.size.width);
             let h = f32::from(b.size.height);
@@ -228,31 +277,38 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh + AUTO_H - 1., w, 1.), border()));
                 }
             }
-            // Grid.
-            let first_bar = (view.scroll_x / (ppb * 4.)).floor() as i64;
-            let bars = (w / (ppb * 4.)).ceil() as i64 + 1;
-            for i in 0..=bars {
-                let bar = first_bar + i;
-                let x = bar as f32 * ppb * 4. - view.scroll_x;
-                if bar % 8 >= 4 {
-                    window.paint_quad(paint::fill_rect(at(o, x, 0., ppb * 4., h), content(0.012)));
-                }
-                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), if bar % 4 == 0 { p().grid_bar } else { p().grid_beat }));
-                if ppb >= 14. {
-                    for beat in 1..4 {
-                        window.paint_quad(paint::fill_rect(at(o, x + beat as f32 * ppb, 0., 1., h), p().grid_sub));
-                    }
-                }
-            }
+            // Grid: bars, beats and the subdivisions the zoom leaves room for.
+            overlay.paint_grid(window, o, w, h, true);
             if let Some((a, bb)) = loop_px {
                 window.paint_quad(paint::fill_rect(at(o, a, 0., bb - a, h), accent_alpha(0.035)));
             }
             if end_px > 0. && end_px < w {
                 window.paint_quad(paint::fill_rect(at(o, end_px, 0., 1., h), content(0.18)));
             }
-            // Clips.
-            for c in &clips {
-                paint_clip(window, cx, o, c);
+            // Clips. The one under the pointer, or held by a drag, is lit
+            // and shows its handles; the pointer shows what a press does.
+            let hot = match held {
+                Some((id, zone)) => clips.iter().position(|c| c.id == id).map(|i| (i, zone)),
+                None if idle && hitbox.is_hovered(window) => {
+                    let at = window.mouse_position();
+                    arrange_clips::geom::topmost(&boxes, f32::from(at.x - o.x), f32::from(at.y - o.y))
+                }
+                None => None,
+            };
+            for (i, c) in clips.iter().enumerate() {
+                paint_clip(window, cx, o, c, w, hot.filter(|h| h.0 == i).map(|h| h.1));
+            }
+            window.set_cursor_style(arrange_clips::cursor_for(hot.map(|h| h.1), copying), &hitbox);
+            if idle {
+                // Paint again when the pointer moves on to another target.
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _| {
+                    if phase == DispatchPhase::Bubble {
+                        let now = hitbox.is_hovered(window).then(|| arrange_clips::geom::topmost(&boxes, f32::from(e.position.x - o.x), f32::from(e.position.y - o.y))).flatten();
+                        if now != hot {
+                            window.refresh();
+                        }
+                    }
+                });
             }
             // Automation.
             for a in &autos {
@@ -280,6 +336,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     ));
                 }
             }
+            // Time selection and insert marker.
+            overlay.paint_time_selection(window, o);
+            overlay.paint_marker(window, o, w, h);
             // Playhead.
             if playhead >= 0. && playhead <= w {
                 window.paint_quad(paint::fill_rect(at(o, playhead, 0., 1., h), accent()));
@@ -304,7 +363,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .on_drop(cx.listener(|this, d: &crate::workspace::DraggedSample, window, cx| {
             let pos = window.mouse_position();
             let (tick, row) = this.arrange_pos(pos);
-            let start = crate::state::Snap::Beat.floor(tick.max(0));
+            // On the grid line nearest to where it was dropped.
+            let start = this.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), false);
             this.add_sample_clip(&d.0, row, Some(start), cx);
         }))
         .on_scroll_wheel(cx.listener(on_wheel));
@@ -339,19 +399,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             if let Some((a, bb)) = loop_px {
                 window.paint_quad(paint::rrect(at(o, a, 3., bb - a, 8.), 3., accent_alpha(0.75)));
             }
-            let bar_px = ppb * 4.;
-            let step = [1, 2, 4, 8, 16].into_iter().find(|s| *s as f32 * bar_px >= 40.).unwrap_or(32);
-            let first = (view.scroll_x / bar_px).floor() as i64;
-            let count = (w / bar_px).ceil() as i64 + 1;
-            for i in 0..=count {
-                let bar = first + i;
-                if bar < 0 || bar % step != 0 {
-                    continue;
-                }
-                let x = bar as f32 * bar_px - view.scroll_x;
-                window.paint_quad(paint::fill_rect(at(o, x, h - 10., 1., 10.), content(0.3)));
-                paint::text(window, cx, &format!("{}", bar + 1), o.x + px(x + 4.), o.y + px(12.), TEXT_XS, p().muted, FontWeight::MEDIUM, TextAlign::Left);
-            }
+            // Bar numbers, thinning out when zoomed out; beats when zoomed in.
+            ruler_overlay.paint_ruler(window, cx, o, w, h, 12.);
+            ruler_overlay.paint_ruler_selection(window, o, h);
+            ruler_overlay.paint_marker_flag(window, o, w, h);
             if playhead >= 0. && playhead <= w {
                 paint::polygon(
                     window,
@@ -366,20 +417,21 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .id("ruler")
         .flex_1()
         .h_full()
+        // Labels and the loop brace scrolled past the left edge stay out of the toolbar.
+        .overflow_hidden()
         .cursor_pointer()
         .child(ruler)
-        .tooltip(widgets::tip("Click to locate · drag the top strip to set the loop", None))
+        .tooltip(widgets::tip("Click to place the insert marker · drag the top strip to set the loop", None))
         .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
             let b = this.regions.ruler.get();
             let y = f32::from(e.position.y - b.origin.y);
             let x = f32::from(e.position.x - b.origin.x) + this.s.arrange.scroll_x;
             let tick = (x / this.s.arrange.px_per_beat * PPQ as f32) as Tick;
             if y < 12. {
-                let anchor = Snap::Bar.round(tick).max(0);
+                let anchor = this.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt).max(0);
                 this.begin_drag(Drag::LoopBrace { anchor }, cx);
             } else {
-                this.b.engine.locate(Snap::Beat.floor(tick.max(0)));
-                this.begin_drag(Drag::Scrub, cx);
+                crate::editing::gestures::ruler_down(this, tick, e, cx);
             }
         }))
         .on_scroll_wheel(cx.listener(on_wheel));
@@ -407,21 +459,23 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .rounded(px(r_md()))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
-                .tooltip(widgets::tip("Snap grid", None))
+                .tooltip(widgets::tip("Snap grid: adaptive follows the zoom · hold Alt while dragging to bypass", Some("Ctrl+4")))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
                     this.open_menu(MenuKind::Snap, point(at.x - px(16.), at.y + px(14.)), cx);
                 }))
                 .child(icon(Icon::Magnet, 14., if ws.s.snap == Snap::Off { pal.faint } else { pal.accent }))
-                .child(label(ws.s.snap.label(), TEXT_SM, pal.text)),
+                .child(label(ws.s.snap_label(crate::editing::GridView::Arrange), TEXT_SM, pal.text)),
         )
         .child(div().flex_1())
         .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, 24., 14.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
-            this.s.arrange.px_per_beat = (this.s.arrange.px_per_beat / 1.25).max(4.);
+            let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
+            this.s.arrange = crate::nav::zoom_at(this.s.arrange, 0.8, centre);
             cx.notify();
         })))
         .child(widgets::sized_icon_button("zoom-in", Icon::ZoomIn, false, 24., 14.).tooltip(widgets::tip("Zoom in", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
-            this.s.arrange.px_per_beat = (this.s.arrange.px_per_beat * 1.25).min(160.);
+            let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
+            this.s.arrange = crate::nav::zoom_at(this.s.arrange, 1.25, centre);
             cx.notify();
         })));
 
@@ -520,15 +574,21 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     div().flex_none().flex().border_t_1().border_color(border_strong()).bg(pal.surface).child(headers).child(lanes).into_any_element()
 }
 
-fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint) {
+/// One clip. `canvas_w` bounds what is worth drawing; `hot` is what the
+/// pointer is over (or a drag holds) when it is this clip.
+fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint, canvas_w: f32, hot: Option<Zone>) {
     let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
     let fill = if c.muted { mix(clip_fill(c.color), p().well, 0.7) } else { clip_fill(c.color) };
     let fg = if c.muted { p().muted } else { clip_text(c.color) };
     window.paint_quad(paint::rrect_border(body, r_sm(), with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
     window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), r_sm(), fill));
+    if hot.is_some() {
+        window.paint_quad(paint::rrect(body, r_sm(), hover()));
+    }
+    let glyph = if c.looping { arrange_clips::draw::loop_glyph(window, cx, o, &c.bx, fg) } else { 0. };
     if c.w > 28. {
         window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
-            paint::text(window, cx, &paint::fit(&c.name, c.w - 10., TEXT_XS), o.x + px(c.x + 5.), o.y + px(c.y + 0.5), TEXT_XS, fg, FontWeight::MEDIUM, TextAlign::Left);
+            paint::text(window, cx, &paint::fit(&c.name, c.w - 10. - glyph, TEXT_XS), o.x + px(c.x + 5.), o.y + px(c.y + 0.5), TEXT_XS, fg, FontWeight::MEDIUM, TextAlign::Left);
         });
     }
     let inner_y = c.y + CLIP_HEAD + 2.;
@@ -558,35 +618,17 @@ fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &Cli
                 }
             }
         }
-        Body::Audio { seed } => {
-            // Placeholder waveform until the engine reports real peaks.
-            let mid = inner_y + inner_h / 2.;
-            let n = ((c.w - 2.) / 2.).max(2.) as usize;
-            let mut top = Vec::with_capacity(n * 2);
-            let mut s = *seed as f32 * 0.37;
-            for i in 0..n {
-                let x = c.x + 1. + i as f32 * 2.;
-                let beat = (i as f32 * 2.) / (c.px_per_tick * PPQ as f32);
-                let env = 0.35 + 0.55 * (-(beat.fract()) * 2.2).exp();
-                s = (s * 1.3 + 0.618).fract();
-                let a = (env * (0.6 + 0.4 * s) * inner_h / 2.).max(0.5);
-                top.push(point(o.x + px(x), o.y + px(mid - a)));
-            }
-            let bottom: Vec<_> = top.iter().rev().map(|p| point(p.x, o.y + px(2. * mid) - (p.y - o.y))).collect();
-            let wave = crate::theme::mix(fg, p().waveform, 0.5);
-            if style().waveform == WaveformStyle::Outline {
-                let mut ring = top.clone();
-                ring.extend(bottom);
-                if let Some(first) = ring.first().copied() {
-                    ring.push(first);
-                }
-                paint::polyline(window, &ring, 1., wave);
-            } else {
-                top.extend(bottom);
-                paint::polygon(window, &top, wave);
-            }
+        Body::Audio { wave, shape } => {
+            // The file's peaks as they will sound, then the fades over them.
+            arrange_clips::draw::wave(window, o, &c.bx, shape, wave.as_ref(), canvas_w, crate::theme::mix(fg, p().waveform, 0.5));
+            arrange_clips::draw::fades(window, o, &c.bx, canvas_w, hot, fg);
         }
     });
+    // Where a looping clip starts over.
+    crate::editing::overlay::paint_repeats(window, o, c.x, inner_y, inner_h, &c.repeats, fg);
+    if hot.is_some() || c.selected {
+        arrange_clips::draw::handles(window, o, &c.bx, hot);
+    }
 }
 
 fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) -> AnyElement {
@@ -748,7 +790,8 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
             let index = match hit {
                 Some(i) => i,
                 None => {
-                    let t = ws.s.snap.round(tick);
+                    // On the grid the lanes snap to (adaptive by default), like the drag that follows.
+                    let t = ws.s.snap_tick(crate::editing::GridView::Arrange, tick, false);
                     ws.s.set_automation_point(track, target, t, value, false);
                     let pts = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
                     pts.iter().position(|p| p.tick == t).unwrap_or(0)
@@ -759,39 +802,17 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
         }
         return;
     }
-    // Clips.
-    let hit = ws.s.project.track(track).and_then(|t| {
-        t.arrangement.iter().rev().find_map(|pl| {
-            let c = ws.s.project.clips.get(&pl.clip)?;
-            (tick >= pl.start && tick < pl.start + c.length).then_some((pl.id, pl.clip, pl.start, c.length))
-        })
-    });
-    match hit {
-        Some((pid, clip, start, length)) => {
-            ws.s.selected_placement = Some((track, pid));
-            ws.s.select_clip(Some(clip));
-            if e.click_count >= 2 {
-                // The Clip tab: piano roll for notes, sample editor for audio.
-                ws.set_tab(crate::state::BottomTab::PianoRoll, cx);
-                return;
-            }
-            let right_edge = (start + length) as f32 * ppt;
-            if right_edge - x < 8. {
-                ws.begin_drag(Drag::ClipResize { clip, length, grab_tick: tick }, cx);
-            } else {
-                ws.begin_drag(Drag::Clip { track, placement: pid, start, grab_tick: tick, applied: (start, track) }, cx);
-            }
-        }
-        None => {
-            ws.s.selected_placement = None;
-            if e.click_count >= 2 && row.kind == TrackKind::Instrument {
-                create_clip(ws, track, Snap::Bar.floor(tick));
-            } else if !ws.b.engine.transport().playing {
-                ws.b.engine.locate(Snap::Beat.floor(tick.max(0)));
-            }
-            cx.notify();
-        }
+    // The insert marker, the time selection and Shift/Ctrl+click are handled
+    // there; a plain click on a clip comes back here to open or drag it.
+    if crate::editing::gestures::lane_down(ws, track, row.kind, tick, e, cx) {
+        return;
     }
+    // A plain click on a clip: the fade handles, the edges or the body.
+    let Some(pid) = crate::editing::gestures::clip_at(ws, track, tick) else { return };
+    let Some((_, pl, _)) = ws.s.placement(pid) else { return };
+    ws.s.selected_placement = Some((track, pid));
+    ws.s.select_clip(Some(pl.clip));
+    arrange_clips::press(ws, &row, pid, tick, e, cx);
 }
 
 fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -809,30 +830,8 @@ fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: 
         }
         return;
     }
-    let hit = ws.s.project.track(row.track).and_then(|t| {
-        t.arrangement.iter().find(|pl| ws.s.project.clips.get(&pl.clip).is_some_and(|c| tick >= pl.start && tick < pl.start + c.length)).map(|pl| pl.id)
-    });
-    if let Some(pid) = hit {
-        ws.s.remove_placement(row.track, pid);
-        ws.toast("Clip deleted — Ctrl+Z to undo", cx);
-    }
-}
-
-/// Double-click on an empty MIDI lane: a new one-bar clip.
-fn create_clip(ws: &mut Workspace, track: TrackId, start: Tick) {
-    let color = ws.s.project.track(track).map_or(Color::palette(0), |t| t.color);
-    let src = ws.s.project.alloc_source_id();
-    let clip = ws.s.project.alloc_clip_id();
-    let pl = ws.s.project.alloc_placement_id();
-    let c = Clip::new("New Clip", color, src, BAR);
-    if ws.s.edit("Add clip", vec![
-        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource::default())) },
-        Command::AddClip { id: clip, clip: Box::new(c) },
-        Command::PlaceClip { track, placement: Placement { id: pl, clip, start: start.max(0), lane: 0 } },
-    ]) {
-        ws.s.selected_placement = Some((track, pl));
-        ws.s.select_clip(Some(clip));
-    }
+    // A clip or empty lane space: the context menu.
+    crate::editing::gestures::context_down(ws, row.track, tick, e, cx);
 }
 
 fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -845,7 +844,7 @@ fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut C
         let b = ws.regions.arrange.get();
         let mx = f32::from(e.position.x - b.origin.x).max(0.);
         let tick_at = (mx + v.scroll_x) / v.px_per_beat;
-        v.px_per_beat = (v.px_per_beat * (1. + d.1 / 400.)).clamp(4., 160.);
+        v.px_per_beat = (v.px_per_beat * (1. + d.1 / 400.)).clamp(4., crate::nav::MAX_PX_PER_BEAT);
         v.scroll_x = (tick_at * v.px_per_beat - mx).max(0.);
     } else if e.modifiers.shift || d.0.abs() > d.1.abs() {
         let dx = if d.0.abs() > d.1.abs() { d.0 } else { d.1 };

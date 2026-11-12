@@ -13,6 +13,7 @@
 
 use super::geom::{curve_through, end_u};
 use crate::state::AppState;
+use crate::views::arrange_clips::edit::{move_others, other_placements};
 use aitrack_model::ops::{self, MIN_CLIP_LEN};
 use aitrack_model::*;
 
@@ -46,7 +47,8 @@ pub fn placement_of(s: &AppState, clip: ClipId) -> Option<Placed> {
 /// `geom`), already snapped; gains are linear 0..=1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
-    /// The start marker: trims or reveals audio, which stays where it is on the timeline.
+    /// The start marker: trims or reveals audio, which stays where it is on
+    /// the timeline in every placement of the clip.
     Start(Tick),
     /// The end marker; past the end of the file the clip starts looping.
     End(Tick),
@@ -91,6 +93,9 @@ pub struct Snapshot {
     pub id: ClipId,
     pub clip: Clip,
     pub place: Option<Placed>,
+    /// The clip's other placements (track, placement, start, lane): a trim
+    /// moves them too, as the left edge does in the lanes.
+    others: Vec<(TrackId, PlacementId, Tick, u16)>,
     /// Only this clip, its file and its placement, for the `ops` builders.
     scratch: Project,
     track: TrackId,
@@ -114,7 +119,8 @@ impl Snapshot {
         let mut lane_track = Track::new(track, TrackKind::Audio, "", Color(0));
         lane_track.arrangement.push(Placement { id: placement, clip: id, start, lane });
         scratch.tracks = vec![lane_track];
-        Some(Self { id, clip, place, scratch, track, placement, start })
+        let others = place.map_or_else(Vec::new, |pl| other_placements(&s.project, id, pl.placement));
+        Some(Self { id, clip, place, others, scratch, track, placement, start })
     }
 
     /// Length of the file in source ticks, when it is known.
@@ -129,6 +135,7 @@ impl Snapshot {
         if self.place.is_none() {
             cmds.retain(|c| !matches!(c, Command::MovePlacement { .. }));
         }
+        move_others(&mut cmds, self.start, &self.others);
         cmds.retain(|c| match c {
             Command::UpdateClip { id, clip } => now.clips.get(id) != Some(&**clip),
             Command::MovePlacement { track, id, start, .. } => {
@@ -281,17 +288,19 @@ pub fn reset_shaping(s: &mut AppState, clip: ClipId) -> bool {
     *old != new && sealed(s, "Reset fades and volume", vec![Command::UpdateClip { id: clip, clip: Box::new(new) }])
 }
 
-/// Cut the clip in two at unrolled position `u`. The left part keeps the
-/// clip's id and stays selected. Needs the clip to be in the arrangement.
+/// Cut the clip in two at unrolled position `u`. The left part keeps its
+/// placement and stays selected (it keeps the clip's id too, unless the clip
+/// is used somewhere else, which is left as it is). Needs the clip to be in
+/// the arrangement.
 pub fn split(s: &mut AppState, clip: ClipId, u: Tick) -> Result<(), &'static str> {
     let offset = s.project.clips.get(&clip).ok_or("There is no clip to split")?.offset;
     let place = placement_of(s, clip).ok_or("Place the clip in the arrangement to split it")?;
     let at = place.start + (u - offset);
-    let cmds = ops::split_at(&mut s.project, place.track, place.placement, at).ok_or("Put the cursor inside the clip to split it")?;
-    if !sealed(s, "Split clip", cmds) {
+    let split = ops::split_placement(&mut s.project, place.track, place.placement, at).ok_or("Put the cursor inside the clip to split it")?;
+    if !sealed(s, "Split clip", split.commands) {
         return Err("The clip could not be split");
     }
-    s.selected_clip = Some(clip);
+    s.selected_clip = Some(split.left);
     s.selected_placement = Some((place.track, place.placement));
     Ok(())
 }
@@ -664,6 +673,42 @@ mod tests {
         assert_eq!((f.clip().offset, f.clip().length, f.start()), (2 * BEAT, BEAT, 17 * BEAT));
         assert!(f.s.undo() && f.s.undo());
         assert_eq!((f.clip().offset, f.clip().length, f.start()), (BEAT, 4 * BEAT, 16 * BEAT));
+    }
+
+    #[test]
+    fn the_start_marker_moves_every_placement_of_the_clip_as_the_lane_edge_does() {
+        use crate::views::arrange_clips::edit as lane;
+        // The same clip placed twice; one trimmed by a beat in each view.
+        let twice = || {
+            let mut f = fixture(true);
+            let twin = f.s.project.alloc_placement_id();
+            assert!(f.s.edit("Place again", vec![Command::PlaceClip { track: f.track, placement: Placement { id: twin, clip: f.clip, start: 40 * BEAT, lane: 0 } }]));
+            f.s.seal();
+            (f, twin)
+        };
+        let starts = |f: &Fixture, twin: PlacementId| (f.start(), f.s.placement(twin).unwrap().1.start);
+        let (mut f, twin) = twice();
+        let before = f.s.project.clone();
+        assert_eq!(f.drag(&[Gesture::Start(BEAT / 2), Gesture::Start(BEAT)]), 1);
+        assert_eq!(starts(&f, twin), (17 * BEAT, 41 * BEAT), "both start a beat later, so the audio stays where it was in both");
+        assert_eq!((f.clip().offset, f.clip().length), (BEAT, 3 * BEAT));
+        let editor = f.s.project.clone();
+        // Dragged back to where it was, the other placement goes back too.
+        f.drag(&[Gesture::Start(0)]);
+        assert_eq!(starts(&f, twin), (16 * BEAT, 40 * BEAT));
+        // The other markers leave the placements where they are.
+        f.drag(&[Gesture::End(3 * BEAT), Gesture::FadeIn(BEAT)]);
+        assert_eq!(starts(&f, twin), (16 * BEAT, 40 * BEAT));
+        while f.s.project != before {
+            assert!(f.s.undo(), "undo restores exactly");
+        }
+        // The lane's left edge makes the same project.
+        let (mut f, _) = twice();
+        f.s.seal();
+        let origin = lane::Origin::take(&f.s, f.placement.unwrap()).unwrap();
+        assert!(lane::apply(&mut f.s, &origin, lane::Edit::Start(17 * BEAT)));
+        f.s.seal();
+        assert_eq!(f.s.project, editor);
     }
 
     #[test]

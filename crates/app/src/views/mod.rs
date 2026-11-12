@@ -2,6 +2,7 @@
 //! (`crate::workspace::Workspace`); dense content paints in canvases.
 
 pub mod ai_panel;
+pub mod arrange_clips;
 pub mod arrangement;
 pub mod bottom;
 pub mod browser;
@@ -18,3 +19,4 @@ pub mod sample_editor;
 pub mod session;
 pub mod steps;
 pub mod topbar;
+pub mod shortcuts;

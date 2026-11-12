@@ -5,6 +5,10 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod actions;
+mod commands;
+mod editing;
+mod keys;
+mod nav;
 mod audition;
 mod appearance;
 mod assets;
@@ -37,6 +41,7 @@ fn main() {
     gpui::Application::with_platform(platform).with_assets(assets::Assets).run(|cx: &mut App| {
         assets::load_fonts(cx);
         actions::bind(cx);
+        keys::bind(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

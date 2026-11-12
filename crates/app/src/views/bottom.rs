@@ -212,7 +212,7 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     this.open_menu(MenuKind::Snap, point(at.x - px(16.), at.y - px(300.)), cx);
                 }))
                 .child(icon(Icon::Magnet, 14., if ws.s.snap == Snap::Off { pal.faint } else { pal.accent }))
-                .child(label(ws.s.snap.label(), TEXT_SM, pal.text)),
+                .child(label(ws.s.snap_label(crate::editing::GridView::Piano), TEXT_SM, pal.text)),
         )
         .child(widgets::icon_button("pr-quantize", Icon::Quantize, false).tooltip(widgets::tip("Quantize to grid", None)).on_click(cx.listener(|this, _, _, cx| this.quantize_clip(cx))))
         .child(

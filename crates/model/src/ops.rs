@@ -173,12 +173,33 @@ pub fn crop(p: &Project, clip: ClipId, from: Tick, to: Tick) -> Option<Command> 
     update(p, clip, new)
 }
 
+/// A cut worked out by [`split_placement`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Split {
+    pub commands: Vec<Command>,
+    /// The clip of the part before the cut, which keeps the placement id:
+    /// the clip that was cut, or a new one when that clip has other users.
+    pub left: ClipId,
+    /// The new clip and placement of the part after the cut.
+    pub right: ClipId,
+    pub right_placement: PlacementId,
+}
+
 /// Cut a placed clip at the absolute tick `at` (strictly inside it) into two
 /// independent clips. The left half keeps the clip id; the right half is a
 /// new clip and placement on the same lane. The cut edges get no fade, the
 /// volume envelope is divided with a point on each side of the cut, audio
 /// halves share the file and a notes half gets its own copy of the notes.
+///
+/// A clip that is also placed somewhere else, or sits in a session slot, is
+/// left as it is for its other users: the left half becomes a new clip too,
+/// and the placement that was cut (same id) points at it.
 pub fn split_at(p: &mut Project, track: TrackId, placement: PlacementId, at: Tick) -> Option<Vec<Command>> {
+    split_placement(p, track, placement, at).map(|split| split.commands)
+}
+
+/// [`split_at`], with the ids of the two halves.
+pub fn split_placement(p: &mut Project, track: TrackId, placement: PlacementId, at: Tick) -> Option<Split> {
     let place = find_placement(p, track, placement)?.clone();
     let old = p.clips.get(&place.clip)?.clone();
     let cut = at - place.start;
@@ -196,14 +217,26 @@ pub fn split_at(p: &mut Project, track: TrackId, placement: PlacementId, at: Tic
     }
     clamp_fades(&mut left, Edge::End);
     clamp_fades(&mut right, Edge::Start);
-    let mut cmds = Vec::with_capacity(4);
+    let mut cmds = Vec::with_capacity(7);
+    let shared = p.tracks.iter().any(|t| t.arrangement.iter().any(|pl| pl.clip == place.clip && pl.id != placement) || t.session_slots.values().any(|c| *c == place.clip));
+    let left_id = if shared {
+        own_notes(p, &mut left, &mut cmds);
+        let id = p.alloc_clip_id();
+        cmds.push(Command::AddClip { id, clip: Box::new(left) });
+        cmds.push(Command::RemovePlacement { track, id: placement });
+        cmds.push(Command::PlaceClip { track, placement: Placement { clip: id, ..place.clone() } });
+        id
+    } else {
+        cmds.push(Command::UpdateClip { id: place.clip, clip: Box::new(left) });
+        place.clip
+    };
     own_notes(p, &mut right, &mut cmds);
     let right_id = p.alloc_clip_id();
     let right_place = Placement { id: p.alloc_placement_id(), clip: right_id, start: at, lane: place.lane };
-    cmds.push(Command::UpdateClip { id: place.clip, clip: Box::new(left) });
+    let right_placement = right_place.id;
     cmds.push(Command::AddClip { id: right_id, clip: Box::new(right) });
     cmds.push(Command::PlaceClip { track, placement: right_place });
-    Some(cmds)
+    Some(Split { commands: cmds, left: left_id, right: right_id, right_placement })
 }
 
 /// An independent copy of a placed clip at `start` on the same track and
@@ -678,6 +711,70 @@ mod tests {
                 assert_ne!(x.id, y.id);
                 assert_eq!(Note { id: y.id, ..x.clone() }, *y);
             }
+        });
+    }
+
+    #[test]
+    fn splitting_one_placement_of_a_shared_clip_leaves_the_other_alone() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        edit(&mut f, |c| {
+            c.offset = BEAT;
+            c.fade_out = Fade { length: BEAT, curve: 0.2 };
+        });
+        // The same clip again, later in the song.
+        let twin = f.p.alloc_placement_id();
+        f.p.track_mut(track).unwrap().arrangement.push(Placement { id: twin, clip, start: 16 * BEAT, lane: 0 });
+        let whole = f.p.clips[&clip].clone();
+        let split = split_placement(&mut f.p, track, placement, 6 * BEAT).unwrap();
+        let (left_id, right_id, right_place) = (split.left, split.right, split.right_placement);
+        assert!(left_id != clip && right_id != clip && left_id != right_id, "both halves are new clips");
+        round_trip(&mut f.p, split.commands, |p| {
+            let find = |id: PlacementId| p.track(track).unwrap().arrangement.iter().find(|pl| pl.id == id).unwrap().clone();
+            // The other placement plays what it played: same clip, length and offset.
+            assert_eq!((find(twin).clip, find(twin).start), (clip, 16 * BEAT));
+            assert_eq!(p.clips[&clip], whole);
+            // The placement that was cut keeps its id and place, on a clip of its own.
+            assert_eq!((find(placement).clip, find(placement).start), (left_id, 4 * BEAT));
+            assert_eq!((find(right_place).clip, find(right_place).start), (right_id, 6 * BEAT));
+            let (left, right) = (&p.clips[&left_id], &p.clips[&right_id]);
+            assert_eq!((left.offset, left.length, left.fade_out), (BEAT, 2 * BEAT, Fade::default()));
+            assert_eq!((right.offset, right.length, right.fade_out), (3 * BEAT, 2 * BEAT, whole.fade_out));
+            assert_eq!(p.sources.len(), 1, "all of them play the same file");
+        });
+        // A clip that also sits in a session slot is left alone the same way.
+        let mut f = fixture(None, 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let scene = f.p.alloc_scene_id();
+        f.p.track_mut(track).unwrap().session_slots.insert(scene, clip);
+        let whole = f.p.clips[&clip].clone();
+        let split = split_placement(&mut f.p, track, placement, 5 * BEAT).unwrap();
+        let (left_id, right_id) = (split.left, split.right);
+        assert_ne!(left_id, clip);
+        round_trip(&mut f.p, split.commands, |p| {
+            assert_eq!((p.clips[&clip].clone(), p.track(track).unwrap().session_slots[&scene]), (whole.clone(), clip));
+            assert_eq!((p.clips[&left_id].length, p.clips[&right_id].offset), (BEAT, BEAT));
+            // Each half has notes of its own; the slot's clip keeps the original ones.
+            let sources: std::collections::BTreeSet<SourceId> = [clip, left_id, right_id].iter().map(|id| p.clips[id].source).collect();
+            assert_eq!((sources.len(), p.sources.len()), (3, 3));
+        });
+    }
+
+    #[test]
+    fn splitting_the_only_placement_keeps_the_clip_id() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let clips = f.p.clips.len();
+        let split = split_placement(&mut f.p, track, placement, 5 * BEAT).unwrap();
+        assert_eq!(split.left, clip);
+        assert!(matches!(&split.commands[..], [Command::UpdateClip { id, .. }, Command::AddClip { .. }, Command::PlaceClip { .. }] if *id == clip));
+        let again = fixture(Some(8), 4 * BEAT);
+        let mut p = again.p;
+        assert_eq!(split_at(&mut p, track, placement, 5 * BEAT), Some(split.commands.clone()), "`split_at` is the same cut");
+        round_trip(&mut f.p, split.commands, |p| {
+            assert_eq!(p.clips.len(), clips + 1);
+            assert_eq!((p.clips[&clip].length, p.clips[&split.right].length), (BEAT, 3 * BEAT));
+            assert!(p.track(track).unwrap().arrangement.iter().any(|pl| pl.id == split.right_placement && pl.clip == split.right));
         });
     }
 

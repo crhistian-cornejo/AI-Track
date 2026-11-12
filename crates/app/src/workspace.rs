@@ -48,6 +48,12 @@ pub enum Drag {
     Marquee { clip: ClipId, from: Point<Pixels>, to: Point<Pixels>, base: BTreeSet<NoteId> },
     Clip { track: TrackId, placement: PlacementId, start: Tick, grab_tick: Tick, applied: (Tick, TrackId) },
     ClipResize { clip: ClipId, length: Tick, grab_tick: Tick },
+    /// A fade handle, a fade's slope or the left edge of a clip in the lanes.
+    ClipShape(Box<views::arrange_clips::ShapeDrag>),
+    /// Ctrl+drag on a clip: copies of the selection follow the pointer.
+    ClipCopy(views::arrange_clips::CopyDrag),
+    /// Dragging in empty lane space selects time, from where the drag began (tick, track).
+    TimeSel { anchor: (Tick, TrackId) },
     AutoPoint { track: TrackId, target: AutomationTarget, original: Vec<AutomationPoint>, index: usize },
     /// Alt + drag on an automation segment bends it.
     AutoCurve { track: TrackId, target: AutomationTarget, index: usize, start_y: f32, start_curve: f32, rising: bool },
@@ -68,6 +74,9 @@ pub enum MenuKind {
     Presets(DeviceId),
     /// Library actions (right-click in the browser).
     LibraryContext,
+    /// Right-click on an arrangement clip, and on empty lane space.
+    ClipContext,
+    LaneContext,
     TimeSignature,
     /// File: new from a template, open, save.
     File,
@@ -151,6 +160,8 @@ pub struct Workspace {
     pub chat_log: Vec<ChatEntry>,
     pub regions: Rc<Regions>,
     pub toast: Option<(String, Instant)>,
+    /// The shortcuts sheet and the Rename field.
+    pub ui: crate::commands::EditUi,
     synced_revision: Option<u64>,
     meters_live: bool,
     ai_poll: Option<Task<()>>,
@@ -294,6 +305,7 @@ impl Workspace {
             chat_log: Vec::new(),
             regions: Rc::new(Regions::default()),
             toast: None,
+            ui: crate::commands::EditUi::new(cx),
             synced_revision: None,
             meters_live: false,
             ai_poll: None,
@@ -470,6 +482,8 @@ impl Workspace {
         if self.b.engine.transport().playing {
             self.b.engine.stop();
         } else {
+            // Playback starts from the insert marker (Shift+Space continues instead).
+            self.b.engine.locate(self.s.ed.marker);
             self.b.engine.play();
         }
         cx.notify();
@@ -478,6 +492,17 @@ impl Workspace {
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.b.engine.stop();
         cx.notify();
+    }
+
+    /// Ctrl+E and Split in the clip menu: cut at the insert marker, or at
+    /// the playhead while playing.
+    pub fn split_clips(&mut self, cx: &mut Context<Self>) {
+        let t = self.b.engine.transport();
+        match self.s.split(t.playing.then_some(t.position)) {
+            0 if t.playing => self.toast("Nothing to split at the playhead", cx),
+            0 => self.toast("Nothing to split at the marker", cx),
+            _ => cx.notify(),
+        }
     }
 
     fn toggle_view(&mut self, _: &ToggleView, _: &mut Window, cx: &mut Context<Self>) {
@@ -534,7 +559,10 @@ impl Workspace {
     }
 
     fn toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
-        let on = !self.b.engine.transport().looping;
+        // With a selection the loop brace goes around it and the loop switches on;
+        // pressed again, or with nothing selected, the loop switches on or off.
+        let moved = self.s.selection_span().is_some_and(|span| self.s.project.loop_region != Some(span)) && self.s.loop_selection();
+        let on = moved || !self.b.engine.transport().looping;
         self.b.engine.set_looping(on);
         cx.notify();
     }
@@ -550,6 +578,10 @@ impl Workspace {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.s.select_all_clips() {
+            cx.notify();
+            return;
+        }
         if let Some((_, n)) = self.s.selected_clip.and_then(|c| self.s.clip_notes(c)) {
             self.s.selected_notes = n.notes.iter().map(|n| n.id).collect();
             cx.notify();
@@ -559,7 +591,7 @@ impl Workspace {
     pub fn quantize_clip(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.s.selected_clip {
             let n = self.s.quantize(c, 1.);
-            self.toast(if n == 0 { "Already on the grid".into() } else { format!("Quantized {n} notes to {}", self.s.snap.label()) }, cx);
+            self.toast(if n == 0 { "Already on the grid".into() } else { format!("Quantized {n} notes to {}", self.s.snap_label(crate::editing::GridView::Piano)) }, cx);
         }
     }
 
@@ -683,7 +715,7 @@ impl Workspace {
             Drag::Notes { clip, originals, origin, resize, applied, preview } => {
                 let (tick, key) = self.piano_pos(e.position);
                 let raw = tick - origin.0;
-                let dt = if self.s.snap == Snap::Off { raw } else { self.s.snap.round(raw) };
+                let dt = self.s.snap_tick(crate::editing::GridView::Piano, raw, e.modifiers.alt);
                 let dk = if *resize { 0 } else { key - origin.1 };
                 if let Some((track, previous)) = *preview {
                     let next = (origin.1 + dk).clamp(0, 127) as u8;
@@ -740,31 +772,12 @@ impl Workspace {
                 }
                 self.s.selected_notes = sel;
             }
-            Drag::Clip { track, placement, start, grab_tick, applied } => {
-                let (tick, row) = self.arrange_pos(e.position);
-                let snap = if self.s.snap == Snap::Off { Snap::Off } else { Snap::Beat.max_grid(self.s.snap) };
-                let new_start = snap.round(*start + tick - *grab_tick).max(0);
-                let kind = self.s.project.track(*track).map(|t| t.kind);
-                let to = row
-                    .and_then(|r| self.s.project.track(r))
-                    .filter(|t| Some(t.kind) == kind)
-                    .map_or(applied.1, |t| t.id);
-                if (new_start, to) != *applied {
-                    let from = applied.1;
-                    if self.s.move_placement(from, *placement, to, new_start) {
-                        *applied = (new_start, to);
-                    }
-                }
-            }
-            Drag::ClipResize { clip, length, grab_tick } => {
-                let (tick, _) = self.arrange_pos(e.position);
-                let snap = if self.s.snap == Snap::Off { Snap::Off } else { Snap::Beat.max_grid(self.s.snap) };
-                let new_len = (*length + snap.round(tick - *grab_tick)).max(PPQ);
-                self.s.resize_clip(*clip, new_len);
-            }
+            // Clips, their edges and the time selection snap to the grid of the arrangement.
+            d @ (Drag::Clip { .. } | Drag::ClipResize { .. } | Drag::TimeSel { .. }) => crate::editing::gestures::drag_move(self, d, e),
+            d @ (Drag::ClipShape(_) | Drag::ClipCopy(_)) => views::arrange_clips::drag_move(self, d, e),
             Drag::AutoPoint { track, target, original, index } => {
                 let (tick, _) = self.arrange_pos(e.position);
-                let tick = self.s.snap.round(tick);
+                let tick = self.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt);
                 if let Some(value) = views::arrangement::automation_value_at(self, *track, e.position) {
                     self.s.move_automation_point(*track, *target, original.clone(), *index, tick, value);
                 }
@@ -777,7 +790,7 @@ impl Workspace {
             }
             Drag::LoopBrace { anchor } => {
                 let (tick, _) = self.arrange_pos(e.position);
-                let t = Snap::Bar.round(tick).max(0);
+                let t = self.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt).max(0);
                 let (a, b) = ((*anchor).min(t), (*anchor).max(t));
                 if b > a {
                     self.s.set_loop(Some((a, b)));
@@ -785,7 +798,10 @@ impl Workspace {
             }
             Drag::Scrub => {
                 let (tick, _) = self.arrange_pos(e.position);
-                self.b.engine.locate(Snap::Beat.floor(tick.max(0)));
+                // The insert marker follows the scrub.
+                let at = self.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+                self.s.ed.marker = at;
+                self.b.engine.locate(at);
             }
             Drag::Pick { hue } => {
                 let hue = *hue;
@@ -807,8 +823,19 @@ impl Workspace {
                 Drag::Notes { .. } => {
                     self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
                 }
+                Drag::ClipCopy(d) => views::arrange_clips::copy_end(self, d),
+                // A click on a clip that never moved it puts the insert
+                // marker (and, when stopped, the playhead) where it was clicked.
+                Drag::Clip { track, start, applied, .. } => {
+                    if let Some(at) = self.s.release_clip(applied != (start, track))
+                        && !self.b.engine.transport().playing
+                    {
+                        self.b.engine.locate(at);
+                    }
+                }
                 _ => {}
             }
+            self.s.ed.pressed = None;
             self.s.seal();
             cx.notify();
         }
@@ -1420,7 +1447,7 @@ impl Workspace {
     fn arrange_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
         let a = &mut self.s.arrange;
         let old = a.px_per_beat;
-        let new = (old * factor).clamp(1., 160.);
+        let new = (old * factor).clamp(crate::nav::MIN_PX_PER_BEAT, crate::nav::MAX_PX_PER_BEAT);
         let width = f32::from(self.regions.arrange.get().size.width);
         let playhead = self.b.engine.transport().position as f32 / PPQ as f32;
         let anchor_px = playhead * old - a.scroll_x;
@@ -1511,13 +1538,6 @@ impl Workspace {
                 ))
                 .into_any_element(),
         )
-    }
-}
-
-impl Snap {
-    /// The coarser of two grids (clips move on at least a beat).
-    fn max_grid(self, other: Snap) -> Snap {
-        if other.ticks() > self.ticks() { other } else { self }
     }
 }
 
@@ -1676,6 +1696,8 @@ impl Render for Workspace {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::piano_key_down))
             .on_key_up(cx.listener(Self::piano_key_up))
+            // The commands of the key table (clipboard, grid, navigation…).
+            .map(|d| crate::keys::register(d, cx))
             .on_action(cx.listener(Self::play_stop))
             .on_action(cx.listener(Self::toggle_view))
             .on_action(cx.listener(Self::undo))
@@ -1690,13 +1712,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenProject, window, cx| this.file_open(window, cx)))
             .on_action(cx.listener(|this, _: &SaveProject, _, cx| this.file_save(cx)))
             .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| this.file_save_as(None, cx)))
-            .on_action(cx.listener(|this, _: &SplitClip, _, cx| {
-                let at = this.b.engine.transport().position;
-                match this.s.split_at(at) {
-                    0 => this.toast("Nothing to split: put the playhead inside a clip of the selected track", cx),
-                    _ => cx.notify(),
-                }
-            }))
+            .on_action(cx.listener(|this, _: &SplitClip, _, cx| this.split_clips(cx)))
             .on_action(cx.listener(|this, _: &GroupTracks, _, cx| {
                 if this.s.group_selected().is_some() {
                     cx.notify();
@@ -1725,7 +1741,7 @@ impl Render for Workspace {
                 // Fit the whole song to the width of the lanes.
                 let width = f32::from(this.regions.arrange.get().size.width).max(200.);
                 let beats = (this.s.project.arrangement_end() as f32 / PPQ as f32).max(4.);
-                this.s.arrange.px_per_beat = (width / beats * 0.96).clamp(1., 160.);
+                this.s.arrange.px_per_beat = (width / beats * 0.96).clamp(crate::nav::MIN_PX_PER_BEAT, crate::nav::MAX_PX_PER_BEAT);
                 this.s.arrange.scroll_x = 0.;
                 cx.notify();
             }))
@@ -1779,9 +1795,15 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                // A fade, trim or copy drag in the lanes is given up first.
+                if views::arrange_clips::cancel_drag(this) {
+                    cx.notify();
+                    return;
+                }
                 this.menu = None;
                 this.modal = if this.export.running.is_some() { this.modal } else { None };
                 this.s.selected_notes.clear();
+                this.s.clear_arrange_selection();
                 this.focus.focus(window, cx);
                 cx.notify();
             }))

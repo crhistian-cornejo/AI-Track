@@ -47,6 +47,8 @@ pub enum Tool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Snap {
     Off,
+    /// The grid follows the zoom of the view (see [`AppState::snap_step`]).
+    Adaptive,
     Bar,
     Beat,
     Eighth,
@@ -56,12 +58,14 @@ pub enum Snap {
 }
 
 impl Snap {
-    pub const ALL: [Snap; 7] =
-        [Self::Off, Self::Bar, Self::Beat, Self::Eighth, Self::Sixteenth, Self::ThirtySecond, Self::TripletSixteenth];
+    pub const ALL: [Snap; 8] =
+        [Self::Off, Self::Adaptive, Self::Bar, Self::Beat, Self::Eighth, Self::Sixteenth, Self::ThirtySecond, Self::TripletSixteenth];
 
     pub fn ticks(self) -> Tick {
         match self {
             Self::Off => 1,
+            // Without a view to ask, the adaptive grid counts as sixteenths.
+            Self::Adaptive => PPQ / 4,
             Self::Bar => BAR,
             Self::Beat => PPQ,
             Self::Eighth => PPQ / 2,
@@ -74,6 +78,7 @@ impl Snap {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
+            Self::Adaptive => "Adaptive",
             Self::Bar => "1 Bar",
             Self::Beat => "1/4",
             Self::Eighth => "1/8",
@@ -86,11 +91,6 @@ impl Snap {
     pub fn floor(self, t: Tick) -> Tick {
         let g = self.ticks();
         t.div_euclid(g) * g
-    }
-
-    pub fn round(self, t: Tick) -> Tick {
-        let g = self.ticks();
-        (t + g / 2).div_euclid(g) * g
     }
 }
 
@@ -126,6 +126,8 @@ pub struct AppState {
     pub automation_shown: BTreeSet<TrackId>,
     pub arrange: ArrangeView,
     pub piano: PianoView,
+    /// Selection, insert marker, clipboard and grid of the editing commands.
+    pub ed: crate::editing::EditState,
     /// Length new notes get (the last drawn or resized length, FL-style).
     pub note_length: Tick,
     pub last_error: Option<String>,
@@ -141,7 +143,7 @@ impl AppState {
             bottom_tab: BottomTab::PianoRoll,
             browser_tab: BrowserTab::Library,
             tool: Tool::Draw,
-            snap: Snap::Sixteenth,
+            snap: Snap::Adaptive,
             selected_track: first_track,
             selected_clip: None,
             selected_placement: None,
@@ -149,6 +151,7 @@ impl AppState {
             automation_shown: BTreeSet::new(),
             arrange: ArrangeView { px_per_beat: 7., scroll_x: 0., scroll_y: 0. },
             piano: PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 0. },
+            ed: Default::default(),
             note_length: PPQ / 2,
             last_error: None,
         };
@@ -229,7 +232,8 @@ impl AppState {
         done
     }
 
-    fn prune_selection(&mut self) {
+    pub(crate) fn prune_selection(&mut self) {
+        self.prune_edit_selection();
         if let Some(c) = self.selected_clip
             && !self.project.clips.contains_key(&c) {
                 self.selected_clip = None;
@@ -327,7 +331,8 @@ impl AppState {
     /// Draw a note at `tick` (floored to the snap grid) and select it.
     pub fn draw_note(&mut self, clip: ClipId, key: u8, tick: Tick) -> Option<NoteId> {
         let (source, _) = self.clip_notes(clip)?;
-        let start = self.snap.floor(tick.max(0));
+        let start = self.snap_floor(crate::editing::GridView::Piano, tick.max(0));
+        self.ed.area = crate::editing::Area::Piano;
         let id = self.project.alloc_note_id();
         let note = Note::new(id, key.min(127), start, self.note_length.max(1), 0.8);
         if self.edit("Add note", vec![Command::AddNotes { source, notes: vec![note] }]) {
@@ -371,7 +376,7 @@ impl AppState {
     /// Change the length of `originals` by `dl` ticks (one coalesced drag).
     pub fn resize_notes(&mut self, clip: ClipId, originals: &[Note], dl: Tick) -> bool {
         let Some((source, _)) = self.clip_notes(clip) else { return false };
-        let min_len = self.snap.ticks().clamp(PPQ / 16, PPQ / 4);
+        let min_len = self.grid().clamp(PPQ / 16, PPQ / 4);
         let notes: Vec<Note> =
             originals.iter().map(|n| Note { length: (n.length + dl).max(min_len), ..n.clone() }).collect();
         if let Some(n) = notes.first() {
@@ -399,12 +404,12 @@ impl AppState {
     /// Quantise note starts to the snap grid (`strength` 0..=1). Returns how many moved.
     pub fn quantize(&mut self, clip: ClipId, strength: f32) -> usize {
         let Some((source, notes)) = self.tool_targets(clip) else { return 0 };
-        let grid = if self.snap == Snap::Off { Snap::Sixteenth } else { self.snap };
+        let grid = self.grid();
         let s = strength.clamp(0., 1.);
         let changed: Vec<Note> = notes
             .into_iter()
             .filter_map(|n| {
-                let target = grid.round(n.start);
+                let target = (n.start + grid / 2).div_euclid(grid) * grid;
                 let start = n.start + ((target - n.start) as f32 * s).round() as Tick;
                 (start != n.start).then_some(Note { start, ..n })
             })
@@ -437,12 +442,12 @@ impl AppState {
     // ── Keyboard editing (the Live key commands) ──
 
     fn grid(&self) -> Tick {
-        if self.snap == Snap::Off { PPQ / 4 } else { self.snap.ticks().max(1) }
+        self.snap_step(crate::editing::GridView::Piano).unwrap_or(PPQ / 4).max(1)
     }
 
     /// The selected notes of the open clip, when the piano roll has the keys.
     fn key_notes(&self) -> Option<(ClipId, SourceId, Vec<Note>)> {
-        let clip = self.selected_clip?;
+        let clip = self.selected_clip.filter(|_| self.ed.area == crate::editing::Area::Piano)?;
         let (source, n) = self.clip_notes(clip)?;
         let sel: Vec<Note> = n.notes.iter().filter(|n| self.selected_notes.contains(&n.id)).cloned().collect();
         (!sel.is_empty()).then_some((clip, source, sel))
@@ -499,20 +504,7 @@ impl AppState {
             self.seal();
             return ok;
         }
-        if let (Some((track, id)), KeyEdit::Left | KeyEdit::Right) = (self.selected_placement, e) {
-            let Some(start) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id)).map(|p| p.start) else {
-                return false;
-            };
-            let to = if e == KeyEdit::Left { (start - grid).max(0) } else { start + grid };
-            if to == start {
-                return false;
-            }
-            self.seal();
-            let ok = self.move_placement(track, id, track, to);
-            self.seal();
-            return ok;
-        }
-        false
+        self.key_edit_arrangement(e)
     }
 
     /// `0` in Live: deactivate or reactivate the selection. Notes when notes
@@ -547,6 +539,9 @@ impl AppState {
     /// Ctrl+D: duplicate the selected notes right after themselves, or the
     /// selected arrangement clip right after itself (as an independent copy).
     pub fn duplicate_selection(&mut self) -> bool {
+        if let Some(done) = self.duplicate_arrangement() {
+            return done;
+        }
         let grid = self.grid();
         if let Some((_, source, sel)) = self.key_notes() {
             let (first, last) = (sel.iter().map(|n| n.start).min().unwrap_or(0), sel.iter().map(Note::end).max().unwrap_or(0));
@@ -577,19 +572,33 @@ impl AppState {
 
     // ── Clips and tracks (the Live key commands) ──
 
-    /// Ctrl+E: split at `tick`. The selected arrangement clip when the cut
-    /// falls inside it, otherwise every clip of the selected track under it.
-    /// Returns how many clips were split.
-    pub fn split_at(&mut self, tick: Tick) -> usize {
-        let tick = self.snap.round(tick);
-        let spans = |p: &Project, pl: &Placement| p.clips.get(&pl.clip).is_some_and(|c| tick > pl.start && tick < pl.start + c.length);
-        let mut targets: Vec<(TrackId, Placement)> = Vec::new();
-        if let Some((track, id)) = self.selected_placement
-            && let Some(pl) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id))
-            && spans(&self.project, pl)
-        {
-            targets.push((track, pl.clone()));
+    /// Ctrl+E and Split in the clip menu: cut at the insert marker, or at
+    /// `playhead` (on the grid) while the transport is playing. Returns how
+    /// many clips were split.
+    pub fn split(&mut self, playhead: Option<Tick>) -> usize {
+        match playhead {
+            Some(at) => self.split_at(at),
+            None => self.split_exact(self.ed.marker),
         }
+    }
+
+    /// Split at `tick`, on the grid. The selected arrangement clips the cut
+    /// falls inside, otherwise every clip of the selected track under it.
+    /// The parts before the cut are the selection afterwards. Returns how
+    /// many clips were split.
+    pub fn split_at(&mut self, tick: Tick) -> usize {
+        let tick = self.snap_tick(crate::editing::GridView::Arrange, tick, false);
+        self.split_exact(tick)
+    }
+
+    fn split_exact(&mut self, tick: Tick) -> usize {
+        if let Some(cut) = self.split_time_selection() {
+            return cut;
+        }
+        let spans = |p: &Project, pl: &Placement| p.clips.get(&pl.clip).is_some_and(|c| tick > pl.start && tick < pl.start + c.length);
+        let mut targets: Vec<(TrackId, Placement)> =
+            self.clip_selection().into_iter().filter(|(_, pl, _)| spans(&self.project, pl)).map(|(track, pl, _)| (track, pl)).collect();
+        let selected = !targets.is_empty();
         if targets.is_empty()
             && let Some(track) = self.selected_track
             && let Some(t) = self.project.track(track)
@@ -599,14 +608,12 @@ impl AppState {
         let mut cmds = Vec::new();
         let mut last = None;
         for (track, pl) in &targets {
-            let Some(clip) = self.project.clips.get(&pl.clip).cloned() else { continue };
-            let head = tick - pl.start;
-            let right = Clip { offset: clip.offset + head, length: clip.length - head, ..clip.clone() };
-            let (right_id, place_id) = (self.project.alloc_clip_id(), self.project.alloc_placement_id());
-            cmds.push(Command::UpdateClip { id: pl.clip, clip: Box::new(Clip { length: head, ..clip }) });
-            cmds.push(Command::AddClip { id: right_id, clip: Box::new(right) });
-            cmds.push(Command::PlaceClip { track: *track, placement: Placement { id: place_id, clip: right_id, start: tick, lane: pl.lane } });
-            last = Some((*track, place_id));
+            // The model's split keeps the fades on the outer edges, divides the
+            // volume envelope, gives a notes half its own notes and leaves a
+            // clip that is used elsewhere as it is there.
+            let Some(split) = aitrack_model::ops::split_placement(&mut self.project, *track, pl.id, tick) else { continue };
+            last = Some(pl.id);
+            cmds.extend(split.commands);
         }
         if cmds.is_empty() {
             return 0;
@@ -615,7 +622,11 @@ impl AppState {
         let ok = self.edit("Split clip", cmds);
         self.seal();
         if ok {
-            self.selected_placement = last;
+            // The part before the cut keeps its placement and stays selected,
+            // in the lane and in the Clip tab alike.
+            let ids = if selected { self.selected_clip_ids() } else { targets.iter().map(|(_, pl)| pl.id).collect() };
+            let last = self.selected_placement.map(|(_, id)| id).filter(|id| ids.contains(id)).or(last);
+            self.select_clips(ids, last);
             targets.len()
         } else {
             0
@@ -847,9 +858,9 @@ impl AppState {
     }
 
     pub fn resize_clip(&mut self, clip: ClipId, length: Tick) -> bool {
-        let Some(c) = self.project.clips.get(&clip) else { return false };
-        let clip_box = Box::new(Clip { length: length.max(PPQ / 4), ..c.clone() });
-        self.edit_coalesced("clip-resize", "Resize clip", vec![Command::UpdateClip { id: clip, clip: clip_box }])
+        // Past the end of its file an audio clip starts looping.
+        let Some(cmd) = aitrack_model::ops::resize_end(&self.project, clip, length) else { return false };
+        self.edit_coalesced("clip-resize", "Resize clip", vec![cmd])
     }
 
     pub fn remove_placement(&mut self, track: TrackId, id: PlacementId) -> bool {
@@ -928,6 +939,9 @@ impl AppState {
 
     /// Delete whatever is selected: notes in the piano roll, else the selected arrangement clip.
     pub fn delete_selection(&mut self) -> bool {
+        if let Some(done) = self.delete_arrangement() {
+            return done;
+        }
         if !self.selected_notes.is_empty() && self.bottom_tab == BottomTab::PianoRoll {
             return self.delete_selected_notes();
         }
@@ -1245,12 +1259,17 @@ mod tests {
         assert_eq!(s.split_at(cut + 7), 1, "the cut snaps to the grid");
         let t = s.project.track(track).unwrap();
         assert_eq!(t.arrangement.len(), before + 1);
-        let left = &s.project.clips[&place.clip];
+        // The part before the cut keeps its placement.
+        let left_clip = t.arrangement.iter().find(|p| p.id == place.id).expect("the placement stays").clip;
+        let left = &s.project.clips[&left_clip];
         let right_place = t.arrangement.iter().find(|p| p.start == cut).expect("a clip starts at the cut");
         let right = &s.project.clips[&right_place.clip];
         assert_eq!(left.length, BAR);
-        assert_eq!((right.offset, right.length), (clip.offset + BAR, clip.length - BAR));
-        assert_eq!(s.selected_placement, Some((track, right_place.id)), "the right half is selected");
+        // The right half plays on from the cut; in a looping clip that position wraps inside the loop.
+        let from = clip.looping.map_or(clip.offset + BAR, |l| l.start + (clip.offset + BAR - l.start) % (l.end - l.start));
+        assert_eq!((right.offset, right.length), (from, clip.length - BAR));
+        assert_eq!((s.selected_placement, s.selected_clip), (Some((track, place.id)), Some(left_clip)), "the left half is selected, in the lane and in the Clip tab");
+        assert_eq!(s.selected_clip_ids(), [place.id].into());
         assert!(s.undo());
         assert_eq!(s.project.clips[&place.clip].length, clip.length);
         assert_eq!(s.project.track(track).unwrap().arrangement.len(), before);

@@ -21,6 +21,8 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::AddDevice(track) => device_menu(ws, *track, cx),
         MenuKind::Presets(device) => preset_menu(ws, *device, cx)?,
         MenuKind::LibraryContext => library_menu(ws, cx),
+        MenuKind::ClipContext => crate::editing::menus::clip_menu(ws, cx),
+        MenuKind::LaneContext => crate::editing::menus::lane_menu(cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
         MenuKind::File => file_menu(ws, cx),
     })
@@ -57,6 +59,10 @@ fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .child(menu_item("file-save-as", Some(Icon::File), "Save as…", key("Ctrl+Shift+S", "⇧⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
             this.menu = None;
             this.file_save_as(None, cx);
+        })))
+        .child(menu_item("file-shortcuts", Some(Icon::Keyboard), "Keyboard shortcuts…", key("Ctrl+/", "⌘/"), false).on_click(cx.listener(|this, _, window, cx| {
+            this.menu = None;
+            crate::commands::run(this, crate::keys::Cmd::Shortcuts, window, cx);
         })))
         .child(menu_item("file-export", Some(Icon::Send), "Export audio…", key("Ctrl+Shift+E", "⇧⌘E"), false).on_click(cx.listener(|this, _, _, cx| {
             this.menu = None;
@@ -122,8 +128,10 @@ fn scale_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 fn snap_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let mut card = widgets::menu_card("snap-menu", 176.).child(menu_header("SNAP GRID"));
     for (i, s) in Snap::ALL.iter().copied().enumerate() {
+        // Adaptive follows the zoom; Ctrl+1 / Ctrl+2 make it finer or coarser.
+        let hint = (s == Snap::Adaptive).then_some("follows zoom");
         card = card.child(
-            menu_item(("snap", i), Some(Icon::Magnet), s.label(), None, ws.s.snap == s).on_click(cx.listener(move |this, _, _, cx| {
+            menu_item(("snap", i), Some(Icon::Magnet), s.label(), hint, ws.s.snap == s).on_click(cx.listener(move |this, _, _, cx| {
                 this.s.snap = s;
                 this.menu = None;
                 cx.notify();
@@ -142,7 +150,7 @@ fn tools_menu(cx: &mut Context<Workspace>) -> AnyElement {
     };
     widgets::menu_card("tools-menu", 220.)
         .child(menu_header("NOTE TOOLS · selection or whole clip"))
-        .child(menu_item("t-quantize", Some(Icon::Quantize), "Quantize", Some("Q"), false).on_click(cx.listener(|this, _, _, cx| {
+        .child(menu_item("t-quantize", Some(Icon::Quantize), "Quantize", Some(if cfg!(target_os = "macos") { "⌘U" } else { "Ctrl+U" }), false).on_click(cx.listener(|this, _, _, cx| {
             this.menu = None;
             this.quantize_clip(cx);
         })))

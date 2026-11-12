@@ -48,7 +48,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }
     };
     let color = clip.color;
-    let snap_px = ws.s.snap.ticks() as f32 * ppt;
+    // The grid of this zoom and the insert marker.
+    let overlay = crate::editing::overlay::Overlay::piano(&ws.s);
+    let ruler_overlay = overlay.clone();
     let marquee = match &ws.drag {
         Some(Drag::Marquee { from, to, .. }) => Some((*from, *to)),
         _ => None,
@@ -81,20 +83,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let o = b.origin;
             let w = f32::from(b.size.width);
             window.paint_quad(paint::fill_rect(b, p().surface));
-            let bar_px = 4. * view.px_per_beat;
-            let first = (view.scroll_x / bar_px).floor() as i64;
-            for i in 0..=((w / bar_px).ceil() as i64 + 1) {
-                let bar = first + i;
-                let x = bar as f32 * bar_px - view.scroll_x;
-                if bar < 0 {
-                    continue;
-                }
-                window.paint_quad(paint::fill_rect(at(o, x, 8., 1., RULER - 8.), content(0.3)));
-                paint::text(window, cx, &format!("{}", bar + 1), o.x + px(x + 4.), o.y + px(3.), TEXT_XS, p().muted, FontWeight::MEDIUM, TextAlign::Left);
-                for beat in 1..4 {
-                    window.paint_quad(paint::fill_rect(at(o, x + beat as f32 * view.px_per_beat, 14., 1., 6.), content(0.15)));
-                }
-            }
+            ruler_overlay.paint_ruler(window, cx, o, w, RULER, 3.);
             let end = len as f32 * ppt - view.scroll_x;
             window.paint_quad(paint::fill_rect(at(o, end, 0., 2., RULER), accent_alpha(0.8)));
             window.paint_quad(paint::fill_rect(at(o, 0., RULER - 1., w, 1.), border()));
@@ -166,23 +155,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 }
                 window.paint_quad(paint::fill_rect(at(o, 0., y + view.row_h - 1., w, 1.), if pc == 0 { pal.grid_beat } else { pal.grid_sub }));
             }
-            // Vertical grid: snap lines, beats, bars.
-            let first_tick = view.scroll_x / ppt;
-            if snap_px >= 6. {
-                let step = snap_px;
-                let start = (view.scroll_x / step).floor() as i64;
-                for i in 0..=((w / step).ceil() as i64 + 1) {
-                    let x = (start + i) as f32 * step - view.scroll_x;
-                    window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), pal.grid_sub));
-                }
-            }
-            let beat_start = (first_tick / PPQ as f32).floor() as i64;
-            for i in 0..=((w / view.px_per_beat).ceil() as i64 + 1) {
-                let beat = beat_start + i;
-                let x = beat as f32 * view.px_per_beat - view.scroll_x;
-                let bar = beat % 4 == 0;
-                window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), if bar { pal.grid_bar } else { pal.grid_beat }));
-            }
+            // Vertical grid: bars, beats and the snap subdivisions.
+            overlay.paint_grid(window, o, w, h, false);
             // Outside the clip.
             let end = len as f32 * ppt - view.scroll_x;
             if end < w {
@@ -223,6 +197,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let y1 = f32::from(a.y.max(bb.y) - o.y);
                 window.paint_quad(paint::rrect_border(at(o, x0, y0, x1 - x0, y1 - y0), 2., accent_alpha(0.1), accent_alpha(0.8), 1.));
             }
+            overlay.paint_marker(window, o, w, h);
             if let Some(tick) = play_tick {
                 let x = tick as f32 * ppt - view.scroll_x;
                 window.paint_quad(paint::fill_rect(at(o, x, 0., 1., h), accent()));
@@ -273,7 +248,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .h(px(RULER))
                 .flex()
                 .child(div().w(px(KEYS_W)).h_full().bg(pal.surface).border_r_1().border_b_1().border_color(border()))
-                .child(div().flex_1().h_full().child(ruler)),
+                .child(div().flex_1().h_full().overflow_hidden().child(ruler)),
         )
         .child(
             div()
@@ -357,6 +332,11 @@ fn grid_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, right: bool, 
     }
     let (tick, key) = ws.piano_pos(e.position);
     let hit = note_at(ws, clip, tick, key);
+    // The piano roll has the editing keys now; a click on empty space puts its insert marker there.
+    ws.s.ed.area = crate::editing::Area::Piano;
+    if hit.is_none() && !right {
+        ws.s.ed.piano_marker = ws.s.snap_floor(crate::editing::GridView::Piano, tick.max(0));
+    }
     if right {
         if let Some(n) = hit {
             let ids = if ws.s.selected_notes.contains(&n.id) { ws.s.selected_notes.iter().copied().collect() } else { vec![n.id] };

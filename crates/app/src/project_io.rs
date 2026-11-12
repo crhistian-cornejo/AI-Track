@@ -230,6 +230,46 @@ mod tests {
     }
 
     #[test]
+    fn shaped_clips_round_trip_and_files_saved_before_fades_still_load() {
+        use aitrack_model::{AutomationLane, AutomationPoint, AutomationTarget, Fade, LoopRegion};
+        let dir = std::env::temp_dir().join(format!("aitrack-io-fades-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = crate::demo::project();
+        // A project as it was saved before clips had fades: the same file without the two keys.
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("fade_in");
+                    map.remove("fade_out");
+                    map.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut old: serde_json::Value = serde_json::from_str(&plain.to_json().unwrap()).unwrap();
+        strip(&mut old);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("fade_in") && !plain.clips.is_empty());
+        let path = with_extension(dir.join("Old"));
+        std::fs::write(&path, text).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!((back.clips, back.tracks, back.sources), (plain.clips.clone(), plain.tracks.clone(), plain.sources.clone()));
+        // Saved now, a clip with fades, a volume envelope and a loop comes back equal.
+        let mut shaped = plain;
+        let clip = shaped.clips.values_mut().next().unwrap();
+        clip.fade_in = Fade { length: 120, curve: 0.5 };
+        clip.fade_out = Fade { length: 240, curve: -0.75 };
+        clip.looping = Some(LoopRegion { start: 0, end: clip.length / 2 });
+        clip.envelopes.push(AutomationLane { points: vec![AutomationPoint { tick: 0, value: 0.25, curve: 0.3 }, AutomationPoint { tick: 480, value: 1., curve: 0. }], ..AutomationLane::new(AutomationTarget::Volume) });
+        let path = with_extension(dir.join("New"));
+        save(&path, &shaped).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!((back.clips, back.tracks, back.sources), (shaped.clips, shaped.tracks, shaped.sources));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn templates_build_and_are_organised() {
         for t in Template::ALL {
             let p = t.build();

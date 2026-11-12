@@ -207,7 +207,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     continue;
                 }
                 let sel = grid_sel.contains(&n.id);
-                let body = with_alpha(if sel { theme_mix(fill, pal.clip_text_light, 0.35) } else { fill }, 0.55 + 0.45 * n.velocity);
+                // Deactivated notes (0) stay visible but drained of colour.
+                let base = if n.muted { theme_mix(fill, pal.well, 0.75) } else { fill };
+                let body = with_alpha(if sel { theme_mix(base, pal.clip_text_light, 0.35) } else { base }, if n.muted { 0.45 } else { 0.55 + 0.45 * n.velocity });
                 window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, if sel { pal.accent } else { shadow(0.35) }, if sel { 1.5 } else { 1. }));
                 // Resize grip.
                 if nw > 10. {

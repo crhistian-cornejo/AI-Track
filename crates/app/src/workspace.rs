@@ -47,6 +47,8 @@ pub enum Drag {
     Clip { track: TrackId, placement: PlacementId, start: Tick, grab_tick: Tick, applied: (Tick, TrackId) },
     ClipResize { clip: ClipId, length: Tick, grab_tick: Tick },
     AutoPoint { track: TrackId, target: AutomationTarget, original: Vec<AutomationPoint>, index: usize },
+    /// Alt + drag on an automation segment bends it.
+    AutoCurve { track: TrackId, target: AutomationTarget, index: usize, start_y: f32, start_curve: f32, rising: bool },
     LoopBrace { anchor: Tick },
     Scrub,
     /// Colour picker: the hue strip or the saturation/value square.
@@ -702,6 +704,12 @@ impl Workspace {
                 if let Some(value) = views::arrangement::automation_value_at(self, *track, e.position) {
                     self.s.move_automation_point(*track, *target, original.clone(), *index, tick, value);
                 }
+            }
+            Drag::AutoCurve { track, target, index, start_y, start_curve, rising } => {
+                // Dragging up always lifts the middle of the segment, whichever way it runs.
+                let dy = (*start_y - f32::from(e.position.y)) / 60.;
+                let curve = *start_curve + if *rising { -dy } else { dy };
+                self.s.set_automation_curve(*track, *target, *index, curve);
             }
             Drag::LoopBrace { anchor } => {
                 let (tick, _) = self.arrange_pos(e.position);

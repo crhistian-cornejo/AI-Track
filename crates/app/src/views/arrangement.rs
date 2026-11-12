@@ -59,6 +59,26 @@ fn total_height(rows: &[LaneRow]) -> f32 {
     rows.last().map_or(0., |r| r.top + r.total())
 }
 
+/// The screen-space line of a lane: its breakpoints, with samples along the
+/// segments that are curved so the drawing follows what the engine plays.
+fn automation_line(lane: &aitrack_model::AutomationLane, px_per_tick: f32, scroll_x: f32) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(lane.points.len());
+    for (i, p) in lane.points.iter().enumerate() {
+        out.push((p.tick as f32 * px_per_tick - scroll_x, p.value));
+        if let Some(next) = lane.points.get(i + 1)
+            && p.curve.abs() > 1e-3
+        {
+            for k in 1..16 {
+                let tick = p.tick + (next.tick - p.tick) * k / 16;
+                if let Some(v) = lane.value_at(tick) {
+                    out.push((tick as f32 * px_per_tick - scroll_x, v));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Normalised automation value under a window position in `track`'s lane.
 pub fn automation_value_at(ws: &Workspace, track: TrackId, pos: Point<Pixels>) -> Option<f32> {
     let row = rows(&ws.s).into_iter().find(|r| r.track == track)?;
@@ -108,11 +128,15 @@ struct ClipPaint {
     body: Body,
     px_per_tick: f32,
     offset: Tick,
+    /// Deactivated with 0: drawn drained of colour.
+    muted: bool,
 }
 
 struct AutoPaint {
     y: f32,
     points: Vec<(f32, f32)>,
+    /// The lane as drawn: breakpoints plus samples along curved segments.
+    line: Vec<(f32, f32)>,
     color: Hsla,
 }
 
@@ -170,6 +194,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 body,
                 px_per_tick,
                 offset: c.offset,
+                muted: c.muted,
             });
         }
         if let Some(target) = r.auto
@@ -177,6 +202,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 autos.push(AutoPaint {
                     y: ry + r.h,
                     points: lane.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect(),
+                    line: automation_line(lane, px_per_tick, view.scroll_x),
                     color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
                 });
             }
@@ -236,7 +262,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 if let Some(first) = a.points.first() {
                     pts.push(point(o.x, o.y + px(lane_top + lane_h * (1. - first.1))));
                 }
-                for (x, v) in &a.points {
+                for (x, v) in &a.line {
                     pts.push(point(o.x + px(*x), o.y + px(lane_top + lane_h * (1. - v))));
                 }
                 if let Some(last) = a.points.last() {
@@ -496,8 +522,8 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint) {
     let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
-    let fill = clip_fill(c.color);
-    let fg = clip_text(c.color);
+    let fill = if c.muted { mix(clip_fill(c.color), p().well, 0.7) } else { clip_fill(c.color) };
+    let fg = if c.muted { p().muted } else { clip_text(c.color) };
     window.paint_quad(paint::rrect_border(body, r_sm(), with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
     window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), r_sm(), fill));
     if c.w > 28. {
@@ -704,6 +730,21 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
             let points = lane.map(|l| l.points).unwrap_or_default();
             let value = (1. - (ly - row.h - 6.) / (AUTO_H - 12.)).clamp(0., 1.);
             let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 6. && ((1. - p.value) * (AUTO_H - 12.) + 6. - (ly - row.h)).abs() < 8.);
+            // Double-click a breakpoint to delete it (as in Live).
+            if let Some(i) = hit.filter(|_| e.click_count >= 2) {
+                ws.s.delete_automation_point(track, target, i);
+                cx.notify();
+                return;
+            }
+            // Alt + drag between two breakpoints bends that segment.
+            if hit.is_none() && e.modifiers.alt {
+                if let Some(i) = points.windows(2).position(|w| tick >= w[0].tick && tick < w[1].tick) {
+                    let (a, b) = (points[i], points[i + 1]);
+                    ws.s.seal();
+                    ws.begin_drag(Drag::AutoCurve { track, target, index: i, start_y: f32::from(e.position.y), start_curve: a.curve, rising: b.value >= a.value }, cx);
+                }
+                return;
+            }
             let index = match hit {
                 Some(i) => i,
                 None => {
@@ -754,8 +795,18 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
 }
 
 fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
-    let Some((row, tick, _, ly)) = lane_hit(ws, e.position) else { return };
+    let Some((row, tick, x, ly)) = lane_hit(ws, e.position) else { return };
     if ly >= row.h {
+        // Right-click a breakpoint to delete it.
+        if let Some(target) = row.auto {
+            let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
+            let points = ws.s.project.track(row.track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
+            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 7. && ((1. - p.value) * (AUTO_H - 12.) + 6. - (ly - row.h)).abs() < 9.);
+            if let Some(i) = hit {
+                ws.s.delete_automation_point(row.track, target, i);
+                cx.notify();
+            }
+        }
         return;
     }
     let hit = ws.s.project.track(row.track).and_then(|t| {

@@ -758,12 +758,35 @@ impl AppState {
             .and_then(|t| t.automation.iter().find(|l| l.target == target).cloned())
             .unwrap_or_else(|| AutomationLane::new(target));
         let mut points = original;
+        // The point keeps the curve of the segment that starts at it.
+        let curve = points.get(index).map_or(0., |p| p.curve);
         if index < points.len() {
             points.remove(index);
         }
         lane.points = points;
-        lane.insert(AutomationPoint { tick: tick.max(0), value: value.clamp(0., 1.), curve: 0. });
+        lane.insert(AutomationPoint { tick: tick.max(0), value: value.clamp(0., 1.), curve });
         self.edit_coalesced("automation", "Edit automation", vec![Command::SetAutomation { track, target, lane: Some(lane) }])
+    }
+
+    /// Remove one breakpoint of an automation lane (double-click or right-click).
+    pub fn delete_automation_point(&mut self, track: TrackId, target: AutomationTarget, index: usize) -> bool {
+        let Some(mut lane) = self.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned()) else { return false };
+        if index >= lane.points.len() {
+            return false;
+        }
+        lane.points.remove(index);
+        self.seal();
+        let ok = self.edit("Delete automation point", vec![Command::SetAutomation { track, target, lane: Some(lane) }]);
+        self.seal();
+        ok
+    }
+
+    /// Bend the segment that starts at point `index` (−1..1, 0 = straight). One coalesced drag.
+    pub fn set_automation_curve(&mut self, track: TrackId, target: AutomationTarget, index: usize, curve: f32) -> bool {
+        let Some(mut lane) = self.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned()) else { return false };
+        let Some(p) = lane.points.get_mut(index) else { return false };
+        p.curve = curve.clamp(-1., 1.);
+        self.edit_coalesced("automation-curve", "Curve automation", vec![Command::SetAutomation { track, target, lane: Some(lane) }])
     }
 
     /// Delete whatever is selected: notes in the piano roll, else the selected arrangement clip.
@@ -1008,6 +1031,36 @@ mod tests {
         s.selected_placement = None;
         assert_eq!(s.toggle_active(), Some("Track deactivated"));
         assert!(s.project.track(track).unwrap().mute);
+    }
+
+    #[test]
+    fn automation_points_can_be_deleted_and_segments_curved() {
+        let mut s = state();
+        let track = s.project.tracks.iter().find(|t| t.name == "Lead").unwrap().id;
+        let target = AutomationTarget::Pan;
+        assert!(s.set_automation_point(track, target, 0, 0.2, false));
+        assert!(s.set_automation_point(track, target, 4 * PPQ, 0.8, false));
+        assert!(s.set_automation_point(track, target, 8 * PPQ, 0.5, false));
+        let lane = |s: &AppState| s.project.track(track).unwrap().automation.iter().find(|l| l.target == target).unwrap().clone();
+        assert_eq!(lane(&s).value_at(2 * PPQ), Some(0.5), "straight segment");
+        s.seal();
+        assert!(s.set_automation_curve(track, target, 0, 0.6));
+        assert!(s.set_automation_curve(track, target, 0, 0.9));
+        s.seal();
+        let mid = lane(&s).value_at(2 * PPQ).unwrap();
+        assert!(mid < 0.4, "a positive curve holds low and rises late: {mid}");
+        // Moving the point keeps its curve.
+        let original = lane(&s).points;
+        assert!(s.move_automation_point(track, target, original, 0, 0, 0.3));
+        s.seal();
+        assert!((lane(&s).points[0].curve - 0.9).abs() < 1e-6);
+        // The whole curve drag is one undo step.
+        assert_eq!(s.history.undo_label(), Some("Edit automation"));
+        assert!(s.delete_automation_point(track, target, 1));
+        assert_eq!(lane(&s).points.len(), 2);
+        assert!(s.undo());
+        assert_eq!(lane(&s).points.len(), 3);
+        assert!(!s.delete_automation_point(track, target, 9));
     }
 
     #[test]

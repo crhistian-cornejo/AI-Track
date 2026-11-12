@@ -598,6 +598,9 @@ impl AudioProcessor {
             first = false;
         }
 
+        if self.status.tap.wants_main() {
+            self.status.tap.write(self.out.channel(0), self.out.channel(1));
+        }
         let engine_ticks = g.tempo.samples_to_tick(self.pos as f64, sr);
         let audible = if self.playing { g.tempo.samples_to_tick((self.pos - lat) as f64, sr) } else { engine_ticks };
         g.publish(engine_ticks);

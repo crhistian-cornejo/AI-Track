@@ -6,7 +6,8 @@
 //! are only ever locked by the UI and control threads, never by the audio
 //! thread (which holds its own clone of the `Arc` inside the graph).
 
-use aitrack_model::{SceneId, TrackId};
+use crate::tap::{AnalysisTap, DeviceMeter, TAP_FRAMES};
+use aitrack_model::{DeviceId, SceneId, TrackId};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -179,6 +180,10 @@ pub(crate) struct SharedStatus {
     pub meters: Mutex<Arc<MeterBank>>,
     pub session: Mutex<Arc<SessionStatus>>,
     pub track_latency: Mutex<Vec<(TrackId, u32)>>,
+    /// Stereo ring the UI's analysers drain (written only while enabled).
+    pub tap: Arc<AnalysisTap>,
+    /// `meter()` slots of the current graph's devices, sorted by id.
+    pub device_meters: Mutex<Vec<(DeviceId, Arc<DeviceMeter>)>>,
 }
 
 impl SharedStatus {
@@ -199,6 +204,8 @@ impl SharedStatus {
             meters: Mutex::new(Arc::new(MeterBank::new(Vec::new()))),
             session: Mutex::new(Arc::new(SessionStatus::new(Vec::new(), Vec::new()))),
             track_latency: Mutex::new(Vec::new()),
+            tap: Arc::new(AnalysisTap::new(TAP_FRAMES)),
+            device_meters: Mutex::new(Vec::new()),
         }
     }
 

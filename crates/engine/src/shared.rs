@@ -9,6 +9,7 @@
 //! reference (and the plugin's teardown) never goes away on the audio thread.
 
 use crate::factory::{create_with_fallback, ProcessorFactory};
+use crate::tap::DeviceMeter;
 use aitrack_dsp::Processor;
 use aitrack_model::{Device, DeviceId, DeviceKind};
 use std::cell::UnsafeCell;
@@ -67,6 +68,8 @@ impl SharedProcessor {
 struct PoolEntry {
     kind_key: String,
     proc: Arc<SharedProcessor>,
+    /// Where the audio thread publishes the processor's `meter()` values.
+    meter: Arc<DeviceMeter>,
     /// Parameter values already applied to (or scheduled for) the processor.
     applied: BTreeMap<u32, f32>,
     used: bool,
@@ -79,6 +82,7 @@ pub(crate) struct Resolved {
     /// (empty for brand-new processors, which get everything up front).
     pub init_params: Vec<(u32, f32)>,
     pub is_instrument: bool,
+    pub meter: Arc<DeviceMeter>,
 }
 
 /// Control-thread cache of live processors keyed by device id.
@@ -144,7 +148,7 @@ impl ProcessorPool {
                     }
                 }
                 entry.applied.clone_from(params);
-                return Some(Resolved { proc: entry.proc.clone(), init_params: init, is_instrument: device.is_instrument() });
+                return Some(Resolved { proc: entry.proc.clone(), init_params: init, is_instrument: device.is_instrument(), meter: entry.meter.clone() });
             }
         let mut processor = create_with_fallback(factory, device, sample_rate, max_frames)?;
         processor.prepare(sample_rate, max_frames);
@@ -156,11 +160,12 @@ impl ProcessorPool {
         }
         let is_instrument = device.is_instrument() || processor.info().category == aitrack_dsp::Category::Instrument;
         let proc = Arc::new(SharedProcessor::new(processor));
+        let meter = Arc::new(DeviceMeter::default());
         self.entries.insert(
             device.id,
-            PoolEntry { kind_key: key, proc: proc.clone(), applied: params.clone(), used: true },
+            PoolEntry { kind_key: key, proc: proc.clone(), meter: meter.clone(), applied: params.clone(), used: true },
         );
-        Some(Resolved { proc, init_params: Vec::new(), is_instrument })
+        Some(Resolved { proc, init_params: Vec::new(), is_instrument, meter })
     }
 
     /// Re-prepare every pooled processor for a new sample rate / block size.

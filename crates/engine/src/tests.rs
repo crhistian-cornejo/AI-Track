@@ -141,6 +141,7 @@ fn compile_plain(p: &Project) -> Result<crate::CompiledGraph, CompileError> {
             max_frames: 256,
             prev_meters: None,
             taps: Vec::new(),
+            analysis: None,
         },
     )
 }
@@ -487,6 +488,7 @@ fn processors_survive_recompiles() {
                 max_frames: 256,
                 prev_meters: None,
                 taps: Vec::new(),
+                analysis: None,
             },
         )
         .unwrap()
@@ -757,6 +759,55 @@ fn busy_project() -> (Project, Vec<TrackId>, SceneId) {
 }
 
 #[test]
+fn analysis_tap_follows_the_main_output() {
+    let mut b = P::new(120.0);
+    let (t, _) = b.synth_track("synth");
+    let gain = b.device(t, TEST_GAIN, &[(0, 0.25)], None);
+    let c = b.notes(&[(60, 0, 4 * PPQ)], 4 * PPQ, None);
+    b.place(t, c, 0);
+    let (h, proc_) = Engine::new(EngineConfig::headless(SR), Arc::new(FallbackFactory)).unwrap();
+    let mut proc_ = proc_.unwrap();
+    h.update_project(&b.p);
+    h.flush();
+    h.play();
+    let mut tap = h.analysis_tap();
+    let mut buf = AudioBuffer::new(2, 256);
+    let mut frames = Vec::new();
+    // Off: nothing is written.
+    proc_.process_planar(&mut buf);
+    assert_eq!(tap.read(&mut frames), 0);
+    assert!(frames.is_empty());
+    tap.set_enabled(true);
+    let mut expect: Vec<[f32; 2]> = Vec::new();
+    let mut meter = [0.0f32; 4];
+    for _ in 0..40 {
+        h.device_meter(gain, &mut meter);
+        proc_.process_planar(&mut buf);
+        expect.extend(buf.channel(0).iter().zip(buf.channel(1)).map(|(l, r)| [*l, *r]));
+    }
+    assert_eq!(tap.available(), expect.len());
+    assert_eq!(tap.read(&mut frames), 0);
+    assert_eq!(frames, expect);
+    assert!(frames.iter().any(|f| f[0].abs() > 1e-3));
+    assert_eq!(h.device_meter(gain, &mut meter), 2);
+    assert_eq!(meter[..2], [0.25, 42.0]);
+    assert_eq!(h.device_meter(DeviceId(9_999), &mut meter), 0, "unknown device");
+    // A track tap: the synth track post-fader (the Main output is not written).
+    tap.set_source(Some(t));
+    frames.clear();
+    for _ in 0..4 {
+        proc_.process_planar(&mut buf);
+    }
+    assert_eq!(tap.read(&mut frames), 0);
+    assert_eq!(frames.len(), 4 * 256);
+    assert!(frames.iter().any(|f| f[0].abs() > 1e-3));
+    // Disabled again: the ring stops moving.
+    tap.set_enabled(false);
+    proc_.process_planar(&mut buf);
+    assert_eq!(tap.available(), 0);
+}
+
+#[test]
 fn allocation_counter_counts() {
     let (v, n) = count_allocs(|| vec![1u8; 64]);
     assert!(n >= 1);
@@ -778,6 +829,19 @@ fn audio_thread_never_allocates() {
     let mut interleaved = vec![0.0f32; 2 * 300];
     // Warm-up block installs the first graph.
     proc_.process_planar(&mut buf);
+    // The UI's analysis tap and device meters are live for the whole test.
+    let mut tap = h.analysis_tap();
+    tap.set_enabled(true);
+    let gain_devices: Vec<DeviceId> =
+        project.tracks.iter().flat_map(|t| &t.devices).filter(|d| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id == TEST_GAIN)).map(|d| d.id).collect();
+    assert!(!gain_devices.is_empty());
+    let mut meter_out = [0.0f32; 8];
+    let watch = |h: &crate::EngineHandle, out: &mut [f32; 8]| {
+        for d in &gain_devices {
+            h.device_meter(*d, out);
+        }
+    };
+    watch(&h, &mut meter_out);
 
     let run = |proc_: &mut crate::AudioProcessor, buf: &mut AudioBuffer, interleaved: &mut [f32], blocks: usize| {
         count_allocs(|| {
@@ -792,6 +856,15 @@ fn audio_thread_never_allocates() {
         .1
     };
     assert_eq!(run(&mut proc_, &mut buf, &mut interleaved, 400), 0, "steady-state playback");
+    let mut frames = Vec::new();
+    assert!(tap.read(&mut frames) > 0, "400 blocks overran the unread ring");
+    assert_eq!(frames.len(), tap.capacity());
+    assert!(frames.iter().any(|f| f[0] != 0.0), "the tap carries the mix");
+    assert_eq!(h.device_meter(gain_devices[0], &mut meter_out), 2);
+    assert_eq!(meter_out[1], 42.0, "device meter values reach the UI side");
+    // Tap one track instead of the Main output for the next window.
+    tap.set_source(Some(ids[1]));
+    watch(&h, &mut meter_out);
 
     // A recompiled graph is swapped in (state adopted, old one retired).
     project.track_mut(ids[1]).unwrap().volume_db = -4.0;
@@ -814,6 +887,11 @@ fn audio_thread_never_allocates() {
     h.pause();
     h.play();
     h.stop();
+    frames.clear();
+    tap.read(&mut frames);
+    assert!(frames.iter().any(|f| f[0] != 0.0), "the track tap carries signal");
+    tap.set_source(None);
+    watch(&h, &mut meter_out);
     assert_eq!(run(&mut proc_, &mut buf, &mut interleaved, 100), 0, "transport changes");
     assert!(h.meters(ids[0]).is_some());
 }

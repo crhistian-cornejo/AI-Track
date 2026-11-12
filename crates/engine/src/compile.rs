@@ -58,6 +58,9 @@ pub struct CompileContext<'a> {
     pub prev_meters: Option<Arc<MeterBank>>,
     /// Tracks whose post-fader output is captured for stem export.
     pub taps: Vec<TrackId>,
+    /// The live engine's analysis ring (`None` offline): lets the UI tap one
+    /// track instead of the Main output.
+    pub analysis: Option<Arc<crate::tap::AnalysisTap>>,
 }
 
 struct Handle {
@@ -196,6 +199,7 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                             enabled,
                             init_params: r.init_params,
                             is_instrument: r.is_instrument,
+                            meter: r.meter,
                         }));
                     }
                     None => {
@@ -574,6 +578,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                     block: AudioBuffer::new(2, max),
                 })
             }),
+            analysis: cx.analysis.clone().filter(|_| t.kind.carries_audio()),
         });
     }
     let tracks_out: Vec<TrackNode> = nodes.into_iter().map(|n| n.expect("every track placed")).collect();

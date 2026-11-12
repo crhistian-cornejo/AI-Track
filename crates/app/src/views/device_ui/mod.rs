@@ -40,7 +40,7 @@ use aitrack_dsp::ParamInfo;
 use aitrack_model::{Command, Device, DeviceId};
 use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, FocusHandle, InteractiveElement, IntoElement, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, anchored, canvas, deferred, div, px,
+    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, anchored, canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -198,6 +198,9 @@ pub enum PopKind {
     Choice { device: DeviceId, param: u32 },
     /// An EQ band's menu: type, slope, channel, dynamic, delete.
     EqBand { device: DeviceId, band: usize },
+    /// The track a device listens to on its sidechain; `param` is its
+    /// Internal/External switch, set along with the source.
+    Sidechain { device: DeviceId, param: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -448,6 +451,7 @@ pub fn overlay(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Option<AnyEle
     let body = match &pop.kind {
         PopKind::Choice { device, param } => choice_menu(ws, *device, *param, cx)?,
         PopKind::EqBand { device, band } => eq::band_menu(ws, *device, *band, cx)?,
+        PopKind::Sidechain { device, param } => sidechain_menu(ws, *device, *param, cx)?,
     };
     let id = gpui::ElementId::Name(format!("fx-pop-{}", pop.seq).into());
     Some(
@@ -486,6 +490,76 @@ fn choice_menu(ws: &mut Workspace, device: DeviceId, param: u32, cx: &mut Contex
         })));
     }
     Some(widgets::menu_card("fx-choice-menu", 184.).child(menu_header(info.name.to_uppercase())).child(list).into_any_element())
+}
+
+/// The sidechain chip of a dynamics device: which track it listens to.
+pub fn sidechain_chip(ws: &Workspace, dev: &Dev, param: u32, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let device = dev.id;
+    let source = ws.s.project.device(device).and_then(|d| d.sidechain).and_then(|t| ws.s.project.track(t)).map(|t| (t.name.clone(), t.color));
+    let on = source.is_some();
+    div()
+        .id(("sidechain", dev.key(param as usize)))
+        .flex_none()
+        .h(px(20.))
+        .px(px(SP2))
+        .gap(px(SP1))
+        .flex()
+        .items_center()
+        .rounded(px(r_sm()))
+        .cursor_pointer()
+        .bg(if on { accent_alpha(0.2) } else { content(0.06) })
+        .hover(|s| s.bg(if on { accent_alpha(0.28) } else { content(0.12) }))
+        .tooltip(widgets::tip("Sidechain: the track this device listens to instead of its own input", None))
+        .child(crate::icons::icon(crate::icons::Icon::Link, 10., if on { pal.accent } else { pal.faint }))
+        .when_some(source.as_ref().map(|s| s.1), |d, color| d.child(div().size(px(6.)).rounded_full().bg(track_color(color))))
+        .child(label(source.map_or("Sidechain".to_owned(), |s| crate::paint::fit(&s.0, 88., TEXT_XS)), TEXT_XS, if on { pal.text } else { pal.muted }))
+        .child(crate::icons::icon(crate::icons::Icon::ChevronDown, 10., pal.faint))
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            let at = e.position();
+            this.fx.open_pop(PopKind::Sidechain { device, param }, gpui::point(at.x - px(8.), at.y + px(12.)));
+            cx.notify();
+        }))
+        .into_any_element()
+}
+
+/// Commands that connect `device`'s sidechain to `source` and flip its
+/// Internal/External switch to match, as one edit.
+pub fn sidechain_commands(ws: &Workspace, device: DeviceId, param: u32, source: Option<aitrack_model::TrackId>) -> Vec<Command> {
+    let plugin = match ws.s.project.device(device).map(|d| &d.kind) {
+        Some(aitrack_model::DeviceKind::Stock { plugin_id }) => plugin_id.clone(),
+        _ => return Vec::new(),
+    };
+    let mut cmds = vec![Command::SetSidechain { device, source }];
+    if let Some(info) = ws.b.plugins.device(&plugin).and_then(|i| i.params.iter().find(|x| x.id == param)) {
+        let external = info.to_normalized(if source.is_some() { info.max } else { info.min });
+        cmds.push(Command::SetParam { device, param, value: Some(external) });
+    }
+    cmds
+}
+
+fn sidechain_menu(ws: &mut Workspace, device: DeviceId, param: u32, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let own = ws.s.project.device_track(device)?;
+    let current = ws.s.project.device(device)?.sidechain;
+    let tracks: Vec<(aitrack_model::TrackId, String)> =
+        ws.s.project.tracks.iter().filter(|t| t.id != own && t.kind.carries_audio()).map(|t| (t.id, t.name.clone())).collect();
+    let mut list = div().id("fx-sidechain").max_h(px(420.)).overflow_y_scroll().flex().flex_col();
+    let item = |i: usize, name: String, source: Option<aitrack_model::TrackId>| {
+        menu_item(("fx-sc", i), None, name, None, current == source).on_click(cx.listener(move |this, _, _, cx| {
+            let cmds = sidechain_commands(this, device, param, source);
+            this.s.seal();
+            this.s.edit("Route sidechain", cmds);
+            this.s.seal();
+            this.fx.pop = None;
+            cx.notify();
+        }))
+    };
+    list = list.child(item(0, "No sidechain (its own input)".to_owned(), None));
+    for (i, (id, name)) in tracks.into_iter().enumerate() {
+        list = list.child(item(i + 1, name, Some(id)));
+    }
+    Some(widgets::menu_card("fx-sidechain-menu", 216.).child(menu_header("LISTEN TO")).child(list).into_any_element())
 }
 
 // ───────────────────────────── Dispatch ─────────────────────────────

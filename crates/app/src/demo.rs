@@ -428,4 +428,48 @@ mod tests {
         assert!(rms > 0.01, "demo is (nearly) silent: rms {rms}");
         assert!(peak < 1.0, "demo clips: peak {peak}");
     }
+
+    #[test]
+    fn a_kick_ducks_the_bass_through_the_compressor_sidechain() {
+        use aitrack_stock::fx::compressor::p as comp;
+        // A kick on every beat, a held bass note, and a compressor on the bass
+        // listening to the kick. The kick's fader is down: only the bass is heard.
+        let build = |connected: bool| {
+            let mut b = Builder { p: Project::new("duck") };
+            b.run(Command::SetTempo { bpm: 120. });
+            let kick = b.track(TrackKind::Instrument, "Kick", 0, |t| t.mute = true);
+            b.device(kick, "instrument.wavetable", "Kick", Some("Bass/House Organ Bass"), &[]);
+            let bass = b.track(TrackKind::Instrument, "Bass", 7, |_| {});
+            b.device(bass, "instrument.wavetable", "Bass", Some("Bass/House Organ Bass"), &[]);
+            let c = b.device(bass, "fx.compressor", "Duck", None, &[("Threshold", 0.2), ("Ratio", 1.0), ("Attack", 0.1), ("Release", 0.35), ("Sidechain", 1.0)]);
+            if connected {
+                b.run(Command::SetSidechain { device: c, source: Some(kick) });
+            }
+            let hits: Vec<(u8, Tick, Tick, f32)> = (0..8).map(|i| (36, i * PPQ, PPQ / 4, 1.)).collect();
+            let kicks = b.notes("Kicks", 0, &hits, 2 * BAR, None);
+            let held = b.notes("Held", 7, &[(33, 0, 2 * BAR, 0.9)], 2 * BAR, None);
+            b.place(kick, kicks, &[0]);
+            b.place(bass, held, &[0]);
+            (b.p, c)
+        };
+        let render = |p: &Project| aitrack_engine::render_offline(p, &crate::real::plugins::StockFactory, (0, 2 * BAR), 48_000., 256).expect("render");
+        // RMS of the bass in the 60 ms after each of beats 2..8, and just before them.
+        let levels = |audio: &aitrack_dsp::AudioBuffer| {
+            let rms = |from: usize, len: usize| (audio.channel(0)[from..from + len].iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / len as f64).sqrt();
+            let beat = 24_000;
+            let on: f64 = (1..8).map(|i| rms(i * beat + 480, 2_880)).sum::<f64>() / 7.;
+            let before: f64 = (1..8).map(|i| rms(i * beat - 3_360, 2_880)).sum::<f64>() / 7.;
+            (on, before)
+        };
+        let (project, c) = build(true);
+        assert_eq!(project.device(c).unwrap().params[&comp::SIDECHAIN], 1.0, "the compressor is set to External");
+        let (ducked_on, ducked_before) = levels(&render(&project));
+        let (plain_on, plain_before) = levels(&render(&build(false).0));
+        eprintln!("ducked: on {ducked_on:.4} before {ducked_before:.4} | unconnected: on {plain_on:.4} before {plain_before:.4}");
+        assert!(plain_on > 0.01, "the bass is audible");
+        assert!(ducked_on < 0.5 * plain_on, "the kick pushes the bass down: {ducked_on} vs {plain_on}");
+        assert!(ducked_before > 1.5 * ducked_on, "and it comes back between kicks: {ducked_before} vs {ducked_on}");
+        // Without a source the external sidechain is silent, so nothing is compressed.
+        assert!((plain_on - plain_before).abs() < 0.3 * plain_before);
+    }
 }

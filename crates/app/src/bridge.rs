@@ -948,6 +948,12 @@ pub trait LibraryBridge {
     fn status(&self) -> String {
         "Demo library".into()
     }
+    /// Listen to every sample and detect its key, tempo and type (in the
+    /// background, one file at a time). File names alone rarely carry a key,
+    /// so "Matches project" needs this to have much to show.
+    fn detect_keys(&mut self) -> Result<(), String> {
+        Err("Key detection needs the real library".into())
+    }
     /// Index a folder into the user library (scanned in the background).
     fn add_folder(&mut self, _path: &Path) -> Result<(), String> {
         Err("The demo library cannot index folders".into())

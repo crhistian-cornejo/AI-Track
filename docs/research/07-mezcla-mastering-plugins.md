@@ -551,4 +551,572 @@ Editor (diseño propio): una página de osciladores con el visor de tabla en per
 
 Advertencia de licencia: Vital y Surge son GPL y no se copian. Las tablas de fábrica de Serum, Vital o Massive no se redistribuyen; las nuestras se generan por código. El formato de cuadros de 2048 muestras en WAV es un uso extendido y no una marca.
 
-<!--CONT-->
+---
+
+## 4. Análisis de brechas y plan
+
+Escala: valor A (alto), M (medio), B (bajo); esfuerzo S (días), M (una o dos semanas), L (más). Dentro de cada dispositivo, las mejoras van ordenadas por valor/esfuerzo.
+
+### 4.0 Brechas transversales (antes que cualquier dispositivo)
+
+| # | Brecha | Evidencia en el código | Propuesta | V/E |
+|---|---|---|---|---|
+| T1 | **El sidechain externo no está enrutado** | `process_devices` crea `ProcessContext { sidechain: None, … }` para todos los dispositivos (`crates/engine/src/graph.rs:91`); `crates/model/src/project.rs` no tiene un campo de fuente de sidechain; el parámetro "Sidechain: External" de `fx.compressor` y `fx.gate` existe pero no recibe señal | Campo `sidechain: Option<SidechainSource>` por dispositivo (pista, bus o retorno; pre o post fader), un `Command` para fijarlo, y que el compilador del grafo ordene las pistas y pase el búfer. Selector "Sidechain" en la cabecera de la tarjeta del dispositivo | A/M |
+| T2 | **No hay moduladores de host** | El modelo solo tiene automatización y envolventes de clip | LFO dibujable, seguidor de envolvente y macros a nivel de pista, arrastrables a cualquier parámetro de cualquier dispositivo (doc 04 §5 ya lo proponía). El editor de curvas es el mismo que el de `fx.shaper` y el del LFO del sintetizador | A/L |
+| T3 | Entrada numérica con unidades y notas | Los controles `num` de `device_ui/kit.rs` solo se arrastran | Doble clic para escribir: "2k", "A4", "-3", "1/8." | A/S |
+| T4 | Comparación A/B y ganancia igualada | No existe por dispositivo | Dos estados por dispositivo y un conmutador "igualar loudness al comparar" (mide LUFS a corto plazo antes y después, compensa en la escucha) | A/M |
+| T5 | Escucha de la diferencia (delta) | Solo `SC Listen` en el compresor | Conmutador común en compresor, limitador, clipper, de-esser, multibanda y supresor | M/S |
+| T6 | Sobremuestreo en render | El factor es un parámetro fijo | Factor distinto para la exportación (por ejemplo 4× en vivo y 8× al exportar) | M/S |
+| T7 | Presets de cadena | Los presets son por dispositivo (`crates/stock/src/presets.rs`) | Presets de rack completos (cadena de voz, cadena de máster, bus de batería), buscables por etiqueta | A/M |
+
+### 4.1 Los quince dispositivos actuales
+
+#### 1. `fx.eq`
+- **Tiene**: 8 bandas, 8 formas, 6–96 dB/oct, canal por banda (Stereo, Mid, Side, Left, Right), dinámica descendente por banda, modos Matched y Classic, auto gain; editor con nodos, espectro posterior, creación según la zona, panel de valores, menú contextual y teclado. 15 presets.
+- **Un profesional echaría de menos**: escucha de banda, espectro previo y de sidechain, congelar, entrada "2k"/"A4", selección múltiple y copiar bandas, expansión dinámica y umbral automático, sidechain por banda, fase lineal, más de 8 bandas, agarrar picos, igualar a una referencia, colisiones.
+- **Mejoras**: (1) escucha de banda, A/S; (2) entrada numérica, A/S; (3) espectro previo más inclinación y congelar, A/S; (4) rango dinámico ± con umbral automático, A/M; (5) selección múltiple y copiar o pegar, A/M; (6) 16 bandas, all-pass y tilt plano, M/S; (7) agarrar picos, M/M; (8) fase lineal, M/L; (9) igualar a referencia y dibujar curva, M/L; (10) modo "solo picos" espectral, M/L. Especificación en §3.1.
+
+#### 2. `fx.compressor`
+- **Tiene**: umbral, ratio, rodilla, ataque, release, release automático, 4 estilos (Clean, Punch, Glue, Opto), detección RMS en %, enlace, lookahead, sidechain interno o externo con HPF y escucha, rango, makeup manual y automático, mezcla, salida. Editor con curva de transferencia arrastrable, historial y medidor. 12 presets.
+- **Echaría de menos**: que el sidechain funcione (T1), EQ de sidechain completo (LPF y campana), hold, compresión ascendente, estilo de bus con valores escalonados, color (saturación), sobremuestreo, M/S, release sincronizado al tempo.
+- **Mejoras**: (1) T1; (2) estilo "Bus" con ratios 2, 4 y 10, ataques 0,1 a 30 ms, releases 0,1 a 1,2 s y automático, rodilla dependiente de la ratio, A/S; (3) hold 0–500 ms y release en figuras, M/S; (4) LPF y campana en el sidechain, M/S; (5) estilo "Ascendente", M/M; (6) color pre o post con ADAA y 2×, M/M; (7) Mid o Side como destino, M/S; (8) macro de 3 controles (Cantidad, Velocidad, Color), M/M.
+
+#### 3. `fx.limiter`
+- **Tiene**: ganancia, techo, release fijo o adaptativo, lookahead 0,5–10 ms, pico real 4×, sobremuestreo 1×/2×/4×, enlace; editor con envolvente desplazable, techo arrastrable y lecturas de pico real y LUFS S e I. 8 presets.
+- **Echaría de menos**: estilos, enlace separado de transitorios y release, ganancia unitaria, diferencia, dither con noise shaping, objetivos de loudness, LRA y PLR, etiquetas de reducción, 8×.
+- **Mejoras**: (1) ganancia unitaria y diferencia, A/S; (2) columna de loudness con objetivo, LRA, PLR y avisos de color, A/S (el medidor ya existe en `crates/dsp/src/loudness.rs`); (3) estilos, A/M; (4) dither con forma de ruido, M/S; (5) enlace por etapas y ataque, M/S; (6) 8× y factor de render, M/S; (7) disparo por sidechain, B/S. Especificación en §3.2.
+
+#### 4. `fx.saturator`
+- **Tiene**: 1 a 3 bandas con cruces LR4, 5 estilos (Tape, Tube, Clip, Fold, Bitcrush), drive, nivel y bias por banda, bits y frecuencia, sobremuestreo 1×/2×/4×, tono, mezcla, salida, auto gain. Editor con curvas de transferencia y cruces arrastrables. 12 presets.
+- **Echaría de menos**: más estilos (diodo, transformador, recorte suave, amplificador, rectificador), mezcla y tono por banda, dinámica por banda, solo de banda, curva dibujable, vista de armónicos, modulación.
+- **Mejoras**: (1) solo y mezcla por banda, A/S; (2) 4 a 6 estilos más con antiderivada cerrada, A/M; (3) vista de armónicos (tono de prueba interno de 100 Hz o FFT de la salida), M/S; (4) curva propia de 3 a 5 nodos, idea tomada del saturador de vibez, sin copiar código, M/M; (5) dinámica por banda (preservar o aplastar), M/M; (6) realimentación por banda, B/M.
+
+#### 5. `fx.reverb`
+- **Tiene**: Hall, Room y Plate; FDN de 8 o 16 líneas con RT60 exacto por banda, pre-delay, tamaño, damping, multiplicador de graves, difusión, modulación, reflexiones tempranas, ancho, cortes, mezcla, congelar. Editor con curva de decay frente a frecuencia (3 puntos) y esquema del impulso. 12 presets.
+- **Echaría de menos**: ducking, pre-delay sincronizado, puerta y reverb invertida, shimmer, modos cámara y ambiente, color de época, EQ de salida, más puntos en la curva de decay, convolución.
+- **Mejoras**: (1) ducking por la propia entrada y por sidechain, A/S; (2) pre-delay en figuras, A/S; (3) modos Cámara, Ambiente y "No lineal" (puerta e invertida), M/M; (4) shimmer (desplazador de una octava dentro del lazo), M/M; (5) color (ancho de banda reducido y modulación más profunda), M/S; (6) curva de decay de 6 puntos, M/M; (7) convolución con IR sintético por envolventes, idea de Pro-Wave, M/L.
+
+#### 6. `fx.delay`
+- **Tiene**: estéreo, ping-pong y mono; sincronía; tiempos y figuras por canal; feedback con HP, LP y tanh; modulación; ducking; ancho; mezcla; drive del lazo; el tiempo desliza como una cinta. Editor con taps sobre rejilla de tiempos y rango de filtro. 11 presets.
+- **Echaría de menos**: cambio de tiempo por salto (crossfade), estilos (cinta, BBD, digital, lo-fi), difusión, congelar, inverso, wow y flutter, swing, multitap rítmico.
+- **Mejoras**: (1) modo de cambio "salto", A/S; (2) congelar, A/S; (3) estilos como presets de filtro, saturación, ruido y ancho de banda, A/M; (4) difusión con all-pass en el lazo, M/S; (5) wow y flutter con ruido filtrado, M/S; (6) swing y desfase del ping-pong, M/S; (7) modo inverso, M/M; (8) multitap de hasta 8 taps con editor de patrón, B/L.
+
+#### 7. `fx.filter`
+- **Tiene**: LP, HP, BP, notch y pico en 12 o 24 dB/oct; drive; LFO de 7 formas, libre o sincronizado, con fase estéreo; seguidor de envolvente. Editor con respuesta y nodo. 11 presets.
+- **Echaría de menos**: ladder, peine, formante, morph entre tipos, dos filtros, LFO dibujable, disparo por sidechain.
+- **Mejoras**: (1) LFO dibujable compartido con `fx.shaper`, A/S una vez hecho aquel; (2) ladder de 4 polos y peine, A/M; (3) morph continuo LP→BP→HP, M/S; (4) seguidor desde sidechain, M/S tras T1; (5) formante, B/M.
+
+#### 8. `fx.gate`
+- **Tiene**: Gate, Expander y Duck; umbral, histéresis, ataque, hold, release, rango, ratio, lookahead, sidechain con HPF y LPF. Editor compartido con el compresor. 8 presets.
+- **Echaría de menos**: que el modo Duck reciba sidechain (T1), hold en figuras, disparo MIDI.
+- **Mejoras**: (1) T1; (2) hold y release en figuras, M/S; (3) escucha del detector, M/S.
+
+#### 9. `fx.transient`
+- **Tiene**: ataque y sustain ±100 %, ventana de ataque, longitud de sustain, recorte de salida, mezcla, salida. 8 presets.
+- **Echaría de menos**: foco por frecuencia (actuar solo en graves o agudos), lookahead, M/S.
+- **Mejoras**: (1) banda de actuación con dos cruces, A/M; (2) lookahead de 1 a 5 ms para atrapar el frente del transitorio, M/S; (3) filtro en la detección, M/S.
+
+#### 10. `fx.chorus`
+- **Tiene**: chorus de 2 a 6 voces, flanger y phaser de 2 a 12 etapas, sincronía, apertura estéreo, mezcla. 9 presets.
+- **Echaría de menos**: ensemble de tres fases, modo "dimensión" (ancho sin vibrato audible), vibrato, pasa-altos en la señal procesada.
+- **Mejoras**: (1) pasa-altos del efecto para no ensuciar el sub, A/S; (2) modos Ensemble y Dimensión, M/M; (3) vibrato (100 % procesado), B/S.
+
+#### 11. `fx.utility`
+- **Tiene**: ganancia, pan, ancho, mono, mono en graves con frecuencia, inversión por canal, intercambio, bloqueo de DC, modo de canal, mute. Editor con abanico estéreo y correlación. 10 presets.
+- **Echaría de menos**: ganancias de Mid y Side por separado, retardo por canal para alinear, escucha de lo que el mono en graves quita.
+- **Mejoras**: (1) ganancia de Mid y de Side en dB, A/S; (2) retardo 0–50 ms o en muestras por canal, M/S; (3) botón de escucha del mono en graves, B/S.
+
+#### 12. `fx.analyzer`
+- **Tiene**: espectro de 128 bandas, LUFS momentáneo, corto e integrado, LRA, pico real por canal, pico y RMS, correlación; FFT 2048 a 8192, caída, inclinación 0, 3 o 4,5 dB/oct, fuente Mid, Left, Right o Side. 6 presets.
+- **Echaría de menos**: PLR y PSR, objetivo de loudness, historial de loudness, curva de referencia superpuesta, media y máximos mantenidos, vectorscopio propio.
+- **Mejoras**: (1) PLR, PSR y objetivo con colores, A/S; (2) media larga y máximos, A/S; (3) superponer el espectro de una referencia, A/M; (4) historial de LUFS a corto plazo, M/S. Parte de esto vive mejor en la tira de medidores (`crates/app/src/views/meters.rs`), que ya tiene forma de onda, espectrograma, espectro, campo estéreo, niveles, VU y osciloscopio.
+
+#### 13. `instrument.wavetable`
+- Ver §3.4. Resumen de brechas: tablas fijas, sin importar ni editar, sin warp, unísono de 7, un filtro de 3 tipos, 2 LFO fijos, 8 ranuras, sin macros, efectos mínimos. Fase 1 A/L, fase 2 A/L, fase 3 M/L.
+
+#### 14. `instrument.sampler`
+- **Tiene**: un sample, 16 voces, modos Classic, One-Shot y Loop con crossfade, tono raíz, seguimiento, transposición, inicio y fin, filtro con envolvente, glide. Editor con forma de onda, marcadores y envolvente. 6 presets.
+- **Echaría de menos**: zonas multisample por nota y velocidad, troceado, inverso, estiramiento de tiempo, LFO, envolvente de tono, bucle de ida y vuelta, unísono.
+- **Mejoras**: (1) inverso y bucle de ida y vuelta, A/S; (2) troceado por transitorios o por rejilla con una nota por trozo, A/M; (3) LFO y envolvente de tono, M/S; (4) estiramiento con Signalsmith Stretch (MIT), M/L; (5) zonas multisample con importación SFZ, M/L.
+
+#### 15. `instrument.drum`
+- **Tiene**: 16 pads; por pad sample, afinación, decay, corte, pan, nivel, grupo de choke y modo gate; curvas de velocidad; kit sintético de reserva; 32 voces. Editor con rejilla 4×4 y forma de onda del pad. 6 presets.
+- **Echaría de menos**: inicio del sample, ataque, inverso, capas por velocidad, envíos por pad, saturación o transitorio por pad, salidas separadas, envolvente de tono, cambio rápido de sample por parecido, síntesis de bombo.
+- **Mejoras**: (1) inicio, ataque e inverso por pad, A/S; (2) envolvente de tono por pad (imprescindible para bombos y toms), A/S; (3) "siguiente o anterior sample parecido" usando la librería (`crates/library`), A/M; (4) drive y transitorio por pad, M/M; (5) capas por velocidad y round robin, M/M; (6) salidas por pad hacia el mezclador, M/L; (7) pad sintético de bombo (seno con barrido de tono, clic y saturación), M/M.
+
+### 4.2 Lo que tienen las referencias y nosotros no
+
+Inventario leído en `reference/` (solo lectura). Lemon-Studio trae 29 dispositivos, futureboard-studio 25 crates de DSP (22 conectados), vibez 14 efectos y 5 instrumentos, Pro-Wave 13 efectos, 8 efectos MIDI y 2 sintetizadores.
+
+| Categoría que nos falta | Quién la tiene | Mejor diseño para estudiar |
+|---|---|---|
+| De-esser | futureboard `deesser` | futureboard: modos partido y ancho, detección estéreo, Mid o Side, resta sin crossover, lookahead, escucha |
+| Ducker y curva de volumen | futureboard `duckstep` | futureboard: 16 puntos con curvatura, figuras, disparo por tiempo, audio o MIDI, solo graves o agudos, escucha de la diferencia |
+| Multibanda ascendente y descendente | Lemon `Press` (mapas dibujados); futureboard `compresser` y Pro-Wave (solo descendente) | Lemon `Press`: la curva de transferencia por banda se dibuja como un clip de automatización. Idea potente; código GPL, no se copia |
+| Clipper | futureboard `67Clipper`, Lemon Soft Clipper | futureboard: solo se sobremuestrea el residuo, así lo que queda bajo la rodilla pasa intacto |
+| Imager por bandas | futureboard `imager` | futureboard: 4 bandas LR4 sobre Mid y Side, stereoize por Haas o all-pass, mono en graves, vectorscopio |
+| Limitador con medidor BS.1770 integrado | futureboard `burnLimit` | Seis estilos, dither, objetivo en LUFS |
+| Excitador o "aire" | futureboard `airboost` | Shelf de aire, excitador Chebyshev de 2.º y 3.er armónico, de-esser interno |
+| Corrección de afinación | futureboard `whitesharp`; Pro-Wave Flex Pitch (offline) | futureboard: YIN sobre suma mono diezmada más TD-PSOLA estéreo, formantes, humanizar |
+| Vocoder | Lemon `Vocoder` | Bandas emparejadas con envolvente por banda |
+| Eco de cinta, bitcrusher, auto-pan | vibez `Echo`, `Bitcrush`, `Auto-Pan` | vibez: buenas pantallas (repeticiones futuras, forma del paneo por lado) |
+| Reverb de convolución | Pro-Wave `Space D`, Lemon `Tesla` | Pro-Wave: IR sintético con envolventes de volumen y filtro, sin archivos |
+| Sintetizador FM | vibez (4 operadores, 8 algoritmos, macros), Lemon `Citrus` | vibez por las macros sobre un motor complejo |
+| Aditivo | Lemon `Smith` | — |
+| Efectos MIDI (arpegiador, acordes, escala) | Pro-Wave | El diseño más simple de copiar en concepto |
+| Moduladores (seguidor de picos, fórmula) | Lemon `Peak Controller`, `Formula Controller` | Refuerzan T2 |
+| Reparación espectral (ruido, clipping, reverb) | Lemon `Tesla` | Para el editor de audio, no para un dispositivo |
+| Tira de canal | futureboard `mixstation` | — |
+| Simulador de amplificador | futureboard `rodharerist`, Pro-Wave | Fuera del foco de electrónica |
+
+Ninguna de las cuatro trae supresor de resonancias, desplazador de frecuencia, granular, síntesis de bombo, igualación a referencia ni asistente de máster. En futureboard hay plugins GPL de ejemplo de nih-plug vendorizados (`external/nihplug_gpui/plugins`), entre ellos un compresor espectral: no forman parte de su código MIT y no se portan.
+
+Los mejor diseñados para estudiar, por orden: `verbspace`, `67Clipper`, `imager`, `duckstep`, `burnLimit` y `deesser` de futureboard (flujo de señal documentado, sin asignaciones en audio, editores que dibujan con las mismas funciones del DSP); `Press` y el modo LIN del EQ de Lemon; el saturador con curva dibujable y el Echo de vibez; `Space D` de Pro-Wave.
+
+### 4.3 Dispositivos nuevos, por orden
+
+#### 4.3.1 `fx.clipper` — recorte de picos (V A / E S)
+
+**Propósito.** Recortar transitorios de bombo, caja y bus de batería, y quitarle trabajo al limitador del máster. Es el dispositivo nuevo más barato y uno de los más usados en electrónica.
+
+| Parámetro | Rango | Inicial |
+|---|---|---|
+| Entrada (drive) | 0…+24 dB | 0 dB |
+| Techo | −24…0 dB | −0,3 dB |
+| Forma | 0…100 % (0 = duro, 100 = rodilla que empieza 12 dB antes) | 20 % |
+| Sobremuestreo | 1×, 2×, 4×, 8× | 4× |
+| Enlace estéreo | Sí/No (afecta solo a la medición; el recorte es por muestra) | — |
+| Compensar ganancia | Sí/No (la salida resta la entrada) | No |
+| Escuchar diferencia | Sí/No | No |
+| Mezcla | 0…100 % | 100 % |
+| Salida | −24…+12 dB | 0 dB |
+
+**DSP.** Función de recorte con rodilla cuadrática: lineal hasta `techo − rodilla`, parábola tangente hasta el techo, plana después. Tiene antiderivada cerrada, así que se aplica ADAA de primer orden (`Adaa1` en `crates/dsp/src/shaper.rs`) dentro del `Oversampler` polifásico existente. Mejora tomada como idea de `67Clipper`: sobremuestrear solo el residuo `x − clip(x)` y restarlo, de modo que la señal por debajo de la rodilla no pasa por los filtros de sobremuestreo. Tras decimar puede haber rebasamiento por el filtro: se cierra con un recorte duro final a la frecuencia base o, mejor, con 0,1 dB de margen interno. Referencias: Parker, Zavalishin y Le Bivic (DAFx-16) y Bilbao et al. (2017), ya citadas en doc 04 §3.7.
+
+**Medidores.** dB recortados (pico y media), porcentaje de muestras recortadas en el último segundo, pico de entrada y de salida.
+
+**Editor.** A la izquierda, la curva de transferencia con dos asas: techo (vertical) y forma (la esquina de la rodilla). A la derecha, forma de onda desplazable con lo recortado pintado en el color de acento por encima de la línea del techo. Arrastrar la forma de onda en vertical cambia la entrada.
+
+**Presets.** Bombo duro (3 dB), Caja con chasquido, Bus de batería (2 dB), 808 saturado, Máster antes del limitador (1,5 dB, forma 30 %), Máster suave, Transparente 8×.
+
+#### 4.3.2 `fx.shaper` — curva dibujable sincronizada (V A / E M)
+
+**Propósito.** El "sidechain sin sidechain": una curva de volumen que se repite con el tempo. Sirve también como puerta rítmica, trémolo y stutter. Cubre el uso de LFOTool, Kickstart y VolumeShaper, y su editor de curvas se reutiliza en el LFO del sintetizador y en los moduladores de host (T2).
+
+| Parámetro | Rango | Inicial |
+|---|---|---|
+| Destino | Volumen, Filtro (corte), Pan | Volumen |
+| Longitud | 1/32 … 8 compases, con puntillo y tresillo; o Hz (0,05–50) | 1/4 |
+| Disparo | Transporte, Audio, MIDI, Libre | Transporte |
+| Umbral de disparo (Audio) | −60…0 dB | −24 dB |
+| Fuente del disparo (Audio) | Entrada, Sidechain | Sidechain |
+| Reintento mínimo | 10…500 ms | 60 ms |
+| Profundidad | 0…100 % | 100 % |
+| Suavizado | 0…50 ms | 4 ms |
+| Desfase | −50…+50 % | 0 % |
+| Swing | 0…75 % | 0 % |
+| Banda | Todo, Solo graves, Solo agudos | Todo |
+| Cruce | 40…2000 Hz | 150 Hz |
+| Patrón | 1…8 (cambiable por automatización o por nota MIDI) | 1 |
+| Mezcla, Salida | 0…100 %; −24…+12 dB | 100 %; 0 dB |
+
+La curva (hasta 32 puntos con x, y y curvatura por tramo, por cada uno de los 8 patrones) va en el estado del dispositivo, no en parámetros.
+
+**DSP.** Al editar, el hilo de control muestrea la curva en una tabla de 1024 puntos y la publica al hilo de audio por intercambio atómico (la vieja se libera fuera del hilo RT). En audio: fase = fracción de `posición_en_tiempos / longitud` tomada de `Transport` (exacta a la muestra, sin deriva); lectura lineal de la tabla; un paso bajo de un polo con la constante de "suavizado" evita clics en los escalones; ganancia = 1 − profundidad·(1 − tabla). En modo banda, un `Lr4` parte la señal y solo se multiplica una mitad. Disparo por audio: seguidor de pico rápido con histéresis y tiempo de reintento; al disparar, la fase vuelve a cero. Destino filtro: un `Svf` cuyo corte sigue la tabla en octavas.
+
+**Editor.** Un pozo con rejilla (divisiones X de 2 a 32, Y de 4 a 16) y la curva encima. Detrás, la forma de onda de la entrada plegada sobre la longitud del patrón, y la del sidechain si lo hay, para ver bombo y bajo juntos. Interacciones: doble clic crea o borra un punto; arrastrar un punto lo mueve con imán a la rejilla (Shift lo desactiva); arrastrar un tramo en vertical cambia su curvatura; herramientas de dibujo (línea, curva, escalón) que pintan varios puntos al arrastrar; clic derecho en un punto ofrece "escalón aquí" y "simétrico". Una cabeza de reproducción recorre la curva. Fila de 12 formas predefinidas como miniaturas.
+
+**Presets.** Sidechain de negra clásico, Sidechain corto (techno), Sidechain largo (future house), Bombeo a contratiempo, Solo sub (graves, 150 Hz), Puerta de 1/16, Trance gate, Trémolo de tresillo, Stutter de 1/8, Subida de 4 compases, Seguir al bombo (disparo por audio).
+
+#### 4.3.3 `fx.multiband` — multibanda ascendente y descendente (V A / E M)
+
+**Propósito.** Densidad y brillo por bandas: el sonido "OTT" de bajos, leads y drums. Con las ratios suaves sirve también como multibanda de máster.
+
+Lo que se sabe del original: OTT de Xfer tiene Depth, Time, ganancias de entrada y salida, ganancia por banda, Upward % y Downward %, y cruces fijos en 88,3 Hz y 2,5 kHz [S]. El preset de Ableton del que viene usa ratio por encima del umbral de ∞:1 en agudos y 66,7:1 en medios y graves, ratio por debajo de 4:1 aproximadamente, ganancia de entrada de +5,2 dB por banda y de salida de +10,3 dB (graves y agudos) y +5,7 dB (medios) [S, análisis de terceros]. Umbrales y tiempos del preset, de memoria y sin verificar: por encima −33,8 / −30,2 / −35,5 dB (graves, medios, agudos); por debajo −40,8 / −41,8 / −40,8 dB; ataque y release 47,8/282 ms, 22,4/282 ms y 13,5/132 ms [M]. Nuestros valores iniciales se ajustarán de oído; estos sirven de punto de partida.
+
+| Parámetro | Rango | Inicial |
+|---|---|---|
+| Cruce grave | 40…1000 Hz | 90 Hz |
+| Cruce agudo | 500…12000 Hz | 2500 Hz |
+| Cantidad | 0…100 % (mezcla del proceso) | 50 % |
+| Tiempo | 10…1000 % (escala ataques y releases) | 100 % |
+| Ascendente | 0…100 % (escala la ratio por debajo) | 100 % |
+| Descendente | 0…100 % (escala la ratio por encima) | 100 % |
+| Detección | Pico, RMS | RMS |
+| Rodilla | 0…18 dB | 6 dB |
+| Entrada, Salida | −24…+24 dB | 0 dB |
+| Por banda: umbral superior | −60…0 dB | −32 / −30 / −34 dB |
+| Por banda: ratio superior | 1:1…∞:1 | 20:1 |
+| Por banda: umbral inferior | −80…−10 dB | −41 dB |
+| Por banda: ratio inferior (ascendente) | 1:1…1:8 | 1:4 |
+| Por banda: ganancia máxima ascendente | 0…36 dB | 24 dB |
+| Por banda: ataque, release | 0,1…200 ms; 5…2000 ms | 48/280, 22/280, 13/130 ms |
+| Por banda: ganancia de salida | −24…+24 dB | +6 / +3 / +6 dB |
+| Por banda: solo, bypass | — | — |
+
+**DSP.** `Crossover3` (LR4) parte en tres. Por banda: nivel en dB con el `EnvelopeFollower` (pico o RMS); curva estática con dos umbrales: por encima de `umbral superior` la ganancia es `(umbral − nivel)·(1 − 1/ratio)` (compresión descendente); por debajo de `umbral inferior` es `(umbral − nivel)·(1 − 1/ratio_inf)` positiva y acotada por la ganancia máxima (compresión ascendente); entre ambos, 0 dB. Rodilla cuadrática en los dos codos. La ganancia en dB pasa por el `GainSmoother` con ataque y release. La ganancia máxima ascendente es esencial: sin ella, el silencio se convierte en ruido. Semántica de umbrales por encima y por debajo: manual de Live 12 [P]. Computador de ganancia: Giannoulis, Massberg y Reiss (2012). Latencia cero.
+
+**Editor.** El espectro de fondo con los dos cruces como líneas arrastrables. En cada banda, una columna vertical de nivel con dos asas (umbral superior e inferior): la zona por encima del superior se tiñe con el color de "baja", la zona por debajo del inferior con el de "sube", y una barra enseña el nivel en vivo y la ganancia aplicada. Arrastrar un asa con Alt cambia la ratio. Un control grande de Cantidad. Vista compacta: Cantidad, Tiempo, Ascendente, Descendente y tres ganancias de banda.
+
+**Presets.** Clásico electrónico (los valores de arriba al 100 %), Suave 30 %, Bajo reese controlado, Lead brillante, Drums en paralelo, Voz al frente, Pad con aire, Máster multibanda suave (solo descendente, 2:1, 1 dB), Quitar barro (solo banda media-grave).
+
+#### 4.3.4 `fx.deesser` (V A / E S)
+
+Especificación completa en §3.3.
+
+#### 4.3.5 `fx.resonance` — supresor de resonancias y ducking espectral (V A / E L)
+
+**Propósito.** Bajar automáticamente lo que sobresale del espectro en cada instante (aspereza de voces, platos, supersaws, guitarras), sin buscar frecuencias a mano. Con sidechain, abrir hueco solo en las frecuencias que ocupa otra pista (uso de Trackspacer).
+
+| Parámetro | Rango | Inicial |
+|---|---|---|
+| Profundidad | 0…100 % (escala el recorte; máximo −24 dB por bin) | 30 % |
+| Detalle | 0…100 % (ancho del suavizado que define "lo normal": de 1 octava a 1/12) | 50 % |
+| Selectividad | 0…12 dB (cuánto debe sobresalir un pico para actuar) | 3 dB |
+| Modo | Relativo (no depende del nivel), Absoluto (con umbral) | Relativo |
+| Umbral (Absoluto) | −60…0 dB | −30 dB |
+| Inclinación | −6…+6 dB/oct | 0 |
+| Ataque, Release | 0…100 ms; 5…500 ms | 5 ms; 60 ms |
+| Límite grave, Límite agudo | 20 Hz…20 kHz | 200 Hz; 16 kHz |
+| Fuente | Propia, Sidechain | Propia |
+| Estéreo | Enlace 0…100 %; Estéreo, Mid o Side | 100 %; Estéreo |
+| Calidad | 1024, 2048, 4096 | 2048 |
+| Escuchar diferencia | Sí/No | No |
+| Mezcla, Salida | 0…100 %; ±12 dB | 100 %; 0 dB |
+
+**DSP.** STFT con ventana Hann y solape del 75 %. Por trama: magnitud en dB; se calcula una envolvente suavizada en frecuencia (suavizado de fracción de octava, Hatziantoniou y Mourjopoulos, JAES 2000, con el ancho que marca Detalle); exceso = magnitud − envolvente − selectividad; reducción = profundidad × exceso, acotada; suavizado temporal por bin con ataque y release y un suavizado ligero entre bins vecinos para evitar ruido musical; se multiplica el espectro y se resintetiza por solape y suma con ventana de síntesis. En modo Sidechain, la envolvente a restar es el espectro del sidechain suavizado y normalizado: se recorta donde la otra pista tiene energía. Latencia igual al tamaño de la FFT (2048 muestras, 43 ms a 48 kHz), declarada al host. Todo preasignado en `prepare`; la FFT es `realfft`, ya usada por `SpectrumAnalyzer`. Coste estimado: dos FFT de 2048 cada 512 muestras por canal, muy por debajo del 1 % de un núcleo. Variante sin latencia para la v2: el mismo análisis gobierna un banco de 24 a 32 campanas SVF en fase mínima. Base teórica: J. O. Smith, *Spectral Audio Signal Processing* (STFT y solape y suma).
+
+Es un diseño propio. soothe, Gullfoss y la dinámica espectral de Pro-Q no publican sus algoritmos, y no intentamos reproducirlos.
+
+**Editor.** Espectro de entrada como área; la reducción cuelga desde arriba por frecuencia, como un medidor de reducción con forma de espectro. Dos corchetes arrastrables fijan los límites grave y agudo. Arrastrar en vertical en cualquier punto cambia la Profundidad; la rueda cambia el Detalle. Botón de diferencia.
+
+**Presets.** Voz áspera, Platos y hi-hats, Supersaw, Lead agresivo, Bus de mezcla (20 %), Retorno de reverb, Hueco para la voz (sidechain), Hueco para el bombo (sidechain, 30–200 Hz).
+
+#### 4.3.6 `fx.imager` — imagen estéreo por bandas (V M / E S)
+
+**Propósito.** Mono en graves, ancho en agudos, y dar anchura a fuentes mono sin romper la suma a mono.
+
+| Parámetro | Rango | Inicial |
+|---|---|---|
+| Bandas | 1…4 | 3 |
+| Cruces | 40…16000 Hz | 120, 1000, 6000 Hz |
+| Por banda: ancho | 0…200 % | 0 %, 100 %, 100 %, 120 % |
+| Por banda: estereoizar | 0…100 % | 0 % |
+| Por banda: solo, bypass | — | — |
+| Seguro en mono | Sí/No (reduce el ancho si la correlación de la banda baja de 0) | Sí |
+| Ancho global | 0…200 % | 100 % |
+| Salida | ±12 dB | 0 dB |
+
+**DSP.** Conversión a Mid y Side, cruces LR4 iguales en ambos, ganancia del Side por banda. Estereoizar: una copia del Mid pasa por una cadena corta de all-pass de Schroeder y se suma al Side; como va solo al Side, desaparece al sumar a mono. Correlación por banda con medias exponenciales de L·R, L² y R². Latencia cero.
+
+**Editor.** Vectorscopio polar a la izquierda con medidor de correlación; a la derecha, el espectro del Mid y del Side superpuestos, con las bandas como columnas y un asa de ancho por columna; cruces arrastrables. La columna se tiñe de aviso si su correlación es negativa.
+
+**Presets.** Máster: graves en mono; Máster ancho arriba; Pad enorme; Bajo centrado; Voz doblada falsa; Comprobar mono (todo a 0 %).
+
+#### 4.3.7 `fx.color` — cinta y lo-fi (V M / E M)
+
+**Propósito.** Carácter en un gesto: inestabilidad de tono, ruido, saturación y ancho de banda de cinta, casete, vinilo o sampler antiguo.
+
+Módulos, cada uno con cantidad y bypass, y una **Intensidad** global que los escala todos:
+
+| Módulo | Parámetros | DSP |
+|---|---|---|
+| Oscilación | Wow 0…100 % (0,3–2 Hz), Flutter 0…100 % (5–12 Hz), aleatoriedad, estéreo | Línea de retardo fraccional con lectura cúbica, modulada por dos LFO más ruido filtrado |
+| Saturación | Drive 0…24 dB, tipo (Cinta, Válvula, Transistor), sesgo | Shapers existentes con ADAA; cinta con pre y de-énfasis. Histéresis real (modelo de Jiles-Atherton, Chowdhury, DAFx-19) para la v2 |
+| Ruido | Tipo (siseo, vinilo, zumbido 50/60 Hz, aire), nivel, sigue a la señal | Ruido filtrado; chasquidos de vinilo como impulsos de Poisson por un resonador; opción de puerta para que solo suene con señal |
+| Digital | Bits 4…16, frecuencia 2…48 kHz, jitter | `Bitcrusher` existente |
+| Banda | Pasa-altos 20…1000 Hz, pasa-bajos 1…20 kHz, resonancia de "altavoz" | SVF |
+| Desgaste | Caídas de nivel aleatorias, pérdida de agudos lenta | Ganancia y corte modulados por ruido muy lento |
+| Pegamento | Compresión de un control | Compresor Opto existente con valores fijos |
+
+Editor: seis mosaicos con un dibujo en vivo cada uno (la onda de tono oscilando, la curva de saturación, el ruido, la escalera de bits, la banda, las caídas) y un deslizador grande de Intensidad. Presets: Casete gastado, Cinta de estudio, Vinilo, Sampler de 12 bits, VHS, Radio, Lo-fi hip-hop, Solo wow suave.
+
+#### 4.3.8 `fx.tune` y `fx.pitch` — afinación y formantes (V M / E L)
+
+**`fx.tune`, corrección en tiempo real.** Parámetros: tonalidad y escala (por defecto, las del proyecto: `crates/model/src/scale.rs`), notas activas, velocidad de corrección 0…400 ms (0 = efecto duro), humanizar 0…100 % (las notas largas se corrigen menos), tolerancia en cents, transposición ±12 semitonos, formantes ±12 semitonos con "conservar formantes", vibrato (cantidad, velocidad, retardo), rango de voz (grave, media, aguda), mezcla. DSP: detección de tono con YIN (de Cheveigné y Kawahara, JASA 2002) sobre la suma mono diezmada; nota objetivo por la escala; cambio de tono con TD-PSOLA (Moulines y Charpentier, 1990) para voz monofónica, que conserva formantes por construcción. Latencia de 10 a 25 ms. Editor: teclado con la nota detectada y la objetivo, traza de tono desplazable antes y después, y un anillo para la velocidad. `whitesharp` de futureboard (MIT) sigue este esquema y sirve de referencia.
+
+**`fx.pitch`, desplazador.** Tono ±24 semitonos, fino ±100 cents, formantes ±12, enlace tono-formante, modo (Voz: PSOLA; Polifónico: vocoder de fase con bloqueo de fase, o port de Signalsmith Stretch, MIT), retardo y realimentación para efectos de escalera, mezcla.
+
+**Edición por notas (fuera de línea).** No es un dispositivo: es una vista del clip de audio que usa la detección monofónica que ya tiene `crates/ai/src/midi/mono.rs` para trocear en notas y permite arrastrarlas en tono y tiempo. Va después de los dos anteriores.
+
+#### 4.3.9 Cadena de máster asistida (V A / E M)
+
+No es un dispositivo de DSP nuevo sino un rack de fábrica más un panel. Detalle en §5.
+
+#### 4.3.10 Otros, en orden de interés
+
+| Dispositivo | Para qué | V/E |
+|---|---|---|
+| Efectos MIDI de host: arpegiador, acordes, escala, repetidor | Los usa todo instrumento; sustituyen al arpegiador interno de un sinte | A/M |
+| `instrument.kick`: sintetizador de bombo | Seno con envolvente de tono, clic, saturación y cola; afinado a la tonalidad del proyecto | A/M |
+| `fx.vocoder` | Voces robóticas y pads vocales; necesita T1 | M/M |
+| Excitador ("aire") | Shelf alto más armónicos de 2.º y 3.er orden | M/S |
+| `fx.shift`: desplazador de frecuencia y modulador en anillo | Efectos metálicos, ensanchado sutil | M/M |
+| Half-time y stutter | Búfer de 1 a 8 compases reproducido a media velocidad con fundidos | M/M |
+| Reverb de convolución | Espacios reales e IR sintéticos | M/L |
+| `instrument.fm` | 4 operadores con macros | M/L |
+| Granular | Texturas a partir de la entrada o de un sample | M/L |
+
+### 4.4 Cómo encaja todo
+
+```mermaid
+flowchart TD
+    subgraph MODELO["crates/model"]
+        PROJ["Project y Command<br/>project.rs, command.rs"]
+        SCSRC["Fuente de sidechain por dispositivo<br/>project.rs (nuevo campo y Command)"]
+        MODS["Moduladores de pista: LFO dibujable,<br/>seguidor, macros (nuevo)"]
+        PROP["Propuestas y deshacer<br/>history.rs"]
+    end
+
+    subgraph MOTOR["crates/engine"]
+        COMP["Compilador del grafo<br/>compile.rs"]
+        GRAPH["process_devices<br/>graph.rs"]
+        SCBUF["Búfer de sidechain en ProcessContext<br/>graph.rs:91 (hoy None)"]
+        TAP["Tap de análisis del Main<br/>tap.rs"]
+        TAPN["Taps por pista y pista de referencia (nuevo)"]
+        EXP["Exportación<br/>export.rs"]
+    end
+
+    subgraph DSP["crates/dsp"]
+        PRIM["Primitivas: Svf, Lr4, Crossover3, EnvelopeFollower,<br/>Adaa1, Oversampler, TruePeak, LufsMeter, SpectrumAnalyzer"]
+        CURVE["Curva dibujable y tabla (nuevo)<br/>curve.rs"]
+        STFT["Núcleo STFT con solape y suma (nuevo)<br/>stft.rs"]
+        PITCH["YIN y PSOLA (nuevo)<br/>pitch.rs"]
+    end
+
+    subgraph STOCK["crates/stock"]
+        OLD["15 dispositivos actuales<br/>fx/*.rs, instrument/*.rs"]
+        UPG["Mejoras: fx.eq, fx.limiter, fx.compressor,<br/>instrument.wavetable"]
+        NEW["Nuevos: fx.clipper, fx.shaper, fx.multiband,<br/>fx.deesser, fx.imager, fx.resonance,<br/>fx.color, fx.tune, fx.pitch"]
+        RACKS["Presets de cadena: voz, bus, máster<br/>presets/"]
+    end
+
+    subgraph APP["crates/app"]
+        DEVUI["Editores visuales<br/>views/device_ui/*.rs"]
+        KIT["kit.rs: entrada '2k'/'A4', editor de curvas,<br/>arcos de modulación (nuevo)"]
+        STRIP["Tira de medidores<br/>views/meters.rs"]
+        ASSIST["Asistente de mezcla y máster (nuevo)<br/>views/assistant.rs"]
+        AIP["Panel de IA y propuestas<br/>views/ai_panel.rs"]
+        EXPUI["Diálogo de exportación<br/>views/export.rs"]
+    end
+
+    subgraph AI["crates/ai"]
+        ANA["Análisis: tonalidad, BPM, loudness, features<br/>analysis.rs, features.rs"]
+        REF["Perfil de referencia y de género (nuevo)<br/>reference.rs"]
+    end
+
+    PROJ --> COMP --> GRAPH
+    SCSRC --> COMP
+    COMP --> SCBUF --> GRAPH
+    MODS --> GRAPH
+    PRIM --> OLD
+    PRIM --> NEW
+    CURVE --> NEW
+    CURVE --> MODS
+    CURVE --> UPG
+    STFT --> NEW
+    PITCH --> NEW
+    OLD --> GRAPH
+    UPG --> GRAPH
+    NEW --> GRAPH
+    GRAPH --> TAP --> STRIP
+    GRAPH --> TAPN --> ASSIST
+    STRIP --> ASSIST
+    ANA --> REF --> ASSIST
+    ASSIST -- "propone Commands" --> PROP --> PROJ
+    ASSIST --> AIP
+    RACKS --> ASSIST
+    DEVUI --> KIT
+    NEW --> DEVUI
+    UPG --> DEVUI
+    ASSIST --> EXPUI --> EXP
+
+    classDef cambio fill:#f59e0b,stroke:#b45309,color:#000
+    class SCSRC,MODS,SCBUF,TAPN,CURVE,STFT,PITCH,UPG,NEW,RACKS,KIT,ASSIST,REF cambio
+```
+
+**Leyenda**: en naranja, lo nuevo o modificado que propone este documento. En el color por defecto, lo que ya existe. Los nombres de archivo nuevos (`curve.rs`, `stft.rs`, `pitch.rs`, `assistant.rs`, `reference.rs`) son propuestas.
+
+---
+
+## 5. Asistente de mezcla y mastering
+
+Principio: el asistente **mide, avisa y propone**; no decide. Cada sugerencia es una propuesta de `aitrack-model` que el usuario acepta o descarta, y cada número enseña de dónde sale. Todo el análisis corre fuera del hilo de audio, sobre los taps del motor.
+
+### 5.1 Lista de comprobación viva
+
+Un panel plegable junto a la tira de medidores con dos pestañas, Mezcla y Máster. Cada línea tiene estado (bien, aviso, problema, sin datos), la lectura que lo justifica y un botón que lleva al sitio o propone el arreglo.
+
+| Comprobación | Cómo se mide | Aviso cuando | Arreglo propuesto |
+|---|---|---|---|
+| Recorte en pistas o buses | Pico por pista (ya se mide) | Pico > 0 dBFS antes del máster | Bajar la ganancia del clip o añadir Utility |
+| Margen del bus principal | Pico real del Main sin el limitador | Pico real > −1 dBTP sin limitador | Bajar el grupo o insertar limitador |
+| Graves en mono | Correlación por debajo de 120 Hz (tap del Main filtrado) | Correlación < 0,5 durante más de 2 s | Utility con mono en graves, o `fx.imager` |
+| Compatibilidad mono | Diferencia de LUFS entre estéreo y suma mono, por bandas | Pérdida > 3 dB en alguna banda | Señalar la pista responsable (la de menor correlación en esa banda) |
+| Choque de bombo y bajo | Solape de energía entre 30 y 150 Hz de las dos pistas en las mismas tramas | Solape alto y sin ducking | Insertar `fx.shaper` (preset de negra) o sidechain |
+| Enmascaramiento de la voz o del lead | Espectros a 1/3 de octava de la pista protegida y del resto | Otra pista supera a la protegida en 1–5 kHz más del 30 % del tiempo | `fx.resonance` en modo sidechain, o un corte de EQ dinámico en la pista que estorba |
+| Balance tonal | Espectro medio del Main frente a la curva del género o de la referencia | Desviación > 3 dB en una banda de octava | Enseñar la banda; proponer un shelf o una campana ancha como propuesta |
+| Dinámica | PLR y PSR del Main | PSR < 6 en la sección más fuerte, o LRA < 3 | Informar; no propone nada |
+| Loudness frente al objetivo | LUFS integrado y a corto plazo máximo | Fuera de ±1 LU del objetivo elegido | Ajustar la ganancia del limitador |
+| Pico real | Pico real del Main tras el limitador | Por encima del techo del perfil | Bajar el techo, activar pico real |
+| Sibilancia | Relación de energía de 5–10 kHz frente a banda ancha en pistas etiquetadas como voz | Picos repetidos | Insertar `fx.deesser` |
+| DC y silencio | Media de la señal; cola al final | DC > −60 dBFS; cola cortada | Bloqueo de DC; alargar la cola de exportación |
+
+La lista se evalúa de forma continua con poco coste, y a fondo con "Analizar el tema": un render interno fuera de tiempo real que recorre el arreglo entero y deja un informe con los problemas situados en el tiempo.
+
+### 5.2 Objetivos de loudness
+
+Perfiles editables, guardados como datos con fecha y fuente. Valores iniciales según §1.3 y §1.4:
+
+| Perfil | Integrado | Techo | Nota que ve el usuario |
+|---|---|---|---|
+| Streaming (Spotify, YouTube, Tidal, Amazon) | −14 LUFS | −1 dBTP | Lo publicado por Spotify; más fuerte se bajará al reproducir |
+| Streaming, máster fuerte | −9 LUFS | −2 dBTP | Spotify pide −2 dBTP si se supera −14 LUFS |
+| Apple Music | −16 LUFS | −1 dBTP | −16 es medición de terceros; Apple solo pide 1 dB de margen |
+| Club y descarga (Beatport, Bandcamp) | −8 LUFS (ajustable por género, −9 a −5) | −0,3 dBTP | Sin normalización; mira la tabla de géneros |
+| Emisión europea | −23 LUFS | −1 dBTP | EBU R 128 |
+| Personalizado | — | — | — |
+
+En el limitador, en el analizador y en la tira de medidores, la lectura de LUFS cambia de color según el perfil activo. El diálogo de exportación gana: normalizar a LUFS (ganancia fija calculada tras un render de medición, sin tocar la dinámica), comprobar el techo en dBTP, y un informe junto al archivo con integrado, corto plazo máximo, LRA, PLR y pico real.
+
+### 5.3 Pistas de enmascaramiento
+
+- El motor mantiene, para las pistas visibles, un espectro de 1/3 de octava suavizado (un tap ligero por pista, calculado en la interfaz como ya hace la tira de medidores).
+- En el EQ de una pista, el usuario elige "comparar con…" otra pista: se dibuja su espectro detrás y se sombrean las zonas donde ambas tienen energía a la vez por encima de un umbral relativo. Es la idea de las colisiones de Pro-Q, hecha por el host, que conoce todas las pistas.
+- En el mezclador, un mapa de calor opcional de pistas por bandas de octava enseña dónde se amontona la energía.
+- Es una indicación, no un juicio: dos señales en la misma banda no siempre se estorban.
+
+### 5.4 Pista de referencia
+
+- Una pista especial "Referencia" que sale directa a los monitores, sin pasar por el máster, y no se exporta.
+- Al cargar un tema, `crates/ai/src/analysis.rs` calcula tonalidad, BPM y loudness (ya lo hace para la librería); se añaden el espectro medio a 1/3 de octava, el LRA, el PLR y la anchura por bandas. Ese es el "perfil de referencia".
+- Escucha igualada: al conmutar entre mezcla y referencia, la referencia se atenúa para igualar el LUFS a corto plazo de la mezcla. Una tecla alterna.
+- La tira de medidores superpone la curva de la referencia en el módulo de espectro y sus valores en el de loudness.
+- "Igualar tono": propone un `fx.eq` en el máster con 3 a 8 bandas anchas que acercan el espectro medio de la mezcla al de la referencia, limitado a ±3 dB por banda. Es una propuesta que se acepta o se descarta.
+- Perfiles de género: la media de varias referencias que el propio usuario marca como "mi sonido de techno", guardada como perfil. No se distribuyen perfiles sacados de música comercial.
+
+### 5.5 Cadena de máster asistida
+
+Un rack de fábrica en el Main con este orden, todos los módulos desactivables: `fx.eq` (correctivo) → `fx.multiband` (solo descendente, suave) → `fx.compressor` (estilo Bus) → `fx.eq` (tonal) → `fx.imager` → `fx.clipper` → `fx.limiter` → dither en la exportación.
+
+Flujo de "Preparar máster":
+1. El usuario elige perfil (§5.2) y, si quiere, una referencia.
+2. Render de análisis del tema entero: LUFS, corto plazo máximo, LRA, pico real, espectro medio, correlación por bandas, factor de cresta de graves.
+3. Reglas simples y explicables fijan los valores iniciales: EQ tonal hacia la referencia o hacia la curva del perfil (máximo ±3 dB); imager con graves en mono si la correlación por debajo de 120 Hz es menor de 0,8; clipper con el recorte necesario para bajar el factor de cresta 1 a 2 dB; ganancia del limitador para llegar al objetivo; techo del perfil.
+4. Todo llega como **una propuesta** con el antes y el después medidos (LUFS, LRA, pico real) y escucha a loudness igualado. El usuario acepta, edita o descarta.
+5. Si la reducción del limitador pasa de 4 dB de forma sostenida, el asistente avisa de que el problema está en la mezcla (graves, transitorios) y enlaza con la lista de la pestaña Mezcla.
+
+La capa de IA entra de dos formas: (a) el asistente conversacional del panel de IA puede leer el informe de análisis y explicar en lenguaje llano qué significa y qué comandos propone; (b) más adelante, un modelo pequeño que sugiera la cadena a partir del perfil. La v1 no necesita modelo: son mediciones y reglas.
+
+---
+
+## 6. Lo que no se pudo verificar
+
+- **Serum 1**: el manual oficial no se pudo abrir (la página de producto antigua da 404). Tamaño de cuadro de 2048 muestras, lista completa de warps, unísono de 16 voces por una fuente secundaria, edición por armónicos: de memoria o de fuentes secundarias. La matriz tiene 16 filas según la reseña de Sound On Sound de la v1.01; versiones posteriores pueden tener más.
+- **Serum 2**: lista completa de warps, de filtros y de los 13 efectos; el documento "What's New" los cuenta pero no los enumera todos.
+- **Pro-L 2**: rangos numéricos de lookahead, ataque, release y ganancia; factores de sobremuestreo en una página leída hoy (el 32× viene de doc 04).
+- **Pro-DS**: rangos de Threshold y Range; cómo detecta el modo Single Vocal (no publicado).
+- **Pro-Q 4**: rango de Q, lista fija de pendientes, rangos de umbral, y el método de Natural Phase y de Spectral Dynamics (no publicados).
+- **Ozone 12**: lista completa de modos IRC y funciones del Maximizer; la ayuda no se pudo leer.
+- **Preset OTT de Ableton**: umbrales y tiempos, de memoria. Las ratios y ganancias vienen de un análisis de terceros.
+- **Kirchhoff-EQ**: número real de modelos vintage (la página se contradice) y el quinto modo de fase.
+- **Gullfoss y Decapitator**: rangos de parámetros; los PDF no se pudieron leer.
+- **LFOTool, Kickstart 2**: destino de volumen, disparo MIDI y versión actual no figuran en las páginas del fabricante.
+- **Vital, Sylenth1, XO, Battery, Portal**: versión actual.
+- **Gross Beat**: si se sigue vendiendo como VST fuera de FL Studio.
+- **Plataformas**: Apple, YouTube, Tidal, Amazon y Deezer no publican un objetivo en LUFS; las cifras son mediciones de terceros. TikTok e Instagram, sin datos fiables. El "−2 dBTP" de Amazon no se pudo rastrear.
+- **Loudness por género**: datos de vendedores con métodos no auditables. Reggaetón y lo-fi, sin medición creíble.
+- **Convenciones de mezcla**: nivel de bombo frente a bajo, frecuencias fijas de pasa-altos, tamaño de los movimientos de EQ en máster y pre-delay "de 10 a 30 ms" no tienen fuente verificada; aparecen como oficio.
+- **Referencias de DSP citadas de memoria**: Chowdhury (DAFx-19, histéresis de cinta), de Cheveigné y Kawahara (YIN), Moulines y Charpentier (PSOLA). Son publicaciones conocidas, pero no se abrieron en esta sesión.
+- **Nuestro código**: no se compiló ni se ejecutó. La afirmación de que el sidechain no llega a los dispositivos sale de leer `graph.rs` y `project.rs`; conviene confirmarla con quien mantiene el motor.
+- **Costes de CPU** de los dispositivos nuevos: estimaciones, sin medir.
+
+---
+
+## 7. Fuentes
+
+### FabFilter
+- Pro-Q 4, ayuda: https://www.fabfilter.com/help/pro-q/using/overview · https://www.fabfilter.com/help/pro-q/using/eqdisplay · https://www.fabfilter.com/help/pro-q/using/bandcontrols · https://www.fabfilter.com/help/pro-q/using/dynamic-eq · https://www.fabfilter.com/help/pro-q/using/spectral-dynamics · https://www.fabfilter.com/help/pro-q/using/analyzer · https://www.fabfilter.com/help/pro-q/using/eqmatch · https://www.fabfilter.com/help/pro-q/using/spectrumgrab · https://www.fabfilter.com/help/pro-q/using/output
+- Pro-L 2, ayuda: https://www.fabfilter.com/help/pro-l/using/overview · https://www.fabfilter.com/help/pro-l/using/advancedsettings · https://www.fabfilter.com/help/pro-l/using/metering · https://www.fabfilter.com/help/pro-l/using/loudnessmetering · https://www.fabfilter.com/help/pro-l/using/outputoptions · https://www.fabfilter.com/help/pro-l/using/dithering · https://www.fabfilter.com/help/pro-l/using/recommendedworkflow
+- Pro-DS: https://www.fabfilter.com/help/pro-ds/using/overview · https://www.fabfilter.com/help/pro-ds/using/basiccontrols · https://www.fabfilter.com/help/pro-ds/using/advancedcontrols · https://www.fabfilter.com/products/pro-ds-de-esser-plug-in
+- Pro-C 3, Pro-MB, Saturn 2, Pro-R 2: https://www.fabfilter.com/products/pro-c-3-compressor-plug-in · https://www.fabfilter.com/help/pro-c/using/styleandcharacter · https://www.fabfilter.com/products/pro-mb-multiband-compressor-plug-in · https://www.fabfilter.com/products/saturn-2-multiband-distortion-saturation-plug-in · https://www.fabfilter.com/products/pro-r-2-reverb-plug-in · https://www.fabfilter.com/download
+
+### Xfer
+- Serum 2: https://xferrecords.com/products/serum-2 · https://static.xferrecords.com/Serum%202%20What's%20New.pdf
+- Serum 1 (secundarias): https://www.soundonsound.com/reviews/xfer-records-serum · https://www.edmprod.com/how-to-use-serum-tutorial/ · https://www.edmprod.com/serum-2-guide/ · https://modeaudio.com/magazine/an-introduction-to-serum-2
+- OTT y LFOTool: https://xferrecords.com/freeware · https://xferrecords.com/products/lfo-tool · https://www.edmprod.com/ott-plugin/
+
+### EQ, espectro y dinámica
+- Kirchhoff-EQ: https://www.plugin-alliance.com/products/kirchhoff-eq
+- oeksound: https://oeksound.com/manuals/soothe3 · https://oeksound.com/plugins/soothe3 · https://oeksound.com/manuals/soothe2/ · https://oeksound.com/plugins/soothe-live/ · https://oeksound.com/plugins/spiff/ · https://oeksound.com/plugins/bloom/ · https://www.soundonsound.com/news/oeksound-introduce-soothe3
+- Gullfoss: https://www.soundtheory.com/gullfoss · https://www.soundonsound.com/reviews/soundtheory-gullfoss
+- TDR Nova: https://www.tokyodawn.net/tdr-nova/
+- Trackspacer: https://www.wavesfactory.com/audio-plugins/trackspacer/
+- SSL Native Bus Compressor 2: https://support.solidstatelogic.com/hc/en-gb/articles/4408670926109
+- The Glue: https://cytomic.com/product/glue/
+- Waves SSL G-Master: https://www.waves.com/how-to-use-ssl-bus-compressor-classic-mix-glue
+- Kickstart 2: https://www.kickstart-plugin.com/
+- Cableguys: https://www.cableguys.com/shaperbox · https://www.cableguys.com/volumeshaper · https://www.cableguys.com/halftime · https://downloads.cableguys.com/Cableguys-HalfTime-Manual.pdf · https://www.cableguys.com/timeshaper
+- Ableton Live 12, referencia de efectos de audio: https://www.ableton.com/en/live-manual/12/live-audio-effect-reference/
+
+### Limitadores, clippers y color
+- Ozone 12: https://www.izotope.com/en/products/ozone/features/maximizer.html · https://www.soundonsound.com/reviews/izotope-ozone-12-advanced
+- StandardCLIP: https://siraudiotools.com/StandardCLIP_manual.php
+- KClip 3: https://kazrog.com/products/kclip-3
+- Gold Clip: https://www.schwabedigital.com/goldclip
+- Elevate: https://www.newfangledaudio.com/elevate · https://www.newfangledaudio.com/post/when-to-clip-vs-when-to-limit-and-why-order-matters
+- Decapitator y Devil-Loc: https://www.soundtoys.com/product/decapitator/ · https://www.soundtoys.com/product/devil-loc-deluxe/
+- RC-20 Retro Color: https://www.xlnaudio.com/products/addictive_fx/effect/rc-20_retro_color
+- Trash: https://www.izotope.com/en/products/trash.html
+
+### Reverb, delay, estéreo y medición
+- Valhalla: https://valhalladsp.com/shop/reverb/valhalla-room/ · https://valhalladsp.com/shop/reverb/valhalla-vintage-verb/ · https://valhalladsp.com/shop/reverb/valhalla-supermassive/ · https://valhalladsp.com/shop/delay/valhalladelay/
+- EchoBoy: https://www.soundtoys.com/product/echoboy/
+- H-Delay: https://www.waves.com/plugins/h-delay-hybrid-delay
+- Ozone Imager: https://www.izotope.com/en/products/ozone-imager.html · https://www.izotope.com/en/products/ozone/features/imager.html · https://s3.amazonaws.com/izotopedownloads/docs/ozone9/en/print/index.html
+- Voxengo: https://www.voxengo.com/product/msed/ · https://www.voxengo.com/product/span/ · https://www.voxengo.com/product/spanplus/
+- Youlean: https://youlean.co/youlean-loudness-meter/ · https://youlean.co/youlean-loudness-meter-changelog/
+- LEVELS, Insight, SoundID: https://www.masteringthemix.com/products/levels · https://www.izotope.com/en/products/insight.html · https://www.sonarworks.com/soundid-reference
+
+### Voz, sintetizadores, samplers y efectos creativos
+- AutoTune: https://www.antarestech.com/products/auto-tune · https://www.antarestech.com/products/auto-tune/pro
+- Melodyne: https://www.celemony.com/en/melodyne/what-is-melodyne · https://www.celemony.com/en/melodyne/editions-and-technical-matters
+- Little AlterBoy: https://www.soundtoys.com/product/little-alterboy/
+- Vital: https://vital.audio/ · https://github.com/mtytel/vital
+- Massive X y Massive XL: https://docs.native-instruments.com/online-guides/massive-x-manual/en/wavetable-oscillators · https://www.native-instruments.com/en/products/komplete/synths/massive-xl/
+- Pigments: https://www.arturia.com/products/software-instruments/pigments/overview
+- Diva: https://u-he.com/products/diva/
+- Sylenth1: https://www.lennardigital.com/sylenth1/
+- Phase Plant: https://kilohearts.com/products/phase_plant
+- Kontakt 8, Battery 4: https://www.native-instruments.com/en/products/komplete/samplers/kontakt-8/ · https://www.native-instruments.com/en/products/komplete/drums/battery-4/
+- XO: https://www.xlnaudio.com/products/xo
+- Effectrix 2: https://sugar-bytes.de/effectrix2
+- Gross Beat: https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/plugins/Gross%20Beat.htm
+- Portal: https://output.com/products/portal
+
+### Loudness, plataformas y práctica
+- Spotify: https://support.spotify.com/us/artists/article/loudness-normalization/ · https://support.spotify.com/gn-en/artists/article/audio-file-formats/
+- Apple Digital Masters: https://www.apple.com/apple-music/apple-digital-masters/docs/apple-digital-masters.pdf · https://help.apple.com/itc/videoaudioassetguide/en.lproj/static.html
+- YouTube: https://support.google.com/youtube/answer/14106294 · https://productionadvice.co.uk/stats-for-nerds/
+- SoundCloud: https://help.soundcloud.com/hc/en-us/articles/360053660014 · https://help.soundcloud.com/hc/en-us/articles/360039171614-Upload-Requirements
+- Deezer, Amazon, Beatport, Bandcamp: https://support.deezer.com/hc/en-gb/articles/360005369938-Volume-Normalization-on-Deezer · https://greenroomsupport.beatport.com/hc/en-us/articles/15594106807316 · https://get.bandcamp.help/en/articles/15263088-how-do-i-upload-music
+- Normas: https://www.itu.int/rec/R-REC-BS.1770 · https://tech.ebu.ch/docs/r/r128v5_0.pdf · https://aes.org/wp-content/uploads/2026/10/20210924_TD1008_v3.13.pdf · https://www.atsc.org/wp-content/uploads/2026/07/A85-2026-07.pdf
+- Estudios de loudness: https://www.izotope.com/community/blog/mastering-trends · https://www.izotope.com/community/blog/dance-electronic-analysis · https://www.masteringthemix.com/pages/how-loud-should-you-master · https://productionadvice.co.uk/how-loud/
+- Tablas por género (vendedores): https://tracksensei.com/blog/we-analyzed-563-techno-house-tracks · https://www.mixgraph.io/tools/lufs-meter · https://musictracker.io/demo-analyzer · https://masterbar.app/lufs-by-genre/ · https://audioroom.us/loudness/ · https://freshlybakedstudios.com/blog/average-lufs-by-genre
+- Mezcla y máster: https://www.soundonsound.com/sound-advice/q-should-gain-stage-6dbfs-or-18dbfs · https://www.soundonsound.com/techniques/establishing-project-studio-reference-monitoring-levels · https://www.soundonsound.com/techniques/mixing-pink-noise-reference · https://edmprod.com/sidechain-compression · https://www.sonible.com/blog/stereo-to-mono/ · https://flypaper.soundfly.com/produce/the-abbey-road-trick-how-to-eq-reverb-sends-to-free-up-space-in-a-mix/ · https://www.izotope.com/en/learn/what-is-an-ideal-mastering-signal-chain · https://www.izotope.com/en/learn/crafting-a-basic-vocal-chain · https://www.izotope.com/en/learn/what-is-dithering-in-audio/ · https://www.izotope.com/community/blog/mastering-for-streaming-platforms · https://splice.com/blog/common-mastering-myths · https://support.apple.com/en-vn/102006 · https://support.discmakers.com/hc/en-us/articles/208924288
+
+### DSP (además de las de doc 04)
+- D. Giannoulis, M. Massberg, J. D. Reiss, "Digital Dynamic Range Compressor Design", JAES 60(6), 2012: https://www.aes.org/e-lib/browse.cfm?elib=16354
+- P. Hatziantoniou, J. Mourjopoulos, "Generalized fractional-octave smoothing of audio and acoustic responses", JAES 48(4), 2000.
+- J. O. Smith, *Spectral Audio Signal Processing*: https://ccrma.stanford.edu/~jos/sasp/
+- J. Parker, V. Zavalishin, E. Le Bivic, DAFx-16 (ADAA): https://dafx16.vutbr.cz/dafxpapers/20-DAFx-16_paper_41-PN.pdf
+- A. de Cheveigné, H. Kawahara, "YIN, a fundamental frequency estimator for speech and music", JASA 111(4), 2002 [M].
+- E. Moulines, F. Charpentier, "Pitch-synchronous waveform processing techniques for text-to-speech synthesis using diphones", Speech Communication 9, 1990 [M].
+- J. Chowdhury, "Real-time physical modelling for analog tape machines", DAFx-19 [M].
+- Signalsmith Stretch (MIT): https://github.com/Signalsmith-Audio/signalsmith-stretch
+
+### Código local leído
+- `D:\dev\AI-Track\crates\stock\src\fx\*.rs`, `D:\dev\AI-Track\crates\stock\src\instrument\*.rs`, `D:\dev\AI-Track\crates\stock\presets\`
+- `D:\dev\AI-Track\crates\app\src\views\device_ui\*.rs`, `meters.rs`, `export.rs`, `ai_panel.rs`
+- `D:\dev\AI-Track\crates\engine\src\graph.rs`, `D:\dev\AI-Track\crates\model\src\project.rs`, `D:\dev\AI-Track\crates\dsp\src\`
+- Referencias: `D:\dev\AI-Track\reference\futureboard-studio\crates\BuiltinAudioPlugins\crates\`, `D:\dev\AI-Track\reference\Lemon-Studio\plugins\` y `crates\os-engine\src\effects\`, `D:\dev\AI-Track\reference\vibez\crates\vibez-dsp\src\`, `D:\dev\AI-Track\reference\Pro-Wave\crates\prowave-engine\src\fx.rs`

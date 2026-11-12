@@ -522,6 +522,14 @@ impl Library {
         Ok(self.conn.query_row(&sql, params![root.id.0, rel], |r| self.row_to_sample(r)).optional()?)
     }
 
+    /// How many samples have a musical key (detected or tagged).
+    pub fn count_keyed(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM samples WHERE status = 'ok' AND key_root IS NOT NULL AND scale_kind IS NOT NULL", [], |r| r.get::<_, i64>(0))?
+            as u64)
+    }
+
     pub fn count(&self) -> Result<u64> {
         Ok(self
             .conn

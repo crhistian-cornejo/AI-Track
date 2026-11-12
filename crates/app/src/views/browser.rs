@@ -6,7 +6,7 @@ use crate::icons::{Icon, icon};
 use crate::state::BrowserTab;
 use crate::theme::*;
 use crate::widgets::{self, badge, label, mono};
-use crate::workspace::{DraggedSample, MenuKind, Workspace};
+use crate::workspace::{DraggedSample, MatchKind, MenuKind, Workspace};
 use aitrack_model::{PluginFormat, Scale, ScaleKind, TrackKind};
 use gpui::{
     AnyElement, AppContext as _, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Stateful,
@@ -124,7 +124,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         format!("Results for “{query}”")
     } else if ws.library_matches {
         let key = ws.s.project.scale.map_or("any key".to_owned(), |s| s.display());
-        format!("Matches {key} · {:.0} BPM", ws.s.project.tempo.initial_bpm())
+        format!("In {key}")
     } else {
         find_folder(ws.b.library.folders(), &ws.library_folder).map_or("Library".to_owned(), |f| f.name.clone())
     };
@@ -148,7 +148,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             .map(|i| {
                 let it = &list_items[i];
                 let pal = p();
-                let in_key = it.key.zip(project_key).is_some_and(|(a, b)| a.mask() == b.mask());
+                let in_key = it.key.zip(project_key).is_some_and(|(a, b)| crate::workspace::keys_match(a, b));
                 let item = it.clone();
                 let fav_item = it.clone();
                 let weak = weak.clone();
@@ -218,7 +218,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .hover(|s| s.bg(content(0.12)))
                 .child(icon(Icon::Sparkles, 12., if matches_on { pal.accent } else { pal.muted }))
                 .child(label("Matches project", TEXT_XS, if matches_on { pal.text } else { pal.muted }))
-                .tooltip(widgets::tip("Ranked for the project key and tempo", None))
+                .tooltip(widgets::tip("Only samples in the song's key or its relative major/minor", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.library_matches = !this.library_matches;
                     cx.notify();
@@ -230,6 +230,51 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             let at = e.position();
             this.open_menu(MenuKind::LibraryContext, gpui::point(at.x - px(180.), at.y + px(12.)), cx);
         })));
+    // While matching: narrow to loops or one-shots, and offer to listen to
+    // the library when few samples have a detected key.
+    let match_bar = (matches_on && query.is_empty()).then(|| {
+        let kinds = [(MatchKind::All, "All"), (MatchKind::Loops, "Loops"), (MatchKind::OneShots, "One-shots")];
+        let mut chips = div().flex().items_center().gap(px(SP1));
+        for (i, (kind, name)) in kinds.into_iter().enumerate() {
+            let on = ws.match_kind == kind;
+            chips = chips.child(
+                div()
+                    .id(("match-kind", i))
+                    .h(px(20.))
+                    .px(px(SP2))
+                    .flex()
+                    .items_center()
+                    .rounded(px(r_md()))
+                    .cursor_pointer()
+                    .bg(if on { accent_alpha(0.18) } else { content(0.05) })
+                    .hover(|s| s.bg(content(0.12)))
+                    .child(label(name, TEXT_XS, if on { pal.text } else { pal.muted }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.match_kind = kind;
+                        cx.notify();
+                    })),
+            );
+        }
+        let sparse = count < 24 && !scan.running && ws.s.project.scale.is_some();
+        div().px(px(SP2)).pt(px(SP2)).flex().flex_col().gap(px(SP2)).child(chips).when(sparse, |d| {
+            d.child(
+                div()
+                    .p(px(SP2))
+                    .flex()
+                    .flex_col()
+                    .gap(px(SP2))
+                    .rounded(px(r_md()))
+                    .bg(content(0.04))
+                    .child(label("Few samples have a known key: file names rarely say it.", TEXT_XS, pal.muted))
+                    .child(widgets::text_button("detect-keys", "Detect keys by listening", Some(Icon::Wand), false).on_click(cx.listener(|this, _, _, cx| {
+                        match this.b.library.detect_keys() {
+                            Ok(()) => this.toast("Detecting keys in the background…", cx),
+                            Err(e) => this.toast(e, cx),
+                        }
+                    }))),
+            )
+        })
+    });
     let scan_row = scan.running.then(|| {
         div()
             .px(px(SP3))
@@ -247,6 +292,7 @@ fn library(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .flex_col()
         .child(toolbar)
         .children(scan_row)
+        .children(match_bar)
         .when(query.is_empty() && !matches_on, |d| {
             d.child(div().id("folder-tree").max_h(px(220.)).overflow_y_scroll().pt(px(SP2)).child(tree)).child(div().mx(px(SP3)).my(px(SP1)).child(widgets::divider_h()))
         })

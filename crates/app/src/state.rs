@@ -1240,6 +1240,17 @@ mod tests {
     }
 
     #[test]
+    fn matching_keys_are_the_same_key_or_its_relative() {
+        use crate::workspace::keys_match;
+        let key = |root: u8, kind: ScaleKind| Scale::new(Key(root), kind);
+        let a_minor = key(9, ScaleKind::Minor);
+        assert!(keys_match(a_minor, a_minor));
+        assert!(keys_match(key(0, ScaleKind::Major), a_minor), "C major is the relative of A minor");
+        assert!(!keys_match(key(9, ScaleKind::Major), a_minor), "A major is not");
+        assert!(!keys_match(key(4, ScaleKind::Minor), a_minor), "a fifth away is close, but not the same key");
+    }
+
+    #[test]
     fn split_cuts_the_clip_under_the_playhead() {
         let mut s = state();
         let (track, place) = s

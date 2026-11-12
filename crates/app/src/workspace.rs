@@ -127,6 +127,8 @@ pub struct Workspace {
     pub usage: crate::usage::Usage,
     /// The `.aitrack` file the project was opened from or saved to.
     pub project_path: Option<std::path::PathBuf>,
+    /// Which matches "Matches project" lists.
+    pub match_kind: MatchKind,
     pub bottom_h: f32,
     pub bottom_open: bool,
     /// The mixer section between the arrangement and the detail panel.
@@ -177,6 +179,24 @@ pub struct OrganizeUi {
     pub preview: Option<crate::bridge::OrganizePreview>,
     pub running: bool,
     pub result: Option<Result<String, String>>,
+}
+
+/// The kinds of sample "Matches project" can be narrowed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    All,
+    Loops,
+    OneShots,
+}
+
+/// Whether a sample in `key` sits in a song in `song`: the same key or its
+/// relative major/minor (the same number on the Camelot wheel).
+pub fn keys_match(key: Scale, song: Scale) -> bool {
+    let number = |s: Scale| s.camelot().map(|c| c.trim_end_matches(['A', 'B']).to_owned());
+    match (number(key), number(song)) {
+        (Some(a), Some(b)) => a == b,
+        _ => key.mask() == song.mask(),
+    }
 }
 
 /// A sample dragged out of the browser.
@@ -250,6 +270,7 @@ impl Workspace {
             meters: views::meters::MeterStrip::default(),
             usage: crate::usage::Usage::default(),
             project_path: None,
+            match_kind: MatchKind::All,
             bottom_h: 300.,
             bottom_open: true,
             mixer_open: false,
@@ -1014,7 +1035,20 @@ impl Workspace {
         if !q.is_empty() {
             self.b.library.search(q, None)
         } else if self.library_matches {
-            self.b.library.recommend(self.s.project.scale, self.s.project.tempo.initial_bpm())
+            let scale = self.s.project.scale;
+            let mut items = self.b.library.recommend(scale, self.s.project.tempo.initial_bpm());
+            // Only what is in the song's key (or its relative major/minor).
+            if let Some(scale) = scale {
+                items.retain(|it| it.key.is_some_and(|k| keys_match(k, scale)));
+            }
+            match self.match_kind {
+                MatchKind::All => {}
+                MatchKind::Loops => items.retain(|it| it.is_loop),
+                MatchKind::OneShots => items.retain(|it| !it.is_loop),
+            }
+            // Loops first, then one-shots; inside each, by type and name.
+            items.sort_by(|a, b| b.is_loop.cmp(&a.is_loop).then_with(|| a.category.cmp(&b.category)).then_with(|| a.name.cmp(&b.name)));
+            items
         } else {
             self.b.library.items(&self.library_folder)
         }

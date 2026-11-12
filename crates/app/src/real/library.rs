@@ -162,6 +162,7 @@ pub struct RealLibrary {
     /// `[factory, user]`.
     libs: [Option<Library>; 2],
     user_path: PathBuf,
+    factory_path: Option<PathBuf>,
     folders: Vec<LibraryFolder>,
     map: HashMap<String, VirtualFolder>,
     items_cache: RefCell<HashMap<String, Vec<LibraryItem>>>,
@@ -195,6 +196,7 @@ impl RealLibrary {
         let mut this = Self {
             libs: [f, u],
             user_path: user,
+            factory_path: factory,
             folders: Vec::new(),
             map: HashMap::new(),
             items_cache: RefCell::default(),
@@ -324,6 +326,21 @@ impl LibraryBridge for RealLibrary {
             Some(_) => format!("Factory bank: {} samples · yours: {user}", self.count(FACTORY)),
             None => format!("Factory sound bank not found (set AITRACK_CONTENT_DIR) · yours: {user}"),
         }
+    }
+
+    fn detect_keys(&mut self) -> Result<(), String> {
+        if self.scan.is_some() {
+            return Err("A scan is already running".into());
+        }
+        // The factory bank was indexed from file names only; listen to it
+        // first, then to the user's folders on the next call.
+        let keyed = |l: &Option<Library>| l.as_ref().and_then(|l| l.count_keyed().ok()).unwrap_or(0);
+        let factory_pending = self.factory_path.is_some() && keyed(&self.libs[0]) * 2 < self.count(0);
+        let path = if factory_pending { self.factory_path.clone().expect("checked") } else { self.user_path.clone() };
+        let job = ScanJob::spawn(path, self.analyzer.clone(), ScanOptions { force: true, ..Default::default() });
+        self.scan = Some(Scan { job });
+        self.status = ScanStatus { running: true, fraction: 0., message: "Detecting keys…".into() };
+        Ok(())
     }
 
     fn add_folder(&mut self, path: &Path) -> Result<(), String> {

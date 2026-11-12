@@ -75,6 +75,7 @@ pub fn cascade_q(order: usize, section: usize) -> f32 {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // short-lived, built per curve; boxing would allocate per band
 #[derive(Clone, Copy, Debug)]
 enum Stage {
     Biquad(BiquadCoeffs),

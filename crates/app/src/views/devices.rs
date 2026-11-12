@@ -166,6 +166,19 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             )
         })
         .child(badge(kind_label, pal.muted))
+        .when(matches!(&d.kind, DeviceKind::Stock { plugin_id } if crate::views::device_ui::has_editor(plugin_id)), |h| {
+            let big = ws.fx.big.contains(&id);
+            h.child(
+                widgets::sized_icon_button(("grow-dev", id.0 as usize), if big { Icon::ZoomOut } else { Icon::ZoomIn }, big, 20., 12.)
+                    .tooltip(widgets::tip(if big { "Compact editor" } else { "Large editor" }, None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.fx.big.remove(&id) {
+                            this.fx.big.insert(id);
+                        }
+                        cx.notify();
+                    })),
+            )
+        })
         .child(fold)
         .child(
             widgets::sized_icon_button(("remove-dev", id.0 as usize), Icon::X, false, 20., 12.)
@@ -194,20 +207,10 @@ fn card(ws: &mut Workspace, track: TrackId, d: &Device, cx: &mut Context<Workspa
             })))
             .into_any_element(),
         DeviceKind::Stock { plugin_id } => {
-            let params = ws.b.plugins.device(plugin_id).map(|i| i.params.clone()).unwrap_or_default();
-            // Big synths get a third row so their card stays scrollable, not endless.
-            let rows = if params.len() > 16 { 3 } else { 2 };
-            let cols = params.len().div_ceil(rows).max(3);
-            let mut grid = div().w(px(cols as f32 * CELL_W + 2. * SP2)).p(px(SP2)).flex().flex_wrap().gap_y(px(SP3));
-            for info in params {
-                let value = d.params.get(&info.id).copied().unwrap_or_else(|| info.default_normalized());
-                let default = info.default_normalized();
-                let target = KnobTarget::Param { device: id, param: info.id, default };
-                let bipolar = info.min < 0. && info.max > 0.;
-                let k = knob_control(("knob", (id.0 as usize) << 8 | info.id as usize), value, bipolar, enabled, target, cx);
-                grid = grid.child(knob_cell(k, info.short, info.format(value), CELL_W));
-            }
-            grid.into_any_element()
+            // Every stock device draws its own editor: the display is the control.
+            let bpm = ws.s.project.tempo.initial_bpm();
+            let dev = ws.fx.dev(ws.b.engine.as_mut(), ws.b.plugins.as_ref(), d, plugin_id, bpm);
+            crate::views::device_ui::editor(ws, plugin_id, &dev, d, cx)
         }
     };
     card_shell(id, enabled).child(header).child(div().flex_1().child(body)).into_any_element()

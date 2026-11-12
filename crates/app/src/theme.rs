@@ -186,6 +186,14 @@ tokens! {
     clip_text_dark: "Clip text on light clip colours",
     shadow: "Shadows and dark overlays on clips",
     ink: "Translucent hover/press fills are made of this",
+    series1: "Series 1: EQ band 1, first trace in device editors and meters",
+    series2: "Series 2: EQ band 2, second trace",
+    series3: "Series 3: EQ band 3, third trace",
+    series4: "Series 4: EQ band 4",
+    series5: "Series 5: EQ band 5",
+    series6: "Series 6: EQ band 6",
+    series7: "Series 7: EQ band 7",
+    series8: "Series 8: EQ band 8",
 }
 
 impl Default for Colors {
@@ -335,6 +343,7 @@ fn make(
     let [base, panel, surface, raised, overlay, well] = layers;
     let [record, play, solo, mute, arm] = states;
     let [row_scale, row_out, key_white, key_black] = rows;
+    let series = series_colors(accent, dark, surface, well);
     Theme {
         name: name.into(),
         dark,
@@ -379,10 +388,41 @@ fn make(
             clip_text_dark: Rgba8::rgb(0x16171A),
             shadow: Rgba8::rgba(0x000000, 0x40),
             ink: Rgba8::rgb(ink),
+            series1: series[0],
+            series2: series[1],
+            series3: series[2],
+            series4: series[3],
+            series5: series[4],
+            series6: series[5],
+            series7: series[6],
+            series8: series[7],
         },
         clips,
         style: Style::default(),
     }
+}
+
+/// How many series colours a theme defines.
+pub const SERIES: usize = 8;
+
+/// The series colours of a built-in theme: eight hues spread around the
+/// wheel from the accent's (neighbours in the list sit 135° apart, so
+/// adjacent EQ bands never look alike), each lightened or darkened until it
+/// reads on the theme's surface and well.
+fn series_colors(accent: u32, dark: bool, surface: u32, well: u32) -> [Rgba8; SERIES] {
+    let base = Rgba8::rgb(accent).to_hsla();
+    let (bg_a, bg_b) = (Rgba8::rgb(surface).to_hsla(), Rgba8::rgb(well).to_hsla());
+    std::array::from_fn(|i| {
+        let h = (base.h + (i * 3 % SERIES) as f32 / SERIES as f32).fract();
+        let mut c = Hsla { h, s: if dark { 0.78 } else { 0.82 }, l: if dark { 0.6 } else { 0.46 }, a: 1. };
+        for _ in 0..40 {
+            if contrast(c, bg_a).min(contrast(c, bg_b)) >= 3.2 {
+                break;
+            }
+            c.l = (c.l + if dark { 0.01 } else { -0.01 }).clamp(0.05, 0.95);
+        }
+        Rgba8::from_hsla(c)
+    })
 }
 
 const DARK_CLIPS: ClipStyle = ClipStyle { saturation: 0.85, brightness: 0.62 };
@@ -520,6 +560,12 @@ pub fn session_row_h() -> f32 {
 
 // ── Colour helpers ──
 
+/// Series colour `i` (EQ bands, saturator bands, traces), cycling after eight.
+pub fn series(i: usize) -> Hsla {
+    let pal = p();
+    [pal.series1, pal.series2, pal.series3, pal.series4, pal.series5, pal.series6, pal.series7, pal.series8][i % SERIES]
+}
+
 /// Translucent content ink: hover fills, quiet glyphs.
 pub fn content(alpha: f32) -> Hsla {
     with_alpha(p().ink, alpha)
@@ -649,6 +695,24 @@ mod tests {
             }
             let c = contrast(p.on_accent, p.accent);
             assert!(c >= 3.0, "{}: text on accent is {c:.2}:1", t.name);
+        }
+    }
+
+    #[test]
+    fn series_colours_read_on_every_theme() {
+        for t in builtin_themes() {
+            let p = t.colors.palette(t.dark);
+            let series = [p.series1, p.series2, p.series3, p.series4, p.series5, p.series6, p.series7, p.series8];
+            for (i, c) in series.iter().enumerate() {
+                for (bg, name) in [(p.surface, "surface"), (p.well, "well"), (p.panel, "panel")] {
+                    let ratio = contrast(*c, bg);
+                    assert!(ratio >= 3.0, "{}: series {} on {name} is {ratio:.2}:1", t.name, i + 1);
+                }
+                // Neighbouring bands are far apart on the hue wheel.
+                let next = series[(i + 1) % SERIES];
+                let d = (c.h - next.h).abs();
+                assert!(d.min(1. - d) > 0.2, "{}: series {} and its neighbour look alike", t.name, i + 1);
+            }
         }
     }
 

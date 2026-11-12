@@ -13,13 +13,16 @@ use super::settings::Settings;
 use crate::bridge::*;
 use aitrack_engine::{
     ActiveAudio, ChannelSelection, ClipSlotStatus, Engine, EngineConfig, EngineError, EngineHandle, FactoryStack, Lame, Mp3Tags,
-    RenderOptions, RenderRange, ShareMode, WavFormat,
+    RenderOptions, RenderRange, ShareMode, TapReader, WavFormat,
 };
 use aitrack_model::{DeviceId, Project, SceneId, Tick, TrackId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+/// The analysis tap pauses when the UI has not drained it for this long.
+const TAP_IDLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Meters fall at this rate after a peak (dB per second).
 const METER_FALL_DB_S: f32 = 26.;
@@ -55,6 +58,10 @@ pub struct RealEngine {
     lame: OnceLock<Result<(), String>>,
     messages: Vec<String>,
     preview: super::preview::Preview,
+    /// The UI's cursor into the engine's analysis ring.
+    tap: TapReader,
+    analysis: bool,
+    tap_drained: Instant,
 }
 
 fn host_name(h: AudioHost) -> &'static str {
@@ -162,7 +169,11 @@ impl RealEngine {
             }
         };
         let active = handle.active_audio();
+        let tap = handle.analysis_tap();
         let mut this = Self {
+            tap,
+            analysis: false,
+            tap_drained: Instant::now(),
             handle,
             export_factory,
             rt,
@@ -346,7 +357,35 @@ impl EngineBridge for RealEngine {
 
     fn idle(&mut self) -> bool {
         self.preview.collect();
+        // Nobody drained the tap for a while (window hidden or minimised):
+        // stop feeding it until the next drain.
+        if self.tap.is_enabled() && self.tap_drained.elapsed() > TAP_IDLE {
+            self.tap.set_enabled(false);
+        }
         self.rt.idle()
+    }
+
+    fn set_analysis(&mut self, on: bool) {
+        self.analysis = on;
+        self.tap_drained = Instant::now();
+        self.tap.set_enabled(on);
+    }
+
+    fn set_analysis_source(&mut self, track: Option<TrackId>) {
+        self.tap.set_source(track);
+    }
+
+    fn drain_analysis(&mut self, out: &mut Vec<[f32; 2]>) -> u32 {
+        self.tap_drained = Instant::now();
+        if self.analysis && !self.tap.is_enabled() {
+            self.tap.set_enabled(true);
+        }
+        self.tap.read(out);
+        self.session_rate()
+    }
+
+    fn device_meter(&mut self, device: DeviceId, out: &mut [f32]) -> usize {
+        self.handle.device_meter(device, out)
     }
 
     fn preview(&mut self, path: Option<&std::path::Path>) {

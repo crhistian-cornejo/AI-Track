@@ -245,6 +245,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(mono(format!("{:>2.0}%", cpu * 100.), TEXT_SM, pal.muted).w(px(28.))),
         )
         .child(
+            widgets::icon_button("meters", Icon::Gauge, ws.meters.open)
+                .tooltip(widgets::tip("Meters: loudness, spectrum, stereo field", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.meters.toggle();
+                    cx.notify();
+                })),
+        )
+        .child(
             widgets::icon_button("export", Icon::Send, false)
                 .tooltip(widgets::tip("Export audio", Some("Ctrl+Shift+E")))
                 .on_click(cx.listener(|this, _, _, cx| this.open_export(cx))),

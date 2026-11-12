@@ -108,6 +108,10 @@ pub struct Workspace {
     pub focus: FocusHandle,
     pub drag: Option<Drag>,
     pub menu: Option<Menu>,
+    /// View state of the visual device editors.
+    pub fx: views::device_ui::UiState,
+    /// The meter strip under the top bar.
+    pub meters: views::meters::MeterStrip,
     pub bottom_h: f32,
     pub bottom_open: bool,
     pub browser_open: bool,
@@ -218,6 +222,8 @@ impl Workspace {
             focus: cx.focus_handle(),
             drag: None,
             menu: None,
+            fx: views::device_ui::UiState::default(),
+            meters: views::meters::MeterStrip::default(),
             bottom_h: 300.,
             bottom_open: true,
             browser_open: true,
@@ -1239,8 +1245,15 @@ impl Render for Workspace {
         if let Some(animate) = self.look.pending.take() {
             self.apply_look(window, animate, cx);
         }
-        if self.wants_frames() || self.drag.is_some() || theme::tweening() {
+        self.meters.tick(self.b.engine.as_mut(), self.s.selected_track);
+        let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
+        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() {
             window.request_animation_frame();
+        }
+        self.fx.sample_rate = f64::from(self.b.engine.audio_config().sample_rate.max(8_000));
+        {
+            let project = &self.s.project;
+            self.fx.prune(|id| project.device(id).is_some());
         }
         let pal = p();
         let center = match self.s.view {
@@ -1274,6 +1287,10 @@ impl Render for Workspace {
         let modal = views::prefs::render_modal(self, window, cx);
         let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
+        let fx_capture = views::device_ui::capture(self, cx);
+        let fx_overlay = views::device_ui::overlay(self, cx);
+        let meter_strip = views::meters::render(self, cx);
+        let meter_layers = views::meters::overlay(self, cx);
         let toast = self.render_toast();
         let status = self.render_status(cx);
         let banner = self.render_banner(cx);
@@ -1322,6 +1339,7 @@ impl Render for Workspace {
             .children(backdrop)
             .child(views::topbar::render(self, window, cx))
             .children(banner)
+            .children(meter_strip)
             .child(
                 div()
                     .flex_1()
@@ -1337,6 +1355,9 @@ impl Render for Workspace {
             .children(toast)
             .children(modal)
             .children(capture)
+            .children(fx_capture)
+            .children(fx_overlay)
+            .children(meter_layers)
             .children(menu)
     }
 }

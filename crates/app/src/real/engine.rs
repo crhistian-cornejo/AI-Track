@@ -402,6 +402,12 @@ impl EngineBridge for RealEngine {
         }
     }
 
+    fn preview_pitched(&mut self, path: Option<&std::path::Path>, ratio: f64, reverse: bool) {
+        if let Err(e) = self.preview.play_pitched(path, ratio, reverse) {
+            self.messages.push(e);
+        }
+    }
+
     fn meter(&self, track: TrackId) -> MeterLevel {
         self.frame.meters.get(&track).copied().unwrap_or_default()
     }

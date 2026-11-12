@@ -99,6 +99,12 @@ impl Preview {
 
     /// Play `path` (decoded off this thread), or stop with `None`.
     pub fn play(&mut self, path: Option<&Path>) -> Result<(), String> {
+        self.play_pitched(path, 1.0, false)
+    }
+
+    /// Play `path` as a clip with these sample settings sounds: `ratio`
+    /// times faster (Re-Pitch transpose), backwards when `reverse`.
+    pub fn play_pitched(&mut self, path: Option<&Path>, ratio: f64, reverse: bool) -> Result<(), String> {
         self.collect();
         if self.failed {
             return Err("preview output unavailable".into());
@@ -118,21 +124,57 @@ impl Preview {
             .name("aitrack-preview-decode".into())
             .spawn(move || match aitrack_engine::sample_cache::load_audio(&path, rate) {
                 Ok(a) => {
-                    let n = a.frames.min(rate as usize * MAX_SECONDS);
-                    let left = a.channels.first();
-                    let right = a.channels.get(1).or(left);
-                    let mut frames = Vec::with_capacity(n * 2);
-                    if let (Some(l), Some(r)) = (left, right) {
-                        for i in 0..n {
-                            frames.push(l[i]);
-                            frames.push(r[i]);
-                        }
-                    }
+                    let frames = render(&a, rate as usize * MAX_SECONDS, ratio, reverse);
                     let _ = tx.lock().push(Some(Box::new(Voice { frames, pos: 0 })));
                 }
                 Err(e) => log::warn!("preview {}: {e}", path.display()),
             })
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+/// Interleaved stereo of `a` as it plays `ratio` times faster (read through
+/// the engine's interpolator) and backwards when `reverse`, at most `max`
+/// frames long.
+fn render(a: &aitrack_engine::sample_cache::DecodedAudio, max: usize, ratio: f64, reverse: bool) -> Vec<f32> {
+    if a.channels.is_empty() {
+        return Vec::new();
+    }
+    let ratio = if ratio.is_finite() && ratio > 0. { ratio } else { 1. };
+    let n = ((a.frames as f64 / ratio).floor() as usize).min(max);
+    let right = if a.channels.len() >= 2 { 1 } else { 0 };
+    let last = a.frames as f64 - 1.;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let pos = i as f64 * ratio;
+        let pos = if reverse { last - pos } else { pos };
+        if ratio == 1. {
+            out.push(a.frame(0, pos as i64));
+            out.push(a.frame(right, pos as i64));
+        } else {
+            out.push(a.sample(0, pos));
+            out.push(a.sample(right, pos));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pitched_previews_play_faster_and_backwards() {
+        let ramp: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        let a = aitrack_engine::sample_cache::DecodedAudio::from_planar(vec![ramp], 48_000);
+        let plain = render(&a, 10_000, 1., false);
+        assert_eq!((plain.len(), plain[2], plain[3]), (2000, 1., 1.));
+        let octave = render(&a, 10_000, 2., false);
+        assert_eq!(octave.len(), 1000);
+        assert!((octave[2 * 100] - 200.).abs() < 0.5);
+        let back = render(&a, 10_000, 1., true);
+        assert_eq!((back[0], back[2]), (999., 998.));
+        assert_eq!(render(&a, 300, 1., false).len(), 600, "capped");
     }
 }

@@ -157,7 +157,8 @@ fn duplicating_a_time_selection_repeats_the_part_inside_it() {
     let sel = s.time_selection().unwrap();
     assert_eq!((sel.start, sel.end), (4 * BEAT, 6 * BEAT), "the selection moved onto the copy");
     let copy = s.project.track(midi).unwrap().arrangement.iter().find(|pl| pl.start == 4 * BEAT).unwrap();
-    assert_eq!(s.project.clips[&copy.clip].offset, 2 * BEAT, "it shows what the selection covered");
+    assert_eq!(s.project.clips[&copy.clip].offset, 0, "it holds just what the selection covered");
+    assert!(s.clip_notes(copy.clip).unwrap().1.notes.is_empty(), "the note before the selection is not in it");
 }
 
 #[test]
@@ -172,7 +173,9 @@ fn deleting_a_time_selection_cuts_the_clips_crossing_its_edges() {
     assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (4 * BEAT, 4 * BEAT), (9 * BEAT, BEAT)]);
     assert_eq!(clip_of(&s, long).length, 2 * BEAT, "the left part is the original clip");
     let right = s.project.track(midi).unwrap().arrangement.iter().find(|pl| pl.start == 4 * BEAT).unwrap();
-    assert_eq!(s.project.clips[&right.clip].offset, 4 * BEAT, "the right part plays on from the cut");
+    assert_eq!(s.project.clips[&right.clip].offset, 0, "the right part starts at its own tick 0");
+    let right_notes: Vec<_> = s.clip_notes(right.clip).unwrap().1.notes.iter().map(|n| (n.key, n.start)).collect();
+    assert_eq!(right_notes, [(64, BEAT)], "and holds the notes it plays");
     assert_eq!(spans(&s, audio), [(2 * BEAT, 2 * BEAT)], "tracks outside the selection are left alone");
     assert_eq!(steps(&s), before + 1);
     // Across both tracks a clip wholly inside goes.
@@ -195,7 +198,7 @@ fn copying_a_time_selection_takes_the_parts_inside_it() {
     assert_eq!(s.project, project, "copying changes nothing");
     let Some(Clipboard::Clips { span, rows }) = &s.ed.clipboard else { panic!("clips on the clipboard") };
     assert_eq!((*span, rows.len(), rows[0].seeds.len()), (3 * BEAT, 1, 1));
-    assert_eq!((rows[0].seeds[0].at, rows[0].seeds[0].clip.offset, rows[0].seeds[0].clip.length), (0, 2 * BEAT, 3 * BEAT));
+    assert_eq!((rows[0].seeds[0].at, rows[0].seeds[0].clip.offset, rows[0].seeds[0].clip.length), (0, 0, 3 * BEAT));
     // Paste on another MIDI track, at the marker.
     s.set_marker(BEAT, Some(midi2));
     assert!(s.paste());
@@ -410,7 +413,7 @@ fn consolidate_joins_midi_clips_and_writes_out_loops() {
     let with_loop = Clip { looping: Some(LoopRegion { start: 0, end: BEAT }), ..s.project.clips[&looped].clone() };
     assert!(s.edit("Loop", vec![Command::UpdateClip { id: looped, clip: Box::new(with_loop) }]));
     s.select_clips([a, b], None);
-    assert_eq!(s.consolidate(), Ok(1));
+    assert!(matches!(s.consolidate(), Ok(Consolidation::Done(1))));
     assert_eq!(spans(&s, midi), [(0, 7 * BEAT)]);
     let (_, joined, _) = s.clip_selection()[0].clone();
     let mut notes: Vec<_> = s.clip_notes(joined.clip).unwrap().1.notes.iter().map(|n| (n.start, n.key, n.length)).collect();
@@ -420,11 +423,71 @@ fn consolidate_joins_midi_clips_and_writes_out_loops() {
     assert_eq!((s.project.clips.len(), s.project.sources.len()), (1, 1), "the old clips are gone");
     assert!(s.undo());
     assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (4 * BEAT, 3 * BEAT)]);
-    // Audio is refused.
+    // Audio waits for its render: nothing changes until the file is there.
     let kick = audio_clip(&mut s, audio, 0, BEAT);
-    s.select_clips([kick], None);
-    assert!(s.consolidate().is_err());
-    assert_eq!(spans(&s, audio), [(0, BEAT)]);
+    let snare = audio_clip(&mut s, audio, 2 * BEAT, BEAT);
+    s.select_clips([kick, snare], None);
+    let project = s.project.clone();
+    let Ok(Consolidation::Render(job)) = s.consolidate() else { panic!("audio needs a render") };
+    assert_eq!(s.project, project);
+    assert_eq!(job.groups.len(), 1);
+    let g = &job.groups[0];
+    assert_eq!((g.track, g.start, g.end, g.audio, g.parts.len()), (audio, 0, 3 * BEAT, true, 2));
+    let file = AudioSource { path: "Samples/Consolidated/Kick Consolidated.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 72_000, warp: Warp::default(), key: None };
+    assert_eq!(s.finish_consolidate(&job, &[(0, file.clone())]), Ok(1));
+    assert_eq!(spans(&s, audio), [(0, 3 * BEAT)]);
+    let (_, joined, _) = s.clip_selection()[0].clone();
+    assert_eq!(s.project.sources[&s.project.clips[&joined.clip].source], Source::Audio(file.clone()));
+    assert!(s.undo());
+    assert_eq!(spans(&s, audio), [(0, BEAT), (2 * BEAT, BEAT)]);
+    // A song that changed during the render is left alone.
+    s.select_clips([kick, snare], None);
+    let Ok(Consolidation::Render(job)) = s.consolidate() else { panic!("audio needs a render") };
+    let id = s.placement(snare).unwrap().1.clip;
+    assert!(s.edit("Gain", vec![Command::UpdateClip { id, clip: Box::new(Clip { gain_db: -3.0, ..s.project.clips[&id].clone() }) }]));
+    assert!(s.finish_consolidate(&job, &[(0, file)]).is_err());
+    assert_eq!(spans(&s, audio), [(0, BEAT), (2 * BEAT, BEAT)]);
+}
+
+#[test]
+fn consolidate_audio_in_a_time_selection_renders_just_that_part() {
+    let Song { mut s, audio, .. } = song();
+    audio_clip(&mut s, audio, 0, 4 * BEAT);
+    s.set_time_selection((BEAT, audio), (3 * BEAT, audio));
+    let Ok(Consolidation::Render(job)) = s.consolidate() else { panic!("audio needs a render") };
+    assert_eq!(spans(&s, audio), [(0, 4 * BEAT)], "the cut waits for the render too");
+    let g = &job.groups[0];
+    assert_eq!((g.start, g.end, g.parts.len()), (BEAT, 3 * BEAT, 1));
+    assert_eq!(job.project.clips[&g.parts[0].clip].offset, BEAT, "the render plays the middle of the file");
+    let file = AudioSource { path: "joined.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 48_000, warp: Warp::default(), key: None };
+    assert_eq!(s.finish_consolidate(&job, &[(0, file)]), Ok(1));
+    assert_eq!(spans(&s, audio), [(0, BEAT), (BEAT, 2 * BEAT), (3 * BEAT, BEAT)]);
+}
+
+#[test]
+fn split_midi_halves_open_with_only_their_own_notes() {
+    let Song { mut s, midi, .. } = song();
+    let riff = midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT), (62, BEAT + BEAT / 2, BEAT), (64, 3 * BEAT, BEAT)]);
+    s.click_clip(riff, false);
+    assert_eq!(s.split_at(2 * BEAT), 1);
+    let right = s.project.track(midi).unwrap().arrangement.iter().find(|pl| pl.start == 2 * BEAT).unwrap().clone();
+    let notes = |s: &AppState, clip: ClipId| s.clip_notes(clip).unwrap().1.notes.iter().map(|n| (n.key, n.start, n.length)).collect::<Vec<_>>();
+    let left = s.placement(riff).unwrap().1.clip;
+    // The note across the cut is shortened on the left and not in the right half.
+    assert_eq!(notes(&s, left), [(60, 0, BEAT), (62, BEAT + BEAT / 2, BEAT / 2)]);
+    assert_eq!(notes(&s, right.clip), [(64, BEAT, BEAT)]);
+    // Open the right half and edit it: the left half does not change.
+    s.click_clip(right.id, false);
+    assert_eq!(s.selected_clip, Some(right.clip));
+    let (source, n) = s.clip_notes(right.clip).map(|(id, n)| (id, n.notes[0].clone())).unwrap();
+    assert!(s.edit("Move", vec![Command::UpdateNotes { source, notes: vec![Note { key: 65, ..n }] }]));
+    assert_eq!(notes(&s, right.clip), [(65, BEAT, BEAT)]);
+    assert_eq!(notes(&s, left), [(60, 0, BEAT), (62, BEAT + BEAT / 2, BEAT / 2)]);
+    // Joined again with Ctrl+J they make the original riff, minus the part of the note that was cut.
+    s.select_clips([riff, right.id], None);
+    assert!(matches!(s.consolidate(), Ok(Consolidation::Done(1))));
+    let (_, joined, _) = s.clip_selection()[0].clone();
+    assert_eq!(notes(&s, joined.clip), [(60, 0, BEAT), (62, BEAT + BEAT / 2, BEAT / 2), (65, 3 * BEAT, BEAT)]);
 }
 
 #[test]

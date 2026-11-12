@@ -698,6 +698,53 @@ impl AppState {
         self.edit_coalesced(key, label, vec![Command::SetTrack { id, change }])
     }
 
+    /// The audio clips a sample edit made on `clip` acts on: every selected
+    /// audio clip when `clip` is one of them, else `clip` alone.
+    pub fn warp_targets(&self, clip: ClipId) -> Vec<ClipId> {
+        let audio = |c: &ClipId| self.project.clips.get(c).is_some_and(|c| matches!(self.project.sources.get(&c.source), Some(Source::Audio(_))));
+        let selected: std::collections::BTreeSet<ClipId> = self.clip_selection().iter().map(|(_, pl, _)| pl.clip).filter(audio).collect();
+        if selected.contains(&clip) { selected.into_iter().collect() } else { vec![clip] }
+    }
+
+    /// Edit the sample settings (transpose, detune, reverse, warp on/off) of
+    /// `clip` and of the other selected audio clips with it; the rest stay as
+    /// they are. A sample shared with clips outside the edit is copied for
+    /// the edited ones first, so every clip keeps its own settings as in Live.
+    /// Edits under the same `key` (one drag) are one undo step.
+    pub fn set_clip_warp(&mut self, key: &str, clip: ClipId, f: impl Fn(&mut Warp)) -> bool {
+        let targets = self.warp_targets(clip);
+        let mut sources: Vec<SourceId> = Vec::new();
+        for c in &targets {
+            if let Some(s) = self.project.clips.get(c).map(|c| c.source).filter(|s| !sources.contains(s)) {
+                sources.push(s);
+            }
+        }
+        let mut cmds = Vec::new();
+        for src in sources {
+            let Some(Source::Audio(a)) = self.project.sources.get(&src).cloned() else { continue };
+            let mut warp = a.warp.clone();
+            f(&mut warp);
+            warp.transpose = warp.transpose.round().clamp(-48., 48.);
+            warp.detune = warp.detune.round().clamp(-50., 50.);
+            if warp == a.warp {
+                continue;
+            }
+            let shared = self.project.clips.iter().any(|(id, c)| c.source == src && !targets.contains(id));
+            if !shared {
+                cmds.push(Command::SetWarp { source: src, warp: Box::new(warp) });
+                continue;
+            }
+            let id = self.project.alloc_source_id();
+            cmds.push(Command::AddSource { id, source: Box::new(Source::Audio(AudioSource { warp, ..a })) });
+            for c in &targets {
+                if let Some(clip) = self.project.clips.get(c).filter(|cl| cl.source == src) {
+                    cmds.push(Command::UpdateClip { id: *c, clip: Box::new(Clip { source: id, ..clip.clone() }) });
+                }
+            }
+        }
+        !cmds.is_empty() && self.edit_coalesced(key, "Edit sample", cmds)
+    }
+
     pub fn set_send(&mut self, track: TrackId, index: usize, level_db: f32) -> bool {
         let Some(t) = self.project.track(track) else { return false };
         let mut sends = t.sends.clone();
@@ -777,6 +824,43 @@ impl AppState {
 
     pub fn remove_device(&mut self, id: DeviceId) -> bool {
         self.edit("Delete device", vec![Command::RemoveDevice { id }])
+    }
+
+    /// Delete several devices in one undo step. A device inside a rack that
+    /// goes too is left to the rack.
+    pub fn remove_devices(&mut self, ids: Vec<DeviceId>) -> bool {
+        let inside = |id: DeviceId| {
+            let mut found = false;
+            for r in &ids {
+                if let Some(Device {
+                    kind: DeviceKind::Rack(_),
+                    ..
+                }) = self.project.device(*r)
+                {
+                    let mut hit = |d: &Device| found |= d.id == id && d.id != *r;
+                    aitrack_model::visit_devices(
+                        std::slice::from_ref(self.project.device(*r).unwrap()),
+                        &mut hit,
+                    );
+                }
+            }
+            found
+        };
+        let cmds: Vec<Command> = ids
+            .iter()
+            .filter(|id| !inside(**id))
+            .map(|&id| Command::RemoveDevice { id })
+            .collect();
+        let label = if cmds.len() > 1 {
+            "Delete devices"
+        } else {
+            "Delete device"
+        };
+        let ok = self.edit(label, cmds);
+        if ok {
+            self.ed.devices.clear();
+        }
+        ok
     }
 
     // ── Clips, arrangement, transport settings ──
@@ -1060,6 +1144,70 @@ mod tests {
         AppState::new(crate::demo::project())
     }
 
+    #[test]
+    fn warp_edits_clamp_and_a_drag_is_one_undo_step() {
+        let mut s = state();
+        let clip = *s.project.clips.iter().find(|(_, c)| matches!(s.project.sources.get(&c.source), Some(Source::Audio(_)))).unwrap().0;
+        let warp = |s: &AppState| match s.project.sources.get(&s.project.clips[&clip].source) {
+            Some(Source::Audio(a)) => a.warp.clone(),
+            _ => unreachable!(),
+        };
+        let before = warp(&s);
+        s.seal();
+        for st in [3., 9., 60.] {
+            s.set_clip_warp("transpose-drag", clip, |w| w.transpose = st);
+        }
+        s.seal();
+        assert_eq!(warp(&s).transpose, 48.);
+        assert!(s.set_clip_warp("detune", clip, |w| w.detune = -80.4));
+        assert_eq!(warp(&s).detune, -50.);
+        assert!(!s.set_clip_warp("detune", clip, |w| w.detune = -50.), "no change, no undo step");
+        s.seal();
+        s.undo();
+        s.undo();
+        assert_eq!(warp(&s), before);
+    }
+
+    #[test]
+    fn sample_edits_follow_the_clip_selection_and_split_shared_samples() {
+        let mut s = state();
+        let (&src, _) = s.project.sources.iter().find(|(_, x)| matches!(x, Source::Audio(_))).unwrap();
+        let track = s.add_track(TrackKind::Audio).unwrap();
+        // Three clips on one sample, placed side by side.
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let clip = s.project.alloc_clip_id();
+            let pl = s.project.alloc_placement_id();
+            s.edit("add", vec![
+                Command::AddClip { id: clip, clip: Box::new(Clip::new("c", Color(0), src, PPQ)) },
+                Command::PlaceClip { track, placement: Placement { id: pl, clip, start: i * 4 * PPQ, lane: 0 } },
+            ]);
+            ids.push((clip, pl));
+        }
+        let source_of = |s: &AppState, c: ClipId| s.project.clips[&c].source;
+        let warp_of = |s: &AppState, c: ClipId| match &s.project.sources[&s.project.clips[&c].source] {
+            Source::Audio(a) => a.warp.clone(),
+            _ => unreachable!(),
+        };
+        // The first two selected: they get their own sample, the third keeps the old one.
+        s.click_clip(ids[0].1, false);
+        s.click_clip(ids[1].1, true);
+        assert_eq!(s.warp_targets(ids[0].0), vec![ids[0].0, ids[1].0]);
+        s.seal();
+        assert!(s.set_clip_warp("t", ids[0].0, |w| w.transpose = 5.));
+        assert!(s.set_clip_warp("t", ids[0].0, |w| w.transpose = 7.), "a drag goes on in the copy");
+        s.seal();
+        assert_eq!(source_of(&s, ids[0].0), source_of(&s, ids[1].0));
+        assert_ne!(source_of(&s, ids[0].0), src);
+        assert_eq!(source_of(&s, ids[2].0), src);
+        assert_eq!((warp_of(&s, ids[0].0).transpose, warp_of(&s, ids[2].0).transpose), (7., 0.));
+        // A clip outside the selection is edited alone.
+        assert_eq!(s.warp_targets(ids[2].0), vec![ids[2].0]);
+        // One undo step brings the shared sample back.
+        s.undo();
+        assert_eq!(source_of(&s, ids[0].0), src);
+    }
+
     fn lead_clip(s: &AppState) -> ClipId {
         let lead = s.project.tracks.iter().find(|t| t.name == "Lead").unwrap();
         *lead.session_slots.values().next().unwrap()
@@ -1189,6 +1337,7 @@ mod tests {
             .find_map(|t| t.arrangement.first().filter(|_| t.kind == TrackKind::Instrument).map(|p| (t.id, p.clone())))
             .unwrap();
         let clip = s.project.clips[&place.clip].clone();
+        let original = s.project.clone();
         s.selected_track = Some(track);
         s.selected_placement = None;
         let before = s.project.track(track).unwrap().arrangement.len();
@@ -1203,9 +1352,15 @@ mod tests {
         let right_place = t.arrangement.iter().find(|p| p.start == cut).expect("a clip starts at the cut");
         let right = &s.project.clips[&right_place.clip];
         assert_eq!(left.length, BAR);
-        // The right half plays on from the cut; in a looping clip that position wraps inside the loop.
-        let from = clip.looping.map_or(clip.offset + BAR, |l| l.start + (clip.offset + BAR - l.start) % (l.end - l.start));
-        assert_eq!((right.offset, right.length), (from, clip.length - BAR));
+        // The right half plays on from the cut, with notes of its own from its tick 0.
+        assert_eq!(right.length, clip.length - BAR);
+        assert_ne!(right.source, clip.source);
+        let heard = |c: &Clip, src: &Project| {
+            let Some(Source::Notes(n)) = src.sources.get(&c.source) else { panic!("a notes clip") };
+            aitrack_model::ops::heard_notes(c, &n.notes).into_iter().map(|n| (n.start, n.key, n.length)).collect::<Vec<_>>()
+        };
+        let whole: Vec<_> = heard(&clip, &original).into_iter().filter(|(at, ..)| *at >= BAR).map(|(at, k, len)| (at - BAR, k, len)).collect();
+        assert_eq!(heard(right, &s.project), whole);
         assert_eq!((s.selected_placement, s.selected_clip), (Some((track, place.id)), Some(left_clip)), "the left half is selected, in the lane and in the Clip tab");
         assert_eq!(s.selected_clip_ids(), [place.id].into());
         assert!(s.undo());

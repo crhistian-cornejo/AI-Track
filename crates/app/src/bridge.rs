@@ -112,6 +112,11 @@ pub trait EngineBridge {
     fn set_sandbox_plugins(&mut self, _on: bool) {}
     /// Audition an audio file at a low level (`None` stops).
     fn preview(&mut self, _path: Option<&Path>) {}
+    /// Audition an audio file the way a clip plays it: `ratio` times faster
+    /// (transpose and detune) and backwards when `reverse`.
+    fn preview_pitched(&mut self, path: Option<&Path>, _ratio: f64, _reverse: bool) {
+        self.preview(path);
+    }
     /// Plugin load failures and similar, drained by the UI as toasts.
     fn take_messages(&mut self) -> Vec<String> {
         Vec::new()

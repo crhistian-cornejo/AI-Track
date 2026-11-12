@@ -23,7 +23,20 @@ pub fn save(path: &Path, project: &Project) -> Result<(), String> {
 
 pub fn load(path: &Path) -> Result<Project, String> {
     let json = std::fs::read_to_string(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-    Project::from_json(&json).map_err(|e| format!("{} is not an AI-Track project: {e}", path.display()))
+    let mut project = Project::from_json(&json).map_err(|e| format!("{} is not an AI-Track project: {e}", path.display()))?;
+    settle_notes(&mut project);
+    Ok(project)
+}
+
+/// Older projects can have notes clips with an offset (trimmed from the
+/// left before trims settled on offset 0). Settle them as they open, so the
+/// piano roll shows each clip's own notes; it plays the same.
+fn settle_notes(project: &mut Project) {
+    let cmds = aitrack_model::ops::rebase_all_notes(project);
+    if !cmds.is_empty() {
+        // Before any history exists: this is how the project opens, not an edit to undo.
+        let _ = aitrack_model::Command::Batch { commands: cmds }.apply(project);
+    }
 }
 
 /// `name.aitrack`, adding the extension when the dialog left it out.
@@ -199,6 +212,26 @@ impl Workspace {
 fn default_folder() -> PathBuf {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
     [home.join("Music"), home.join("Documents"), home.clone()].into_iter().find(|p| p.is_dir()).unwrap_or(home)
+}
+
+/// Where Consolidate writes the audio it renders: `Samples/Consolidated`
+/// next to the saved project, else `AI-Track/Consolidated` in the user's
+/// music folder (the files stay where they are when the project is saved
+/// later).
+pub fn consolidate_folder(project_path: Option<&Path>) -> PathBuf {
+    match project_path.and_then(Path::parent) {
+        Some(dir) => dir.join("Samples").join("Consolidated"),
+        None => default_folder().join("AI-Track").join("Consolidated"),
+    }
+}
+
+/// A `.wav` path in `dir` named after `name` that no file (nor `taken`) has yet.
+pub fn fresh_wav(dir: &Path, name: &str, taken: &[&Path]) -> PathBuf {
+    let base = safe_name(name);
+    (1..)
+        .map(|n| dir.join(if n == 1 { format!("{base} Consolidated.wav") } else { format!("{base} Consolidated {n}.wav") }))
+        .find(|p| !p.exists() && !taken.contains(&p.as_path()))
+        .expect("a free name")
 }
 
 /// A project name that is a valid file name on Windows and macOS.

@@ -13,7 +13,9 @@ use crate::parse::KeyHint;
 use crate::taxonomy::{Category, SampleKind};
 
 /// 2: absolute roots are stored with symlinks resolved (see [`stored_root_path`]).
-pub const SCHEMA_VERSION: i32 = 2;
+/// 3: `samples.onsets` (attacks counted while decoding), and labels are
+/// re-derived whenever [`crate::reanalyse::TAGGER_VERSION`] grows.
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// The form a root is stored in. An absolute path that exists is stored with
 /// its symlinks resolved, because the OS reports canonical paths to the
@@ -108,6 +110,7 @@ CREATE TABLE IF NOT EXISTS samples(
   status TEXT NOT NULL DEFAULT 'ok',
   error TEXT,
   duration REAL,
+  onsets INTEGER,
   sample_rate INTEGER,
   channels INTEGER,
   peak_db REAL,
@@ -381,10 +384,59 @@ impl Library {
         if v < 2 {
             self.canonicalize_stored_roots()?;
         }
+        if v < 3 && !self.has_column("samples", "onsets")? {
+            self.conn.execute_batch("ALTER TABLE samples ADD COLUMN onsets INTEGER")?;
+        }
         if v < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        self.retag_if_stale();
         Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut st = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = st.query_map([], |r| r.get::<_, String>(1))?;
+        for n in names {
+            if n? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Re-derives the labels of every stored sample when they were made by
+    /// an older tagger (see [`Library::retag`]). A failure is logged and
+    /// retried on the next open; the library still opens.
+    fn retag_if_stale(&self) {
+        use crate::reanalyse::TAGGER_VERSION;
+        let stored = self.meta("tagger_version").ok().flatten().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        if stored >= TAGGER_VERSION {
+            return;
+        }
+        match self.retag() {
+            Ok(n) => {
+                if n > 0 {
+                    log::info!("library: re-tagged {n} samples (tagger {stored} -> {TAGGER_VERSION})");
+                }
+                if let Err(e) = self.set_meta("tagger_version", &TAGGER_VERSION.to_string()) {
+                    log::warn!("library: could not record the tagger version: {e}");
+                }
+            }
+            Err(e) => log::warn!("library: re-tagging failed, labels stay as they were: {e}"),
+        }
     }
 
     pub fn db_path(&self) -> Option<&Path> {
@@ -686,7 +738,8 @@ impl Library {
                    duration=?7, sample_rate=?8, channels=?9, peak_db=?10, loudness=?11, loudness_kind=?12,
                    bpm=?13, bpm_source=?14, root_note=?15, kind=?16, is_loop=?17, loop_family=?18,
                    genres=?19, pack=?20, license=?21, analyzer=?22, analysis_version=?23,
-                   embedding=COALESCE(?24, embedding), embedding_model=COALESCE(?25, embedding_model)
+                   embedding=COALESCE(?24, embedding), embedding_model=COALESCE(?25, embedding_model),
+                   onsets=?26
                  WHERE id=?1",
                 params![
                     id,
@@ -714,6 +767,7 @@ impl Library {
                     version,
                     emb_blob,
                     emb_model,
+                    a.audio.onsets,
                 ],
             )?;
             if !keep_label {
@@ -740,9 +794,9 @@ impl Library {
                 "INSERT INTO samples(root_id, rel_path, name, ext, hash, size, mtime, duration, sample_rate,
                    channels, peak_db, loudness, loudness_kind, bpm, bpm_source, key_root, scale_kind, camelot,
                    key_source, root_note, kind, is_loop, loop_family, category, subcategory, label_source,
-                   genres, pack, license, analyzer, analysis_version, embedding, embedding_model, added_at)
+                   genres, pack, license, analyzer, analysis_version, embedding, embedding_model, added_at, onsets)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,
-                        ?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
+                        ?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)",
                 params![
                     root_id.0,
                     rel,
@@ -778,6 +832,7 @@ impl Library {
                     emb_blob,
                     emb_model,
                     now(),
+                    a.audio.onsets,
                 ],
             )?;
             self.conn.last_insert_rowid()

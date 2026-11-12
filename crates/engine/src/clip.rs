@@ -11,9 +11,11 @@
 //! and clip launches, so notes never hang when the project is edited.
 //!
 //! Audio clips play decoded, resampled data from the sample cache. Without
-//! warp they play at their native speed, reading whole frames (looping or
-//! not). With `warp.enabled` and an `original_bpm` they are *repitched*
-//! (speed follows the tempo). Pitch-preserving stretch plugs in at
+//! warp and transpose they play at their native speed, reading whole frames
+//! (looping or not). With `warp.enabled` and an `original_bpm` they are
+//! *repitched* (speed follows the tempo); transpose and detune repitch on
+//! top, warped or not, as Live's Re-Pitch does. A reversed clip reads its
+//! source backwards. Pitch-preserving stretch plugs in at
 //! [`AudioClipData::source_frame`].
 //!
 //! The gain of an audio clip is its `gain_db` times its fades and volume
@@ -216,11 +218,32 @@ pub(crate) struct AudioClipData {
     /// Repitch warp: source plays at `original_bpm`.
     pub warped: bool,
     pub original_bpm: f64,
-    /// Semitones (repitch only; pitch-preserving modes are a TODO).
-    pub transpose: f32,
+    /// Source speed asked for by transpose and detune (1 = as recorded).
+    /// Re-Pitch: the pitch moves with the speed.
+    pub ratio: f64,
+    /// Read the source backwards.
+    pub reverse: bool,
 }
 
 impl AudioClipData {
+    /// Whether the clip plays whole frames at the file's own speed.
+    #[inline]
+    fn exact(&self) -> bool {
+        !self.warped && self.ratio == 1.0
+    }
+
+    /// Frame `index` of the source as this clip reads it (mirrored when reversed).
+    #[inline]
+    fn frame(&self, audio: &DecodedAudio, ch: usize, index: i64) -> f32 {
+        audio.frame(ch, if self.reverse { audio.frames as i64 - 1 - index } else { index })
+    }
+
+    /// Interpolated read at a fractional frame (mirrored when reversed).
+    #[inline]
+    fn sample(&self, audio: &DecodedAudio, ch: usize, pos: f64) -> f32 {
+        audio.sample(ch, if self.reverse { (audio.frames as f64 - 1.0) - pos } else { pos })
+    }
+
     /// Warp hook: fractional source frame for a source tick. Unwarped clips
     /// map ticks at the tempo where the clip started (`unwarped_spt` =
     /// samples per tick there); warped clips at their original tempo. A
@@ -583,7 +606,7 @@ impl CompiledClip {
 
         // A clip at its native speed reads whole frames: playback is
         // bit-identical to the file instead of an interpolated copy of it.
-        if !data.warped {
+        if data.exact() {
             let start_i = start_exact.round() as i64;
             let stop = end_sample.map_or(hi, |e| hi.min(e.ceil() as i64));
             let frames = looping.map(|(ls, le)| FrameLoop::new(offset, ls, le, spt, ctx.sr));
@@ -609,16 +632,16 @@ impl CompiledClip {
                     let dt = (t1 - t0) / (chunk_end - n) as f64;
                     for j in n..chunk_end {
                         let frame = pass.frame.saturating_add(j - k);
-                        let mut sl = audio.frame(0, frame);
-                        let mut sr = if stereo { audio.frame(1, frame) } else { sl };
+                        let mut sl = data.frame(audio, 0, frame);
+                        let mut sr = if stereo { data.frame(audio, 1, frame) } else { sl };
                         if pass.seam > 0 {
                             let left = pass_end - j;
                             if left <= pass.seam {
                                 // Fade the tail into what leads up to the loop start.
                                 let w = (pass.seam - left + 1) as f32 / (pass.seam + 1) as f32;
                                 let lead = (loop_start - left).max(lead_floor);
-                                let pl = audio.frame(0, lead);
-                                let pr = if stereo { audio.frame(1, lead) } else { pl };
+                                let pl = data.frame(audio, 0, lead);
+                                let pr = if stereo { data.frame(audio, 1, lead) } else { pl };
                                 sl += (pl - sl) * w;
                                 sr += (pr - sr) * w;
                             }
@@ -639,9 +662,9 @@ impl CompiledClip {
             return;
         }
 
-        // Repitch warp: the source position follows the tempo map and is read
-        // through the interpolator.
-        let ratio = 2f64.powf(data.transpose as f64 / 12.0);
+        // Repitch (warped, transposed or detuned): the source position follows
+        // the tempo map and is read through the interpolator.
+        let ratio = data.ratio;
         let span = looping.map_or(0.0, |(ls, le)| (le - ls) as f64);
         // Seam length in source ticks: for a repeat, and for the first pass
         // (which cannot start crossfading before the clip does).
@@ -679,12 +702,12 @@ impl CompiledClip {
                     }
                 }
                 let frame = data.source_frame(src, spt);
-                let mut sl = audio.sample(0, frame);
-                let mut sr = if stereo { audio.sample(1, frame) } else { sl };
+                let mut sl = data.sample(audio, 0, frame);
+                let mut sr = if stereo { data.sample(audio, 1, frame) } else { sl };
                 if w > 0.0 {
                     let lead = data.source_frame(src - span, spt).max(lead_floor);
-                    let pl = audio.sample(0, lead);
-                    let pr = if stereo { audio.sample(1, lead) } else { pl };
+                    let pl = data.sample(audio, 0, lead);
+                    let pr = if stereo { data.sample(audio, 1, lead) } else { pl };
                     sl += (pl - sl) * w;
                     sr += (pr - sr) * w;
                 }
@@ -759,7 +782,7 @@ mod tests {
 
     fn audio_clip(clip: &Clip, data: Vec<f32>, original_bpm: Option<f64>) -> CompiledClip {
         let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
-        let data = AudioClipData { audio: Some(audio), warped: original_bpm.is_some(), original_bpm: original_bpm.unwrap_or(120.0), transpose: 0.0 };
+        let data = AudioClipData { audio: Some(audio), warped: original_bpm.is_some(), original_bpm: original_bpm.unwrap_or(120.0), ratio: 1.0, reverse: false };
         CompiledClip::audio(ClipId(1), clip, data)
     }
 
@@ -777,6 +800,39 @@ mod tests {
             s += 100;
         }
         out
+    }
+
+    fn pitched_clip(clip: &Clip, data: Vec<f32>, ratio: f64, reverse: bool) -> CompiledClip {
+        let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
+        CompiledClip::audio(ClipId(1), clip, AudioClipData { audio: Some(audio), warped: false, original_bpm: 120.0, ratio, reverse })
+    }
+
+    #[test]
+    fn transpose_repitches_an_unwarped_clip() {
+        // A ramp: the value read tells where in the file playback is.
+        let ramp: Vec<f32> = (0..48_000).map(|i| i as f32 / 48_000.).collect();
+        let c = clip(0, 8 * PPQ, None);
+        // +12 st: twice as fast, so 1000 samples in it reads frame 2000.
+        let up = play(&pitched_clip(&c, ramp.clone(), 2f64.powf(12. / 12.), false), 120., 0, Some(8 * PPQ), 1200);
+        assert!((up[1000] - 2000. / 48_000.).abs() < 1e-3, "{}", up[1000]);
+        // -12 st: half speed.
+        let down = play(&pitched_clip(&c, ramp.clone(), 0.5, false), 120., 0, Some(8 * PPQ), 1200);
+        assert!((down[1000] - 500. / 48_000.).abs() < 1e-3, "{}", down[1000]);
+        // +50 ct: 2^(0.5/12) faster.
+        let fine = play(&pitched_clip(&c, ramp, 2f64.powf(0.5 / 12.), false), 120., 0, Some(8 * PPQ), 1200);
+        assert!((fine[1000] - 1000. * 2f32.powf(0.5 / 12.) / 48_000.).abs() < 1e-3, "{}", fine[1000]);
+    }
+
+    #[test]
+    fn reverse_reads_the_file_backwards() {
+        let ramp: Vec<f32> = (0..4_800).map(|i| i as f32).collect();
+        let c = clip(0, 8 * PPQ, None);
+        // Exact frames when the speed is unchanged.
+        let back = play(&pitched_clip(&c, ramp.clone(), 1.0, true), 120., 0, Some(8 * PPQ), 1000);
+        assert_eq!(back[100..103], [4_699., 4_698., 4_697.]);
+        // And through the interpolator when transposed.
+        let fast = play(&pitched_clip(&c, ramp, 2.0, true), 120., 0, Some(8 * PPQ), 1000);
+        assert!((fast[500] - 3_799.).abs() < 0.5, "{}", fast[500]);
     }
 
     fn shaped_clip() -> Clip {

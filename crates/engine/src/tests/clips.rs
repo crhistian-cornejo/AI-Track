@@ -528,3 +528,47 @@ fn fades_follow_the_timeline_through_a_tempo_ramp() {
     assert!(ch[end - 2] > 0.0 && ch[end - 1].abs() < 1e-3, "last samples {} {}", ch[end - 2], ch[end - 1]);
     assert!(peak(&ch[end + 1..]) == 0.0);
 }
+
+// ───────────────────────────── Consolidate ─────────────────────────────
+
+#[test]
+fn consolidate_renders_the_clips_with_their_gain_and_the_gaps() {
+    let mut b = P::new(120.0);
+    let samples = SampleCache::blocking();
+    let t = b.track(TrackKind::Audio, "audio");
+    let data = ramp(2 * BEAT);
+    let sid = source(&mut b, &samples, "joined", data.clone(), Warp::default());
+    // Beat 1: the first beat of the file at half gain. Beat 3: its second beat.
+    let quiet = add_clip(&mut b, Clip { gain_db: -6.020_6, ..Clip::new("a", Color(0), sid, PPQ) });
+    let later = add_clip(&mut b, Clip { offset: PPQ, ..Clip::new("b", Color(0), sid, PPQ) });
+    b.place(t, quiet, PPQ);
+    b.place(t, later, 3 * PPQ);
+    let unselected = add_clip(&mut b, Clip::new("c", Color(0), sid, PPQ));
+    b.place(t, unselected, 2 * PPQ);
+    let ids: Vec<PlacementId> = b.p.track(t).unwrap().arrangement.iter().filter(|pl| pl.clip != unselected).map(|pl| pl.id).collect();
+    let out = render_clips(&b.p, t, &ids, (PPQ, 4 * PPQ), SR, Some(samples.clone())).unwrap();
+    assert_eq!(out.frames(), 3 * BEAT);
+    for ch in 0..2 {
+        let c = out.channel(ch);
+        // (The second clip starts inside the file: playback declicks its first samples.)
+        for i in (500..BEAT).step_by(997) {
+            assert!((c[i] - 0.5 * data[i]).abs() < 1e-4, "first clip at {i}: {} vs {}", c[i], 0.5 * data[i]);
+            assert!((c[2 * BEAT + i] - data[BEAT + i]).abs() < 1e-4, "second clip at {i}");
+        }
+        assert_eq!(peak(&c[BEAT..2 * BEAT]), 0.0, "the gap is silent and the clip that was not chosen is left out");
+    }
+
+    // Written out: mono, because the file is mono, and warped at the song tempo.
+    let dir = std::env::temp_dir().join(format!("aitrack-consolidate-{}", std::process::id()));
+    let path = dir.join("joined.wav");
+    let file = consolidate_to_wav(&b.p, t, &ids, (PPQ, 4 * PPQ), 48_000, &path, Some(samples)).unwrap();
+    assert_eq!((file.channels, file.frames, file.sample_rate), (1, 3 * BEAT as u64, 48_000));
+    assert_eq!((file.warp.enabled, file.warp.original_bpm), (true, Some(120.0)));
+    assert_eq!(file.length_ticks(90.0), 3 * PPQ, "it stays three beats long at another tempo");
+    let (decoded, rate) = crate::sample_cache::decode_file(&path).unwrap();
+    assert_eq!((decoded.len(), decoded[0].len(), rate), (1, 3 * BEAT, 48_000));
+    assert!((decoded[0][2 * BEAT + 600] - data[BEAT + 600]).abs() < 1e-4);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Notes clips are refused.
+    assert!(render_clips(&b.p, t, &[PlacementId(9999)], (0, PPQ), SR, None).is_err());
+}

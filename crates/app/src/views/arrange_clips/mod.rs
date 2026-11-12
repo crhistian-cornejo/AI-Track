@@ -179,6 +179,13 @@ pub fn copy_end(ws: &mut Workspace, d: CopyDrag) {
     }
 }
 
+/// Mouse-up of a fade or trim drag: a trimmed notes clip settles its notes.
+pub fn shape_end(ws: &mut Workspace, d: &ShapeDrag) {
+    if d.zone == Zone::Start && d.applied {
+        edit::finish_trim(&mut ws.s, &d.origin);
+    }
+}
+
 /// Escape during one of these drags: the clip goes back to how it was, the
 /// copies go away. `false` when no such drag is in flight.
 pub fn cancel_drag(ws: &mut Workspace) -> bool {

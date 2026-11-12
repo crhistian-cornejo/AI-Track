@@ -1,0 +1,19 @@
+{
+  "name": "Delta Listen",
+  "plugin": "fx.clipper",
+  "author": "AI-Track",
+  "tags": [
+    "clipper",
+    "delta",
+    "utility",
+    "check"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.5,
+    "2": 1.0,
+    "3": 0.0,
+    "4": 1.0,
+    "5": 0.0
+  }
+}

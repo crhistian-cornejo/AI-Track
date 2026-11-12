@@ -244,12 +244,15 @@ fn info_panel(ws: &mut Workspace, dev: &Dev, b: usize, s: &BandSpec, range: f32,
     let x = r.w * fx;
     let left = if x + 18. + width > r.w { x - 18. - width } else { x + 18. };
     let top = (r.h * fy.clamp(0., 1.) - 28.).clamp(4., (r.h - height - 4.).max(4.));
-    let mut values = div().flex().gap(px(SP1)).child(kit::num(dev, id(p::FREQ), cx));
+    let mut values = div()
+        .flex()
+        .gap(px(SP1))
+        .child(kit::num(ws, dev, id(p::FREQ), cx));
     if s.kind.uses_gain() {
-        values = values.child(kit::num(dev, id(p::GAIN), cx));
+        values = values.child(kit::num(ws, dev, id(p::GAIN), cx));
     }
     if s.kind.uses_q() {
-        values = values.child(kit::num(dev, id(p::Q), cx));
+        values = values.child(kit::num(ws, dev, id(p::Q), cx));
     }
     if s.kind.uses_slope() {
         values = values.child(div().h(px(32.)).flex().items_center().child(kit::pick(dev, id(p::SLOPE), cx)));
@@ -285,7 +288,9 @@ fn info_panel(ws: &mut Workspace, dev: &Dev, b: usize, s: &BandSpec, range: f32,
     if dynamic_row {
         let mut row = div().h(px(32.)).flex().items_center().gap(px(SP1)).child(kit::pick(dev, id(p::DYNAMIC), cx));
         if s.dynamic {
-            row = row.child(kit::num(dev, id(p::THRESHOLD), cx)).child(kit::num(dev, id(p::RATIO), cx));
+            row = row
+                .child(kit::num(ws, dev, id(p::THRESHOLD), cx))
+                .child(kit::num(ws, dev, id(p::RATIO), cx));
         }
         card = card.child(row);
     }
@@ -408,7 +413,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .child(range_chip)
                 .child(kit::pick(dev, p::AUTO_GAIN, cx))
                 .child(kit::pick(dev, p::MODE, cx))
-                .child(kit::num(dev, p::OUTPUT, cx)),
+                .child(kit::num(ws, dev, p::OUTPUT, cx)),
         )
         .into_any_element()
 }

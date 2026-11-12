@@ -16,7 +16,7 @@ use crate::state::{BottomTab, Snap, Tool};
 use crate::theme::*;
 use crate::views::sample_editor::geom;
 use crate::widgets::{self, label, mono};
-use crate::workspace::{Drag, MenuKind, Workspace};
+use crate::workspace::{Drag, KnobTarget, MenuKind, NumTarget, Workspace, plain_text};
 use aitrack_model::{
     AutomationTarget, Clip, ClipId, Command, LaunchMode, LoopRegion, Note, Quantize, Source, Tick, TimeSignature,
 };
@@ -253,6 +253,45 @@ fn small_button(id: impl Into<gpui::ElementId>, text: impl Into<SharedString>, e
         .child(mono(text, TEXT_XS, pal.text))
 }
 
+/// A small on/off button of the properties column, lit while on.
+fn toggle_button(id: impl Into<gpui::ElementId>, text: &'static str, on: bool) -> Stateful<Div> {
+    let b = small_button(id, text, true);
+    if on {
+        b.bg(accent_alpha(0.22)).border_color(accent())
+    } else {
+        b
+    }
+}
+
+/// A value box that opens for typing on a click: Enter applies the number,
+/// Escape or a click elsewhere drops it.
+fn num_box(ws: &Workspace, id: impl Into<gpui::ElementId>, target: NumTarget, shown: String, prefill: String, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    let pal = p();
+    let editing = ws.num_edit.as_ref().filter(|e| e.target == target).map(|e| e.text.clone());
+    let body = match editing {
+        Some(text) => div().flex().items_center().child(mono(text, TEXT_SM, pal.accent)).child(div().w(px(1.)).h(px(12.)).ml(px(1.)).bg(pal.accent)),
+        None => div().child(mono(shown, TEXT_SM, pal.text)),
+    };
+    div()
+        .id(id)
+        .h(px(20.))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .rounded(px(r_sm()))
+        .bg(pal.well)
+        .border_1()
+        .border_color(if ws.num_edit.as_ref().is_some_and(|e| e.target == target) { accent() } else { border() })
+        .cursor_text()
+        .tooltip(widgets::tip("Click to type a value", None))
+        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+            if !this.num_edit.as_ref().is_some_and(|e| e.target == target) {
+                this.begin_num_edit(target, prefill.clone(), cx);
+            }
+        }))
+        .child(body)
+}
+
 /// A value shown in a well (what Live draws as a number box).
 fn value_box(text: impl Into<SharedString>) -> Div {
     let pal = p();
@@ -480,6 +519,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
             };
             let gain = clip.gain_db;
             let warp = &src.warp;
+            let (warp_on, reversed) = (warp.enabled, warp.reverse);
             let mode = format!("{:?}", warp.mode);
             let sample_box = section("SAMPLE", Icon::Sample)
                 .child(div().px(px(SP2)).h(px(ROW_H)).flex().items_center().child(label(crate::paint::fit(&file, PROPS_W - 16., TEXT_SM), TEXT_SM, pal.text)))
@@ -490,11 +530,54 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                     div()
                         .flex()
                         .gap(px(SP1))
-                        .child(widgets::badge(if warp.enabled { "On" } else { "Off" }, if warp.enabled { pal.accent } else { pal.muted }))
-                        .child(widgets::badge(mode, pal.muted)),
+                        .child(
+                            toggle_button(("warp-on", n), if warp.enabled { "On" } else { "Off" }, warp.enabled)
+                                .tooltip(widgets::tip("Warp: follow the project tempo (Re-Pitch: speed and pitch move together)", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let bpm = this.s.project.tempo.initial_bpm();
+                                    this.s.seal();
+                                    let on = !warp_on;
+                                    this.s.set_clip_warp("warp-toggle", id, |w| {
+                                        w.enabled = on;
+                                        // Without a known tempo the sample is taken to be at the project's, so it sounds the same.
+                                        if w.enabled && w.original_bpm.is_none() {
+                                            w.original_bpm = Some(bpm);
+                                        }
+                                    });
+                                    this.s.seal();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(widgets::badge(mode, pal.muted).id(("warp-mode", n)).tooltip(widgets::tip("Warp mode. Only Re-Pitch plays for now: pitch-preserving stretch is on its way", None))),
                 ))
                 .when_some(warp.original_bpm, |d, b| d.child(row("Seg. BPM", value_box(format!("{b:.2}")))))
-                .child(row("Transpose", value_box(format!("{:+.0} st", warp.transpose))))
+                .child(row(
+                    "Transpose",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP1))
+                        .child(crate::views::devices::knob_control(("transpose", n), (warp.transpose + 48.) / 96., true, true, KnobTarget::Transpose { clip: id }, cx).tooltip(widgets::tip("Transpose in semitones: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", None)))
+                        .child(num_box(ws, ("transpose-value", n), NumTarget::Transpose { clip: id }, format!("{:+.0} st", warp.transpose), plain_text(f64::from(warp.transpose)), cx))
+                ))
+                .child(row(
+                    "Detune",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP1))
+                        .child(crate::views::devices::knob_control(("detune", n), (warp.detune + 50.) / 100., true, true, KnobTarget::Detune { clip: id }, cx).tooltip(widgets::tip("Detune in cents: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", None)))
+                        .child(num_box(ws, ("detune-value", n), NumTarget::Detune { clip: id }, format!("{:+.0} ct", warp.detune), plain_text(f64::from(warp.detune)), cx)),
+                ))
+                .child(row(
+                    "Reverse",
+                    toggle_button(("reverse", n), "Rev", warp.reverse).tooltip(widgets::tip("Play the sample backwards", None)).on_click(cx.listener(move |this, _, _, cx| {
+                        this.s.seal();
+                        this.s.set_clip_warp("reverse", id, |w| w.reverse = !reversed);
+                        this.s.seal();
+                        cx.notify();
+                    })),
+                ))
                 .when_some(src.key, |d, k| d.child(row("Key", widgets::badge(k.display(), pal.accent))))
                 .child(row(
                     "Gain",

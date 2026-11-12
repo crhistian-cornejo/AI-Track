@@ -190,11 +190,42 @@ pub struct WaveMap {
     pub frames_per_tick: f64,
     /// Width of a pixel column in ticks.
     pub ticks_per_px: f64,
+    /// Source ticks played per clip tick: transpose and detune (Re-Pitch).
+    pub ratio: f64,
+    /// Frames of the file when it plays reversed: frames are mirrored.
+    pub mirror: Option<f64>,
 }
 
 impl WaveMap {
     pub fn of(clip: &Clip, frames_per_tick: f64, px_per_tick: f64) -> Self {
-        Self { offset: clip.offset, looping: clip.looping, frames_per_tick, ticks_per_px: 1. / px_per_tick.max(1e-9) }
+        Self {
+            offset: clip.offset,
+            looping: clip.looping,
+            frames_per_tick,
+            ticks_per_px: 1. / px_per_tick.max(1e-9),
+            ratio: 1.,
+            mirror: None,
+        }
+    }
+
+    /// As playback reads the source: `ratio` times faster (transpose), and
+    /// backwards through a file of `mirror` frames.
+    pub fn pitched(self, ratio: f64, mirror: Option<f64>) -> Self {
+        Self {
+            ratio: ratio.max(1e-6),
+            mirror,
+            ..self
+        }
+    }
+
+    /// The source frames shown by the column at clip time `t`, as the file
+    /// stores them (mirrored back when the clip plays reversed).
+    pub fn file_frames(&self, t: f64) -> (f64, f64) {
+        let (from, to) = self.frames(t);
+        match self.mirror {
+            Some(n) => (n - to, n - from),
+            None => (from, to),
+        }
     }
 
     /// The source frames `from..to` shown by the pixel column that starts at
@@ -202,8 +233,8 @@ impl WaveMap {
     /// loop; a column never reads past the end of the loop it is in, and one
     /// that is wider than the whole loop shows all of it.
     pub fn frames(&self, t: f64) -> (f64, f64) {
-        let u = self.offset as f64 + t;
-        let width = self.ticks_per_px * self.frames_per_tick;
+        let u = self.offset as f64 + t * self.ratio;
+        let width = self.ticks_per_px * self.ratio * self.frames_per_tick;
         let from = unroll(self.looping, u) * self.frames_per_tick;
         match self.looping.filter(|l| l.end > l.start) {
             Some(l) => {
@@ -226,7 +257,7 @@ pub fn columns(peaks: &Peaks, channel: Option<usize>, clip: &Clip, map: &WaveMap
     let mut prev = None;
     for i in 0..count {
         let t = t0 + i as f64 * map.ticks_per_px;
-        let (from, to) = map.frames(t);
+        let (from, to) = map.file_frames(t);
         let col = peaks.range(channel, from, to);
         let (lo, hi) = waveform::join(col, prev);
         prev = col;
@@ -343,6 +374,21 @@ mod tests {
 
     fn frame_of(value: f32, frames: usize) -> f64 {
         f64::from(value + 1.) / 2. * (frames - 1) as f64
+    }
+
+    #[test]
+    fn transposed_and_reversed_columns_read_what_plays() {
+        let clip = Clip {
+            offset: 200,
+            ..Clip::new("c", Color(0), SourceId(1), 400)
+        };
+        // An octave up reads the file twice as fast from the same start.
+        let up = WaveMap::of(&clip, 100., 0.1).pitched(2., None);
+        assert_eq!(up.frames(0.), (20_000., 22_000.));
+        assert_eq!(up.frames(50.), (30_000., 32_000.));
+        // Reversed, the same columns come from the far end of the file.
+        let back = WaveMap::of(&clip, 100., 0.1).pitched(1., Some(100_000.));
+        assert_eq!(back.file_frames(0.), (79_000., 80_000.));
     }
 
     #[test]

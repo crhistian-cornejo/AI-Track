@@ -1,0 +1,19 @@
+{
+  "name": "4x Clean Master",
+  "plugin": "fx.clipper",
+  "author": "AI-Track",
+  "tags": [
+    "clipper",
+    "clean",
+    "master",
+    "4x"
+  ],
+  "params": {
+    "0": 0.98333335,
+    "1": 0.20833333,
+    "2": 0.0,
+    "3": 0.1,
+    "4": 0.0,
+    "5": 1.0
+  }
+}

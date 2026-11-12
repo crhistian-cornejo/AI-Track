@@ -11,15 +11,19 @@
 //! - [`hub`]: the sound bank manifest (bundled packs + Content Hub links).
 //! - [`install`]: one-click download of the optional packs, with progress.
 //! - [`reanalyse`]: key/BPM from audio for samples that miss them, cached by file hash.
+//! - [`cover`]: sample pack artwork found in the pack's folders.
+//! - [`labels`]: a static catalogue of popular sample labels by genre.
 //! - `ai` (feature `ai`): [`AiDetector`](ai::AiDetector), the `aitrack-ai` detector.
 
 #[cfg(feature = "ai")]
 pub mod ai;
 pub mod analyze;
+pub mod cover;
 pub mod db;
 pub mod error;
 pub mod hub;
 pub mod install;
+pub mod labels;
 pub mod organize;
 pub mod parse;
 pub mod query;
@@ -41,6 +45,7 @@ pub use analyze::{Analysis, Analyzer, AudioInfo, BasicAnalyzer, Source};
 pub use db::{Library, PackInfo, Preset, Root, RootId, RootKind, Sample, SampleId};
 pub use error::{LibraryError, Result};
 pub use hub::{BundledPack, HubEntry, Manifest};
+pub use labels::{Genre, LABELS, Label};
 pub use organize::{OrganizeJournal, OrganizeLayout, OrganizeMode, OrganizePlan};
 pub use parse::{KeyHint, NameHints, parse_name, parse_path};
 pub use query::{

@@ -1,9 +1,17 @@
 //! Content Hub packs in the palette: the bundled ones, the optional ones
 //! the app installs itself (download → unpack → index into the user
 //! library) and the link-only ones the user gets from the official page.
+//! Above them, popular sample labels by genre ([`aitrack_library::labels`]),
+//! each opening its official site (and its free-packs page, when it has one).
 
+use crate::icons::{Icon, icon};
+use crate::theme::*;
+use crate::widgets::{self, label};
+use crate::workspace::Workspace;
 use aitrack_library::hub::{HubKind, Manifest};
 use aitrack_library::install::{self, InstallEvent, InstallJob, Stage};
+use aitrack_library::labels::{self, Genre, Label};
+use gpui::{AnyElement, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -181,9 +189,119 @@ impl Packs {
     }
 }
 
+// ───────────────────────────── Labels ─────────────────────────────
+
+/// Labels for the genre filter and the typed query (name or genre).
+pub fn visible_labels(genre: Option<Genre>, query: &str) -> Vec<&'static Label> {
+    let q = query.trim();
+    labels::by_genre(genre)
+        .filter(|l| {
+            let genres: Vec<&str> = l.genres.iter().map(|g| g.label()).collect();
+            q.is_empty() || super::text_score(q, l.name, &genres).is_some()
+        })
+        .collect()
+}
+
+/// Whether the Packs tab draws the labels block (it sits above the rows).
+pub fn labels_shown(ws: &Workspace) -> bool {
+    ws.palette.tab == super::Tab::Packs && !visible_labels(ws.palette.label_genre, &ws.palette.query).is_empty()
+}
+
+fn label_chip(id: (&'static str, usize), text: &'static str, ic: Icon, color: gpui::Hsla) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(24.))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .cursor_pointer()
+        .hover(|s| s.bg(content(0.08)))
+        .child(icon(ic, 12., color))
+        .child(label(text, TEXT_SM, color))
+}
+
+/// Genre chips and the matching labels; each label opens its official site.
+pub fn labels_section(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    if !labels_shown(ws) {
+        return None;
+    }
+    let pal = p();
+    let current = ws.palette.label_genre;
+    let mut genres = div().flex().flex_wrap().items_center().gap(px(SP1)).child(super::chip("label-genre-all", "All genres", current.is_none()).on_click(cx.listener(|this, _, _, cx| {
+        this.palette.label_genre = None;
+        cx.notify();
+    })));
+    for (i, g) in labels::genres_in_use().into_iter().enumerate() {
+        genres = genres.child(super::chip(("label-genre", i), g.label(), current == Some(g)).on_click(cx.listener(move |this, _, _, cx| {
+            this.palette.label_genre = if this.palette.label_genre == Some(g) { None } else { Some(g) };
+            cx.notify();
+        })));
+    }
+    let mut list = div().flex().flex_wrap().items_center().gap(px(SP1));
+    for (i, l) in visible_labels(current, &ws.palette.query).into_iter().enumerate() {
+        let genres_text = l.genres.iter().map(|g| g.label()).collect::<Vec<_>>().join(" · ");
+        let url = l.url;
+        // One pill per label: the site, and its free-packs page beside it.
+        let mut pill = div().flex_none().flex().items_center().rounded(px(r_md())).bg(content(0.05)).overflow_hidden().child(
+            label_chip(("label-site", i), l.name, Icon::Globe, pal.text)
+                .tooltip(widgets::tip_owned(format!("{genres_text}\n{url}")))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.open_url(url);
+                })),
+        );
+        if let Some(free) = l.free_url {
+            pill = pill.child(div().w(px(1.)).h(px(12.)).bg(border())).child(
+                label_chip(("label-free", i), "Free packs", Icon::Link, pal.accent)
+                    .tooltip(widgets::tip_owned(format!("{}'s official free packs page\n{free}", l.name)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(free);
+                    })),
+            );
+        }
+        list = list.child(pill);
+    }
+    Some(
+        div()
+            .px(px(SP3))
+            .py(px(SP2))
+            .mb(px(SP1))
+            .flex()
+            .flex_col()
+            .gap(px(SP2))
+            .border_b_1()
+            .border_color(border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SP2))
+                    .child(label("Sample labels", TEXT_SM, pal.muted))
+                    .child(label("Official sites · opens in your browser", TEXT_XS, pal.faint)),
+            )
+            .child(genres)
+            .child(list)
+            .into_any_element(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_filter_by_genre_and_query() {
+        let all = visible_labels(None, "");
+        assert_eq!(all.len(), labels::LABELS.len());
+        assert!(visible_labels(Some(Genre::Techno), "").iter().all(|l| l.has(Genre::Techno)));
+        assert!(visible_labels(None, "riemann").iter().any(|l| l.name == "Riemann Kollektion"));
+        // A genre word matches labels listed under it.
+        assert!(visible_labels(None, "trap").iter().all(|l| l.has(Genre::Trap)));
+        assert!(visible_labels(None, "zzzz").is_empty());
+    }
 
     #[test]
     fn bundled_manifest_gives_every_kind() {

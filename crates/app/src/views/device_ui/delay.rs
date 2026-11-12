@@ -128,7 +128,21 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .gap(px(SP1))
                 .child(kit::pick(dev, p::MODE, cx))
                 .child(kit::pick(dev, p::SYNC, cx))
-                .child(kit::strip(dev, &[tl, tr, p::FEEDBACK, p::MIX, p::DUCK], &[p::LOW_CUT, p::HIGH_CUT, p::MOD_RATE, p::MOD_DEPTH, p::WIDTH, p::DRIVE, p::OUTPUT], cx)),
+                .child(kit::strip(
+                    ws,
+                    dev,
+                    &[tl, tr, p::FEEDBACK, p::MIX, p::DUCK],
+                    &[
+                        p::LOW_CUT,
+                        p::HIGH_CUT,
+                        p::MOD_RATE,
+                        p::MOD_DEPTH,
+                        p::WIDTH,
+                        p::DRIVE,
+                        p::OUTPUT,
+                    ],
+                    cx,
+                )),
         )
         .into_any_element()
 }

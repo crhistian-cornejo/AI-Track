@@ -108,7 +108,20 @@ pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Worksp
         .gap(px(SP1))
         .child(div().flex().items_center().gap(px(SP2)).child(caption(format!("PAD {}", selected + 1))).child(div().flex_1()).child(kit::pick(dev, id(p::CHOKE), cx)).child(kit::pick(dev, id(p::GATE), cx)))
         .child(div().flex_1().min_h(px(0.)).child(pad_plot))
-        .child(kit::strip(dev, &[id(p::TUNE), id(p::FINE), id(p::DECAY), id(p::CUTOFF), id(p::PAN), id(p::LEVEL)], &[], cx));
+        .child(kit::strip(
+            ws,
+            dev,
+            &[
+                id(p::TUNE),
+                id(p::FINE),
+                id(p::DECAY),
+                id(p::CUTOFF),
+                id(p::PAN),
+                id(p::LEVEL),
+            ],
+            &[],
+            cx,
+        ));
     let voices = dev.m(0);
     let global = div()
         .flex_none()
@@ -118,8 +131,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Worksp
         .flex_col()
         .gap(px(SP1))
         .child(caption("KIT"))
-        .child(kit::num(dev, p::VOLUME, cx))
-        .child(kit::num(dev, p::VEL_SENS, cx))
+        .child(kit::num(ws, dev, p::VOLUME, cx))
+        .child(kit::num(ws, dev, p::VEL_SENS, cx))
         .child(kit::pick(dev, p::VEL_CURVE, cx))
         .child(div().flex_1())
         .child(mono(format!("{voices:.0} voices"), TEXT_XS, pal.faint));

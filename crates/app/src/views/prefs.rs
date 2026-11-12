@@ -7,7 +7,10 @@ use crate::bridge::{AudioConfig, AudioHost, BUFFER_SIZES, SAMPLE_RATES};
 use crate::icons::{Icon, icon};
 use crate::motion;
 use crate::theme::{self, *};
-use crate::widgets::{self, OnSelect, checkbox, form_row, label, mono, section_title, stepper, stepper_el, switch, text_button};
+use crate::widgets::{
+    self, OnSelect, checkbox, label, mono, section_title, setting_block, setting_row, stepper,
+    stepper_el, switch, text_button,
+};
 use crate::workspace::{Drag, Workspace};
 use gpui::{
     AnyElement, Bounds, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
@@ -339,7 +342,7 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .gap(px(SP2))
         .child(section_title("CONTENT HUB"))
         .child(para("Free packs: the bundled ones, optional ones AI-Track downloads and indexes for you, and links to packs and plugins you get from their official pages. Also in the search palette (⌘K → Packs).", pal.muted))
-        .child(form_row(
+        .child(setting_row(
             "Packs",
             None,
             text_button("open-hub", "Open Content Hub", Some(Icon::Package), false).on_click(cx.listener(|this, _, _, cx| this.open_modal(Modal::ContentHub, cx))),
@@ -357,7 +360,7 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     pal.muted,
                 )),
         )
-        .child(form_row(
+        .child(setting_row(
             "Search Splice",
             Some("Adds a Splice section to the palette".into()),
             switch("splice-on", on).on_click(cx.listener(|this, _, _, cx| {
@@ -371,15 +374,13 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         ));
     if on {
         col = col
-            .child(form_row(
+            .child(setting_row(
                 "Splice folder",
-                Some("Where Splice saves your sounds".into()),
+                Some(crate::paint::fit(&folder, 300., TEXT_XS).into()),
                 div()
-                    .flex_1()
                     .flex()
                     .items_center()
                     .gap(px(SP2))
-                    .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&folder, 260., TEXT_SM), TEXT_SM, pal.muted)))
                     .child(text_button("splice-folder", "Folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
                         let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Splice folder".into()) });
                         cx.spawn(async move |this, cx| {
@@ -398,7 +399,7 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     })))
                     .child(text_button("splice-index", "Index now", Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| index_splice_folder(this, cx)))),
             ))
-            .child(form_row(
+            .child(setting_row(
                 "Account",
                 Some(match signed {
                     Some(true) => "Signed in".into(),
@@ -432,7 +433,12 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 fn chip_row(id: &'static str, items: Vec<(String, bool, bool)>, cx: &mut Context<Workspace>, on: impl Fn(&mut Workspace, usize, &mut Context<Workspace>) + 'static) -> Div {
     let pal = p();
     let on = Rc::new(on);
-    let mut row = div().flex().flex_wrap().gap(px(SP1));
+    let mut row = div()
+        .max_w(px(480.))
+        .flex()
+        .flex_wrap()
+        .justify_end()
+        .gap(px(SP1));
     for (i, (text, selected, enabled)) in items.into_iter().enumerate() {
         let on = on.clone();
         row = row.child(
@@ -536,27 +542,27 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .flex()
         .flex_col()
         .child(section_title("DRIVER"))
-        .child(form_row("Audio driver", Some("Host API used to talk to the device".into()), chip_row("host", host_items, cx, move |this, i, cx| {
+        .child(setting_row("Audio driver", Some("Host API used to talk to the device".into()), chip_row("host", host_items, cx, move |this, i, cx| {
             let c = AudioConfig { host: hosts_all[i], input: None, output: None, ..this.b.engine.audio_config() };
             apply_audio(this, c, cx);
         })))
         .child(section_title("DEVICES"))
-        .child(form_row("Output", None, device_list("out-dev", devices.iter().filter(|d| d.output_channels > 0).map(|d| (d.id.clone(), d.name.clone())).collect(), cfg.output.clone(), cx, true)))
-        .child(form_row("Input", None, device_list("in-dev", devices.iter().filter(|d| d.input_channels > 0).map(|d| (d.id.clone(), d.name.clone())).collect(), cfg.input.clone(), cx, false)))
+        .child(setting_block("Output", None, device_list("out-dev", devices.iter().filter(|d| d.output_channels > 0).map(|d| (d.id.clone(), d.name.clone())).collect(), cfg.output.clone(), cx, true)))
+        .child(setting_block("Input", None, device_list("in-dev", devices.iter().filter(|d| d.input_channels > 0).map(|d| (d.id.clone(), d.name.clone())).collect(), cfg.input.clone(), cx, false)))
         .child(section_title("FORMAT"))
-        .child(form_row("Sample rate", Some("Only rates the output device supports".into()), chip_row("rate", rate_items, cx, |this, i, cx| {
+        .child(setting_row("Sample rate", Some("Only rates the output device supports".into()), chip_row("rate", rate_items, cx, |this, i, cx| {
             let c = AudioConfig { sample_rate: SAMPLE_RATES[i], ..this.b.engine.audio_config() };
             apply_audio(this, c, cx);
         })))
-        .child(form_row("Buffer size", Some(format!("{one_way:.1} ms buffer · ≈ {:.1} ms round trip", one_way * 2.).into()), chip_row("buffer", buf_items, cx, |this, i, cx| {
+        .child(setting_row("Buffer size", Some(format!("{one_way:.1} ms buffer · ≈ {:.1} ms round trip", one_way * 2.).into()), chip_row("buffer", buf_items, cx, |this, i, cx| {
             let c = AudioConfig { buffer_size: BUFFER_SIZES[i], ..this.b.engine.audio_config() };
             apply_audio(this, c, cx);
         })))
         .child(section_title("CHANNELS"))
-        .child(form_row("Output channels", out_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("out-ch", out_dev.as_ref().map_or(2, |d| d.output_channels), &cfg.output_channels, true, cx)))
-        .child(form_row("Input channels", in_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("in-ch", in_dev.as_ref().map_or(0, |d| d.input_channels), &cfg.input_channels, false, cx)))
+        .child(setting_row("Output channels", out_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("out-ch", out_dev.as_ref().map_or(2, |d| d.output_channels), &cfg.output_channels, true, cx)))
+        .child(setting_row("Input channels", in_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("in-ch", in_dev.as_ref().map_or(0, |d| d.input_channels), &cfg.input_channels, false, cx)))
         .child(section_title("TEST"))
-        .child(form_row(
+        .child(setting_row(
             "Test tone",
             Some("440 Hz on the selected outputs".into()),
             text_button("test-tone", "Play test tone", Some(Icon::Volume), false).on_click(cx.listener(|this, _, _, cx| {
@@ -565,7 +571,7 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             })),
         ))
         .child(section_title("PLUGINS"))
-        .child(form_row(
+        .child(setting_row(
             "Sandbox",
             Some("Run VST3/CLAP plugins in a separate process (applies to plugins loaded from now on)".into()),
             switch("sandbox", ws.b.engine.sandbox_plugins()).on_click(cx.listener(|this, _, _, cx| {
@@ -574,7 +580,7 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 cx.notify();
             })),
         ))
-        .child(form_row("Plugin folders", Some(scan.message.clone().into()), {
+        .child(setting_row("Plugin folders", Some(scan.message.clone().into()), {
             let mut row = div().flex().items_center().gap(px(SP2));
             if scan.running {
                 row = row.child(widgets::hbar(scan.fraction, 160., 6., pal.accent));
@@ -771,7 +777,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         let active = if a.follow_system { t.name == a.dark_theme || t.name == a.light_theme } else { t.name == active_name };
         cards = cards.child(theme_card(t, active, i, cx));
     }
-    let follow = form_row(
+    let follow = setting_row(
         "Follow system",
         Some(format!("Dark: {} · Light: {}", a.dark_theme, a.light_theme).into()),
         switch("follow-system", a.follow_system).on_click(cx.listener(|this, _, _, cx| this.set_look(true, cx, |a| a.follow_system = !a.follow_system))),
@@ -838,7 +844,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
 
     // ── Colour ──
     let accent_now = p().accent;
-    let accent_row = form_row(
+    let accent_row = setting_row(
         "Accent colour",
         Some(if a.accent.is_some() { "Custom".into() } else { "From the theme".into() }),
         div()
@@ -911,7 +917,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         })
         .detach();
     }));
-    let mut bg_rows = div().flex().flex_col().child(form_row(
+    let mut bg_rows = div().flex().flex_col().child(setting_row(
         "Image",
         bg.as_ref().map(|b| crate::paint::fit(&b.path.display().to_string(), 300., TEXT_XS).into()),
         div().flex().gap(px(SP2)).child(choose).when(bg.is_some(), |d| {
@@ -920,10 +926,48 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
     ));
     if let Some(b) = bg.clone() {
         bg_rows = bg_rows
-            .child(form_row("Fit", None, seg("bg-fit", &[(BgFit::Cover, "Cover"), (BgFit::Contain, "Contain"), (BgFit::Tile, "Tile")], b.fit, 80., cx, |a, v| bg_mut(a).fit = v)))
-            .child(form_row("Blur", Some("Pre-blurred once, cached".into()), look_stepper("bg-blur", format!("{:.0} px", b.blur), cx, |a, d| bg_mut(a).blur = (bg_mut(a).blur + d * 4.).clamp(0., 40.))))
-            .child(form_row("Dim", None, look_stepper("bg-dim", format!("{:.0}%", b.dim * 100.), cx, |a, d| bg_mut(a).dim = (bg_mut(a).dim + d * 0.1).clamp(0., 0.9))))
-            .child(form_row("Glass opacity", Some("How solid translucent panes are".into()), look_stepper("bg-glass", format!("{:.0}%", b.glass_opacity * 100.), cx, |a, d| bg_mut(a).glass_opacity = (bg_mut(a).glass_opacity + d * 0.1).clamp(0.3, 1.))));
+            .child(setting_row(
+                "Fit",
+                None,
+                seg(
+                    "bg-fit",
+                    &[
+                        (BgFit::Cover, "Cover"),
+                        (BgFit::Contain, "Contain"),
+                        (BgFit::Tile, "Tile"),
+                    ],
+                    b.fit,
+                    80.,
+                    cx,
+                    |a, v| bg_mut(a).fit = v,
+                ),
+            ))
+            .child(setting_row(
+                "Blur",
+                Some("Pre-blurred once, cached".into()),
+                look_stepper("bg-blur", format!("{:.0} px", b.blur), cx, |a, d| {
+                    bg_mut(a).blur = (bg_mut(a).blur + d * 4.).clamp(0., 40.)
+                }),
+            ))
+            .child(setting_row(
+                "Dim",
+                None,
+                look_stepper("bg-dim", format!("{:.0}%", b.dim * 100.), cx, |a, d| {
+                    bg_mut(a).dim = (bg_mut(a).dim + d * 0.1).clamp(0., 0.9)
+                }),
+            ))
+            .child(setting_row(
+                "Glass opacity",
+                Some("How solid translucent panes are".into()),
+                look_stepper(
+                    "bg-glass",
+                    format!("{:.0}%", b.glass_opacity * 100.),
+                    cx,
+                    |a, d| {
+                        bg_mut(a).glass_opacity = (bg_mut(a).glass_opacity + d * 0.1).clamp(0.3, 1.)
+                    },
+                ),
+            ));
         let mut panes = div().flex().flex_wrap().gap(px(SP1));
         for (i, pane) in Pane::ALL.iter().copied().enumerate() {
             let on = b.glass.contains(&pane);
@@ -938,7 +982,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
                 })
             })));
         }
-        bg_rows = bg_rows.child(form_row("Translucent panes", None, panes));
+        bg_rows = bg_rows.child(setting_block("Translucent panes", None, panes));
     }
 
     div()
@@ -948,11 +992,15 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         .child(cards)
         .child(div().h(px(SP2)))
         .child(follow)
-        .child(form_row("Theme files", Some(".aitheme in the config folder · reloads on change".into()), file_actions))
+        .child(setting_row(
+            "Theme files",
+            Some(".aitheme in the config folder · reloads on change".into()),
+            file_actions,
+        ))
         .child(section_title("COLOUR"))
         .child(accent_row)
         .when(picker_for_accent, |d| d.children(picker))
-        .child(form_row(
+        .child(setting_row(
             "Token overrides",
             Some(format!("{} overridden", a.overrides.len()).into()),
             div()
@@ -970,15 +1018,90 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         .child(section_title("BACKGROUND"))
         .child(bg_rows)
         .child(section_title("LAYOUT & TYPE"))
-        .child(form_row("UI scale", Some("80–150 %".into()), look_stepper("ui-scale", format!("{:.0}%", a.ui_scale * 100.), cx, |a, d| a.ui_scale = ((a.ui_scale + d * 0.1) * 10.).round().clamp(8., 15.) / 10.)))
-        .child(form_row("Density", None, seg("density", &[(Density::Compact, "Compact"), (Density::Comfortable, "Comfortable")], a.density, 104., cx, |a, v| a.density = v)))
-        .child(form_row("Corner radius", None, look_stepper("radius", format!("{:.0}%", a.radius * 100.), cx, |a, d| a.radius = (a.radius + d * 0.25).clamp(0., 2.))))
-        .child(form_row("Font size", None, look_stepper("font-size", format!("{:.0} px", a.font_size), cx, |a, d| a.font_size = (a.font_size + d).clamp(10., 16.))))
+        .child(setting_row(
+            "UI scale",
+            Some("80–150 %".into()),
+            look_stepper(
+                "ui-scale",
+                format!("{:.0}%", a.ui_scale * 100.),
+                cx,
+                |a, d| a.ui_scale = ((a.ui_scale + d * 0.1) * 10.).round().clamp(8., 15.) / 10.,
+            ),
+        ))
+        .child(setting_row(
+            "Density",
+            None,
+            seg(
+                "density",
+                &[
+                    (Density::Compact, "Compact"),
+                    (Density::Comfortable, "Comfortable"),
+                ],
+                a.density,
+                120.,
+                cx,
+                |a, v| a.density = v,
+            ),
+        ))
+        .child(setting_row(
+            "Corner radius",
+            None,
+            look_stepper("radius", format!("{:.0}%", a.radius * 100.), cx, |a, d| {
+                a.radius = (a.radius + d * 0.25).clamp(0., 2.)
+            }),
+        ))
+        .child(setting_row(
+            "Font size",
+            None,
+            look_stepper("font-size", format!("{:.0} px", a.font_size), cx, |a, d| {
+                a.font_size = (a.font_size + d).clamp(10., 16.)
+            }),
+        ))
         .child(section_title("DISPLAY STYLES"))
-        .child(form_row("Waveforms", None, seg("wave", &[(WaveformStyle::Filled, "Filled"), (WaveformStyle::Outline, "Outline")], a.waveform, 88., cx, |a, v| a.waveform = v)))
-        .child(form_row("Meters", None, seg("meter", &[(MeterStyle::Zones, "Zones"), (MeterStyle::Segmented, "LED"), (MeterStyle::Solid, "Solid")], a.meter, 80., cx, |a, v| a.meter = v)))
-        .child(form_row("Knobs", None, seg("knob", &[(KnobStyle::Arc, "Arc"), (KnobStyle::Minimal, "Minimal")], a.knob, 88., cx, |a, v| a.knob = v)))
-        .child(form_row(
+        .child(setting_row(
+            "Waveforms",
+            None,
+            seg(
+                "wave",
+                &[
+                    (WaveformStyle::Filled, "Filled"),
+                    (WaveformStyle::Outline, "Outline"),
+                ],
+                a.waveform,
+                120.,
+                cx,
+                |a, v| a.waveform = v,
+            ),
+        ))
+        .child(setting_row(
+            "Meters",
+            None,
+            seg(
+                "meter",
+                &[
+                    (MeterStyle::Zones, "Zones"),
+                    (MeterStyle::Segmented, "LED"),
+                    (MeterStyle::Solid, "Solid"),
+                ],
+                a.meter,
+                80.,
+                cx,
+                |a, v| a.meter = v,
+            ),
+        ))
+        .child(setting_row(
+            "Knobs",
+            None,
+            seg(
+                "knob",
+                &[(KnobStyle::Arc, "Arc"), (KnobStyle::Minimal, "Minimal")],
+                a.knob,
+                120.,
+                cx,
+                |a, v| a.knob = v,
+            ),
+        ))
+        .child(setting_row(
             "Reduce motion",
             Some("Panels and fades jump straight to their end".into()),
             switch("reduce-motion", a.reduced_motion).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.reduced_motion = !a.reduced_motion))),

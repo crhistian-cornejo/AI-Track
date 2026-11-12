@@ -36,7 +36,7 @@ pub use audio_io::{ActiveAudio, AudioConfig, AudioDeviceInfo, ChannelSelection, 
 pub use compile::{compile, CompileContext, CompileError};
 pub use engine::{Engine, EngineConfig, EngineHandle};
 pub use export::{
-    export_mp3, export_stems, export_wav, render, render_offline, render_offline_with, write_wav, Dither, Progress, RenderOptions,
+    consolidate_to_wav, export_mp3, export_stems, export_wav, render, render_clips, render_offline, render_offline_with, write_wav, Dither, Progress, RenderOptions,
     RenderRange, Rendered, WavFormat,
 };
 pub use factory::{FactoryStack, NullFactory, ProcessorFactory};

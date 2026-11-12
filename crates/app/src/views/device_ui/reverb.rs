@@ -132,6 +132,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .child(kit::pick(dev, p::MODE, cx))
                 .child(kit::pick(dev, p::FREEZE, cx))
                 .child(kit::strip(
+                    ws,
                     dev,
                     &[p::DECAY, p::PREDELAY, p::SIZE, p::DAMPING, p::MIX],
                     &[p::BASS_MULT, p::BASS_FREQ, p::DAMP_FREQ, p::DIFFUSION, p::MOD_DEPTH, p::MOD_RATE, p::EARLY, p::WIDTH, p::LOW_CUT, p::HIGH_CUT, p::OUTPUT, p::LINES],

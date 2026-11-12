@@ -291,8 +291,10 @@ fn audition(ws: &mut Workspace, cx: &mut Context<Workspace>) {
         cx.notify();
         return;
     }
-    ws.b.engine.preview(Some(&f.source.path));
-    let seconds = if f.source.frames > 0 { f.source.frames as f64 / f64::from(f.source.sample_rate.max(1)) } else { 4. };
+    // As the clip sounds: transposed, detuned, reversed.
+    let ratio = f.source.warp.pitch_ratio();
+    ws.b.engine.preview_pitched(Some(&f.source.path), ratio, f.source.warp.reverse);
+    let seconds = if f.source.frames > 0 { f.source.frames as f64 / f64::from(f.source.sample_rate.max(1)) / ratio } else { 4. };
     let length = Duration::from_secs_f64(seconds.clamp(0.2, 600.));
     ws.sample.audition = Some(Instant::now() + length);
     // The button goes back to rest when the file has played through.
@@ -738,6 +740,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         picked: ws.sample.picked,
         readout: ws.sample.drag.as_ref().and_then(|d| d.readout.clone()),
         color: track_color(c.color),
+        reverse: f.source.warp.reverse,
     };
     let region = ws.sample.region.clone();
     let surface = canvas(move |b, _, _| region.set(b), move |b, _, window, cx| draw::paint(&scene, b, window, cx)).size_full();

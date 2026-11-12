@@ -80,6 +80,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Worksp
                 .child(kit::pick(dev, p::MODE, cx))
                 .child(kit::pick(dev, p::FILTER_TYPE, cx))
                 .child(kit::strip(
+                    ws,
                     dev,
                     &[p::ROOT_KEY, p::TRANSPOSE, p::FINE, p::CUTOFF, p::RESONANCE, p::VOLUME],
                     &[p::FILTER_ENV, p::KEY_TRACK, p::CROSSFADE, p::VEL_SENS, p::PAN, p::GLIDE, p::POLYPHONY, p::BEND_RANGE],

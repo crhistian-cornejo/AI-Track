@@ -48,6 +48,9 @@ pub struct AudioInfo {
     pub peak_db: Option<f32>,
     /// RMS level in dBFS over the whole file.
     pub rms_db: Option<f32>,
+    /// Attacks heard in the file (see [`OnsetCounter`]); `None` when the
+    /// audio was not decoded (a re-tag from stored rows).
+    pub onsets: Option<u32>,
 }
 
 /// The result of analysing one file.
@@ -90,7 +93,9 @@ pub trait Analyzer: Send + Sync {
 pub struct BasicAnalyzer;
 
 impl BasicAnalyzer {
-    pub const VERSION: u32 = 2;
+    /// 3: whole-word genres, no pack-wide genres per sample, onset-aware
+    /// loop/one-shot classification.
+    pub const VERSION: u32 = 3;
 }
 
 impl Analyzer for BasicAnalyzer {
@@ -123,24 +128,13 @@ pub fn analysis_from_hints(audio: AudioInfo, hints: &NameHints) -> Analysis {
     };
     let dur = audio.duration_s;
 
-    a.kind = match hints.kind {
-        Some(k) => k,
-        None => {
-            // A file whose length is a whole number of beats at its BPM, at
-            // least one bar long, is a loop.
-            match hints.bpm {
-                Some(bpm) if dur > 0.0 => {
-                    let beats = dur * bpm as f64 / 60.0;
-                    if beats >= 3.8 && (beats - beats.round()).abs() < 0.06 {
-                        SampleKind::Loop
-                    } else {
-                        SampleKind::OneShot
-                    }
-                }
-                _ => SampleKind::OneShot,
-            }
-        }
-    };
+    let (kind, guessed_bpm) = classify_kind(hints, dur, audio.onsets);
+    a.kind = kind;
+    if a.bpm.is_none()
+        && let Some(b) = guessed_bpm
+    {
+        a.bpm = Some(b);
+    }
 
     // Loops without a BPM in the name: assume 4/4 and 1, 2, 4, 8 or 16 bars,
     // pick the tempo closest to 120 within 70..180.
@@ -156,6 +150,124 @@ pub fn analysis_from_hints(audio: AudioInfo, hints: &NameHints) -> Analysis {
     }
     a.audio = audio;
     a
+}
+
+/// Fewer beats than this are not a loop, whatever the name's tempo says.
+const MIN_LOOP_BEATS: f64 = 3.8;
+/// Shorter files are never called loops by the audio analysis alone.
+const MIN_ANALYSED_LOOP_S: f64 = 2.0;
+/// Attacks a drum file needs before the audio analysis calls it a loop.
+const MIN_LOOP_ONSETS: u32 = 4;
+
+/// Single drum hits and FX gestures: a one-shot unless the name says loop
+/// or gives a tempo the length matches.
+fn is_hit_like(hints: &NameHints) -> bool {
+    matches!(
+        (hints.category, hints.subcategory),
+        (Some(Category::Drums), Some("Kicks" | "Snares" | "Claps" | "Hats" | "Cymbals" | "808s"))
+            | (Some(Category::Fx), Some("Impacts" | "Risers" | "Sweeps"))
+    )
+}
+
+/// Whether `dur` holds a whole number of beats at `bpm` (at least about a
+/// bar). With `bars_only` the count must also be a whole number of 4/4 bars,
+/// which is what an untrusted number in a name has to satisfy.
+fn fits_tempo(dur: f64, bpm: f32, bars_only: bool) -> bool {
+    if dur <= 0.0 || bpm <= 0.0 {
+        return false;
+    }
+    let beats = dur * bpm as f64 / 60.0;
+    if beats < MIN_LOOP_BEATS {
+        return false;
+    }
+    // Trimmed or padded exports drift a little: allow 1.5 % or 0.06 beats.
+    let tol = (beats * 0.015).max(0.06);
+    let unit = if bars_only { 4.0 } else { 1.0 };
+    let n = (beats / unit).round() * unit;
+    n > 0.0 && (beats - n).abs() <= tol
+}
+
+/// One-shot or loop, in a fixed order of trust:
+///
+/// 1. **The name says so**: `loop`/`lp`, `one shot`/`os`/`hit`, `chop`, in
+///    the file name or (failing that) its nearest folder.
+/// 2. **A tempo in the name** (`128bpm`) and a length that is a whole number
+///    of beats at it, at least a bar: a loop.
+/// 3. **Structure**: a drum hit (kick, snare, hat…), an FX gesture (impact,
+///    riser) or a multisample note (`a0`, `C4v8`) is a one-shot.
+/// 4. **A bare number** in the name (`Perc_128`) that the length matches as
+///    whole bars: a loop at that tempo.
+/// 5. **Audio**: a drum file without a specific piece, or one whose name
+///    hints at a loop (`beat`, `riff`), at least two seconds long with
+///    several attacks: a loop.
+///
+/// Everything else is a one-shot. Returns the kind and, for case 4, the
+/// tempo that the name's number turned out to be.
+pub fn classify_kind(hints: &NameHints, dur: f64, onsets: Option<u32>) -> (SampleKind, Option<f32>) {
+    if let Some(k) = hints.kind {
+        return (k, None);
+    }
+    if let Some(bpm) = hints.bpm {
+        return (if fits_tempo(dur, bpm, false) { SampleKind::Loop } else { SampleKind::OneShot }, None);
+    }
+    if is_hit_like(hints) || hints.root_note.is_some() {
+        return (SampleKind::OneShot, None);
+    }
+    if let Some(bpm) = hints.bpm_guess
+        && fits_tempo(dur, bpm, true)
+    {
+        return (SampleKind::Loop, Some(bpm));
+    }
+    let drum_bed = hints.category == Some(Category::Drums) && hints.subcategory.is_none();
+    let rhythmic = onsets.is_some_and(|n| n >= MIN_LOOP_ONSETS);
+    if (drum_bed || hints.loop_hint) && rhythmic && dur >= MIN_ANALYSED_LOOP_S {
+        return (SampleKind::Loop, None);
+    }
+    (SampleKind::OneShot, None)
+}
+
+/// Counts attacks while a file is decoded, without allocating: the signal is
+/// cut into 10 ms frames and an onset is a frame at least 9 dB louder than the
+/// loudest of the previous three, above -45 dBFS, at least 70 ms after the
+/// previous onset. Crude, but enough to tell one hit from a groove.
+#[derive(Clone, Debug)]
+pub struct OnsetCounter {
+    hop: u64,
+    filled: u64,
+    acc: f64,
+    prev: [f64; 3],
+    since_last: u64,
+    refractory: u64,
+    pub count: u32,
+}
+
+impl OnsetCounter {
+    const RISE: f64 = 7.94; // +9 dB in power
+    const FLOOR: f64 = 3.16e-5; // -45 dBFS in power
+
+    pub fn new(sample_rate: u32) -> Self {
+        let hop = (sample_rate as u64 / 100).max(1);
+        Self { hop, filled: 0, acc: 0.0, prev: [0.0; 3], since_last: u64::MAX / 2, refractory: 7, count: 0 }
+    }
+
+    /// Feeds one frame (mono mix of its channels).
+    pub fn push(&mut self, v: f64) {
+        self.acc += v * v;
+        self.filled += 1;
+        if self.filled < self.hop {
+            return;
+        }
+        let e = self.acc / self.hop as f64;
+        self.acc = 0.0;
+        self.filled = 0;
+        let before = self.prev.iter().copied().fold(0.0, f64::max);
+        self.since_last = self.since_last.saturating_add(1);
+        if e > Self::FLOOR && e > before.max(Self::FLOOR / 4.0) * Self::RISE && self.since_last >= self.refractory {
+            self.count += 1;
+            self.since_last = 0;
+        }
+        self.prev = [self.prev[1], self.prev[2], e];
+    }
 }
 
 /// Tempo of a 4/4 loop from its length alone.
@@ -188,15 +300,26 @@ pub fn read_audio_info(path: &Path) -> Result<AudioInfo> {
 fn read_wav(path: &Path) -> Result<AudioInfo> {
     let mut r = hound::WavReader::open(path).map_err(|e| LibraryError::Audio(e.to_string()))?;
     let spec = r.spec();
+    let ch = spec.channels.max(1);
     let mut peak = 0f64;
     let mut sum_sq = 0f64;
     let mut n = 0u64;
+    let mut onsets = OnsetCounter::new(spec.sample_rate);
+    let mut mix = 0f64;
+    let mut feed = |v: f64, n: u64| {
+        mix += v;
+        if (n + 1).is_multiple_of(ch as u64) {
+            onsets.push(mix / ch as f64);
+            mix = 0.0;
+        }
+    };
     match spec.sample_format {
         hound::SampleFormat::Float => {
             for s in r.samples::<f32>() {
                 let v = s.map_err(|e| LibraryError::Audio(e.to_string()))? as f64;
                 peak = peak.max(v.abs());
                 sum_sq += v * v;
+                feed(v, n);
                 n += 1;
             }
         }
@@ -206,11 +329,11 @@ fn read_wav(path: &Path) -> Result<AudioInfo> {
                 let v = s.map_err(|e| LibraryError::Audio(e.to_string()))? as f64 * scale;
                 peak = peak.max(v.abs());
                 sum_sq += v * v;
+                feed(v, n);
                 n += 1;
             }
         }
     }
-    let ch = spec.channels.max(1);
     let frames = n / ch as u64;
     Ok(AudioInfo {
         duration_s: frames as f64 / spec.sample_rate.max(1) as f64,
@@ -219,6 +342,7 @@ fn read_wav(path: &Path) -> Result<AudioInfo> {
         frames,
         peak_db: to_db(peak),
         rms_db: (n > 0).then(|| to_db((sum_sq / n as f64).sqrt())).flatten(),
+        onsets: Some(onsets.count),
     })
 }
 
@@ -260,6 +384,7 @@ fn read_symphonia(path: &Path) -> Result<AudioInfo> {
     let mut n = 0u64;
     let mut frames = 0u64;
     let mut buf: Option<SampleBuffer<f32>> = None;
+    let mut onsets: Option<OnsetCounter> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -285,11 +410,18 @@ fn read_symphonia(path: &Path) -> Result<AudioInfo> {
             _ => buf.insert(SampleBuffer::<f32>::new(needed, spec)),
         };
         sb.copy_interleaved_ref(decoded);
-        for &s in sb.samples() {
-            let v = s as f64;
-            peak = peak.max(v.abs());
-            sum_sq += v * v;
-            n += 1;
+        let oc = onsets.get_or_insert_with(|| OnsetCounter::new(spec.rate));
+        let ch = (channels as usize).max(1);
+        for frame in sb.samples().chunks(ch) {
+            let mut mix = 0f64;
+            for &s in frame {
+                let v = s as f64;
+                peak = peak.max(v.abs());
+                sum_sq += v * v;
+                mix += v;
+                n += 1;
+            }
+            oc.push(mix / ch as f64);
         }
     }
     if frames == 0 {
@@ -305,6 +437,7 @@ fn read_symphonia(path: &Path) -> Result<AudioInfo> {
         frames,
         peak_db: to_db(peak),
         rms_db: (n > 0).then(|| to_db((sum_sq / n as f64).sqrt())).flatten(),
+        onsets: Some(onsets.map_or(0, |o| o.count)),
     })
 }
 
@@ -313,6 +446,7 @@ mod tests {
     use super::*;
     use crate::parse::parse_path;
     use crate::test_util::write_wav;
+    use std::path::Path;
 
     #[test]
     fn wav_metadata_and_loop_detection() {
@@ -345,6 +479,61 @@ mod tests {
         let a3 = BasicAnalyzer.analyze(&p3, &parse_path(&p3, None)).unwrap();
         assert_eq!(a3.kind, SampleKind::OneShot);
         assert_eq!(a3.category, Some(Category::Drums));
+    }
+
+    fn kind_of(name: &str, dur: f64, onsets: Option<u32>) -> (SampleKind, Option<f32>) {
+        let a = analysis_from_hints(AudioInfo { duration_s: dur, onsets, ..Default::default() }, &parse_path(Path::new(name), None));
+        (a.kind, a.bpm)
+    }
+
+    #[test]
+    fn loop_or_one_shot_in_order_of_trust() {
+        use SampleKind::{Loop, OneShot};
+        // 1. The name says so, whatever the length.
+        assert_eq!(kind_of("Synth_Am_128bpm_loop.wav", 8.0, Some(1)).0, Loop);
+        assert_eq!(kind_of("Kick One Shot 128bpm.wav", 7.5, Some(9)).0, OneShot);
+        assert_eq!(kind_of("Loops/Snare Hit.wav", 0.3, Some(1)).0, OneShot);
+        // 2. A tempo in the name and a length of whole beats at it.
+        assert_eq!(kind_of("Hats_128bpm.wav", 7.5, None), (Loop, Some(128.0)));
+        assert_eq!(kind_of("Top_128bpm.wav", 7.47, None).0, Loop, "a trimmed export still fits");
+        assert_eq!(kind_of("Kick_128bpm.wav", 0.3, None).0, OneShot);
+        // 3. Drum hits and multisample notes are one-shots, however many attacks.
+        assert_eq!(kind_of("Kick 1.wav", 0.4, Some(1)).0, OneShot);
+        assert_eq!(kind_of("Snare_120.wav", 4.0, Some(8)).0, OneShot);
+        assert_eq!(kind_of("Crash 2.wav", 6.7, Some(1)).0, OneShot);
+        assert_eq!(kind_of("Samples/bass_8_e2.wav", 1.99, Some(1)), (OneShot, None));
+        assert_eq!(kind_of("Samples/blackheart/A1.wav", 4.5, Some(5)).0, OneShot);
+        // 4. A bare number that the length matches as whole bars.
+        assert_eq!(kind_of("Perc_128.wav", 7.5, None), (Loop, Some(128.0)));
+        assert_eq!(kind_of("Perc_128.wav", 2.2, None).0, OneShot);
+        // 5. Audio: a drum bed or a "beat" with several attacks.
+        let (k, bpm) = kind_of("arovane_beat_a.flac", 14.77, Some(32));
+        assert_eq!(k, Loop);
+        assert!(bpm.is_some());
+        assert_eq!(kind_of("arovane_beat_a.flac", 14.77, Some(1)).0, OneShot);
+        assert_eq!(kind_of("drum_roll.flac", 6.2, Some(30)).0, OneShot, "a roll is one gesture");
+        // Sustained tonal material is never a loop by length alone.
+        assert_eq!(kind_of("Pad_Warm.wav", 8.0, Some(1)).0, OneShot);
+        assert_eq!(kind_of("a0_oscillator_tuned.wav", 1.93, Some(1)).0, OneShot);
+        assert_eq!(kind_of("Untitled 3.wav", 8.0, Some(20)).0, OneShot);
+    }
+
+    #[test]
+    fn onsets_are_counted_while_decoding() {
+        use crate::test_util::write_clicks;
+        let dir = tempfile::tempdir().unwrap();
+        let clicks = dir.path().join("Drum Beat.wav");
+        write_clicks(&clicks, 44_100, 120.0, 16);
+        let a = BasicAnalyzer.analyze(&clicks, &parse_path(&clicks, Some(dir.path()))).unwrap();
+        assert_eq!(a.audio.onsets, Some(16));
+        assert_eq!(a.kind, SampleKind::Loop);
+        assert_eq!(a.bpm, Some(120.0));
+
+        let tone = dir.path().join("Pad Sine.wav");
+        write_wav(&tone, 44_100, 2, 3.0, 0.5);
+        let a = BasicAnalyzer.analyze(&tone, &parse_path(&tone, Some(dir.path()))).unwrap();
+        assert_eq!(a.audio.onsets, Some(1));
+        assert_eq!(a.kind, SampleKind::OneShot);
     }
 
     #[test]

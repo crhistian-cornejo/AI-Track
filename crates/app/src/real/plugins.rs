@@ -48,6 +48,8 @@ fn category_for(id: &str, category: Category) -> DeviceCategory {
         "fx.eq" => DeviceCategory::Eq,
         "fx.compressor" | "fx.limiter" | "fx.gate" | "fx.transient" => DeviceCategory::Dynamics,
         "fx.saturator" => DeviceCategory::Distortion,
+        "fx.clipper" => DeviceCategory::Distortion,
+        "fx.multiband" | "fx.midside" => DeviceCategory::Utility,
         "fx.reverb" | "fx.delay" => DeviceCategory::Space,
         "fx.filter" => DeviceCategory::Filter,
         "fx.chorus" => DeviceCategory::Modulation,

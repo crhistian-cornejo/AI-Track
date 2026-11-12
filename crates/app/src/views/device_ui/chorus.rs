@@ -87,7 +87,17 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     primary.extend(voicing);
     kit::panel(if dev.big { 600. } else { 420. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
-        .child(div().flex_none().flex().flex_wrap().items_center().gap(px(SP1)).child(kit::pick(dev, p::MODE, cx)).child(kit::pick(dev, p::SYNC, cx)).child(kit::strip(dev, &primary, &[p::SPREAD, p::OUTPUT], cx)))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(SP1))
+                .child(kit::pick(dev, p::MODE, cx))
+                .child(kit::pick(dev, p::SYNC, cx))
+                .child(kit::strip(ws, dev, &primary, &[p::SPREAD, p::OUTPUT], cx)),
+        )
         .into_any_element()
 }
 

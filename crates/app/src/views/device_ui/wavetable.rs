@@ -122,8 +122,21 @@ fn osc(ws: &mut Workspace, dev: &Dev, n: u32, cx: &mut Context<Workspace>) -> Di
     });
     section(if n == 0 { "OSC 1" } else { "OSC 2" }, 196.)
         .child(div().flex_1().min_h(px(40.)).child(display))
-        .child(div().flex().items_center().gap(px(SP1)).child(kit::pick(dev, id(p::TABLE), cx)).child(kit::strip(dev, &[id(p::LEVEL)], &[], cx)))
-        .child(kit::strip(dev, &[id(p::OCTAVE), id(p::SEMI), id(p::FINE)], &[id(p::UNISON), id(p::DETUNE), id(p::SPREAD), id(p::PAN)], cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .child(kit::pick(dev, id(p::TABLE), cx))
+                .child(kit::strip(ws, dev, &[id(p::LEVEL)], &[], cx)),
+        )
+        .child(kit::strip(
+            ws,
+            dev,
+            &[id(p::OCTAVE), id(p::SEMI), id(p::FINE)],
+            &[id(p::UNISON), id(p::DETUNE), id(p::SPREAD), id(p::PAN)],
+            cx,
+        ))
 }
 
 fn filter(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
@@ -141,7 +154,13 @@ fn filter(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
     section("FILTER", 236.)
         .child(div().flex_1().min_h(px(40.)).child(plot))
         .child(div().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::FILTER_TYPE, cx)).child(kit::pick(dev, p::FILTER_SLOPE, cx)))
-        .child(kit::strip(dev, &[p::DRIVE, p::FILTER_ENV, p::KEY_TRACK], &[p::CUTOFF, p::RESONANCE], cx))
+        .child(kit::strip(
+            ws,
+            dev,
+            &[p::DRIVE, p::FILTER_ENV, p::KEY_TRACK],
+            &[p::CUTOFF, p::RESONANCE],
+            cx,
+        ))
 }
 
 fn lfo(ws: &mut Workspace, dev: &Dev, n: u32, cx: &mut Context<Workspace>) -> Div {
@@ -169,11 +188,11 @@ fn lfo(ws: &mut Workspace, dev: &Dev, n: u32, cx: &mut Context<Workspace>) -> Di
     section(if n == 0 { "LFO 1" } else { "LFO 2" }, 172.)
         .child(display)
         .child(div().flex().flex_wrap().items_center().gap(px(SP1)).child(kit::pick(dev, id(p::LFO_SHAPE), cx)).child(kit::pick(dev, id(p::LFO_SYNC), cx)).child(kit::pick(dev, id(p::LFO_RETRIGGER), cx)))
-        .child(kit::strip(dev, &[rate], &[], cx))
+        .child(kit::strip(ws, dev, &[rate], &[], cx))
 }
 
 /// The modulation matrix: one row per slot, source → destination, amount.
-fn matrix(dev: &Dev, cx: &mut Context<Workspace>) -> Div {
+fn matrix(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let mut table = section("MODULATION", 312.);
     let head = |text: &'static str, w: f32| label(text, TEXT_XS, pal.faint).w(px(w));
@@ -190,7 +209,7 @@ fn matrix(dev: &Dev, cx: &mut Context<Workspace>) -> Div {
                 .child(mono(format!("{}", s + 1), TEXT_XS, pal.faint).w(px(14.)))
                 .child(div().w(px(96.)).child(kit::pick(dev, p::slot(s, p::MOD_SRC), cx)))
                 .child(div().w(px(108.)).child(kit::pick(dev, p::slot(s, p::MOD_DST), cx)))
-                .child(kit::slim(dev, p::slot(s, p::MOD_AMT), 60., cx)),
+                .child(kit::slim(ws, dev, p::slot(s, p::MOD_AMT), 60., cx)),
         );
     }
     table
@@ -218,22 +237,50 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(
             section("AMP ENVELOPE", 220.)
                 .child(div().flex_1().min_h(px(40.)).child(amp))
-                .child(kit::strip(dev, &[p::VOLUME, p::SUB_LEVEL, p::NOISE], &[p::SUB_SHAPE, p::SUB_OCTAVE, p::VEL_SENS], cx)),
+                .child(kit::strip(
+                    ws,
+                    dev,
+                    &[p::VOLUME, p::SUB_LEVEL, p::NOISE],
+                    &[p::SUB_SHAPE, p::SUB_OCTAVE, p::VEL_SENS],
+                    cx,
+                )),
         );
     if dev.big {
         let env = adsr(ws, dev, 4, [p::MOD_ATTACK, p::MOD_DECAY, p::MOD_SUSTAIN, p::MOD_RELEASE], pal.accent2, cx);
         let voices = dev.m(0);
         row = row
-            .child(section("MOD ENVELOPE", 220.).child(div().flex_1().min_h(px(40.)).child(env)).child(kit::strip(dev, &[p::FILTER_ENV], &[], cx)))
+            .child(
+                section("MOD ENVELOPE", 220.)
+                    .child(div().flex_1().min_h(px(40.)).child(env))
+                    .child(kit::strip(ws, dev, &[p::FILTER_ENV], &[], cx)),
+            )
             .child(lfo(ws, dev, 0, cx))
             .child(lfo(ws, dev, 1, cx))
-            .child(matrix(dev, cx))
+            .child(matrix(ws, dev, cx))
             .child(
                 section("VOICE & FX", 200.)
                     .child(div().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::VOICE_MODE, cx)).child(kit::readout("voices", format!("{voices:.0}"), pal.text)))
-                    .child(kit::strip(dev, &[p::GLIDE, p::POLYPHONY, p::BEND_RANGE], &[], cx))
-                    .child(kit::strip(dev, &[p::CHORUS_MIX, p::DELAY_MIX, p::REVERB_MIX], &[], cx))
-                    .child(kit::strip(dev, &[p::DELAY_TIME, p::DELAY_FEEDBACK, p::REVERB_DECAY], &[], cx)),
+                    .child(kit::strip(
+                        ws,
+                        dev,
+                        &[p::GLIDE, p::POLYPHONY, p::BEND_RANGE],
+                        &[],
+                        cx,
+                    ))
+                    .child(kit::strip(
+                        ws,
+                        dev,
+                        &[p::CHORUS_MIX, p::DELAY_MIX, p::REVERB_MIX],
+                        &[],
+                        cx,
+                    ))
+                    .child(kit::strip(
+                        ws,
+                        dev,
+                        &[p::DELAY_TIME, p::DELAY_FEEDBACK, p::REVERB_DECAY],
+                        &[],
+                        cx,
+                    )),
             );
     }
     row.into_any_element()

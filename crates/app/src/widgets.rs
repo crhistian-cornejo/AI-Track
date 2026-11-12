@@ -461,6 +461,66 @@ pub fn form_row(title: impl Into<SharedString>, hint: Option<SharedString>, cont
         .child(div().flex_1().min_w(px(0.)).flex().items_center().gap(px(SP2)).child(control))
 }
 
+fn setting_text(title: SharedString, hint: Option<SharedString>) -> Div {
+    let pal = p();
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(label(title, TEXT_MD, pal.text))
+        .when_some(hint, |d, h| {
+            d.child(label(h, TEXT_XS, pal.faint).text_ellipsis())
+        })
+}
+
+/// A settings row: text on the left, the control pinned to the right edge.
+/// Rows are separated by hairlines so the eye can follow each label across.
+pub fn setting_row(
+    title: impl Into<SharedString>,
+    hint: Option<SharedString>,
+    control: impl IntoElement,
+) -> Div {
+    div()
+        .min_h(px(48.))
+        .py(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP6))
+        .border_b_1()
+        .border_color(border())
+        .child(setting_text(title.into(), hint))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(SP2))
+                .child(control),
+        )
+}
+
+/// A settings row whose control needs the full width (lists, wrapping chips):
+/// text on top, the control below it.
+pub fn setting_block(
+    title: impl Into<SharedString>,
+    hint: Option<SharedString>,
+    control: impl IntoElement,
+) -> Div {
+    div()
+        .py(px(SP2))
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .border_b_1()
+        .border_color(border())
+        .child(setting_text(title.into(), hint))
+        .child(div().w_full().child(control))
+}
+
 pub fn section_title(text: impl Into<SharedString>) -> Div {
     div().pt(px(SP4)).pb(px(SP1)).child(label(text, TEXT_XS, p().faint).font_weight(FontWeight::SEMIBOLD))
 }

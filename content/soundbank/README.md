@@ -94,6 +94,13 @@ written to the `packs` table from the manifest, so samples with
 uninformative names, such as multisampled instruments, still land in the
 right virtual folder.
 
+Sample labels come from whole words in the file name and its folders inside
+the pack; the pack folder's own name (`karoryfer-string-cyborgs`) is not read
+as a label. A pack's `genres` describe the pack, so they reach its samples only
+when the pack lists exactly one. When those rules change,
+`aitrack_library::reanalyse::TAGGER_VERSION` goes up and every library,
+`factory.db` included, re-derives its labels the next time it is opened.
+
 ## Adding a pack
 
 1. Read the license on the official page **and** in the archive or repository.

@@ -6,7 +6,7 @@ use crate::icons::{Icon, icon};
 use crate::paint;
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
-use crate::workspace::{Drag, KnobTarget, Workspace};
+use crate::workspace::{Drag, KnobTarget, NumTarget, Workspace, click_dragged, plain_text};
 use aitrack_dsp::{ParamInfo, ParamScale};
 use gpui::{
     AnyElement, App, Bounds, ContentMask, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
@@ -421,18 +421,71 @@ pub fn plot(
 // ───────────────────────────── Controls ─────────────────────────────
 
 /// A compact number: the parameter's short name over its value. Drag
-/// vertically to change it (Shift = fine), double-click for the default.
-pub fn num(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
-    num_w(dev, id, 60., cx)
+/// vertically to change it (Shift = fine), click and type to enter it
+/// (Enter applies, Escape cancels), double-click for the default.
+pub fn num(ws: &mut Workspace, dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
+    num_w(ws, dev, id, 60., cx)
 }
 
-pub fn num_w(dev: &Dev, id: u32, width: f32, cx: &mut Context<Workspace>) -> AnyElement {
+pub fn num_w(
+    ws: &mut Workspace,
+    dev: &Dev,
+    id: u32,
+    width: f32,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let pal = p();
     let Some(info) = dev.info(id).cloned() else { return div().into_any_element() };
     let value = dev.norm(id);
     let default = info.default_normalized();
     let device = dev.id;
-    let fill = if info.min < 0. && info.max > 0. { (value - 0.5).abs() * 2. } else { value };
+    if let Some(edit) = ws
+        .num_edit
+        .as_ref()
+        .filter(|e| e.target == NumTarget::Param { device, param: id })
+    {
+        // Being typed into: the text with a cursor (keys are routed at the
+        // workspace root, so every focused view reaches them).
+        let text = edit.text.clone();
+        return div()
+            .id(("num", dev.key(id as usize)))
+            .flex_none()
+            .w(px(width))
+            .h(px(32.))
+            .px(px(SP1 + 2.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .rounded(px(r_sm()))
+            .bg(content(0.08))
+            .border_1()
+            .border_color(accent_alpha(0.8))
+            .overflow_hidden()
+            .tooltip(widgets::tip(info.name, None))
+            .child(label(
+                paint::fit(info.short, width - 8., TEXT_XS),
+                TEXT_XS,
+                pal.faint,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(mono(
+                        paint::fit(&text, width - 10., TEXT_XS),
+                        TEXT_XS,
+                        pal.text,
+                    ))
+                    .child(div().w(px(1.)).h(px(10.)).ml(px(1.)).bg(pal.accent)),
+            )
+            .into_any_element();
+    }
+    let fill = if info.min < 0. && info.max > 0. {
+        (value - 0.5).abs() * 2.
+    } else {
+        value
+    };
+    let info_click = info.clone();
     div()
         .id(("num", dev.key(id as usize)))
         .flex_none()
@@ -457,6 +510,7 @@ pub fn num_w(dev: &Dev, id: u32, width: f32, cx: &mut Context<Workspace>) -> Any
             cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 if e.click_count >= 2 {
+                    this.num_edit = None;
                     set_now(this, device, id, default);
                     cx.notify();
                     return;
@@ -465,6 +519,21 @@ pub fn num_w(dev: &Dev, id: u32, width: f32, cx: &mut Context<Workspace>) -> Any
                 this.begin_drag(Drag::Knob { target: KnobTarget::Param { device, param: id, default }, last_y: f32::from(e.position.y), value }, cx);
             }),
         )
+        // A click that didn't move opens the box for typing (a moved click
+        // was a drag; double-click resets, handled above on mouse-down).
+        .on_click({
+            let info = info_click;
+            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                if e.click_count() >= 2 || click_dragged(e) {
+                    return;
+                }
+                if matches!(&this.num_edit, Some(edit) if edit.target == NumTarget::Param { device, param: id }) {
+                    return;
+                }
+                let plain = info.to_plain(current(this, device, &info));
+                this.begin_num_edit(NumTarget::Param { device, param: id }, plain_text(plain as f64), cx);
+            })
+        })
         .into_any_element()
 }
 
@@ -508,19 +577,25 @@ pub fn pick(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
 }
 
 /// The right control for a parameter: a chip for choices, a number otherwise.
-pub fn ctl(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
+pub fn ctl(ws: &mut Workspace, dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
     match dev.info(id) {
         Some(i) if matches!(i.scale, ParamScale::Stepped) && !i.choices.is_empty() => pick(dev, id, cx),
-        Some(_) => num(dev, id, cx),
+        Some(_) => num(ws, dev, id, cx),
         None => div().into_any_element(),
     }
 }
 
 /// A wrapping row of controls: `primary` always, `more` in the expanded editor.
-pub fn strip(dev: &Dev, primary: &[u32], more: &[u32], cx: &mut Context<Workspace>) -> Div {
+pub fn strip(
+    ws: &mut Workspace,
+    dev: &Dev,
+    primary: &[u32],
+    more: &[u32],
+    cx: &mut Context<Workspace>,
+) -> Div {
     let mut row = div().flex_none().flex().flex_wrap().items_center().gap(px(SP1));
     for id in primary.iter().chain(if dev.big { more.iter() } else { [].iter() }) {
-        row = row.child(ctl(dev, *id, cx));
+        row = row.child(ctl(ws, dev, *id, cx));
     }
     row
 }
@@ -636,8 +711,14 @@ pub fn paint_wave(window: &mut Window, r: Rect, wave: &[(f32, f32)], color: Hsla
 
 
 /// A narrow numeric control for table rows (same gestures as `num`).
-pub fn slim(dev: &Dev, id: u32, width: f32, cx: &mut Context<Workspace>) -> AnyElement {
-    num_w(dev, id, width, cx)
+pub fn slim(
+    ws: &mut Workspace,
+    dev: &Dev,
+    id: u32,
+    width: f32,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    num_w(ws, dev, id, width, cx)
 }
 
 #[cfg(test)]

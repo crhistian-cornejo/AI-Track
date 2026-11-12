@@ -42,6 +42,8 @@ pub struct Scene {
     pub readout: Option<String>,
     /// The clip's colour.
     pub color: Hsla,
+    /// The sample plays reversed: the file is drawn back to front.
+    pub reverse: bool,
 }
 
 struct Pen<'a> {
@@ -205,6 +207,9 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
     };
     // Without a loop there is nothing past the end of the file.
     let file_end = peaks.frames() as f64 / frames_per_tick;
+    // Reversed, frame `f` of what plays is frame `n - 1 - f` of the file.
+    let n = peaks.frames() as f64;
+    let flip = |f: f64| if s.reverse { n - 1. - f } else { f };
     let loops = c.looping.is_some_and(|lp| lp.end > lp.start);
     let color = mix(s.color, pal.waveform, 0.5);
     let outline = style().waveform == WaveformStyle::Outline;
@@ -228,7 +233,10 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
             for n in first.max(0)..=last {
                 let u = n as f64 / frames_per_tick;
                 let frame = (geom::unroll(c.looping, u) * frames_per_tick).round();
-                match peaks.sample(channel, frame.max(0.) as u64).filter(|_| loops || u < file_end) {
+                match peaks
+                    .sample(channel, flip(frame).max(0.) as u64)
+                    .filter(|_| loops || u < file_end)
+                {
                     Some(v) => {
                         let at_sample = pen.pt(l.axis.x(u), y(v, gain(u)));
                         if dots {
@@ -255,7 +263,11 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
                 continue;
             }
             let a = geom::unroll(c.looping, u) * frames_per_tick;
-            let col = peaks.range(channel, a, a + frames_per_px);
+            let col = if s.reverse {
+                peaks.range(channel, n - a - frames_per_px, n - a)
+            } else {
+                peaks.range(channel, a, a + frames_per_px)
+            };
             let (lo, hi) = waveform::join(col, prev);
             prev = col;
             if col.is_none() {

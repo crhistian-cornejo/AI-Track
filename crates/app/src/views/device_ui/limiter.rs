@@ -1,6 +1,8 @@
 //! `fx.limiter`: the level going in as a scrolling, mirrored envelope, what
 //! comes out inside it, the ceiling as a draggable line, gain reduction
-//! hanging from the top, and true-peak / loudness read-outs.
+//! hanging from the top, and true-peak / loudness read-outs. The strip adds
+//! the character controls (style, attack, release, channel mode, auto gain,
+//! dither, delta) and the plugin's own K-weighted loudness meters.
 
 use super::dynamics::trace;
 use super::kit::{self, Handle, PlotCfg, ax};
@@ -69,11 +71,32 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         kit::txt(window, cx, &format!("in {gain:+.1} dB"), r.px(0.06) + 12., r.py(0.5) - 15., TEXT_XS, pal.muted, TextAlign::Left);
     });
 
-    // Loudness comes from the Main output's analysis (the meter strip's).
+    // The plugin publishes its own BS.1770 meters (integrated, short-term,
+    // LRA). Fall back to the Main output analysis before the first block.
     ws.meters.keep_alive();
     let loud = ws.meters.loudness();
-    let (gr, tp, input) = (dev.m(0), if dev.meter.len() > 2 { dev.m(1) } else { -120. }, if dev.meter.len() > 2 { dev.m(2) } else { -120. });
-    let lufs = |v: Option<f32>| v.filter(|v| *v > -99.).map_or("—".to_owned(), |v| format!("{v:.1}"));
+    let own = dev.meter.len() > 6;
+    let (gr, tp, input) = (
+        dev.m(0),
+        if own { dev.m(1) } else { -120. },
+        if own { dev.m(2) } else { -120. },
+    );
+    let lufs = |v: f32| {
+        if v > -99. {
+            format!("{v:.1}")
+        } else {
+            "—".to_owned()
+        }
+    };
+    let (li, ls, lra) = if own {
+        (lufs(dev.m(3)), lufs(dev.m(4)), lufs(dev.m(5)))
+    } else {
+        (
+            lufs(loud.map_or(-120., |l| l.integrated)),
+            lufs(loud.map_or(-120., |l| l.short_term)),
+            lufs(loud.map_or(0., |l| l.range)),
+        )
+    };
     let readouts = div()
         .flex_none()
         .flex()
@@ -81,15 +104,53 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .items_center()
         .gap(px(SP1))
         .child(kit::readout("GR", format!("{gr:.1} dB"), if gr < -0.05 { pal.record } else { pal.muted }))
-        .child(kit::readout("TP", format!("{} dBTP", kit::fmt_db(tp)), if tp > ceiling + 0.05 { pal.record } else { pal.text }))
-        .child(kit::readout("In", format!("{} dB", kit::fmt_db(input)), pal.text))
-        .child(kit::readout("LUFS S", lufs(loud.map(|l| l.short_term)), pal.text))
-        .child(kit::readout("LUFS I", lufs(loud.map(|l| l.integrated)), pal.text));
+        .child(kit::readout(
+            "TP out",
+            format!("{} dBTP", kit::fmt_db(tp)),
+            if tp > ceiling + 0.05 {
+                pal.record
+            } else {
+                pal.text
+            },
+        ))
+        .child(kit::readout(
+            "TP in",
+            format!("{} dBTP", kit::fmt_db(input)),
+            pal.text,
+        ))
+        .child(kit::readout("LUFS I", li, pal.text))
+        .child(kit::readout("LUFS S", ls, pal.text))
+        .child(kit::readout("LRA", format!("{lra} LU"), pal.text));
 
     kit::panel(if dev.big { 720. } else { 480. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
         .child(readouts)
-        .child(kit::strip(dev, &[p::GAIN, p::CEILING, p::RELEASE, p::LOOKAHEAD, p::AUTO_RELEASE, p::TRUE_PEAK], &[p::LINK, p::OVERSAMPLING], cx))
+        .child(kit::strip(
+            ws,
+            dev,
+            &[
+                p::GAIN,
+                p::CEILING,
+                p::STYLE,
+                p::ATTACK,
+                p::RELEASE,
+                p::LOOKAHEAD,
+                p::AUTO_RELEASE,
+                p::TRUE_PEAK,
+            ],
+            &[
+                p::LINK,
+                p::OVERSAMPLING,
+                p::CHANNEL,
+                p::AUTO_ATTACK,
+                p::AUTO_GAIN,
+                p::DITHER,
+                p::SHAPING,
+                p::DELTA,
+                p::RESET,
+            ],
+            cx,
+        ))
         .into_any_element()
 }
 

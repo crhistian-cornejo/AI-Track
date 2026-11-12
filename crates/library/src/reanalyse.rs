@@ -17,7 +17,14 @@
 //! Hand-set values (`key_source = 'user'`, `bpm_source = 'user'`) are never
 //! touched, and neither is a row that already has the value; the one
 //! exception is a tempo guessed from the loop length (`bpm_source =
-//! 'estimate'`), which a confident detection replaces.
+//! 'estimate'`), which a confident detection replaces. Only loops get a
+//! tempo: a detector that hears a beat in a two-second bass note is wrong.
+//!
+//! [`Library::retag`] is the other kind of re-analysis: it re-derives the
+//! labels (category, genres, loop/one-shot, name tempo) of every stored row
+//! from its path and stored length, without decoding anything. The database
+//! runs it on open whenever [`TAGGER_VERSION`] is newer than the one that
+//! made its labels.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,10 +37,21 @@ use crossbeam_channel::{Receiver, unbounded};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Library, SampleId, Sample, now, parse_scale_kind, scale_kind_str};
+use crate::analyze::{AudioInfo, Source, analysis_from_hints};
+use crate::db::{Library, SampleId, Sample, encode_list, now, parse_scale_kind, scale_kind_str};
 use crate::error::{LibraryError, Result};
 use crate::parse::KeyHint;
-use crate::scan::quick_hash;
+use crate::scan::{PackCache, hints_for, quick_hash};
+use crate::taxonomy::{Category, SampleKind};
+
+/// Version of the labelling rules (parser, pack defaults, loop/one-shot
+/// classification). Increase it when they change so stored rows are
+/// re-tagged on the next open.
+///
+/// 1: genres by whole word only, a pack's genre list no longer copied onto
+/// every file, a manifest pack's folder name not read as a category, the
+/// ordered loop/one-shot rules, no detected tempo on one-shots.
+pub const TAGGER_VERSION: u32 = 1;
 
 /// A key needs at least this confidence to be stored on a sample.
 pub const KEY_MIN_CONFIDENCE: f32 = 0.5;
@@ -234,7 +252,7 @@ impl Library {
         {
             wrote.1 = self.conn.execute(
                 "UPDATE samples SET bpm=?2, bpm_source='audio'
-                 WHERE id=?1 AND (bpm IS NULL OR bpm_source = 'estimate')",
+                 WHERE id=?1 AND kind = 'loop' AND (bpm IS NULL OR bpm_source = 'estimate')",
                 params![c.id.0, b],
             )? > 0;
         }
@@ -254,7 +272,7 @@ impl Library {
                  (s.key_root IS NULL AND COALESCE(s.key_source, '') != 'user'
                    AND NOT (COALESCE(s.category, '') = 'Drums' AND COALESCE(s.subcategory, '') != '808s')
                    AND COALESCE(s.duration, 0) >= ?1) AS need_key,
-                 ((s.bpm IS NULL OR s.bpm_source = 'estimate')
+                 ((s.bpm IS NULL OR s.bpm_source = 'estimate') AND s.kind = 'loop'
                    AND COALESCE(s.duration, 0) >= ?2) AS need_bpm
                FROM samples s JOIN roots r ON r.id = s.root_id WHERE s.status = 'ok')
              WHERE need_key OR need_bpm ORDER BY id LIMIT ?3",
@@ -413,6 +431,110 @@ impl Library {
             .optional()?)
     }
 
+    /// Re-derives the labels of every indexed sample from its path, its pack
+    /// and the stored length and attack count, with the current rules; no
+    /// file is opened. Returns how many rows were looked at.
+    ///
+    /// What the user set by hand stays: favourites, ratings, tags, a manual
+    /// category (`label_source = 'user'`), key or tempo. A category the audio
+    /// model gave (`'audio'`) stays unless the name now gives one. A tempo
+    /// detected from audio stays on loops and is dropped from one-shots.
+    pub fn retag(&self) -> Result<u64> {
+        struct Row {
+            id: i64,
+            root: String,
+            rel: String,
+            duration: Option<f64>,
+            onsets: Option<i64>,
+            pack: Option<String>,
+            label_source: Option<String>,
+            key_source: Option<String>,
+            bpm_source: Option<String>,
+        }
+        let rows: Vec<Row> = {
+            let mut st = self.conn.prepare(
+                "SELECT s.id, r.path, s.rel_path, s.duration, s.onsets, s.pack, s.label_source, s.key_source,
+                        s.bpm_source
+                 FROM samples s JOIN roots r ON r.id = s.root_id WHERE s.status = 'ok'",
+            )?;
+            st.query_map([], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    root: r.get(1)?,
+                    rel: r.get(2)?,
+                    duration: r.get(3)?,
+                    onsets: r.get(4)?,
+                    pack: r.get(5)?,
+                    label_source: r.get(6)?,
+                    key_source: r.get(7)?,
+                    bpm_source: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut packs = PackCache::new(self);
+        for row in &rows {
+            let root = self.resolve_root(&row.root);
+            let path = root.join(&row.rel);
+            let pack = match &row.pack {
+                Some(id) => packs.get(id)?.cloned(),
+                None => None,
+            };
+            let hints = hints_for(&root, &row.rel, &path, pack.as_ref());
+            let audio = AudioInfo {
+                duration_s: row.duration.unwrap_or(0.0),
+                onsets: row.onsets.map(|n| n.max(0) as u32),
+                ..Default::default()
+            };
+            let a = analysis_from_hints(audio, &hints);
+            self.conn.execute(
+                "UPDATE samples SET genres=?2, kind=?3, is_loop=?4, loop_family=?5, root_note=?6 WHERE id=?1",
+                params![
+                    row.id,
+                    encode_list(&a.genres),
+                    a.kind.as_str(),
+                    a.kind == SampleKind::Loop,
+                    a.loop_family,
+                    a.root_note
+                ],
+            )?;
+            let label = row.label_source.as_deref();
+            if label != Some("user") && !(label == Some("audio") && a.category.is_none()) {
+                self.conn.execute(
+                    "UPDATE samples SET category=?2, subcategory=?3, label_source=?4 WHERE id=?1",
+                    params![row.id, a.category.map(Category::as_str), a.subcategory, a.category_source.as_str()],
+                )?;
+            }
+            if matches!(row.key_source.as_deref(), None | Some("filename")) {
+                let scale = a.key.and_then(KeyHint::scale);
+                self.conn.execute(
+                    "UPDATE samples SET key_root=?2, scale_kind=?3, camelot=?4, key_source=?5 WHERE id=?1",
+                    params![
+                        row.id,
+                        a.key.map(|k| k.root.0),
+                        a.key.and_then(|k| k.kind).map(scale_kind_str),
+                        scale.and_then(Scale::camelot),
+                        a.key.map(|_| Source::Filename.as_str())
+                    ],
+                )?;
+            }
+            match row.bpm_source.as_deref() {
+                Some("user") => {}
+                Some("audio") if a.kind == SampleKind::Loop => {}
+                _ => {
+                    self.conn.execute(
+                        "UPDATE samples SET bpm=?2, bpm_source=?3 WHERE id=?1",
+                        params![row.id, a.bpm, a.bpm.map(|_| a.bpm_source.as_str())],
+                    )?;
+                }
+            }
+            self.refresh_fts(SampleId(row.id))?;
+        }
+        tx.commit()?;
+        Ok(rows.len() as u64)
+    }
+
     /// Fills the missing key/BPM of samples (typically from the factory bank)
     /// with confident detections cached in this library. Hand-set values and
     /// values already present are kept. Returns how many samples changed.
@@ -423,7 +545,7 @@ impl Library {
         let mut changed = 0;
         for s in samples {
             let wants_key = s.key_root.is_none();
-            let wants_bpm = s.bpm.is_none();
+            let wants_bpm = s.bpm.is_none() && s.is_loop();
             if !(wants_key || wants_bpm) {
                 continue;
             }
@@ -623,7 +745,7 @@ impl ReanalyseJob {
 mod tests {
     use super::*;
     use crate::analyze::BasicAnalyzer;
-    use crate::db::RootKind;
+    use crate::db::{PackInfo, RootKind};
     use crate::scan::ScanOptions;
     use crate::test_util::{write_clicks, write_wav};
     use aitrack_model::ScaleKind;
@@ -730,8 +852,9 @@ mod tests {
         lib.set_key(pad.id, None).unwrap();
         let fake = Fake { calls: AtomicU32::new(0) };
         let stats = lib.reanalyse(&lib, &fake, &opts(true), &mut |_| {}, &AtomicBool::new(false)).unwrap();
-        // The pad is still asked for a tempo, the groove and the strings too.
-        assert_eq!(stats.candidates, 3, "{stats:?}");
+        // The pad is a one-shot, so it is not asked for a tempo either; the
+        // groove and the strings still are.
+        assert_eq!(stats.candidates, 2, "{stats:?}");
         assert_eq!(stats.errors, 1);
         assert_eq!(stats.keys_written, 0);
         let pad = lib.get(pad.id).unwrap();
@@ -739,7 +862,7 @@ mod tests {
         // A failed file is not decoded again until it changes.
         let again = lib.reanalyse(&lib, &fake, &opts(true), &mut |_| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((again.analysed, again.errors), (0, 0), "{again:?}");
-        assert_eq!(fake.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -783,6 +906,92 @@ mod tests {
         assert!(stats.cancelled);
         assert_eq!(stats.analysed, 0);
         assert_eq!(fake.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn opening_an_old_library_retags_it_and_keeps_user_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("packs");
+        let samples = root.join("karoryfer-string-cyborgs/Samples/ironface");
+        std::fs::create_dir_all(&samples).unwrap();
+        std::fs::create_dir_all(root.join("sonic-pi-samples")).unwrap();
+        write_wav(&samples.join("a0_oscillator_tuned.wav"), 22_050, 1, 1.93, 0.5);
+        write_wav(&samples.join("b0_oscillator_tuned.wav"), 22_050, 1, 1.93, 0.5);
+        write_wav(&root.join("sonic-pi-samples/loop_mika.wav"), 22_050, 1, 8.0, 0.5);
+        write_wav(&root.join("sonic-pi-samples/bd_haus.wav"), 22_050, 1, 0.3, 0.5);
+        let dbp = dir.path().join("factory.db");
+        let (osc, other, lp, kick) = {
+            let lib = Library::open(&dbp).unwrap();
+            lib.add_root(&root, RootKind::Factory).unwrap();
+            lib.upsert_pack(&PackInfo {
+                id: "karoryfer-string-cyborgs".into(),
+                name: "String Cyborgs".into(),
+                genres: vec!["Ambient".into(), "Cinematic".into(), "EDM".into()],
+                default_category: Some(Category::Synths),
+                default_subcategory: Some("Pads".into()),
+                factory: true,
+                ..Default::default()
+            })
+            .unwrap();
+            lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+            let get = |p: &Path| lib.find_by_path(p).unwrap().unwrap().id;
+            let ids = (
+                get(&samples.join("a0_oscillator_tuned.wav")),
+                get(&samples.join("b0_oscillator_tuned.wav")),
+                get(&root.join("sonic-pi-samples/loop_mika.wav")),
+                get(&root.join("sonic-pi-samples/bd_haus.wav")),
+            );
+            // What the old tagger stored: the pack's genres on every file, the
+            // pack folder read as "strings", a detected tempo on a one-shot,
+            // no attack counts.
+            let c = lib.connection();
+            c.execute_batch(
+                "UPDATE samples SET genres='|Ambient|Cinematic|EDM|', category='Instruments',
+                   subcategory='Strings', label_source='filename', onsets=NULL
+                   WHERE rel_path LIKE 'karoryfer%';
+                 UPDATE samples SET genres='|Techno|House|Drum & Bass|Ambient|', onsets=NULL
+                   WHERE rel_path LIKE 'sonic%';
+                 UPDATE samples SET bpm=120.3, bpm_source='audio' WHERE rel_path LIKE '%a0_osc%';
+                 UPDATE samples SET bpm=120.0, bpm_source='audio' WHERE rel_path LIKE '%loop_mika%';
+                 DELETE FROM meta WHERE key='tagger_version';
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+            lib.set_favorite(ids.0, true).unwrap();
+            lib.set_rating(ids.0, 4).unwrap();
+            lib.set_user_tags(ids.0, &["dark".into()]).unwrap();
+            lib.set_category(ids.1, Some(Category::Instruments), Some("Strings")).unwrap();
+            ids
+        };
+
+        let lib = Library::open(&dbp).unwrap();
+        let o = lib.get(osc).unwrap();
+        assert_eq!((o.category, o.subcategory.as_deref()), (Some(Category::Synths), Some("Pads")));
+        assert!(o.genres.is_empty(), "{:?}", o.genres);
+        assert_eq!(o.bpm, None, "no detected tempo on a one-shot");
+        assert!(o.favorite);
+        assert_eq!(o.rating, 4);
+        assert_eq!(o.user_tags, vec!["dark".to_string()]);
+        // A category set by hand stays, the genres are still fixed.
+        let other = lib.get(other).unwrap();
+        assert_eq!(other.subcategory.as_deref(), Some("Strings"));
+        assert!(other.genres.is_empty());
+        let lp = lib.get(lp).unwrap();
+        assert!(lp.is_loop());
+        assert!(lp.genres.is_empty(), "{:?}", lp.genres);
+        assert_eq!(lp.bpm, Some(120.0), "a detected tempo on a loop stays");
+        let kick = lib.get(kick).unwrap();
+        assert_eq!(kick.subcategory.as_deref(), Some("Kicks"));
+        assert!(!kick.is_loop());
+        // The full-text index follows: the old genres are not searchable any more.
+        let hits: i64 = lib
+            .connection()
+            .query_row("SELECT COUNT(*) FROM samples_fts WHERE samples_fts MATCH 'tags:Cinematic'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hits, 0);
+        assert_eq!(lib.meta("tagger_version").unwrap(), Some(TAGGER_VERSION.to_string()));
+        let v: i32 = lib.connection().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, crate::db::SCHEMA_VERSION);
     }
 
     #[test]

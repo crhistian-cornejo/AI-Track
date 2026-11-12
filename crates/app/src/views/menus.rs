@@ -23,6 +23,8 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::LibraryContext => library_menu(ws, cx),
         MenuKind::ClipContext => crate::editing::menus::clip_menu(ws, cx),
         MenuKind::LaneContext => crate::editing::menus::lane_menu(cx),
+        MenuKind::TrackContext(track) => crate::editing::menus::track_menu(ws, *track, cx),
+        MenuKind::DeviceContext(device) => crate::editing::menus::device_menu(ws, *device, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
         MenuKind::File => file_menu(ws, cx),
     })

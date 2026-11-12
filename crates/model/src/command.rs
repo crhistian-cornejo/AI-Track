@@ -23,6 +23,8 @@ pub enum CommandError {
     SourceNotFound(SourceId),
     #[error("source {0} is not a note source")]
     NotNotes(SourceId),
+    #[error("source {0} is not an audio source")]
+    NotAudio(SourceId),
     #[error("device {0} not found")]
     DeviceNotFound(DeviceId),
     #[error("device {0} is not a rack")]
@@ -102,6 +104,9 @@ pub enum Command {
     RemoveNotes { source: SourceId, ids: Vec<NoteId> },
     /// Replace notes with the same ids (move, resize, velocity…).
     UpdateNotes { source: SourceId, notes: Vec<Note> },
+    /// Replace an audio source's warp settings (transpose, detune, reverse,
+    /// warp on/off and mode). Every clip playing the source follows.
+    SetWarp { source: SourceId, warp: Box<Warp> },
 
     AddDevice { slot: DeviceSlot, device: Box<Device> },
     RemoveDevice { id: DeviceId },
@@ -156,6 +161,7 @@ impl Command {
             AddSource { .. } | AddClip { .. } => "Add clip",
             RemoveSource { .. } | RemoveClip { .. } => "Delete clip",
             UpdateClip { .. } => "Edit clip",
+            SetWarp { .. } => "Edit sample",
             PlaceClip { .. } => "Place clip",
             RemovePlacement { .. } => "Delete clip",
             MovePlacement { .. } => "Move clip",
@@ -391,6 +397,11 @@ impl Command {
                 src.sort();
                 Ok(UpdateNotes { source, notes: old })
             }
+            SetWarp { source, warp } => match p.sources.get_mut(&source) {
+                Some(Source::Audio(a)) => Ok(SetWarp { source, warp: Box::new(std::mem::replace(&mut a.warp, *warp)) }),
+                Some(_) => Err(CommandError::NotAudio(source)),
+                None => Err(CommandError::SourceNotFound(source)),
+            },
 
             AddDevice { slot, device } => {
                 if p.device(device.id).is_some() {
@@ -684,6 +695,29 @@ mod tests {
         // Ids allocated during the script are kept, everything else is restored.
         p.ids = before.ids.clone();
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn set_warp_swaps_and_undoes() {
+        let mut p = Project::new("t");
+        let src = p.alloc_source_id();
+        let audio = AudioSource { path: "a.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 10, warp: Warp::default(), key: None };
+        Command::AddSource { id: src, source: Box::new(Source::Audio(audio)) }.apply(&mut p).unwrap();
+        let warp = Warp { transpose: -7.0, detune: 25.0, reverse: true, ..Warp::default() };
+        let undo = Command::SetWarp { source: src, warp: Box::new(warp.clone()) }.apply(&mut p).unwrap();
+        let Some(Source::Audio(a)) = p.sources.get(&src) else { panic!() };
+        assert_eq!(a.warp, warp);
+        assert!((a.warp.pitch() + 6.75).abs() < 1e-6);
+        undo.apply(&mut p).unwrap();
+        let Some(Source::Audio(a)) = p.sources.get(&src) else { panic!() };
+        assert_eq!(a.warp, Warp::default());
+        // Old projects without detune / reverse still load.
+        let old: Warp = serde_json::from_str(r#"{"enabled":false,"mode":"beats","original_bpm":null,"transpose":3.0,"markers":[]}"#).unwrap();
+        assert_eq!((old.transpose, old.detune, old.reverse), (3.0, 0.0, false));
+        // A note source has no warp.
+        let notes = p.alloc_source_id();
+        Command::AddSource { id: notes, source: Box::new(Source::Notes(NoteSource::default())) }.apply(&mut p).unwrap();
+        assert_eq!(Command::SetWarp { source: notes, warp: Box::new(Warp::default()) }.apply(&mut p), Err(CommandError::NotAudio(notes)));
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "name": "Loud Master",
+  "plugin": "fx.clipper",
+  "author": "AI-Track",
+  "tags": [
+    "clipper",
+    "loud",
+    "master",
+    "edm"
+  ],
+  "params": {
+    "0": 0.97499996,
+    "1": 0.25,
+    "2": 0.0,
+    "3": 0.15,
+    "4": 0.0,
+    "5": 0.5
+  }
+}

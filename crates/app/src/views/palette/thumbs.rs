@@ -2,10 +2,14 @@
 //! editor (`<config>/thumbnails/plugins/<id>.png`) when one exists, looked
 //! up on a background thread; otherwise the row draws a generated card
 //! (vendor colour, category icon, vendor initials).
+//!
+//! [`Covers`] does the same for sample rows: the sample pack's artwork
+//! ([`aitrack_library::cover`]), resolved once per folder on a background
+//! thread; rows without one keep the pack-initials tile.
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn dir() -> PathBuf {
     crate::appearance::config_dir().join("thumbnails").join("plugins")
@@ -79,6 +83,54 @@ impl Thumbs {
     }
 }
 
+/// Sample pack covers, cached per sample folder (`None` = looked up, none found).
+pub struct Covers {
+    found: HashMap<PathBuf, Option<PathBuf>>,
+    tx: Sender<(PathBuf, PathBuf, Option<String>)>,
+    rx: Receiver<(PathBuf, Option<PathBuf>)>,
+}
+
+impl Default for Covers {
+    fn default() -> Self {
+        let (tx, jobs) = unbounded::<(PathBuf, PathBuf, Option<String>)>();
+        let (done, rx) = unbounded();
+        let run = move || {
+            while let Ok((dir, sample, pack)) = jobs.recv() {
+                let hit = aitrack_library::cover::sample_cover(&sample, pack.as_deref());
+                if done.send((dir, hit)).is_err() {
+                    break;
+                }
+            }
+        };
+        let _ = std::thread::Builder::new().name("palette-covers".into()).spawn(run);
+        Self { found: HashMap::new(), tx, rx }
+    }
+}
+
+impl Covers {
+    /// The cover for `sample` once its folder has been looked up; the first
+    /// ask queues the lookup and answers `None`.
+    pub fn get(&mut self, sample: &Path, pack: Option<&str>) -> Option<PathBuf> {
+        let dir = sample.parent()?;
+        if let Some(hit) = self.found.get(dir) {
+            return hit.clone();
+        }
+        self.found.insert(dir.to_owned(), None);
+        let _ = self.tx.send((dir.to_owned(), sample.to_owned(), pack.map(str::to_owned)));
+        None
+    }
+
+    /// Take finished lookups; `true` when a cover turned up.
+    pub fn poll(&mut self) -> bool {
+        let mut any = false;
+        while let Ok((dir, hit)) = self.rx.try_recv() {
+            any |= hit.is_some();
+            self.found.insert(dir, hit);
+        }
+        any
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +143,26 @@ mod tests {
         assert_eq!(initials(""), "?");
         assert_eq!(key("com.x/Y z"), "com.x_Y_z");
         assert_eq!(hue_slot("Arturia"), hue_slot("Arturia"));
+    }
+
+    #[test]
+    fn covers_resolve_once_per_folder_in_the_background() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("aitrack-covers-{}-{nanos}", std::process::id()));
+        let pack = tmp.join("Deep Pack");
+        std::fs::create_dir_all(pack.join("Kicks")).unwrap();
+        std::fs::write(pack.join("cover.jpg"), b"x").unwrap();
+        let (a, b) = (pack.join("Kicks/a.wav"), pack.join("Kicks/b.wav"));
+        let mut c = Covers::default();
+        assert_eq!(c.get(&a, Some("Deep Pack")), None, "queued");
+        assert_eq!(c.get(&b, Some("Deep Pack")), None, "same folder, not queued twice");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !c.poll() {
+            assert!(std::time::Instant::now() < deadline, "lookup never finished");
+            std::thread::yield_now();
+        }
+        assert_eq!(c.get(&b, Some("Deep Pack")), Some(pack.join("cover.jpg")));
+        assert_eq!(c.found.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -65,9 +65,16 @@ impl Origin {
         let clip = s.project.clips.get(&place.clip)?.clone();
         let mut scratch = Project::new("");
         scratch.tempo = s.project.tempo.clone();
-        // The builders only ask a file for its length; notes stay where they are.
-        if let Some(Source::Audio(file)) = s.project.sources.get(&clip.source) {
-            scratch.sources.insert(clip.source, Source::Audio(file.clone()));
+        // The builders only ask a file for its length, and whether the clip
+        // holds notes (an empty stand-in: the notes settle at mouse-up).
+        match s.project.sources.get(&clip.source) {
+            Some(Source::Audio(file)) => {
+                scratch.sources.insert(clip.source, Source::Audio(file.clone()));
+            }
+            Some(Source::Notes(_)) => {
+                scratch.sources.insert(clip.source, Source::Notes(NoteSource::default()));
+            }
+            None => {}
         }
         scratch.clips.insert(place.clip, clip.clone());
         let mut lane = Track::new(track, TrackKind::Audio, "", Color(0));
@@ -140,6 +147,15 @@ pub fn move_others(cmds: &mut Vec<Command>, home: Tick, others: &[(TrackId, Plac
 pub fn apply(s: &mut AppState, origin: &Origin, edit: Edit) -> bool {
     let cmds = origin.commands(&s.project, edit);
     !cmds.is_empty() && s.edit_coalesced(&format!("clip-shape-{}", origin.placement.0), edit.label(), cmds)
+}
+
+/// Mouse-up of a left-edge trim: a notes clip settles on offset 0 with its
+/// notes moved to match (see [`ops::rebase_notes`]), in the drag's undo step,
+/// so the piano roll shows and edits just what the clip plays. Returns
+/// whether anything changed.
+pub fn finish_trim(s: &mut AppState, origin: &Origin) -> bool {
+    let Some(cmds) = ops::rebase_notes(&mut s.project, origin.id) else { return false };
+    s.edit_coalesced(&format!("clip-shape-{}", origin.placement.0), Edit::Start(0).label(), cmds)
 }
 
 /// Double-click on a fade handle: that fade is gone (`curve_only` keeps its
@@ -394,6 +410,9 @@ mod tests {
         let (track, place) = f.s.project.tracks.iter().find_map(|t| {
             t.arrangement.iter().find(|pl| matches!(f.s.project.sources.get(&f.s.project.clips[&pl.clip].source), Some(Source::Notes(_)))).map(|pl| (t.id, pl.clone()))
         }).expect("the demo has a notes clip");
+        // Without a loop (inside one the offset is the start marker in the loop).
+        let unlooped = Clip { looping: None, ..f.s.project.clips[&place.clip].clone() };
+        assert!(f.s.edit("Unloop", vec![Command::UpdateClip { id: place.clip, clip: Box::new(unlooped) }]));
         let old = f.s.project.clips[&place.clip].clone();
         f.s.click_clip(place.id, false);
         let before = f.steps();
@@ -402,10 +421,53 @@ mod tests {
         assert_eq!(origin.track, track);
         assert!(apply(&mut f.s, &origin, Edit::Start(place.start + BEAT / 2)));
         assert!(apply(&mut f.s, &origin, Edit::Start(place.start + BEAT)));
-        f.s.seal();
-        assert_eq!(f.steps(), before + 1);
         let new = &f.s.project.clips[&place.clip];
         assert_eq!((new.offset, new.length, f.s.placement(place.id).unwrap().1.start), (old.offset + BEAT, old.length - BEAT, place.start + BEAT));
+        // Mouse-up: the notes move instead of the offset, in the same undo step.
+        let heard = |s: &AppState| {
+            let c = &s.project.clips[&place.clip];
+            let Some(Source::Notes(n)) = s.project.sources.get(&c.source) else { panic!("notes") };
+            ops::heard_notes(c, &n.notes).into_iter().map(|n| (n.start, n.key, n.length)).collect::<Vec<_>>()
+        };
+        let playing = heard(&f.s);
+        assert!(finish_trim(&mut f.s, &origin));
+        f.s.seal();
+        assert_eq!(f.steps(), before + 1);
+        assert_eq!(f.s.project.clips[&place.clip].offset, 0);
+        assert_eq!(heard(&f.s), playing, "it plays the same");
+        let source = f.s.project.clips[&place.clip].source;
+        let Some(Source::Notes(n)) = f.s.project.sources.get(&source) else { panic!("notes") };
+        assert!(n.notes.iter().all(|n| n.start >= 0), "no note starts before the clip");
+        assert!(!finish_trim(&mut f.s, &origin), "settled already");
+        assert!(f.s.undo());
+        assert_eq!(f.s.project.clips[&place.clip], old);
+    }
+
+    #[test]
+    fn a_notes_clip_drags_out_to_the_left_and_keeps_its_notes_in_place() {
+        let mut f = fixture();
+        let (_, place) = f.s.project.tracks.iter().find_map(|t| {
+            t.arrangement.iter().find(|pl| pl.start >= 2 * BEAT && matches!(f.s.project.sources.get(&f.s.project.clips[&pl.clip].source), Some(Source::Notes(_)))).map(|pl| (t.id, pl.clone()))
+        }).expect("the demo has a notes clip after beat 2");
+        let unlooped = Clip { looping: None, ..f.s.project.clips[&place.clip].clone() };
+        assert!(f.s.edit("Unloop", vec![Command::UpdateClip { id: place.clip, clip: Box::new(unlooped) }]));
+        let starts = |s: &AppState| {
+            let c = &s.project.clips[&place.clip];
+            let at = s.placement(place.id).unwrap().1.start;
+            let Some(Source::Notes(n)) = s.project.sources.get(&c.source) else { panic!("notes") };
+            let mut v: Vec<Tick> = ops::heard_notes(c, &n.notes).iter().map(|n| at + n.start).collect();
+            v.sort();
+            v
+        };
+        let before = starts(&f.s);
+        f.s.seal();
+        let origin = Origin::take(&f.s, place.id).unwrap();
+        assert!(apply(&mut f.s, &origin, Edit::Start(place.start - 2 * BEAT)));
+        finish_trim(&mut f.s, &origin);
+        f.s.seal();
+        let c = &f.s.project.clips[&place.clip];
+        assert_eq!((c.offset, f.s.placement(place.id).unwrap().1.start), (0, place.start - 2 * BEAT));
+        assert_eq!(starts(&f.s), before, "two empty beats in front, the notes where they were");
     }
 
     #[test]

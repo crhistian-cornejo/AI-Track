@@ -30,7 +30,7 @@ use aitrack_model::{PluginFormat, Scale, ScaleKind};
 use aitrack_splice::SpliceSample;
 use gpui::{
     AnyElement, AppContext as _, Context, Div, Focusable as _, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    ParentElement, ScrollHandle, Stateful, StatefulInteractiveElement, Styled, Window, canvas, div, img, prelude::FluentBuilder, px,
+    ParentElement, ScrollHandle, Stateful, StatefulInteractiveElement, Styled, StyledImage as _, Window, canvas, div, img, prelude::FluentBuilder, px,
 };
 use packs::{InstallState, PackKind};
 use search::{KindFilter, SampleQuery, SampleRow};
@@ -174,7 +174,10 @@ pub struct PaletteState {
     worker: Option<search::Worker>,
     peaks: Option<peaks::MiniPeaks>,
     thumbs: Option<thumbs::Thumbs>,
+    covers: Option<thumbs::Covers>,
     pub packs: Option<packs::Packs>,
+    /// Genre filter of the labels block on the Packs tab.
+    pub label_genre: Option<aitrack_library::labels::Genre>,
     pub splice: Option<splice::SpliceUi>,
     pub settings: settings::PaletteSettings,
     loaded: bool,
@@ -329,6 +332,7 @@ fn ensure(ws: &mut Workspace) {
     }
     pal.peaks.get_or_insert_with(Default::default);
     pal.thumbs.get_or_insert_with(Default::default);
+    pal.covers.get_or_insert_with(Default::default);
     pal.packs.get_or_insert_with(Default::default);
     if pal.presets.is_none() {
         let mut list = Vec::new();
@@ -576,6 +580,9 @@ pub fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     if let Some(t) = &mut ws.palette.thumbs {
         changed |= t.poll();
     }
+    if let Some(c) = &mut ws.palette.covers {
+        changed |= c.poll();
+    }
     if let Some(p) = &mut ws.palette.packs {
         let (c, index, messages) = p.poll();
         changed |= c || p.running();
@@ -641,11 +648,33 @@ fn audition_selected(ws: &mut Workspace, immediate: bool) {
     }
 }
 
+/// → : play the selected sample (or Splice preview) again from the start.
+/// `false` when the selection is not something to audition.
+fn replay_selected(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
+    match ws.palette.selected_item().cloned() {
+        Some(Item::Sample(r)) => {
+            let path = ws.palette.audition.replay(&r.path);
+            ws.b.engine.preview(Some(&path));
+        }
+        Some(Item::Splice(s)) => {
+            ws.palette.audition.stop();
+            match &mut ws.palette.splice {
+                Some(sp) => sp.preview(&s),
+                None => return false,
+            }
+        }
+        _ => return false,
+    }
+    cx.notify();
+    true
+}
+
 fn move_selection(ws: &mut Workspace, delta: i32, cx: &mut Context<Workspace>) {
     let next = step(&ws.palette.rows, ws.palette.selected, delta);
     if next != ws.palette.selected {
         ws.palette.selected = next;
-        ws.palette.scroll.scroll_to_item(next);
+        // The labels block on the Packs tab is the list's first child.
+        ws.palette.scroll.scroll_to_item(next + usize::from(packs::labels_shown(ws)));
         audition_selected(ws, false);
         cx.notify();
     }
@@ -830,6 +859,9 @@ fn on_key(ws: &mut Workspace, e: &KeyDownEvent, window: &mut Window, cx: &mut Co
             cycle_tab(ws, if k.modifiers.shift { -1 } else { 1 }, cx);
             true
         }
+        // The search field has no cursor to move (typing always appends),
+        // so → is free to replay the selected sample, Ableton-style.
+        "right" if !k.modifiers.modified() => replay_selected(ws, cx),
         _ => false,
     };
     if handled {
@@ -873,7 +905,7 @@ fn tag_chip(text: &str, on: bool) -> Div {
 fn artwork(name: Option<&str>, cover: Option<std::path::PathBuf>, size: f32) -> AnyElement {
     let pal = p();
     if let Some(path) = cover {
-        return img(path).size(px(size)).flex_none().rounded(px(r_md())).into_any_element();
+        return img(path).size(px(size)).flex_none().rounded(px(r_md())).object_fit(gpui::ObjectFit::Cover).into_any_element();
     }
     let name = name.unwrap_or("");
     let color = if name.is_empty() { content(0.08) } else { with_alpha(series(thumbs::hue_slot(name)), 0.7) };
@@ -936,6 +968,7 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
     let song = ws.s.project.scale;
     let in_key = r.key.zip(song).is_some_and(|(a, b)| keys_match(a, b));
     let bars = ws.palette.peaks.as_mut().and_then(|pk| pk.get(&r.path));
+    let cover = ws.palette.covers.as_mut().and_then(|c| c.get(&r.path, r.pack.as_deref()));
     let item = r.item();
     let weak = cx.entity().downgrade();
     let tags = &ws.palette.tags;
@@ -944,7 +977,7 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
         chips = chips.child(tag_chip(t, tags.contains(t)));
     }
     row_shell(i, selected, SAMPLE_ROW_H)
-        .child(artwork(r.pack.as_deref(), None, 32.))
+        .child(artwork(r.pack.as_deref(), cover, 32.))
         .child(icon(if r.is_loop { Icon::Loop } else { Icon::Waveform }, 14., if in_key { pal.accent } else { pal.muted }))
         .child(
             div()
@@ -966,7 +999,7 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
             div()
                 .id(("palette-fav", i))
                 .flex_none()
-                .child(icon(Icon::Star, 12., if fav { pal.solo } else { content(0.2) }))
+                .child(if fav { icon(Icon::StarFilled, 12., pal.solo) } else { icon(Icon::Star, 12., content(0.2)) })
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.b.library.set_favorite(id, !fav);
@@ -1449,6 +1482,7 @@ fn footer(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
     let scan = st.running.then(|| (st.message.clone(), st.fraction));
     let status = ws.b.library.status();
     let track = ws.s.selected_track.and_then(|t| ws.s.project.track(t)).map_or("a new track".to_owned(), |t| t.name.clone());
+    let auditions = ws.palette.tab.samples() || ws.palette.tab == Tab::All;
     let hint = |k: &str, t: String| div().flex().items_center().gap(px(SP1)).child(keycap(k.to_owned())).child(label(t, TEXT_XS, pal.faint));
     div()
         .flex_none()
@@ -1459,7 +1493,8 @@ fn footer(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .gap(px(SP4))
         .border_t_1()
         .border_color(border())
-        .child(hint("↑↓", if ws.palette.tab.samples() || ws.palette.tab == Tab::All { "Move and audition".into() } else { "Move".into() }))
+        .child(hint("↑↓", if auditions { "Move and audition".into() } else { "Move".into() }))
+        .when(auditions, |d| d.child(hint("→", "Replay".into())))
         .child(hint("↵", match ws.palette.tab {
             Tab::Commands => "Run".into(),
             Tab::Packs => "Download or open".into(),
@@ -1513,9 +1548,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let rows = ws.palette.rows.clone();
     let selected = ws.palette.selected;
     let mut list = div().id("palette-results").h(px(LIST_H)).overflow_y_scroll().track_scroll(&ws.palette.scroll).px(px(SP2)).py(px(SP1)).flex().flex_col();
-    if rows.is_empty() {
+    let labels = packs::labels_section(ws, cx);
+    if rows.is_empty() && labels.is_none() {
         list = list.child(empty_state(ws, cx));
     }
+    list = list.children(labels);
     for (i, row) in rows.iter().enumerate() {
         let sel = i == selected;
         list = list.child(match row {

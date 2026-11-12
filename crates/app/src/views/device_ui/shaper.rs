@@ -70,7 +70,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
 
     kit::panel(if dev.big { 640. } else { 420. })
         .child(div().flex_1().min_h(px(0.)).rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot))
-        .child(kit::strip(dev, &[p::RATE, p::DEPTH, p::SMOOTH, p::TENSION, p::PHASE], &[], cx))
+        .child(kit::strip(
+            ws,
+            dev,
+            &[p::RATE, p::DEPTH, p::SMOOTH, p::TENSION, p::PHASE],
+            &[],
+            cx,
+        ))
         .into_any_element()
 }
 

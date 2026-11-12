@@ -115,6 +115,14 @@ impl SampleAudition {
         Some(path)
     }
 
+    /// Play `path` again from the start (→ in the palette), even when it
+    /// is the row already playing; as many times as asked.
+    pub fn replay(&mut self, path: &Path) -> PathBuf {
+        self.pending = None;
+        self.playing = Some(path.to_owned());
+        path.to_owned()
+    }
+
     pub fn is_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -143,6 +151,20 @@ mod tests {
         assert!(!a.is_pending());
         assert!(a.stop());
         assert!(!a.stop());
+    }
+
+    #[test]
+    fn replay_restarts_the_same_row_every_time() {
+        let mut a = SampleAudition::default();
+        let t0 = Instant::now();
+        assert!(a.select(Path::new("a"), true, t0).is_some());
+        assert_eq!(a.replay(Path::new("a")), PathBuf::from("a"));
+        assert_eq!(a.replay(Path::new("a")), PathBuf::from("a"));
+        // Replaying cancels a row still settling and becomes the one playing.
+        assert_eq!(a.select(Path::new("b"), false, t0), None);
+        assert_eq!(a.replay(Path::new("b")), PathBuf::from("b"));
+        assert!(!a.is_pending());
+        assert_eq!(a.select(Path::new("b"), true, t0), None, "already playing");
     }
 
     #[test]

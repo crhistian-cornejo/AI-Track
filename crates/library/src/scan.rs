@@ -121,13 +121,17 @@ pub(crate) fn pack_id_for(root: &Path, rel: &str) -> Option<String> {
     }
 }
 
-struct PackCache<'a> {
+pub(crate) struct PackCache<'a> {
     lib: &'a Library,
     map: HashMap<String, Option<PackInfo>>,
 }
 
-impl PackCache<'_> {
-    fn get(&mut self, id: &str) -> Result<Option<&PackInfo>> {
+impl<'a> PackCache<'a> {
+    pub(crate) fn new(lib: &'a Library) -> Self {
+        Self { lib, map: HashMap::new() }
+    }
+
+    pub(crate) fn get(&mut self, id: &str) -> Result<Option<&PackInfo>> {
         if !self.map.contains_key(id) {
             let p = self.lib.pack(id)?;
             self.map.insert(id.to_string(), p);
@@ -136,11 +140,34 @@ impl PackCache<'_> {
     }
 }
 
-/// Applies pack defaults (category, genres) to name hints.
+/// Name hints for a file of a root, with the pack defaults applied.
+///
+/// For a registered pack (a manifest pack such as the factory bank) the pack
+/// folder's own name is a product name, not a description of each file:
+/// `karoryfer-string-cyborgs/Samples/a0_oscillator_tuned.wav` is not a
+/// string sample. Its category comes from the pack's declared default
+/// instead. For a plain folder of the user's ("Trap Pack/Kicks/…") the
+/// folder name is all there is, so it still counts.
+pub(crate) fn hints_for(root: &Path, rel: &str, path: &Path, pack: Option<&PackInfo>) -> NameHints {
+    let stop = match (pack, rel.split_once('/')) {
+        (Some(_), Some((first, _))) => root.join(first),
+        _ => root.to_path_buf(),
+    };
+    merge_pack(parse_path(path, Some(&stop)), pack)
+}
+
+/// Applies pack defaults (category, genre) to name hints.
+///
+/// A pack's genre list describes the pack as a whole ("for Techno, House,
+/// Drum & Bass…"), not every file in it, so it is copied onto the samples
+/// only when the pack declares exactly one genre and the name gave none.
 fn merge_pack(mut hints: NameHints, pack: Option<&PackInfo>) -> NameHints {
     if let Some(p) = pack {
-        if hints.category.is_none()
-            && let Some(c) = p.default_category
+        // The pack's default label fills a name that says nothing, or only
+        // the broad category the pack already declares ("oscillator" in a
+        // pack of synth pads is still a pad).
+        if let Some(c) = p.default_category
+            && (hints.category.is_none() || (hints.category == Some(c) && hints.subcategory.is_none()))
         {
             hints.category = Some(c);
             hints.subcategory = p
@@ -148,12 +175,11 @@ fn merge_pack(mut hints: NameHints, pack: Option<&PackInfo>) -> NameHints {
                 .as_deref()
                 .and_then(|s| c.subcategories().iter().copied().find(|x| x.eq_ignore_ascii_case(s)));
         }
-        for g in &p.genres {
-            if let Some(known) = crate::parse::known_genres().into_iter().find(|k| k.eq_ignore_ascii_case(g))
-                && !hints.genres.contains(&known)
-            {
-                hints.genres.push(known);
-            }
+        if hints.genres.is_empty()
+            && let [g] = p.genres.as_slice()
+            && let Some(known) = crate::parse::known_genres().into_iter().find(|k| k.eq_ignore_ascii_case(g))
+        {
+            hints.genres.push(known);
         }
     }
     hints
@@ -345,7 +371,7 @@ impl Library {
             Some(id) => packs.get(id)?.cloned(),
             None => None,
         };
-        let hints = merge_pack(parse_path(path, Some(&root.path)), pack.as_ref());
+        let hints = hints_for(&root.path, rel, path, pack.as_ref());
         let a = analyzer.analyze(path, &hints)?;
         let hash = quick_hash(path).ok();
         self.upsert_analysis(
@@ -371,7 +397,7 @@ impl Library {
                 Some(id) => packs.get(id)?.cloned(),
                 None => None,
             };
-            let hints = merge_pack(parse_path(path, Some(&root.path)), pack.as_ref());
+            let hints = hints_for(&root.path, &rel, path, pack.as_ref());
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
             let mtime = std::fs::metadata(path).map(|m| mtime_of(&m)).unwrap_or(0);
             self.conn.execute(
@@ -588,6 +614,85 @@ mod tests {
         write_wav(&pack.join("Melody Loop Am 120bpm.wav"), 44_100, 2, 4.0, 0.5);
         lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut no_progress(), &cancel).unwrap();
         assert_eq!(lib.count().unwrap(), 4);
+    }
+
+    fn manifest_pack(id: &str, genres: &[&str], cat: Option<Category>, sub: Option<&str>) -> PackInfo {
+        PackInfo {
+            id: id.into(),
+            name: id.into(),
+            genres: genres.iter().map(|g| g.to_string()).collect(),
+            default_category: cat,
+            default_subcategory: sub.map(str::to_string),
+            factory: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn manifest_packs_do_not_label_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("packs");
+        let cyborgs = root.join("karoryfer-string-cyborgs/Samples/ironface");
+        let caveman = root.join("karoryfer-caveman-cosmonaut/Samples");
+        let sonic = root.join("sonic-pi-samples");
+        let solo = root.join("solo-genre-pack");
+        for d in [&cyborgs, &caveman, &sonic, &solo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_wav(&cyborgs.join("a0_oscillator_tuned.wav"), 22_050, 1, 1.93, 0.5);
+        write_wav(&caveman.join("bass_8_e2.wav"), 22_050, 1, 1.99, 0.5);
+        write_wav(&sonic.join("loop_garzul.wav"), 22_050, 1, 8.0, 0.5);
+        write_wav(&sonic.join("bd_haus.wav"), 22_050, 1, 0.3, 0.9);
+        write_wav(&sonic.join("loop_x_128bpm.wav"), 22_050, 1, 8.0, 0.5);
+        write_wav(&solo.join("Snare 1.wav"), 22_050, 1, 0.2, 0.9);
+
+        let lib = Library::open(dir.path().join("factory.db")).unwrap();
+        lib.add_root(&root, RootKind::Factory).unwrap();
+        lib.upsert_pack(&manifest_pack(
+            "karoryfer-string-cyborgs",
+            &["Ambient", "Cinematic", "EDM"],
+            Some(Category::Synths),
+            Some("Pads"),
+        ))
+        .unwrap();
+        lib.upsert_pack(&manifest_pack(
+            "karoryfer-caveman-cosmonaut",
+            &["Synthwave", "EDM", "Techno"],
+            Some(Category::Synths),
+            None,
+        ))
+        .unwrap();
+        lib.upsert_pack(&manifest_pack("sonic-pi-samples", &["Techno", "House", "Drum & Bass", "Ambient"], None, None))
+            .unwrap();
+        lib.upsert_pack(&manifest_pack("solo-genre-pack", &["Reggaeton"], Some(Category::Drums), None)).unwrap();
+        lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut no_progress(), &AtomicBool::new(false)).unwrap();
+
+        let get = |p: &Path| lib.find_by_path(p).unwrap().unwrap();
+        let osc = get(&cyborgs.join("a0_oscillator_tuned.wav"));
+        assert_eq!((osc.category, osc.subcategory.as_deref()), (Some(Category::Synths), Some("Pads")));
+        assert!(osc.genres.is_empty(), "{:?}", osc.genres);
+        assert!(!osc.is_loop());
+
+        let bass = get(&caveman.join("bass_8_e2.wav"));
+        assert_eq!(bass.category, Some(Category::Bass));
+        assert!(bass.genres.is_empty(), "{:?}", bass.genres);
+        assert!(!bass.is_loop());
+        assert_eq!(bass.bpm, None);
+
+        for name in ["loop_garzul.wav", "loop_x_128bpm.wav"] {
+            let lp = get(&sonic.join(name));
+            assert!(lp.is_loop(), "{name}");
+            assert!(lp.genres.is_empty(), "{name}: {:?}", lp.genres);
+        }
+        assert_eq!(get(&sonic.join("loop_x_128bpm.wav")).bpm, Some(128.0));
+        let kick = get(&sonic.join("bd_haus.wav"));
+        assert_eq!(kick.subcategory.as_deref(), Some("Kicks"));
+        assert!(!kick.is_loop());
+
+        // A pack that declares a single genre lends it to its files.
+        let snare = get(&solo.join("Snare 1.wav"));
+        assert_eq!(snare.genres, vec!["Reggaeton".to_string()]);
+        assert!(!snare.is_loop());
     }
 
     #[test]

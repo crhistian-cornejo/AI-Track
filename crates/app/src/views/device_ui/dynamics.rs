@@ -307,7 +307,15 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
     };
     kit::panel(if dev.big { 760. } else { 520. })
         .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(curve)).child(history).child(meter))
-        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::strip(dev, &primary, &more, cx)).children(sidechain))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .child(kit::strip(ws, dev, &primary, &more, cx))
+                .children(sidechain),
+        )
         .into_any_element()
 }
 

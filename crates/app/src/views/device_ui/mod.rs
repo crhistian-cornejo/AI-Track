@@ -18,6 +18,7 @@
 
 pub mod analyzer;
 pub mod chorus;
+pub mod clipper;
 pub mod delay;
 pub mod drum;
 pub mod dynamics;
@@ -26,6 +27,8 @@ pub mod filter;
 pub mod generic;
 pub mod kit;
 pub mod limiter;
+pub mod midside;
+pub mod multiband;
 pub mod reverb;
 pub mod sampler;
 pub mod saturator;
@@ -228,6 +231,8 @@ pub struct UiState {
     pub selected: HashMap<DeviceId, usize>,
     pub big: BTreeSet<DeviceId>,
     pub show_all: BTreeSet<DeviceId>,
+    /// Racks whose macro knobs are shown.
+    pub macros: BTreeSet<DeviceId>,
     /// Per-device display options (EQ range…), by slot.
     pub opts: HashMap<(DeviceId, u8), f32>,
     sets: HashMap<String, Rc<ParamSet>>,
@@ -249,6 +254,7 @@ impl Default for UiState {
             selected: HashMap::new(),
             big: BTreeSet::new(),
             show_all: BTreeSet::new(),
+            macros: BTreeSet::new(),
             opts: HashMap::new(),
             sets: HashMap::new(),
             live: HashMap::new(),
@@ -282,6 +288,12 @@ impl UiState {
         let set = Rc::new(ParamSet::new(plugins.device(plugin).map(|i| i.params.clone()).unwrap_or_default()));
         self.sets.insert(plugin.to_owned(), set.clone());
         set
+    }
+
+    /// The description of parameter `param` of stock device `device`.
+    pub fn param_info(&mut self, plugins: &dyn PluginCatalog, project: &aitrack_model::Project, device: DeviceId, param: u32) -> Option<ParamInfo> {
+        let aitrack_model::DeviceKind::Stock { plugin_id } = &project.device(device)?.kind else { return None };
+        self.params(plugins, plugin_id).get(param).cloned()
     }
 
     /// Read a device's meter data; returns whether it changed. Histories
@@ -575,6 +587,9 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.gate"
             | "fx.transient"
             | "fx.limiter"
+            | "fx.clipper"
+            | "fx.multiband"
+            | "fx.midside"
             | "fx.saturator"
             | "fx.shaper"
             | "fx.reverb"
@@ -595,6 +610,9 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.filter" => filter::render(ws, dev, cx),
         "fx.compressor" | "fx.gate" | "fx.transient" => dynamics::render(ws, plugin, dev, cx),
         "fx.limiter" => limiter::render(ws, dev, cx),
+        "fx.clipper" => clipper::render(ws, dev, cx),
+        "fx.multiband" => multiband::render(ws, dev, cx),
+        "fx.midside" => midside::render(ws, dev, cx),
         "fx.saturator" => saturator::render(ws, dev, cx),
         "fx.shaper" => shaper::render(ws, dev, cx),
         "fx.reverb" => reverb::render(ws, dev, cx),

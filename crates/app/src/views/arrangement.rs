@@ -235,7 +235,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     // Decoded in the background: flat until the peaks arrive.
                     let wave = ws.waves.peaks(&file.path).map(|peaks| {
                         let base = TimeBase { sample_rate: f64::from(peaks.sample_rate().max(1)), ..TimeBase::of(file, bpm) };
-                        Wave { frames_per_tick: base.tick_to_frame(1.), peaks }
+                        Wave {
+                            frames_per_tick: base.tick_to_frame(1.),
+                            ratio: file.warp.pitch_ratio(),
+                            reverse: file.warp.reverse,
+                            peaks,
+                        }
                     });
                     Body::Audio { wave, shape: arrange_clips::draw::shape_of(c) }
                 }
@@ -723,9 +728,23 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
         .cursor_pointer()
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
             let m = e.modifiers();
+            this.s.ed.area = crate::editing::Area::Arrange;
             this.s.click_track(id, m.secondary(), m.shift);
             cx.notify();
         }))
+        // Right-click (Live): the track joins the selection and the track menu opens.
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.s.ed.area = crate::editing::Area::Arrange;
+                if !this.s.is_track_selected(id) {
+                    this.s.click_track(id, false, false);
+                }
+                this.menu = None;
+                this.open_menu(MenuKind::TrackContext(id), e.position, cx);
+            }),
+        )
         .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
         // The groups around the track: one rule in each one's colour.
         .children(group_rules(ws, id))

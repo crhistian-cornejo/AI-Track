@@ -21,7 +21,7 @@ use crate::shared::ProcessorPool;
 use crate::status::SharedStatus;
 use crate::EngineError;
 use aitrack_dsp::AudioBuffer;
-use aitrack_model::{Project, Tick, TrackId};
+use aitrack_model::{AudioSource, AutomationTarget, Placement, PlacementId, Project, Source, Tick, Track, TrackId, TrackKind, Color, Warp};
 use rtrb::RingBuffer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -297,6 +297,105 @@ pub fn render_offline_with(
         samples: Some(samples),
     };
     Ok(render(project, factory, &opts, &[], None)?.mix)
+}
+
+// ───────────────────────────── Consolidate ─────────────────────────────
+
+/// Render what the audio clips `placements` of `track` play over `range`
+/// (gain, fades, volume envelope, loops and warp exactly as playback does
+/// them, before the track's devices and mixer), as one stereo buffer at
+/// `sample_rate`. Muted clips are silent and gaps stay silent. Runs the
+/// offline renderer on a scratch project that holds only those clips, so
+/// call it off the audio and UI threads.
+pub fn render_clips(
+    project: &Project,
+    track: TrackId,
+    placements: &[PlacementId],
+    range: (Tick, Tick),
+    sample_rate: f64,
+    samples: Option<SampleCache>,
+) -> Result<AudioBuffer, EngineError> {
+    let scratch = clips_only(project, track, placements)?;
+    let samples = samples.unwrap_or_else(SampleCache::blocking);
+    render_offline_with(&scratch, &crate::factory::NullFactory, range, sample_rate, 512, samples)
+}
+
+/// A project with one plain audio track (no devices, unity gain, centred)
+/// holding copies of the given placements, the tempo of `project` and
+/// nothing else.
+fn clips_only(project: &Project, track: TrackId, placements: &[PlacementId]) -> Result<Project, EngineError> {
+    let from = project.track(track).ok_or_else(|| EngineError::Export("the track is gone".into()))?;
+    let mut p = Project::new(project.name.clone());
+    p.tempo = project.tempo.clone();
+    p.loop_region = None;
+    p.sample_rate_hint = project.sample_rate_hint;
+    // The tempo lane on Main folds into the tempo map.
+    if let (Some(main), Some(scratch_main)) = (project.tracks.iter().find(|t| t.kind == TrackKind::Main), p.tracks.first_mut()) {
+        scratch_main.automation = main.automation.iter().filter(|l| l.target == AutomationTarget::Tempo).cloned().collect();
+    }
+    let id = p.alloc_track_id();
+    let mut lane = Track::new(id, TrackKind::Audio, "Consolidate", Color(0));
+    let mut sources = std::collections::BTreeMap::new();
+    for want in placements {
+        let pl = from.arrangement.iter().find(|pl| pl.id == *want).ok_or_else(|| EngineError::Export("a clip is gone".into()))?;
+        let clip = project.clips.get(&pl.clip).ok_or_else(|| EngineError::Export("a clip is gone".into()))?;
+        let source = match project.sources.get(&clip.source) {
+            Some(s @ Source::Audio(_)) => s.clone(),
+            _ => return Err(EngineError::Export("only audio clips are rendered".into())),
+        };
+        let sid = *sources.entry(clip.source).or_insert_with(|| {
+            let sid = p.alloc_source_id();
+            p.sources.insert(sid, source);
+            sid
+        });
+        let cid = p.alloc_clip_id();
+        p.clips.insert(cid, aitrack_model::Clip { source: sid, ..clip.clone() });
+        let pid = p.alloc_placement_id();
+        lane.arrangement.push(Placement { id: pid, clip: cid, start: pl.start, lane: 0 });
+    }
+    lane.arrangement.sort_by_key(|pl| pl.start);
+    p.tracks.insert(0, lane);
+    Ok(p)
+}
+
+/// [`render_clips`] written to `path` as a 32-bit float WAV (mono when every
+/// part is mono). Returns the file as a source to put in the project: warped
+/// at the song tempo when the tempo does not change, so it keeps following
+/// the song like the clips it replaces.
+pub fn consolidate_to_wav(
+    project: &Project,
+    track: TrackId,
+    placements: &[PlacementId],
+    range: (Tick, Tick),
+    sample_rate: u32,
+    path: &Path,
+    samples: Option<SampleCache>,
+) -> Result<AudioSource, EngineError> {
+    let mut buf = render_clips(project, track, placements, range, sample_rate as f64, samples)?;
+    let files: Vec<&AudioSource> = project
+        .track(track)
+        .into_iter()
+        .flat_map(|t| t.arrangement.iter().filter(|pl| placements.contains(&pl.id)))
+        .filter_map(|pl| match project.sources.get(&project.clips.get(&pl.clip)?.source) {
+            Some(Source::Audio(a)) => Some(a),
+            _ => None,
+        })
+        .collect();
+    let mono = !files.is_empty() && files.iter().all(|a| a.channels == 1);
+    if mono {
+        let mut one = AudioBuffer::new(1, buf.frames());
+        one.channel_mut(0).copy_from_slice(buf.channel(0));
+        buf = one;
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(EngineError::Io)?;
+    }
+    write_wav(path, &buf, sample_rate, WavFormat::Float32)?;
+    let steady = project.tempo.points().len() == 1
+        && !project.tracks.iter().any(|t| t.kind == TrackKind::Main && t.automation.iter().any(|l| l.target == AutomationTarget::Tempo && l.enabled && !l.points.is_empty()));
+    let warp = if steady { Warp { enabled: true, original_bpm: Some(project.tempo.initial_bpm()), ..Warp::default() } } else { Warp::default() };
+    let key = files.first().and_then(|a| a.key).filter(|k| files.iter().all(|a| a.key == Some(*k)));
+    Ok(AudioSource { path: path.to_path_buf(), hash: None, sample_rate, channels: buf.channels() as u16, frames: buf.frames() as u64, warp, key })
 }
 
 // ───────────────────────────── WAV ─────────────────────────────

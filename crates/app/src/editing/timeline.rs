@@ -7,35 +7,55 @@ use super::{Area, GridView, TimeSel};
 use crate::state::AppState;
 use aitrack_model::*;
 
-/// Notes of a clip as they are heard: `(ticks from the clip's start, length,
-/// note)`, with the loop unrolled over the clip's length.
-fn heard<'a>(clip: &Clip, notes: &'a [Note]) -> Vec<(Tick, Tick, &'a Note)> {
-    let mut out = Vec::new();
-    let length = clip.length.max(0);
-    match clip.looping.filter(|l| l.end > l.start) {
-        None => {
-            for n in notes.iter().filter(|n| n.start >= clip.offset && n.start < clip.offset + length) {
-                let at = n.start - clip.offset;
-                out.push((at, n.length.min(length - at), n));
-            }
-        }
-        Some(l) => {
-            // The first pass runs from the offset to the loop's end, the rest loop.
-            let mut from = if clip.offset >= l.end { l.start + (clip.offset - l.start) % (l.end - l.start) } else { clip.offset };
-            let mut base = 0;
-            while base < length {
-                for n in notes.iter().filter(|n| n.start >= from && n.start < l.end) {
-                    let at = base + n.start - from;
-                    if at < length {
-                        out.push((at, n.length.min(length - at).min(l.end - n.start), n));
-                    }
-                }
-                base += l.end - from;
-                from = l.start;
-            }
-        }
-    }
-    out
+/// One track's share of a Consolidate: the range it fills and the clips
+/// that go into it, earliest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsolidateGroup {
+    pub track: TrackId,
+    pub start: Tick,
+    pub end: Tick,
+    pub parts: Vec<Placement>,
+    /// Audio clips, which need a render before they can be joined.
+    pub audio: bool,
+}
+
+/// What a Consolidate acts on, taken when it starts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConsolidatePick {
+    Time(TimeSel),
+    Clips(Vec<(TrackId, Placement, Tick)>),
+}
+
+/// A Consolidate with audio in it, waiting for its files: render each audio
+/// group of `project` (the song with the time selection's edges cut) off the
+/// UI thread, then hand the files to [`AppState::finish_consolidate`].
+#[derive(Clone, Debug)]
+pub struct ConsolidateJob {
+    pub pick: ConsolidatePick,
+    pub project: Project,
+    pub groups: Vec<ConsolidateGroup>,
+}
+
+/// How a Consolidate went.
+#[derive(Debug)]
+pub enum Consolidation {
+    /// MIDI only: done, this many clips made.
+    Done(usize),
+    /// Audio is in it: render the job, then finish it.
+    Render(Box<ConsolidateJob>),
+}
+
+/// What a group's clips are, to tell whether the song changed during a render.
+fn content(p: &Project, group: &ConsolidateGroup) -> Vec<(Tick, Option<Clip>, Option<Source>)> {
+    group
+        .parts
+        .iter()
+        .map(|pl| {
+            let clip = p.clips.get(&pl.clip).cloned();
+            let source = clip.as_ref().and_then(|c| p.sources.get(&c.source).cloned());
+            (pl.start, clip, source)
+        })
+        .collect()
 }
 
 impl AppState {
@@ -50,70 +70,100 @@ impl AppState {
         ok
     }
 
-    /// Ctrl+J: join the MIDI clips of the selection into one clip per
-    /// track, spanning from the first to the last (the time selection when
-    /// there is one), with loops written out as notes. Returns how many
-    /// clips were made.
-    pub fn consolidate(&mut self) -> Result<usize, &'static str> {
-        let time = self.time_selection().cloned();
+    /// Ctrl+J: join the clips of the selection into one clip per track,
+    /// spanning from the first to the last (the time selection when there is
+    /// one), gaps included. MIDI is joined at once, with loops written out
+    /// as notes. Audio has to be rendered to a new file first: the result
+    /// is then a job for [`Self::finish_consolidate`].
+    pub fn consolidate(&mut self) -> Result<Consolidation, &'static str> {
+        let pick = match self.time_selection() {
+            Some(sel) => ConsolidatePick::Time(sel.clone()),
+            None => ConsolidatePick::Clips(self.clip_selection()),
+        };
+        let (plan, groups) = self.consolidate_plan(&pick)?;
+        if groups.iter().any(|g| g.audio) {
+            return Ok(Consolidation::Render(Box::new(ConsolidateJob { pick, project: plan.p, groups })));
+        }
+        self.apply_consolidate(plan, &groups, &[]).map(Consolidation::Done)
+    }
+
+    /// Finish a Consolidate with audio in it, once `files[i]` (for each
+    /// audio group `i` of the job) holds what it rendered. Refused when the
+    /// clips changed in the meantime.
+    pub fn finish_consolidate(&mut self, job: &ConsolidateJob, files: &[(usize, AudioSource)]) -> Result<usize, &'static str> {
+        const CHANGED: &str = "The clips changed while they were being rendered: consolidate again";
+        let (plan, groups) = self.consolidate_plan(&job.pick).map_err(|_| CHANGED)?;
+        let same = groups.len() == job.groups.len()
+            && groups.iter().zip(&job.groups).all(|(a, b)| (a.track, a.start, a.end, a.audio) == (b.track, b.start, b.end, b.audio) && content(&plan.p, a) == content(&job.project, b));
+        if !same {
+            return Err(CHANGED);
+        }
+        self.apply_consolidate(plan, &groups, files)
+    }
+
+    /// Cut the time selection's edges (on a scratch copy) and gather what
+    /// each track joins.
+    fn consolidate_plan(&self, pick: &ConsolidatePick) -> Result<(Plan, Vec<ConsolidateGroup>), &'static str> {
         let mut plan = Plan::new(self);
-        // Per track: the range to fill and the clips that go into it.
-        let mut groups: Vec<(TrackId, Tick, Tick, Vec<Placement>)> = Vec::new();
-        match &time {
-            Some(sel) => {
+        let mut groups: Vec<ConsolidateGroup> = Vec::new();
+        match pick {
+            ConsolidatePick::Time(sel) => {
                 for track in &sel.tracks {
                     plan.split_edge(*track, sel.start);
                     plan.split_edge(*track, sel.end);
-                    let inside = plan.placements(*track, |a, b| a >= sel.start && b <= sel.end);
-                    if !inside.is_empty() {
-                        groups.push((*track, sel.start, sel.end, inside));
+                    let parts = plan.placements(*track, |a, b| a >= sel.start && b <= sel.end);
+                    if !parts.is_empty() {
+                        groups.push(ConsolidateGroup { track: *track, start: sel.start, end: sel.end, parts, audio: false });
                     }
                 }
             }
-            None => {
-                for (track, pl, len) in self.clip_selection() {
-                    match groups.iter_mut().find(|g| g.0 == track) {
+            ConsolidatePick::Clips(clips) => {
+                for (track, pl, len) in clips {
+                    if plan.p.track(*track).is_none_or(|t| !t.arrangement.iter().any(|x| x == pl)) {
+                        return Err("The selected clips are gone");
+                    }
+                    match groups.iter_mut().find(|g| g.track == *track) {
                         Some(g) => {
-                            g.1 = g.1.min(pl.start);
-                            g.2 = g.2.max(pl.start + len);
-                            g.3.push(pl);
+                            g.start = g.start.min(pl.start);
+                            g.end = g.end.max(pl.start + len);
+                            g.parts.push(pl.clone());
                         }
-                        None => groups.push((track, pl.start, pl.start + len, vec![pl])),
+                        None => groups.push(ConsolidateGroup { track: *track, start: pl.start, end: pl.start + len, parts: vec![pl.clone()], audio: false }),
                     }
                 }
             }
         }
         if groups.is_empty() {
-            return Err("Select the MIDI clips to consolidate");
+            return Err("Select the clips to consolidate");
         }
-        let is_notes = |p: &Project, pl: &Placement| p.clips.get(&pl.clip).is_some_and(|c| matches!(p.sources.get(&c.source), Some(Source::Notes(_))));
-        if groups.iter().any(|g| g.3.iter().any(|pl| !is_notes(&plan.p, pl))) {
-            return Err("Consolidate joins MIDI clips; audio clips need a render");
-        }
-        let mut made = Vec::new();
-        for (track, start, end, parts) in &groups {
-            let mut notes = Vec::new();
-            let mut first: Option<Clip> = None;
-            for pl in parts {
-                let Some(clip) = plan.p.clips.get(&pl.clip).cloned() else { continue };
-                let Some(Source::Notes(src)) = plan.p.sources.get(&clip.source).cloned() else { continue };
-                for (at, len, n) in heard(&clip, &src.notes) {
-                    notes.push(Note { id: plan.p.alloc_note_id(), start: pl.start - start + at, length: len, ..n.clone() });
-                }
-                first.get_or_insert(clip);
-                plan.remove(*track, pl);
+        for g in &mut groups {
+            g.parts.sort_by_key(|pl| (pl.start, pl.id));
+            let kinds: Vec<bool> = g.parts.iter().map(|pl| plan.p.clips.get(&pl.clip).is_some_and(|c| matches!(plan.p.sources.get(&c.source), Some(Source::Audio(_))))).collect();
+            g.audio = kinds.first().copied().unwrap_or(false);
+            if kinds.iter().any(|k| *k != g.audio) {
+                return Err("A track mixes MIDI and audio clips: consolidate them apart");
             }
-            let Some(first) = first else { continue };
-            let source = plan.p.alloc_source_id();
-            let clip = plan.p.alloc_clip_id();
-            let id = plan.p.alloc_placement_id();
-            let joined = Clip { scale: first.scale, gain_db: first.gain_db, muted: first.muted, ..Clip::new(first.name.clone(), first.color, source, end - start) };
-            plan.run(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
-            plan.run(Command::AddClip { id: clip, clip: Box::new(joined) });
-            plan.run(Command::PlaceClip { track: *track, placement: Placement { id, clip, start: *start, lane: 0 } });
-            made.push(id);
         }
-        if !self.commit("Consolidate", plan) {
+        Ok((plan, groups))
+    }
+
+    /// Join every group in `plan` as one undo step: MIDI through the model's
+    /// notes join, audio onto its rendered file. Selects what was made.
+    fn apply_consolidate(&mut self, mut plan: Plan, groups: &[ConsolidateGroup], files: &[(usize, AudioSource)]) -> Result<usize, &'static str> {
+        let mut made = Vec::new();
+        for (i, g) in groups.iter().enumerate() {
+            let ids: Vec<PlacementId> = g.parts.iter().map(|pl| pl.id).collect();
+            let done = if g.audio {
+                let Some((_, file)) = files.iter().find(|(at, _)| *at == i) else { return Err("An audio clip was not rendered") };
+                ops::consolidate_audio(&mut plan.p, g.track, &ids, g.start, g.end, file.clone())
+            } else {
+                ops::consolidate_notes(&mut plan.p, g.track, &ids, g.start, g.end)
+            };
+            let Some(done) = done else { continue };
+            plan.run_all(done.commands);
+            made.push(done.placement);
+        }
+        if made.is_empty() || !self.commit("Consolidate", plan) {
             return Err("Nothing to consolidate");
         }
         let count = made.len();

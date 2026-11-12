@@ -101,6 +101,7 @@ icons! {
     Split => "split",
     SquareFill => "square-fill",
     Star => "star",
+    StarFilled => "star-filled",
     Steps => "steps",
     Stop => "stop",
     Strum => "strum",
@@ -133,7 +134,7 @@ mod tests {
 
     #[test]
     fn every_icon_is_embedded() {
-        for i in [Icon::Play, Icon::Record, Icon::Sparkles, Icon::Piano, Icon::Mixer, Icon::ZoomOut] {
+        for i in [Icon::Play, Icon::Record, Icon::Sparkles, Icon::Piano, Icon::Mixer, Icon::ZoomOut, Icon::StarFilled] {
             let bytes = bytes(i.path()).expect("embedded");
             assert!(std::str::from_utf8(bytes).unwrap().contains("<svg"));
         }

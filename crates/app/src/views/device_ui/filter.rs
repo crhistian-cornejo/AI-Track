@@ -97,7 +97,19 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     kit::panel(if dev.big { 640. } else { 440. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
         .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))
-        .child(kit::strip(dev, &[p::DRIVE, p::LFO_DEPTH, rate, p::ENV_AMOUNT, p::MIX], &[p::LFO_SHAPE, p::LFO_STEREO, p::ENV_ATTACK, p::ENV_RELEASE, p::OUTPUT], cx))
+        .child(kit::strip(
+            ws,
+            dev,
+            &[p::DRIVE, p::LFO_DEPTH, rate, p::ENV_AMOUNT, p::MIX],
+            &[
+                p::LFO_SHAPE,
+                p::LFO_STEREO,
+                p::ENV_ATTACK,
+                p::ENV_RELEASE,
+                p::OUTPUT,
+            ],
+            cx,
+        ))
         .into_any_element()
 }
 

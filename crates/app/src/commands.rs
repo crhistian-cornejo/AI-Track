@@ -2,7 +2,7 @@
 //! menus and the shortcuts sheet all end up in [`run`], so a command behaves
 //! the same wherever it is triggered from.
 
-use crate::editing::{Area, GridView};
+use crate::editing::{Area, ConsolidateJob, Consolidation, GridView};
 use crate::keys::Cmd;
 use crate::state::{MainView, Snap};
 use crate::views::prefs::Modal;
@@ -69,8 +69,8 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             }
         }
         Cmd::Consolidate => match ws.s.consolidate() {
-            Ok(1) => ws.toast("Consolidated into one clip", cx),
-            Ok(n) => ws.toast(format!("Consolidated into {n} clips"), cx),
+            Ok(Consolidation::Done(n)) => consolidated(ws, n, cx),
+            Ok(Consolidation::Render(job)) => render_consolidate(ws, *job, cx),
             Err(why) => ws.toast(why, cx),
         },
         Cmd::Rename => open_rename(ws, window, cx),
@@ -210,7 +210,19 @@ fn reveal_marker(ws: &mut Workspace) {
 /// else the selected track.
 pub fn open_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let clip = ws.s.clip_selection().first().map(|(_, pl, _)| pl.clip);
-    let target = clip.map(RenameTarget::Clip).or(ws.s.selected_track.map(RenameTarget::Track));
+    let target = clip
+        .map(RenameTarget::Clip)
+        .or(ws.s.selected_track.map(RenameTarget::Track));
+    open_rename_for(ws, target, window, cx);
+}
+
+/// The Rename field for `target` (a track's context menu names it directly).
+pub fn open_rename_for(
+    ws: &mut Workspace,
+    target: Option<RenameTarget>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let name = match target {
         Some(RenameTarget::Clip(c)) => ws.s.project.clips.get(&c).map(|c| c.name.clone()),
         Some(RenameTarget::Track(t)) => ws.s.project.track(t).map(|t| t.name.clone()),
@@ -238,4 +250,69 @@ pub fn apply_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
     ws.modal = None;
     ws.focus.focus(window, cx);
     cx.notify();
+}
+
+fn consolidated(ws: &mut Workspace, n: usize, cx: &mut Context<Workspace>) {
+    ws.toast(if n == 1 { "Consolidated into one clip".to_owned() } else { format!("Consolidated into {n} clips") }, cx);
+}
+
+/// One audio file a Consolidate renders.
+struct Render {
+    group: usize,
+    parts: Vec<PlacementId>,
+    path: std::path::PathBuf,
+    rate: u32,
+}
+
+/// Render the audio of a Consolidate off the UI thread (each track's clips
+/// to a new WAV file at the highest rate among them), then apply it as one
+/// undo step. The song is left alone when a render fails.
+fn render_consolidate(ws: &mut Workspace, job: ConsolidateJob, cx: &mut Context<Workspace>) {
+    let dir = crate::project_io::consolidate_folder(ws.project_path.as_deref());
+    let mut work = Vec::new();
+    for (i, g) in job.groups.iter().enumerate().filter(|(_, g)| g.audio) {
+        let p = &job.project;
+        let rate = g
+            .parts
+            .iter()
+            .filter_map(|pl| match p.sources.get(&p.clips.get(&pl.clip)?.source) {
+                Some(Source::Audio(a)) => Some(a.sample_rate),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(p.sample_rate_hint)
+            .max(8_000);
+        let name = g.parts.first().and_then(|pl| p.clips.get(&pl.clip)).map_or("Audio", |c| c.name.as_str());
+        // Two tracks in one go must not pick the same free name.
+        let taken: Vec<&std::path::Path> = work.iter().map(|w: &Render| w.path.as_path()).collect();
+        let path = crate::project_io::fresh_wav(&dir, name, &taken);
+        work.push(Render { group: i, parts: g.parts.iter().map(|pl| pl.id).collect(), path, rate });
+    }
+    ws.toast("Rendering the audio clips…", cx);
+    let project = job.project.clone();
+    let tracks: Vec<TrackId> = job.groups.iter().map(|g| g.track).collect();
+    let ranges: Vec<(Tick, Tick)> = job.groups.iter().map(|g| (g.start, g.end)).collect();
+    let task = cx.background_executor().spawn(async move {
+        let mut files = Vec::with_capacity(work.len());
+        for w in work {
+            let (track, range) = (tracks[w.group], ranges[w.group]);
+            let file = aitrack_engine::consolidate_to_wav(&project, track, &w.parts, range, w.rate, &w.path, None).map_err(|e| e.to_string())?;
+            files.push((w.group, file));
+        }
+        Ok::<_, String>(files)
+    });
+    cx.spawn(async move |this, cx| {
+        let result = task.await;
+        let _ = this.update(cx, |ws, cx| {
+            match result {
+                Ok(files) => match ws.s.finish_consolidate(&job, &files) {
+                    Ok(n) => consolidated(ws, n, cx),
+                    Err(why) => ws.toast(why, cx),
+                },
+                Err(e) => ws.toast(format!("Consolidate failed: {e}"), cx),
+            }
+            cx.notify();
+        });
+    })
+    .detach();
 }

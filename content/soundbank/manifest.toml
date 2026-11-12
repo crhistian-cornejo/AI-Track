@@ -11,6 +11,14 @@
 #           plugins. The user downloads them from the official page and the
 #           app indexes the download folder.
 #
+# genres: what the pack as a whole is meant for, shown in the Content Hub.
+#         A genre is copied onto the pack's samples only when the list has
+#         exactly one entry, so leave it empty rather than guess, and never
+#         list genres a pack merely "works for".
+# default_category / default_subcategory: the label of files whose own name
+#         says nothing (multisample notes such as "a0_oscillator_tuned").
+#         The pack folder name itself is never read as a label.
+#
 # sha256: archive hash. For format = "github_tree" it is the sha256 of the
 # sorted "path<TAB>git-blob-sha" list of the selected files at the pinned
 # commit (each file is also checked against its git blob sha1).
@@ -150,7 +158,8 @@ license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
 redistributable = true
 license_evidence = "OpenGameArt page, License(s) field: 'CC0'."
 attribution = "100 SFX by rubberduck (CC0 1.0)"
-genres = ["EDM"]
+# Game sound effects: no musical genre (a lone genre here would be copied onto every file).
+genres = []
 kinds = ["fx", "one-shots"]
 default_category = "FX"
 

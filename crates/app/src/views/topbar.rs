@@ -11,7 +11,7 @@ use crate::icons::{Icon, icon};
 use crate::state::MainView;
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
-use crate::workspace::{Drag, MenuKind, Workspace};
+use crate::workspace::{Drag, MenuKind, NumTarget, Workspace, click_dragged, plain_text};
 use aitrack_model::PPQ;
 use gpui::{
     AnyElement, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollDelta,
@@ -230,14 +230,18 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     cx.notify();
                 })),
         )
-        // Drag vertically or scroll, Shift for fine steps.
+        // Drag vertically or scroll, Shift for fine steps; click and type.
         .child(
             readout("bpm", 64.)
                 .cursor_ns_resize()
                 .hover(|s| s.border_color(border_strong()))
-                .tooltip(widgets::tip("Tempo — drag or scroll, Shift for fine, double-click for 120", None))
+                .tooltip(widgets::tip(
+                    "Tempo — click to type, drag or scroll, Shift for fine, double-click for 120",
+                    None,
+                ))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                    if e.click_count == 2 {
+                        if e.click_count == 2 {
+                            this.num_edit = None;
                         this.s.set_tempo(120.);
                         this.s.seal();
                         cx.notify();
@@ -258,7 +262,26 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                         cx.notify();
                     }
                 }))
-                .child(mono(format!("{bpm:.2}"), TEXT_MD, pal.text)),
+                // A click that didn't move opens the box for typing.
+                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                    if e.click_count() >= 2 || click_dragged(e) {
+                        return;
+                    }
+                    if matches!(&this.num_edit, Some(edit) if edit.target == NumTarget::Tempo) {
+                        return;
+                    }
+                    let bpm = this.s.project.tempo.initial_bpm();
+                    this.begin_num_edit(NumTarget::Tempo, plain_text(bpm), cx);
+                }))
+                .child(match &ws.num_edit {
+                    Some(edit) if edit.target == NumTarget::Tempo => div()
+                        .flex()
+                        .items_center()
+                        .child(mono(edit.text.clone(), TEXT_MD, pal.accent))
+                        .child(div().w(px(1.)).h(px(12.)).ml(px(1.)).bg(pal.accent))
+                        .into_any_element(),
+                    _ => mono(format!("{bpm:.2}"), TEXT_MD, pal.text).into_any_element(),
+                }),
         )
         .child(
             readout("timesig", 44.)

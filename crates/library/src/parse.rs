@@ -39,6 +39,13 @@ pub struct NameHints {
     pub subcategory: Option<&'static str>,
     /// Only set when the name says so explicitly (`loop`, `one shot`, `chop`).
     pub kind: Option<SampleKind>,
+    /// A bare number in the file name that looks like a tempo (`Groove_128`)
+    /// but was not trusted as [`NameHints::bpm`]. The analyzer adopts it when
+    /// the file length is a whole number of bars at that tempo.
+    pub bpm_guess: Option<f32>,
+    /// A weak loop word in the file name (`beat`, `pattern`, `riff`): not a
+    /// loop on its own, but lets the audio analysis call it one.
+    pub loop_hint: bool,
     /// "Top loop" (drum loop without kick).
     pub top_loop: bool,
     /// Canonical genre names, deduplicated, in order of appearance.
@@ -56,6 +63,11 @@ enum Hit {
     Kind(SampleKind),
     Top,
     Genre(&'static str),
+    /// A genre word that is also an everyday word (`pop`, `drill`, `jungle`):
+    /// only trusted in folder names, not in a file name.
+    WeakGenre(&'static str),
+    /// A weak loop word (see [`NameHints::loop_hint`]).
+    LoopHint,
     /// Matches a category and also marks the sample as a loop (breakbeats).
     CatLoop(Category, Option<&'static str>, u8),
 }
@@ -208,6 +220,8 @@ const CAT_WORDS: &[(&str, Category, Option<&str>, u8)] = &[
     ("synthesizer", Synths, None, 3),
     ("sintetizador", Synths, None, 3),
     ("sinte", Synths, None, 3),
+    ("oscillator", Synths, None, 3),
+    ("oscillators", Synths, None, 3),
     ("melody", Synths, None, 2),
     ("melodia", Synths, None, 2),
     // Vocals.
@@ -379,7 +393,28 @@ const KIND_WORDS: &[(&str, SampleKind)] = &[
     ("one shots", SampleKind::OneShot),
     ("oneshot", SampleKind::OneShot),
     ("oneshots", SampleKind::OneShot),
+    ("1 shot", SampleKind::OneShot),
+    ("1shot", SampleKind::OneShot),
+    ("os", SampleKind::OneShot),
+    ("hit", SampleKind::OneShot),
+    ("hits", SampleKind::OneShot),
+    ("golpes", SampleKind::OneShot),
+    // A roll (snare, timpani) is many strokes but still one gesture.
+    ("roll", SampleKind::OneShot),
+    ("rolls", SampleKind::OneShot),
+    ("redoble", SampleKind::OneShot),
+    ("lp", SampleKind::Loop),
+    ("lps", SampleKind::Loop),
 ];
+
+/// Words that suggest a loop without saying so (see [`NameHints::loop_hint`]).
+const LOOP_HINT_WORDS: &[&str] = &[
+    "beat", "beats", "pattern", "patterns", "phrase", "phrases", "riff", "riffs", "progression", "ritmo", "patron",
+];
+
+/// Genre words that are also ordinary words (a pop, a drill, the jungle):
+/// a folder called `Pop` is a genre, a file called `elec_pop` is not.
+const WEAK_GENRE_WORDS: &[&str] = &["pop", "drill", "jungle", "garage", "minimal", "trailer"];
 
 const GENRE_WORDS: &[(&str, &str)] = &[
     ("edm", "EDM"),
@@ -466,7 +501,11 @@ fn table() -> &'static HashMap<&'static str, Vec<Hit>> {
             m.entry(w).or_default().push(Hit::Kind(k));
         }
         for &(w, g) in GENRE_WORDS {
-            m.entry(w).or_default().push(Hit::Genre(g));
+            let hit = if WEAK_GENRE_WORDS.contains(&w) { Hit::WeakGenre(g) } else { Hit::Genre(g) };
+            m.entry(w).or_default().push(hit);
+        }
+        for &w in LOOP_HINT_WORDS {
+            m.entry(w).or_default().push(Hit::LoopHint);
         }
         for w in ["top", "tops"] {
             m.entry(w).or_default().push(Hit::Top);
@@ -747,8 +786,10 @@ struct SegmentHints {
     /// A subcategory match for the winning category, even if lower priority.
     kind: Option<SampleKind>,
     loop_from_break: bool,
+    loop_hint: bool,
     top: bool,
     genres: Vec<&'static str>,
+    weak_genres: Vec<&'static str>,
 }
 
 fn parse_bpm_number(s: &str) -> Option<f32> {
@@ -894,6 +935,12 @@ fn analyze_segment(seg: &str) -> SegmentHints {
                             h.genres.push(g);
                         }
                     }
+                    Hit::WeakGenre(g) => {
+                        if !h.weak_genres.contains(&g) {
+                            h.weak_genres.push(g);
+                        }
+                    }
+                    Hit::LoopHint => h.loop_hint = true,
                 }
             }
         }
@@ -1017,8 +1064,15 @@ pub fn parse_name(stem: &str, folders_nearest_first: &[&str]) -> NameHints {
     if out.bpm.is_none() {
         out.bpm = dirs.iter().find_map(|d| d.strong_bpm);
     }
+    if out.bpm.is_none() {
+        out.bpm_guess = file.weak_bpm;
+    }
+    out.loop_hint = file.loop_hint || file.loop_from_break;
 
-    for g in file.genres.iter().chain(dirs.iter().flat_map(|d| d.genres.iter())) {
+    // Genres only from whole words: the file name, then its folders. Words
+    // that double as ordinary words count in folder names only.
+    let folder_genres = dirs.iter().flat_map(|d| d.genres.iter().chain(d.weak_genres.iter()));
+    for g in file.genres.iter().chain(folder_genres) {
         if !out.genres.contains(g) {
             out.genres.push(g);
         }
@@ -1234,6 +1288,70 @@ mod tests {
         assert_eq!((glass.category, glass.kind), (Some(Fx), None));
         // "drum and bass" is a genre, not Bass.
         assert_eq!(p("Drum and Bass Break 174.wav").category, Some(Drums));
+    }
+
+    #[test]
+    fn multisample_names_get_no_invented_labels() {
+        // Karoryfer String Cyborgs: the pack, not the file, says "string".
+        let h = parse_name("a0_oscillator_tuned", &["ironface", "Samples"]);
+        assert_eq!((h.category, h.subcategory), (Some(Synths), None));
+        assert_ne!(h.subcategory, Some("Strings"));
+        assert!(h.genres.is_empty(), "{:?}", h.genres);
+        assert_eq!(h.kind, None);
+
+        let h = parse_name("bass_8_e2", &["Samples"]);
+        assert_eq!(h.category, Some(Bass));
+        assert!(h.genres.is_empty(), "{:?}", h.genres);
+        assert_eq!(h.root_note, Some(40));
+        assert_eq!(h.bpm, None);
+        assert_eq!(h.bpm_guess, None);
+    }
+
+    #[test]
+    fn kind_words() {
+        let cases: &[(&str, Option<SampleKind>)] = &[
+            ("Kick_OS_01.wav", Some(SampleKind::OneShot)),
+            ("Kick One-Shot 3.wav", Some(SampleKind::OneShot)),
+            ("Snare Hit 2.wav", Some(SampleKind::OneShot)),
+            ("Triangle Hit 1.flac", Some(SampleKind::OneShot)),
+            ("Snare Roll 4.wav", Some(SampleKind::OneShot)),
+            ("Timpani1_Roll_v3_rr1_Sum.wav", Some(SampleKind::OneShot)),
+            ("Perc_LP_120.wav", Some(SampleKind::Loop)),
+            ("Synth_Am_128bpm_loop.wav", Some(SampleKind::Loop)),
+            ("Drum Roll Loop 120.wav", Some(SampleKind::Loop)),
+            ("Hits/Kick Loop 128.wav", Some(SampleKind::Loop)),
+            ("Loops/Kick One Shot.wav", Some(SampleKind::OneShot)),
+            ("arovane_beat_a.flac", None),
+            ("Kick.wav", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(p(name).kind, *want, "{name}");
+        }
+        assert!(p("arovane_beat_a.flac").loop_hint);
+        assert!(p("Guitar Riff Am.wav").loop_hint);
+        assert!(!p("Kick 3.wav").loop_hint);
+    }
+
+    #[test]
+    fn tempo_guess_from_a_bare_number() {
+        let h = p("Perc_128.wav");
+        assert_eq!((h.bpm, h.bpm_guess), (None, Some(128.0)));
+        let h = p("Groove_128.wav");
+        assert_eq!((h.bpm, h.bpm_guess), (Some(128.0), None));
+        assert_eq!(p("Kick_01.wav").bpm_guess, None);
+    }
+
+    #[test]
+    fn ambiguous_genre_words_only_count_in_folders() {
+        assert!(p("elec_pop.flac").genres.is_empty());
+        assert!(p("Power Drill.wav").genres.is_empty());
+        assert!(p("Jungle Birds.wav").genres.is_empty());
+        assert_eq!(p("Pop/Vocal Chop 1.wav").genres, vec!["Pop"]);
+        assert_eq!(p("Drill/808 F#.wav").genres, vec!["Drill"]);
+        // Clear genre words still count in file names, by whole word only.
+        assert_eq!(p("Techno_Rumble_Kick.wav").genres, vec!["Techno"]);
+        assert!(p("Housekeeping.wav").genres.is_empty());
+        assert!(p("Strings_Trapped.wav").genres.is_empty());
     }
 
     #[test]

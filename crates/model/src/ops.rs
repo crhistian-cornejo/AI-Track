@@ -135,13 +135,19 @@ pub fn resize_end(p: &Project, clip: ClipId, new_length: Tick) -> Option<Command
 
 /// The left-edge drag: move the placement's start to `new_start` and trim or
 /// reveal the same amount of content, so what is left stays where it was on
-/// the timeline (volume envelope included). Without a loop the clip cannot
-/// start before its source does; inside a loop the offset wraps around.
+/// the timeline (volume envelope included). Without a loop an audio clip
+/// cannot start before its file does; a notes clip can (empty time before
+/// its notes); inside a loop the offset wraps around. A notes clip is left
+/// with an offset: [`rebase_notes`] settles it when the drag ends.
 pub fn trim_start(p: &Project, track: TrackId, placement: PlacementId, new_start: Tick) -> Option<Vec<Command>> {
     let place = find_placement(p, track, placement)?;
     let old = p.clips.get(&place.clip)?;
     let mut delta = (new_start.max(0) - place.start).min(old.length - MIN_CLIP_LEN);
-    if !in_loop(old) {
+    // A notes clip can grow to the left past its first note (the offset goes
+    // negative until [`rebase_notes`] moves the notes instead); audio cannot
+    // start before its file.
+    let notes = matches!(p.sources.get(&old.source), Some(Source::Notes(_)));
+    if !in_loop(old) && !notes {
         delta = delta.max(-old.offset);
     }
     if delta == 0 {
@@ -188,8 +194,14 @@ pub struct Split {
 /// Cut a placed clip at the absolute tick `at` (strictly inside it) into two
 /// independent clips. The left half keeps the clip id; the right half is a
 /// new clip and placement on the same lane. The cut edges get no fade, the
-/// volume envelope is divided with a point on each side of the cut, audio
-/// halves share the file and a notes half gets its own copy of the notes.
+/// volume envelope is divided with a point on each side of the cut and audio
+/// halves share the file with offsets of their own.
+///
+/// Each notes half gets notes of its own holding only what it plays, from
+/// tick 0 (see [`own_trimmed_notes`]): a note that crosses the cut is
+/// shortened to end at it in the left half and is not in the right half,
+/// which never played it. Opened in the piano roll, each half shows and
+/// edits just its own notes.
 ///
 /// A clip that is also placed somewhere else, or sits in a session slot, is
 /// left as it is for its other users: the left half becomes a new clip too,
@@ -217,20 +229,25 @@ pub fn split_placement(p: &mut Project, track: TrackId, placement: PlacementId, 
     }
     clamp_fades(&mut left, Edge::End);
     clamp_fades(&mut right, Edge::Start);
-    let mut cmds = Vec::with_capacity(7);
+    let mut cmds = Vec::with_capacity(9);
     let shared = p.tracks.iter().any(|t| t.arrangement.iter().any(|pl| pl.clip == place.clip && pl.id != placement) || t.session_slots.values().any(|c| *c == place.clip));
+    own_trimmed_notes(p, &mut left, &mut cmds);
     let left_id = if shared {
-        own_notes(p, &mut left, &mut cmds);
         let id = p.alloc_clip_id();
         cmds.push(Command::AddClip { id, clip: Box::new(left) });
         cmds.push(Command::RemovePlacement { track, id: placement });
         cmds.push(Command::PlaceClip { track, placement: Placement { clip: id, ..place.clone() } });
         id
     } else {
+        let notes_replaced = left.source != old.source;
         cmds.push(Command::UpdateClip { id: place.clip, clip: Box::new(left) });
+        // The left half has notes of its own now; nothing else plays the old ones.
+        if notes_replaced && !p.clips.iter().any(|(id, c)| *id != place.clip && c.source == old.source) {
+            cmds.push(Command::RemoveSource { id: old.source });
+        }
         place.clip
     };
-    own_notes(p, &mut right, &mut cmds);
+    own_trimmed_notes(p, &mut right, &mut cmds);
     let right_id = p.alloc_clip_id();
     let right_place = Placement { id: p.alloc_placement_id(), clip: right_id, start: at, lane: place.lane };
     let right_placement = right_place.id;
@@ -252,6 +269,181 @@ pub fn duplicate_placement(p: &mut Project, track: TrackId, placement: Placement
     cmds.push(Command::AddClip { id: clip, clip: Box::new(copy) });
     cmds.push(Command::PlaceClip { track, placement: Placement { id, clip, start: start.max(0), lane: place.lane } });
     Some((cmds, id))
+}
+
+/// Notes of a clip as they are heard: copies with their start in ticks from
+/// the clip's start and their length cut where they stop sounding (the end
+/// of the clip, and of the loop pass they start in), with the loop unrolled
+/// over the clip's length. Notes outside what the clip plays are left out;
+/// ids are kept.
+pub fn heard_notes(clip: &Clip, notes: &[Note]) -> Vec<Note> {
+    let mut out = Vec::new();
+    let length = clip.length.max(0);
+    match clip.looping.filter(|l| l.end > l.start) {
+        None => {
+            for n in notes.iter().filter(|n| n.start >= clip.offset && n.start < clip.offset + length) {
+                let at = n.start - clip.offset;
+                out.push(Note { start: at, length: n.length.min(length - at), ..n.clone() });
+            }
+        }
+        Some(l) => {
+            // The first pass runs from the offset to the loop's end, the rest loop.
+            let mut from = if clip.offset >= l.end { l.start + (clip.offset - l.start) % (l.end - l.start) } else { clip.offset };
+            let mut base = 0;
+            while base < length {
+                for n in notes.iter().filter(|n| n.start >= from && n.start < l.end) {
+                    let at = base + n.start - from;
+                    if at < length {
+                        out.push(Note { start: at, length: n.length.min(length - at).min(l.end - n.start), ..n.clone() });
+                    }
+                }
+                base += l.end - from;
+                from = l.start;
+            }
+        }
+    }
+    out.sort_by_key(|n| (n.start, n.key));
+    out
+}
+
+/// Settle a notes clip that does not loop onto offset 0: its notes move by
+/// the offset so they keep their place on the timeline, and the notes that
+/// start before the clip (never played, crossing its start included) go.
+/// Notes past the clip's end are kept, so dragging the right edge out still
+/// reveals them. The clip gets notes of its own; the old ones are removed
+/// when nothing else uses them. `None` when there is nothing to settle (a
+/// looping or audio clip, or offset 0 already). This is what the left-edge
+/// trim ends with, so the piano roll, which shows a clip's notes from tick
+/// 0, shows and edits exactly what plays.
+pub fn rebase_notes(p: &mut Project, clip: ClipId) -> Option<Vec<Command>> {
+    let old = p.clips.get(&clip)?.clone();
+    if old.offset == 0 || old.looping.is_some_and(|l| l.end > l.start) {
+        return None;
+    }
+    let Some(Source::Notes(src)) = p.sources.get(&old.source) else { return None };
+    let kept: Vec<Note> = src.notes.iter().filter(|n| n.start >= old.offset).map(|n| Note { start: n.start - old.offset, ..n.clone() }).collect();
+    let source = p.alloc_source_id();
+    let notes = kept.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
+    let looping = old.looping.map(|l| LoopRegion { start: l.start - old.offset, end: l.end - old.offset });
+    let mut cmds = vec![
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) },
+        Command::UpdateClip { id: clip, clip: Box::new(Clip { source, offset: 0, looping, ..old.clone() }) },
+    ];
+    if !p.clips.iter().any(|(id, c)| *id != clip && c.source == old.source) {
+        cmds.push(Command::RemoveSource { id: old.source });
+    }
+    Some(cmds)
+}
+
+/// [`rebase_notes`] for every notes clip of the project that needs it (a
+/// project saved before clips were settled this way).
+pub fn rebase_all_notes(p: &mut Project) -> Vec<Command> {
+    let clips: Vec<ClipId> = p.clips.keys().copied().collect();
+    let mut cmds = Vec::new();
+    for id in clips {
+        if let Some(mut c) = rebase_notes(p, id) {
+            cmds.append(&mut c);
+        }
+    }
+    cmds
+}
+
+/// What [`consolidate_notes`] and [`consolidate_audio`] made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Consolidated {
+    pub commands: Vec<Command>,
+    pub clip: ClipId,
+    pub placement: PlacementId,
+}
+
+/// Ctrl+J on MIDI clips: replace the placements `parts` of `track` with one
+/// notes clip over `start..end` holding the notes they play, each where it
+/// was heard (loops written out, gaps kept as silence). The clip takes the
+/// name, color, scale, gain and activation of the earliest part. Clips and
+/// notes nothing uses any more are removed. `None` when a part is missing,
+/// is not a notes clip, or the range is empty.
+pub fn consolidate_notes(p: &mut Project, track: TrackId, parts: &[PlacementId], start: Tick, end: Tick) -> Option<Consolidated> {
+    let placed = gather(p, track, parts, start, end)?;
+    let mut notes = Vec::new();
+    for (pl, clip) in &placed {
+        let Some(Source::Notes(src)) = p.sources.get(&clip.source) else { return None };
+        notes.extend(heard_notes(clip, &src.notes).into_iter().map(|n| Note { start: pl.start - start + n.start, ..n }));
+    }
+    notes.sort_by_key(|n| (n.start, n.key));
+    for n in &mut notes {
+        n.id = p.alloc_note_id();
+    }
+    let first = &placed[0].1;
+    let source = p.alloc_source_id();
+    let joined = Clip { scale: first.scale, gain_db: first.gain_db, muted: first.muted, ..Clip::new(first.name.clone(), first.color, source, end - start) };
+    Some(replace(p, track, &placed, Source::Notes(NoteSource { notes }), source, joined, start))
+}
+
+/// Ctrl+J on audio clips, once their sound is rendered to `file` (from
+/// `start` to `end`, gain, fades, envelopes and warp applied): replace the
+/// placements `parts` of `track` with one plain clip that plays it. The
+/// clip takes the name and color of the earliest part. Clips and sources
+/// nothing uses any more are removed (the files stay on disk). `None` when
+/// a part is missing, is not an audio clip, or the range is empty.
+pub fn consolidate_audio(p: &mut Project, track: TrackId, parts: &[PlacementId], start: Tick, end: Tick, file: AudioSource) -> Option<Consolidated> {
+    let placed = gather(p, track, parts, start, end)?;
+    if placed.iter().any(|(_, c)| !matches!(p.sources.get(&c.source), Some(Source::Audio(_)))) {
+        return None;
+    }
+    let first = &placed[0].1;
+    let source = p.alloc_source_id();
+    let joined = Clip::new(first.name.clone(), first.color, source, end - start);
+    Some(replace(p, track, &placed, Source::Audio(file), source, joined, start))
+}
+
+/// The placements `parts` of `track` with their clips, earliest first.
+fn gather(p: &Project, track: TrackId, parts: &[PlacementId], start: Tick, end: Tick) -> Option<Vec<(Placement, Clip)>> {
+    if parts.is_empty() || end <= start {
+        return None;
+    }
+    let mut placed = Vec::with_capacity(parts.len());
+    for id in parts {
+        let pl = find_placement(p, track, *id)?.clone();
+        let clip = p.clips.get(&pl.clip)?.clone();
+        placed.push((pl, clip));
+    }
+    placed.sort_by_key(|(pl, _)| pl.start);
+    placed.dedup_by_key(|(pl, _)| pl.id);
+    Some(placed)
+}
+
+/// Remove `placed` (and the clips and sources only they used), then place
+/// `clip` over the new `content` at `start`.
+fn replace(p: &mut Project, track: TrackId, placed: &[(Placement, Clip)], content: Source, source: SourceId, clip: Clip, start: Tick) -> Consolidated {
+    let mut cmds = Vec::with_capacity(placed.len() * 3 + 3);
+    let gone: Vec<PlacementId> = placed.iter().map(|(pl, _)| pl.id).collect();
+    for id in &gone {
+        cmds.push(Command::RemovePlacement { track, id: *id });
+    }
+    let used = |clip: ClipId| {
+        p.tracks.iter().any(|t| t.arrangement.iter().any(|pl| pl.clip == clip && !(t.id == track && gone.contains(&pl.id))) || t.session_slots.values().any(|c| *c == clip))
+    };
+    let mut dropped: Vec<ClipId> = placed.iter().map(|(pl, _)| pl.clip).filter(|c| !used(*c)).collect();
+    dropped.sort();
+    dropped.dedup();
+    for id in &dropped {
+        cmds.push(Command::RemoveClip { id: *id });
+    }
+    let mut sources: Vec<SourceId> = dropped.iter().filter_map(|id| p.clips.get(id).map(|c| c.source)).collect();
+    sources.sort();
+    sources.dedup();
+    for id in sources {
+        if !p.clips.iter().any(|(cid, c)| c.source == id && !dropped.contains(cid)) {
+            cmds.push(Command::RemoveSource { id });
+        }
+    }
+    let clip_id = p.alloc_clip_id();
+    let placement = p.alloc_placement_id();
+    let lane = placed[0].0.lane;
+    cmds.push(Command::AddSource { id: source, source: Box::new(content) });
+    cmds.push(Command::AddClip { id: clip_id, clip: Box::new(clip) });
+    cmds.push(Command::PlaceClip { track, placement: Placement { id: placement, clip: clip_id, start, lane } });
+    Consolidated { commands: cmds, clip: clip_id, placement }
 }
 
 // ───────────────────────────── Helpers ─────────────────────────────
@@ -341,6 +533,39 @@ fn split_points(lane: &AutomationLane, cut: Tick) -> (Vec<AutomationPoint>, Vec<
     (left, right)
 }
 
+/// Give a notes clip notes of its own (new source and note ids) that hold
+/// only what it plays, so the piano roll shows exactly that from tick 0:
+/// without a loop, the heard notes ([`heard_notes`]) and offset 0; with a
+/// loop, the notes from the offset (or the loop start, when earlier) to the
+/// loop end, moved so that point is tick 0, and the offset and loop moved
+/// with them. The clip plays the same either way. Audio is left alone.
+fn own_trimmed_notes(p: &mut Project, clip: &mut Clip, cmds: &mut Vec<Command>) {
+    let Some(Source::Notes(src)) = p.sources.get(&clip.source) else { return };
+    let notes: Vec<Note> = match clip.looping.filter(|l| l.end > l.start) {
+        None => {
+            let heard = heard_notes(clip, &src.notes);
+            clip.offset = 0;
+            heard
+        }
+        Some(l) => {
+            let base = clip.offset.min(l.start).max(0);
+            let kept = src
+                .notes
+                .iter()
+                .filter(|n| n.start >= base && n.start < l.end)
+                .map(|n| Note { start: n.start - base, length: n.length.min(l.end - n.start), ..n.clone() })
+                .collect();
+            clip.offset -= base;
+            clip.looping = Some(LoopRegion { start: l.start - base, end: l.end - base });
+            kept
+        }
+    };
+    let id = p.alloc_source_id();
+    let notes = notes.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
+    cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes })) });
+    clip.source = id;
+}
+
 /// Give a notes clip its own copy of its notes (new source and note ids).
 fn own_notes(p: &mut Project, clip: &mut Clip, cmds: &mut Vec<Command>) {
     let Some(Source::Notes(src)) = p.sources.get(&clip.source).cloned() else { return };
@@ -353,6 +578,7 @@ fn own_notes(p: &mut Project, clip: &mut Clip, cmds: &mut Vec<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     const BEAT: Tick = PPQ;
 
@@ -696,21 +922,97 @@ mod tests {
         });
     }
 
+    /// `(start, key, length)` of the notes a clip's source holds, in order.
+    fn notes_of(p: &Project, clip: ClipId) -> Vec<(Tick, u8, Tick)> {
+        let Some(Source::Notes(src)) = p.sources.get(&p.clips[&clip].source) else { panic!("a notes clip") };
+        let mut v: Vec<_> = src.notes.iter().map(|n| (n.start, n.key, n.length)).collect();
+        v.sort();
+        v
+    }
+
+    fn right_half(p: &Project, track: TrackId, placement: PlacementId) -> ClipId {
+        p.track(track).unwrap().arrangement.iter().find(|pl| pl.id != placement).unwrap().clip
+    }
+
     #[test]
-    fn split_notes_gives_the_right_half_its_own_notes() {
+    fn split_notes_gives_each_half_only_its_own_notes() {
+        let mut f = fixture(None, 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let original = f.p.clips[&clip].source;
+        // The second note crosses the cut at beat 2 of the clip.
+        let Some(Source::Notes(src)) = f.p.sources.get_mut(&original) else { unreachable!() };
+        src.notes[1].length = BEAT + BEAT / 2;
+        let cmds = split_at(&mut f.p, track, placement, 6 * BEAT).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let right = right_half(p, track, placement);
+            let (l, r) = (&p.clips[&clip], &p.clips[&right]);
+            assert_eq!((l.offset, l.length, r.offset, r.length), (0, 2 * BEAT, 0, 2 * BEAT), "both halves start at their own tick 0");
+            assert!(l.source != r.source && l.source != original);
+            // The crossing note ends at the cut on the left and is not on the right.
+            assert_eq!(notes_of(p, clip), [(0, 60, BEAT / 2), (BEAT, 61, BEAT)]);
+            assert_eq!(notes_of(p, right), [(0, 62, BEAT / 2), (BEAT, 63, BEAT / 2)]);
+            assert!(!p.sources.contains_key(&original), "nothing plays the old notes any more");
+            let ids: BTreeSet<NoteId> = [l.source, r.source].iter().flat_map(|s| match &p.sources[s] { Source::Notes(n) => n.notes.iter().map(|n| n.id).collect::<Vec<_>>(), _ => vec![] }).collect();
+            assert_eq!(ids.len(), 4, "every note has an id of its own");
+        });
+    }
+
+    #[test]
+    fn editing_one_half_leaves_the_other_alone() {
         let mut f = fixture(None, 4 * BEAT);
         let (track, clip, placement) = (f.track, f.clip, f.placement);
         let cmds = split_at(&mut f.p, track, placement, 6 * BEAT).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        let right = right_half(&f.p, track, placement);
+        let before = notes_of(&f.p, right);
+        let source = f.p.clips[&clip].source;
+        let Source::Notes(src) = &f.p.sources[&source] else { unreachable!() };
+        let moved: Vec<Note> = src.notes.iter().map(|n| Note { key: n.key + 12, ..n.clone() }).collect();
+        Command::UpdateNotes { source, notes: moved }.apply(&mut f.p).unwrap();
+        assert_eq!(notes_of(&f.p, clip), [(0, 72, BEAT / 2), (BEAT, 73, BEAT / 2)]);
+        assert_eq!(notes_of(&f.p, right), before);
+    }
+
+    #[test]
+    fn split_of_a_trimmed_notes_clip_rebases_both_halves() {
+        let mut f = fixture(None, 3 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        edit(&mut f, |c| c.offset = BEAT);
+        let cmds = split_at(&mut f.p, track, placement, 5 * BEAT).unwrap();
         round_trip(&mut f.p, cmds, |p| {
-            let (left, right) = (&p.clips[&clip], p.clips.iter().find(|(id, _)| **id != clip).unwrap().1);
-            assert_eq!((right.offset, right.length), (2 * BEAT, 2 * BEAT));
-            assert_ne!(left.source, right.source);
-            let (Source::Notes(a), Source::Notes(b)) = (&p.sources[&left.source], &p.sources[&right.source]) else { panic!("notes") };
-            assert_eq!(a.notes.len(), b.notes.len());
-            for (x, y) in a.notes.iter().zip(&b.notes) {
-                assert_ne!(x.id, y.id);
-                assert_eq!(Note { id: y.id, ..x.clone() }, *y);
-            }
+            let right = right_half(p, track, placement);
+            assert_eq!(p.clips[&clip].offset, 0);
+            assert_eq!(notes_of(p, clip), [(0, 61, BEAT / 2)]);
+            assert_eq!(notes_of(p, right), [(0, 62, BEAT / 2), (BEAT, 63, BEAT / 2)]);
+        });
+    }
+
+    #[test]
+    fn split_of_a_looping_notes_clip_keeps_the_loop() {
+        let mut f = fixture(None, 8 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        // A two-beat loop over beats 2..4 of the notes, played from beat 1.
+        edit(&mut f, |c| {
+            c.offset = BEAT;
+            c.looping = Some(LoopRegion { start: 2 * BEAT, end: 4 * BEAT });
+        });
+        let heard = |p: &Project, id: ClipId| {
+            let Source::Notes(src) = &p.sources[&p.clips[&id].source] else { unreachable!() };
+            heard_notes(&p.clips[&id], &src.notes).iter().map(|n| (n.start, n.key, n.length)).collect::<Vec<_>>()
+        };
+        let whole = heard(&f.p, clip);
+        let cmds = split_at(&mut f.p, track, placement, 8 * BEAT).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let right = right_half(p, track, placement);
+            let (l, r) = (&p.clips[&clip], &p.clips[&right]);
+            assert_eq!((l.offset, l.looping), (0, Some(LoopRegion { start: BEAT, end: 3 * BEAT })));
+            assert_eq!((r.offset, r.looping), (BEAT, Some(LoopRegion { start: 0, end: 2 * BEAT })));
+            assert_eq!(notes_of(p, clip), [(0, 61, BEAT / 2), (BEAT, 62, BEAT / 2), (2 * BEAT, 63, BEAT / 2)]);
+            assert_eq!(notes_of(p, right), [(0, 62, BEAT / 2), (BEAT, 63, BEAT / 2)]);
+            // Together the halves still play what the clip played.
+            let mut both = heard(p, clip);
+            both.extend(heard(p, right).into_iter().map(|(t, k, len)| (t + 4 * BEAT, k, len)));
+            assert_eq!(both, whole);
         });
     }
 
@@ -753,7 +1055,8 @@ mod tests {
         assert_ne!(left_id, clip);
         round_trip(&mut f.p, split.commands, |p| {
             assert_eq!((p.clips[&clip].clone(), p.track(track).unwrap().session_slots[&scene]), (whole.clone(), clip));
-            assert_eq!((p.clips[&left_id].length, p.clips[&right_id].offset), (BEAT, BEAT));
+            assert_eq!((p.clips[&left_id].length, p.clips[&right_id].offset), (BEAT, 0));
+            assert_eq!(notes_of(p, right_id).len(), 3, "the right half has the three notes after the cut");
             // Each half has notes of its own; the slot's clip keeps the original ones.
             let sources: std::collections::BTreeSet<SourceId> = [clip, left_id, right_id].iter().map(|id| p.clips[id].source).collect();
             assert_eq!((sources.len(), p.sources.len()), (3, 3));
@@ -799,5 +1102,128 @@ mod tests {
             assert_eq!(p.sources.len(), 1);
         });
         assert!(duplicate_placement(&mut f.p, track, PlacementId(9999), 0).is_none());
+    }
+
+    #[test]
+    fn consolidating_notes_joins_them_with_the_gaps() {
+        let mut f = fixture(None, 2 * BEAT);
+        let (track, first) = (f.track, f.placement);
+        // A second clip two beats after the first ends, trimmed to start at its second note.
+        let (cmds, second) = duplicate_placement(&mut f.p, track, first, 8 * BEAT).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        let second_clip = f.p.track(track).unwrap().arrangement.iter().find(|pl| pl.id == second).unwrap().clip;
+        f.p.clips.get_mut(&second_clip).unwrap().offset = BEAT;
+        // One more clip on the same track that is not selected.
+        let (cmds, other) = duplicate_placement(&mut f.p, track, first, 20 * BEAT).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        let (clips, sources) = (f.p.clips.len(), f.p.sources.len());
+        let done = consolidate_notes(&mut f.p, track, &[second, first], 4 * BEAT, 10 * BEAT).unwrap();
+        assert!(Command::Batch { commands: done.commands.clone() }.is_destructive());
+        round_trip(&mut f.p, done.commands, |p| {
+            let arrangement = &p.track(track).unwrap().arrangement;
+            assert_eq!(arrangement.iter().map(|pl| (pl.id, pl.start)).collect::<Vec<_>>(), [(done.placement, 4 * BEAT), (other, 20 * BEAT)]);
+            assert_eq!(p.clips[&done.clip].length, 6 * BEAT);
+            assert_eq!((p.clips[&done.clip].offset, p.clips[&done.clip].looping), (0, None));
+            // First clip: notes at 0 and 1; second (from its beat 1): notes at 4 + 0 and 4 + 1.
+            assert_eq!(notes_of(p, done.clip), [(0, 60, BEAT / 2), (BEAT, 61, BEAT / 2), (4 * BEAT, 61, BEAT / 2), (5 * BEAT, 62, BEAT / 2)]);
+            assert_eq!((p.clips.len(), p.sources.len()), (clips - 1, sources - 1), "the two joined clips and their notes went");
+        });
+        assert!(consolidate_notes(&mut f.p, track, &[first], 4 * BEAT, 4 * BEAT).is_none(), "empty range");
+        assert!(consolidate_notes(&mut f.p, track, &[PlacementId(9999)], 0, BEAT).is_none());
+    }
+
+    #[test]
+    fn consolidating_keeps_a_clip_that_is_used_elsewhere() {
+        let mut f = fixture(None, 2 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let scene = f.p.alloc_scene_id();
+        f.p.track_mut(track).unwrap().session_slots.insert(scene, clip);
+        let done = consolidate_notes(&mut f.p, track, &[placement], 4 * BEAT, 6 * BEAT).unwrap();
+        round_trip(&mut f.p, done.commands, |p| {
+            assert!(p.clips.contains_key(&clip), "the slot still plays it");
+            assert_eq!(p.sources.len(), 2);
+        });
+    }
+
+    #[test]
+    fn consolidating_audio_puts_the_rendered_file_in_their_place() {
+        let mut f = fixture(Some(8), 2 * BEAT);
+        let (track, placement) = (f.track, f.placement);
+        let (cmds, second) = duplicate_placement(&mut f.p, track, placement, 8 * BEAT).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        let file = AudioSource { path: "joined.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 6 * 24_000, warp: Warp::default(), key: None };
+        assert!(consolidate_notes(&mut f.p, track, &[placement, second], 4 * BEAT, 10 * BEAT).is_none(), "audio is not notes");
+        let done = consolidate_audio(&mut f.p, track, &[placement, second], 4 * BEAT, 10 * BEAT, file.clone()).unwrap();
+        round_trip(&mut f.p, done.commands, |p| {
+            let arrangement = &p.track(track).unwrap().arrangement;
+            assert_eq!(arrangement.iter().map(|pl| (pl.id, pl.start)).collect::<Vec<_>>(), [(done.placement, 4 * BEAT)]);
+            let c = &p.clips[&done.clip];
+            assert_eq!((c.offset, c.length, c.gain_db, c.fade_in, c.envelopes.len()), (0, 6 * BEAT, 0.0, Fade::default(), 0));
+            assert_eq!(p.sources[&c.source], Source::Audio(file.clone()));
+            assert_eq!((p.clips.len(), p.sources.len()), (1, 1), "the old file is no longer used by the project");
+        });
+        let mut notes = fixture(None, 2 * BEAT);
+        let (t, pl) = (notes.track, notes.placement);
+        assert!(consolidate_audio(&mut notes.p, t, &[pl], 4 * BEAT, 6 * BEAT, file).is_none(), "notes are not audio");
+    }
+
+    #[test]
+    fn a_left_trim_of_notes_settles_on_offset_zero() {
+        let mut f = fixture(None, 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let original = f.p.clips[&clip].source;
+        // The second note (beat 1) crosses the new start at beat 1 + 1/4.
+        let Some(Source::Notes(src)) = f.p.sources.get_mut(&original) else { unreachable!() };
+        src.notes[1].length = BEAT;
+        // Past the clip's end, revealed by a longer clip later.
+        src.notes.push(Note::new(NoteId(9000), 70, 6 * BEAT, BEAT, 0.8));
+        let cmds = trim_start(&f.p, track, placement, 5 * BEAT + BEAT / 4).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        assert_eq!(f.p.clips[&clip].offset, BEAT + BEAT / 4);
+        let cmds = rebase_notes(&mut f.p, clip).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let c = &p.clips[&clip];
+            assert_eq!((c.offset, c.length), (0, 3 * BEAT - BEAT / 4));
+            let q = BEAT / 4;
+            assert_eq!(notes_of(p, clip), [(BEAT - q, 62, BEAT / 2), (2 * BEAT - q, 63, BEAT / 2), (5 * BEAT - q, 70, BEAT)], "the crossing note went; the rest kept their place");
+            assert!(!p.sources.contains_key(&original));
+        });
+        assert_eq!(rebase_notes(&mut f.p, ClipId(9999)), None);
+    }
+
+    #[test]
+    fn a_notes_clip_grows_to_the_left_into_empty_time() {
+        let mut f = fixture(None, 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let audio = fixture(Some(8), 4 * BEAT);
+        assert_eq!(trim_start(&audio.p, audio.track, audio.placement, BEAT), None, "audio cannot start before its file");
+        let cmds = trim_start(&f.p, track, placement, 2 * BEAT).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        assert_eq!((f.p.clips[&clip].offset, f.p.clips[&clip].length), (-2 * BEAT, 6 * BEAT));
+        let cmds = rebase_notes(&mut f.p, clip).unwrap();
+        Command::Batch { commands: cmds }.apply(&mut f.p).unwrap();
+        assert_eq!(f.p.clips[&clip].offset, 0);
+        assert_eq!(notes_of(&f.p, clip).iter().map(|n| n.0).collect::<Vec<_>>(), [2 * BEAT, 3 * BEAT, 4 * BEAT, 5 * BEAT], "the notes stay where they were on the timeline");
+    }
+
+    #[test]
+    fn rebase_leaves_loops_audio_and_settled_clips_alone() {
+        let mut f = fixture(None, 4 * BEAT);
+        assert_eq!(rebase_notes(&mut f.p, f.clip), None, "offset 0 already");
+        edit(&mut f, |c| {
+            c.offset = BEAT;
+            c.looping = Some(LoopRegion { start: 0, end: 2 * BEAT });
+        });
+        assert_eq!(rebase_notes(&mut f.p, f.clip), None);
+        let mut a = fixture(Some(8), 4 * BEAT);
+        edit(&mut a, |c| c.offset = BEAT);
+        assert_eq!(rebase_notes(&mut a.p, a.clip), None);
+        // A whole old project: only the clip that needs it.
+        let mut old = fixture(None, 4 * BEAT);
+        edit(&mut old, |c| c.offset = BEAT);
+        let cmds = rebase_all_notes(&mut old.p);
+        Command::Batch { commands: cmds }.apply(&mut old.p).unwrap();
+        assert_eq!(notes_of(&old.p, old.clip).len(), 3);
+        assert!(rebase_all_notes(&mut old.p).is_empty());
     }
 }

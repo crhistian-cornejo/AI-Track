@@ -15,9 +15,10 @@ use crate::widgets::{InputEvent, TextInput};
 use crate::{actions::*, motion, views};
 use aitrack_model::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, DispatchPhase, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, Task, Window, anchored,
-    canvas, deferred, div, prelude::FluentBuilder, px,
+    AnyElement, App, Bounds, ClickEvent, Context, DispatchPhase, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, Task, Window,
+    anchored, canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use gpui::{AppContext as _, StatefulInteractiveElement};
 use std::cell::Cell;
@@ -31,7 +32,77 @@ pub enum KnobTarget {
     Param { device: DeviceId, param: u32, default: f32 },
     Macro { rack: DeviceId, index: usize },
     Pan { track: TrackId },
-    Send { track: TrackId, index: usize },
+    Send {
+        track: TrackId,
+        index: usize,
+    },
+    /// An audio clip's transpose (-48..=48 st) and detune (-50..=50 ct), and
+    /// the other selected audio clips' with it.
+    Transpose { clip: ClipId },
+    Detune { clip: ClipId },
+}
+
+/// What a click-to-type value box edits (the device number cells, the tempo box).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NumTarget {
+    Param { device: DeviceId, param: u32 },
+    Tempo,
+    /// An audio clip's transpose (st) and detune (ct), as the knobs edit them.
+    Transpose { clip: ClipId },
+    Detune { clip: ClipId },
+}
+
+/// A value box being typed into. Clicking a draggable number opens it with
+/// the current value selected: the first key replaces it, Enter applies,
+/// Escape or a click anywhere drops it. Dragging still works — a click
+/// that moved is a drag, not an edit ([`click_dragged`]).
+#[derive(Clone, Debug)]
+pub struct NumEdit {
+    pub target: NumTarget,
+    pub text: String,
+    /// Just opened: the next digit replaces the pre-filled value.
+    pub fresh: bool,
+}
+
+/// What a keystroke did to an open value-box edit.
+pub enum NumKey {
+    /// Not editing, or a key that isn't part of a number.
+    Ignored,
+    /// The text changed.
+    Typed,
+    /// Enter: apply the text.
+    Commit,
+    /// Escape: drop the text.
+    Cancel,
+}
+
+/// What a value-box text parses to (`,` works as the decimal mark).
+pub fn parse_plain(text: &str) -> Option<f32> {
+    text.trim().replace(',', ".").parse().ok()
+}
+
+/// A plain value as editable text: no unit, trailing zeros trimmed.
+pub fn plain_text(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        "0".to_owned()
+    } else {
+        s.to_owned()
+    }
+}
+
+/// A click that moved more than a few px between press and release was a
+/// drag, not a click (draggable value boxes begin the drag on mouse-down).
+pub fn click_dragged(e: &ClickEvent) -> bool {
+    match e {
+        ClickEvent::Mouse(m) => {
+            let dx = f32::from(m.up.position.x - m.down.position.x);
+            let dy = f32::from(m.up.position.y - m.down.position.y);
+            dx * dx + dy * dy > 16.
+        }
+        ClickEvent::Keyboard(_) | ClickEvent::Touch(_) => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +147,10 @@ pub enum MenuKind {
     /// Right-click on an arrangement clip, and on empty lane space.
     ClipContext,
     LaneContext,
+    /// Right-click on a track header (acts on the selected tracks).
+    TrackContext(TrackId),
+    /// Right-click on a device's title bar (acts on the picked devices).
+    DeviceContext(DeviceId),
     TimeSignature,
     /// File: new from a template, open, save.
     File,
@@ -125,6 +200,9 @@ pub struct Workspace {
     pub piano_preview: bool,
     pub piano_octave: u8,
     pub drag: Option<Drag>,
+    /// The value box being typed into, if any (`click_dragged` guards it
+    /// against drags).
+    pub num_edit: Option<NumEdit>,
     pub menu: Option<Menu>,
     /// View state of the visual device editors.
     pub fx: views::device_ui::UiState,
@@ -258,6 +336,7 @@ impl Workspace {
             piano_preview: true,
             piano_octave: 4,
             drag: None,
+            num_edit: None,
             menu: None,
             fx: views::device_ui::UiState::default(),
             sample: Default::default(),
@@ -341,11 +420,93 @@ impl Workspace {
                 "ai" => self.ai_open = true,
                 // Open the palette, optionally on a tab: `palette=devices`.
                 "palette" => self.palette_pending = true,
-                "prefs=sounds" => self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Sounds)),
+                "prefs=sounds" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Sounds,
+                    ))
+                }
+                "prefs=look" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Appearance,
+                    ))
+                }
+                "prefs=audio" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Audio,
+                    ))
+                }
                 "play" => self.b.engine.play(),
                 // Put the selected track (`track=Name` first) in a new group.
                 "group" => {
                     self.s.group_tracks();
+                }
+                // Open the first audio clip in the Clip view.
+                "audio" => {
+                    let p = &self.s.project;
+                    let found = p.tracks.iter().find_map(|t| {
+                        let pl = t.arrangement.iter().find(|pl| {
+                            p.clips.get(&pl.clip).is_some_and(|c| {
+                                matches!(p.sources.get(&c.source), Some(Source::Audio(_)))
+                            })
+                        })?;
+                        Some((t.id, pl.id, pl.clip))
+                    });
+                    if let Some((track, placement, clip)) = found {
+                        self.s.selected_track = Some(track);
+                        self.s.selected_clip = Some(clip);
+                        self.s.selected_placement = Some((track, placement));
+                        self.s.bottom_tab = BottomTab::PianoRoll;
+                    }
+                }
+                // Reverse the selected clip's sample; `transpose=-7` / `detune=25` tune it.
+                _ if word == "reverse"
+                    || word.starts_with("transpose=")
+                    || word.starts_with("detune=") =>
+                {
+                    let v: f32 = word.split('=').nth(1).and_then(|v| v.parse().ok()).unwrap_or(0.);
+                    if let Some(clip) = self.s.selected_clip {
+                        self.s.set_clip_warp("dev", clip, |w| match word.split('=').next() {
+                            Some("transpose") => w.transpose = v,
+                            Some("detune") => w.detune = v,
+                            _ => w.reverse = true,
+                        });
+                    }
+                }
+                // Group the selected track's whole chain into a rack.
+                "rack" => {
+                    let ids: Vec<_> = self
+                        .s
+                        .selected_track
+                        .and_then(|t| self.s.project.track(t))
+                        .map(|t| t.devices.iter().map(|d| d.id).collect())
+                        .unwrap_or_default();
+                    for id in ids {
+                        self.s.click_device(id, true, false);
+                    }
+                    self.s
+                        .ed
+                        .devices
+                        .retain(|d| self.s.project.device(*d).is_some());
+                    self.s.group_devices();
+                }
+                // Open the right-click menu of the selected track / of the picked device.
+                "menu=track" => {
+                    if let Some(t) = self.s.selected_track {
+                        self.menu = Some(Menu {
+                            kind: MenuKind::TrackContext(t),
+                            at: gpui::point(gpui::px(120.), gpui::px(220.)),
+                            opened: 0,
+                        });
+                    }
+                }
+                "menu=device" => {
+                    if let Some(d) = self.s.selected_devices().first() {
+                        self.menu = Some(Menu {
+                            kind: MenuKind::DeviceContext(*d),
+                            at: gpui::point(gpui::px(320.), gpui::px(420.)),
+                            opened: 0,
+                        });
+                    }
                 }
                 "big" => {
                     let ids: Vec<_> = self.s.project.tracks.iter().flat_map(|t| t.devices.iter().map(|d| d.id)).collect();
@@ -542,6 +703,14 @@ impl Workspace {
     }
 
     fn delete(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
+        // After a click in the Device View, Delete removes the picked devices.
+        let devices = self.s.selected_devices();
+        if self.s.ed.area == crate::editing::Area::Devices && !devices.is_empty() {
+            if self.s.remove_devices(devices) {
+                cx.notify();
+            }
+            return;
+        }
         if self.s.delete_selection() {
             cx.notify();
         }
@@ -659,6 +828,137 @@ impl Workspace {
         cx.notify();
     }
 
+    // ── Value-box typing ──
+
+    /// Open a value box for typing, pre-filled with the current value (the
+    /// first key replaces it — see [`NumEdit::fresh`]).
+    pub fn begin_num_edit(&mut self, target: NumTarget, prefill: String, cx: &mut Context<Self>) {
+        self.num_edit = Some(NumEdit {
+            target,
+            text: prefill,
+            fresh: true,
+        });
+        cx.notify();
+    }
+
+    /// Feed a keystroke to the open value-box edit.
+    pub fn num_edit_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) -> NumKey {
+        let Some(edit) = &mut self.num_edit else {
+            return NumKey::Ignored;
+        };
+        let k = &e.keystroke;
+        let out = match k.key.as_str() {
+            "enter" => NumKey::Commit,
+            "escape" => {
+                self.num_edit = None;
+                NumKey::Cancel
+            }
+            "backspace" => {
+                if edit.fresh {
+                    edit.text.clear();
+                    edit.fresh = false;
+                } else {
+                    edit.text.pop();
+                }
+                NumKey::Typed
+            }
+            _ if !k.modifiers.modified() => {
+                let Some(ch) = k
+                    .key_char
+                    .as_ref()
+                    .filter(|c| c.chars().all(|c| c.is_ascii_digit() || "-+.,".contains(c)))
+                else {
+                    return NumKey::Ignored;
+                };
+                if edit.fresh {
+                    edit.text.clear();
+                    edit.fresh = false;
+                }
+                edit.text.push_str(ch);
+                NumKey::Typed
+            }
+            _ => return NumKey::Ignored,
+        };
+        cx.stop_propagation();
+        cx.notify();
+        out
+    }
+
+    /// The root's key hook for value-box typing; runs before the piano keys.
+    fn num_edit_key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.num_edit.is_none() {
+            return;
+        }
+        if matches!(self.num_edit_key(e, cx), NumKey::Commit) {
+            self.commit_num_edit(cx);
+        }
+    }
+
+    /// Enter in a value box: parse the text and apply it (one undo step).
+    fn commit_num_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.num_edit.take() else {
+            return;
+        };
+        match edit.target {
+            NumTarget::Param { device, param } => {
+                let info =
+                    self.fx
+                        .param_info(self.b.plugins.as_ref(), &self.s.project, device, param);
+                if let (Some(info), Some(v)) = (info, parse_plain(&edit.text)) {
+                    views::device_ui::set_now(self, device, param, info.to_normalized(v));
+                }
+            }
+            NumTarget::Transpose { clip } => {
+                if let Some(v) = parse_plain(&edit.text) {
+                    self.s.seal();
+                    self.s.set_clip_warp("transpose-typed", clip, |w| w.transpose = v);
+                    self.s.seal();
+                }
+            }
+            NumTarget::Detune { clip } => {
+                if let Some(v) = parse_plain(&edit.text) {
+                    self.s.seal();
+                    self.s.set_clip_warp("detune-typed", clip, |w| w.detune = v);
+                    self.s.seal();
+                }
+            }
+            NumTarget::Tempo => {
+                if let Some(v) = parse_plain(&edit.text) {
+                    self.s.set_tempo((v as f64).clamp(20., 999.));
+                    self.s.seal();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// While a value box is open, a click anywhere drops the text (the
+    /// box's own click reopens it right after, in the bubble phase).
+    fn num_edit_capture(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.num_edit.as_ref()?;
+        let weak = cx.entity().downgrade();
+        Some(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let w = weak.clone();
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            let _ = w.update(cx, |this, cx| {
+                                if this.num_edit.take().is_some() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+            .into_any_element(),
+        )
+    }
+
     fn drag_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
         let Some(mut drag) = self.drag.take() else { return };
         let y = f32::from(e.position.y);
@@ -681,6 +981,12 @@ impl Workspace {
                     }
                     KnobTarget::Send { track, index } => {
                         self.s.set_send(track, index, fader_to_db(v).max(-70.));
+                    }
+                    KnobTarget::Transpose { clip } => {
+                        self.s.set_clip_warp(&format!("transpose-{}", clip.0), clip, |w| w.transpose = v * 96. - 48.);
+                    }
+                    KnobTarget::Detune { clip } => {
+                        self.s.set_clip_warp(&format!("detune-{}", clip.0), clip, |w| w.detune = v * 100. - 50.);
                     }
                 }
             }
@@ -816,6 +1122,7 @@ impl Workspace {
                     self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
                 }
                 Drag::ClipCopy(d) => views::arrange_clips::copy_end(self, d),
+                Drag::ClipShape(d) => views::arrange_clips::shape_end(self, &d),
                 // A click on a clip that never moved it puts the insert
                 // marker (and, when stopped, the playhead) where it was clicked.
                 Drag::Clip { track, start, applied, .. } => {
@@ -1658,6 +1965,7 @@ impl Render for Workspace {
         let modal = views::prefs::render_modal(self, window, cx);
         let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
+        let num_capture = self.num_edit_capture(cx);
         let fx_capture = views::device_ui::capture(self, cx);
         let sample_capture = views::sample_editor::capture(self, cx);
         let fx_overlay = views::device_ui::overlay(self, cx);
@@ -1672,6 +1980,7 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::num_edit_key_down))
             .on_key_down(cx.listener(Self::piano_key_down))
             .on_key_up(cx.listener(Self::piano_key_up))
             // The commands of the key table (clipboard, grid, navigation…).
@@ -1816,6 +2125,7 @@ impl Render for Workspace {
             .children(toast)
             .children(modal)
             .children(capture)
+            .children(num_capture)
             .children(fx_capture)
             .children(sample_capture)
             .children(fx_overlay)
@@ -1858,5 +2168,17 @@ mod tests {
         assert_eq!(bottom_h_clamped(900., 1000.), 700.);
         assert_eq!(bottom_h_clamped(400., 1000.), 400.);
         assert_eq!(bottom_h_clamped(400., 100.), 160.);
+    }
+
+    #[test]
+    fn typed_values_parse_and_prefill_round_trip() {
+        use super::{parse_plain, plain_text};
+        assert_eq!(parse_plain("-7.6"), Some(-7.6));
+        assert_eq!(parse_plain("128,5"), Some(128.5));
+        assert_eq!(parse_plain(""), None);
+        assert_eq!(parse_plain("-"), None);
+        assert_eq!(plain_text(120.), "120");
+        assert_eq!(plain_text(-7.6), "-7.6");
+        assert_eq!(parse_plain(&plain_text(0.5)), Some(0.5));
     }
 }

@@ -577,15 +577,34 @@ pub struct Warp {
     pub mode: WarpMode,
     /// Tempo of the material; warping maps it to the project tempo.
     pub original_bpm: Option<f64>,
-    /// Transpose in semitones (with formant-preserving modes later).
+    /// Transpose in semitones, -48..=48 (Live's clip Transpose). Re-Pitch:
+    /// the sample plays faster or slower as well.
     pub transpose: f32,
+    /// Fine tuning in cents, -50..=50 (Live's clip Detune).
+    #[serde(default)]
+    pub detune: f32,
+    /// Play the sample backwards.
+    #[serde(default)]
+    pub reverse: bool,
     /// (sample frame, tick) anchors.
     pub markers: Vec<(u64, Tick)>,
 }
 
+impl Warp {
+    /// Transpose plus detune, in semitones.
+    pub fn pitch(&self) -> f32 {
+        self.transpose + self.detune / 100.0
+    }
+
+    /// Playback speed of the source that the pitch asks for (1 = as recorded).
+    pub fn pitch_ratio(&self) -> f64 {
+        2f64.powf(f64::from(self.pitch()) / 12.0)
+    }
+}
+
 impl Default for Warp {
     fn default() -> Self {
-        Self { enabled: false, mode: WarpMode::Beats, original_bpm: None, transpose: 0.0, markers: Vec::new() }
+        Self { enabled: false, mode: WarpMode::Beats, original_bpm: None, transpose: 0.0, detune: 0.0, reverse: false, markers: Vec::new() }
     }
 }
 

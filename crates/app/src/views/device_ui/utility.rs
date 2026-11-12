@@ -91,7 +91,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(div().flex().flex_wrap().gap(px(SP1)).child(kit::pick(dev, p::MODE, cx)).child(kit::pick(dev, p::MONO, cx)).child(kit::pick(dev, p::BASS_MONO, cx)))
         .child(div().flex().flex_wrap().gap(px(SP1)).child(kit::pick(dev, p::DC_BLOCK, cx)).child(kit::pick(dev, p::MUTE, cx)))
         .child(label_gap())
-        .child(kit::strip(dev, &[p::GAIN, p::PAN, p::WIDTH], &[p::BASS_FREQ], cx));
+        .child(kit::strip(
+            ws,
+            dev,
+            &[p::GAIN, p::PAN, p::WIDTH],
+            &[p::BASS_FREQ],
+            cx,
+        ));
     let _ = pal;
     kit::panel(if dev.big { 520. } else { 420. })
         .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(field)).child(meters).child(switches))

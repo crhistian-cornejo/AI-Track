@@ -13,7 +13,7 @@ fn lin_db(v: f32) -> f32 {
     if v > 1e-6 { 20. * v.log10() } else { -120. }
 }
 
-pub fn render(_: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let meter = dev.meter.clone();
     let enabled = dev.enabled;
@@ -55,7 +55,13 @@ pub fn render(_: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyE
         .child(kit::readout("I", lufs(m(BANDS + 2)), pal.accent))
         .child(kit::readout("LRA", format!("{:.1}", m(BANDS + 3).max(0.)), pal.text))
         .child(kit::readout("TP", format!("{} / {}", kit::fmt_db(m(BANDS + 4)), kit::fmt_db(m(BANDS + 5))), pal.text))
-        .child(kit::strip(dev, &[p::FFT_SIZE, p::TILT, p::SOURCE, p::FALL, p::RESET], &[], cx));
+        .child(kit::strip(
+            ws,
+            dev,
+            &[p::FFT_SIZE, p::TILT, p::SOURCE, p::FALL, p::RESET],
+            &[],
+            cx,
+        ));
     kit::panel(if dev.big { 720. } else { 480. })
         .child(
             div()

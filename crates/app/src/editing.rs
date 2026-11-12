@@ -17,6 +17,7 @@
 mod clipboard;
 pub mod gestures;
 mod groups;
+mod racks;
 pub mod menus;
 pub mod overlay;
 mod timeline;
@@ -25,6 +26,7 @@ mod timeline;
 mod tests;
 
 pub use clipboard::Clipboard;
+pub use timeline::{ConsolidateJob, Consolidation};
 
 use crate::grid::{self, GridSpec};
 use crate::state::{AppState, ArrangeView, KeyEdit, Snap};
@@ -44,6 +46,8 @@ pub enum Area {
     #[default]
     Arrange,
     Piano,
+    /// The Device View: Cmd+G groups the picked devices into a rack.
+    Devices,
 }
 
 /// A time range across some tracks of the arrangement.
@@ -90,6 +94,9 @@ pub struct EditState {
     /// through [`AppState::selected_tracks`], which also honours a plain
     /// write to `AppState::selected_track`.
     pub tracks: BTreeSet<TrackId>,
+    /// The devices picked with Cmd/Ctrl/Shift+click on their title bars, all
+    /// in one chain. Read it through [`AppState::selected_devices`].
+    pub devices: Vec<DeviceId>,
 }
 
 impl Default for EditState {
@@ -109,6 +116,7 @@ impl Default for EditState {
             drag_origin: Vec::new(),
             pressed: None,
             tracks: BTreeSet::new(),
+            devices: Vec::new(),
         }
     }
 }
@@ -497,6 +505,15 @@ impl AppState {
 
 /// Cmd+G: put the selected tracks in a new group.
 pub fn group_selection(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Context<crate::workspace::Workspace>) {
+    // In the Device View it groups the picked devices into a rack.
+    if ws.s.ed.area == Area::Devices && !ws.s.selected_devices().is_empty() {
+        if ws.s.group_devices().is_some() {
+            cx.notify();
+        } else {
+            ws.toast("Only devices of one chain group into a rack", cx);
+        }
+        return;
+    }
     if ws.s.group_tracks().is_some() {
         cx.notify();
     } else {
@@ -507,6 +524,14 @@ pub fn group_selection(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Cont
 /// Cmd+Shift+G: dissolve the selected groups (or the group the selected
 /// track is in).
 pub fn ungroup_selection(ws: &mut crate::workspace::Workspace, cx: &mut gpui::Context<crate::workspace::Workspace>) {
+    if ws.s.ed.area == Area::Devices && !ws.s.selected_devices().is_empty() {
+        if ws.s.ungroup_devices() {
+            cx.notify();
+        } else {
+            ws.toast("Only racks with one chain ungroup: pick the rack first", cx);
+        }
+        return;
+    }
     if ws.s.ungroup_tracks() {
         cx.notify();
     } else {

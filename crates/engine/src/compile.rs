@@ -479,7 +479,13 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                     CompiledClip::audio(
                         id,
                         clip,
-                        AudioClipData { audio, warped, original_bpm: a.warp.original_bpm.unwrap_or(120.0), transpose: a.warp.transpose },
+                        AudioClipData {
+                            audio,
+                            warped,
+                            original_bpm: a.warp.original_bpm.unwrap_or(120.0),
+                            ratio: a.warp.pitch_ratio(),
+                            reverse: a.warp.reverse,
+                        },
                     )
                 }
                 _ => return None,

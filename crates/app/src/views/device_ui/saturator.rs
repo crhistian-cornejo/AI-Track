@@ -114,9 +114,15 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .gap(px(SP1))
                 .child(div().size(px(8.)).rounded_full().bg(series(b)))
                 .child(caption(["LOW", "MID", "HIGH"][if nb == 1 { 1 } else if nb == 2 { b * 2 } else { b }]))
-                .child(kit::strip(dev, &band_ids, &[], cx))
+                .child(kit::strip(ws, dev, &band_ids, &[], cx))
                 .child(div().w(px(SP2)))
-                .child(kit::strip(dev, &[p::BANDS, p::MIX, p::OUTPUT, p::AUTO_GAIN], &[p::TONE, p::OVERSAMPLING], cx)),
+                .child(kit::strip(
+                    ws,
+                    dev,
+                    &[p::BANDS, p::MIX, p::OUTPUT, p::AUTO_GAIN],
+                    &[p::TONE, p::OVERSAMPLING],
+                    cx,
+                )),
         )
         .into_any_element()
 }

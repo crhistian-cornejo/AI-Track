@@ -34,12 +34,21 @@ fn outputs_stay_finite() {
                 p.set_param(id, v);
             }
             let mut d = Driver::new();
+            // A difference monitor is a bypass-style output: it carries
+            // the input itself (including input gain), so after the loud
+            // signal it can legitimately leave the lookahead window well
+            // above the processed output's brickwall.
+            let monitor = p
+                .info()
+                .params
+                .iter()
+                .any(|info| info.name.to_ascii_lowercase().contains("delta") && p.get_param(info.id) > 0.5);
             for signal in [0usize, 1, 2, 3, 4, 5] {
                 // ~0.5 s per signal.
                 for b in 0..190 {
                     d.block(p.as_mut(), signal);
                     // Loud input may come out loud; it must never explode.
-                    let limit = if signal == 4 { 1e5 } else { 1e3 };
+                    let limit = if signal == 4 || monitor { 1e5 } else { 1e3 };
                     if let Err(e) = d.output_ok(limit) {
                         failures.push(format!("{} pass {pass} signal {signal} block {b}: {e}", entry.id));
                         break;

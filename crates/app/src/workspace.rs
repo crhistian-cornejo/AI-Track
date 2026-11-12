@@ -113,6 +113,10 @@ pub struct Workspace {
     pub piano_octave: u8,
     pub drag: Option<Drag>,
     pub menu: Option<Menu>,
+    /// View state of the visual device editors.
+    pub fx: views::device_ui::UiState,
+    /// The meter strip under the top bar.
+    pub meters: views::meters::MeterStrip,
     pub bottom_h: f32,
     pub bottom_open: bool,
     pub browser_open: bool,
@@ -227,6 +231,8 @@ impl Workspace {
             piano_octave: 4,
             drag: None,
             menu: None,
+            fx: views::device_ui::UiState::default(),
+            meters: views::meters::MeterStrip::default(),
             bottom_h: 300.,
             bottom_open: true,
             browser_open: true,
@@ -277,7 +283,39 @@ impl Workspace {
             this.chat_log.extend(proposal_entry(&s, id));
         }
         this.s = s;
+        this.apply_dev_view();
         this
+    }
+
+    /// Development aid for visual checks without touching the keyboard:
+    /// `AITRACK_DEV_VIEW=devices,meters,play,big,track=Bass` opens the app in
+    /// that state. Unknown words are ignored; unset, nothing happens.
+    fn apply_dev_view(&mut self) {
+        let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
+        for word in spec.split(',').map(str::trim) {
+            match word {
+                "devices" => self.s.bottom_tab = BottomTab::Devices,
+                "piano" => self.s.bottom_tab = BottomTab::PianoRoll,
+                "steps" => self.s.bottom_tab = BottomTab::Steps,
+                "mixer" => self.s.bottom_tab = BottomTab::Mixer,
+                "meters" => self.meters.open = true,
+                "tall" => self.bottom_h = 460.,
+                "no-ai" => self.ai_open = false,
+                "no-browser" => self.browser_open = false,
+                "play" => self.b.engine.play(),
+                "big" => {
+                    let ids: Vec<_> = self.s.project.tracks.iter().flat_map(|t| t.devices.iter().map(|d| d.id)).collect();
+                    self.fx.big.extend(ids);
+                }
+                _ => {
+                    if let Some(name) = word.strip_prefix("track=")
+                        && let Some(t) = self.s.project.tracks.iter().find(|t| t.name.eq_ignore_ascii_case(name))
+                    {
+                        self.s.selected_track = Some(t.id);
+                    }
+                }
+            }
+        }
     }
 
     // ── Engine sync & frames ──
@@ -1348,8 +1386,15 @@ impl Render for Workspace {
         if let Some(animate) = self.look.pending.take() {
             self.apply_look(window, animate, cx);
         }
-        if self.wants_frames() || self.drag.is_some() || theme::tweening() {
+        self.meters.tick(self.b.engine.as_mut(), self.s.selected_track);
+        let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
+        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() {
             window.request_animation_frame();
+        }
+        self.fx.sample_rate = f64::from(self.b.engine.audio_config().sample_rate.max(8_000));
+        {
+            let project = &self.s.project;
+            self.fx.prune(|id| project.device(id).is_some());
         }
         let pal = p();
         let center = match self.s.view {
@@ -1383,6 +1428,10 @@ impl Render for Workspace {
         let modal = views::prefs::render_modal(self, window, cx);
         let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
+        let fx_capture = views::device_ui::capture(self, cx);
+        let fx_overlay = views::device_ui::overlay(self, cx);
+        let meter_strip = views::meters::render(self, cx);
+        let meter_layers = views::meters::overlay(self, cx);
         let toast = self.render_toast();
         let status = self.render_status(cx);
         let banner = self.render_banner(cx);
@@ -1433,6 +1482,7 @@ impl Render for Workspace {
             .children(backdrop)
             .child(views::topbar::render(self, window, cx))
             .children(banner)
+            .children(meter_strip)
             .child(
                 div()
                     .flex_1()
@@ -1448,6 +1498,9 @@ impl Render for Workspace {
             .children(toast)
             .children(modal)
             .children(capture)
+            .children(fx_capture)
+            .children(fx_overlay)
+            .children(meter_layers)
             .children(menu)
     }
 }

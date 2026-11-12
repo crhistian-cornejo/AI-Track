@@ -34,9 +34,17 @@ flowchart LR
 * **Processors survive edits.** `ProcessorPool` keeps one `Arc<SharedProcessor>`
   per `DeviceId`; a recompile reuses it while the device kind is unchanged
   and only re-sends changed parameters. Plugin state is never rebuilt on edit.
+* **Analysis taps.** `tap.rs` holds a stereo ring (`AnalysisTap`, 65 536
+  frames) that the audio thread overwrites wait-free after the mix, or after
+  one track's fader (`TapReader::set_source`). A reader that falls behind
+  skips ahead and gets the number of lost frames; a disabled tap costs one
+  atomic load per block. `DeviceMeter` publishes each processor's `meter()`
+  values once per block, only for devices read in the last ~96 blocks. The
+  UI runs the FFT and loudness maths on its own thread.
 * **The audio thread never allocates, locks or does I/O**
   (`tests::audio_thread_never_allocates`, with a counting global allocator,
-  covers playback, graph swaps, launches, MIDI and transport changes).
+  covers playback, graph swaps, launches, MIDI, transport changes, the
+  analysis tap and device meters).
 
 Processing per track and segment (segments split at loop wraps, launches,
 count-in end): clip player → device chain (sub-blocked every 32 samples
@@ -80,6 +88,9 @@ impl EngineHandle {
     fn position_ticks(&self) -> f64; fn is_playing(&self) -> bool;
     fn meters(&self, TrackId) -> Option<MeterReading>; fn master_meter(&self) -> MeterReading;
     fn cpu_load(&self) -> (f32, f32); fn xruns(&self) -> u64;
+    // analysis (tap.rs): lock-free, written only while a reader asks
+    fn analysis_tap(&self) -> TapReader;            // stereo ring of the Main output (or one track)
+    fn device_meter(&self, DeviceId, out: &mut [f32]) -> usize;   // a device's Processor::meter() values
     fn latency(&self) -> u32; fn track_latencies(&self) -> Vec<(TrackId, u32)>;
     fn last_error(&self) -> Option<String>; fn warnings(&self) -> Vec<String>;
     // devices

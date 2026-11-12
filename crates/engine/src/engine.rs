@@ -24,8 +24,9 @@ use crate::rt::{AudioProcessor, InputQueue, MidiMessage, RtCommand, RtQueues, Tr
 use crate::sample_cache::SampleCache;
 use crate::shared::{ProcessorPool, SharedProcessor};
 use crate::status::{ClipSlotStatus, MeterReading, SharedStatus};
+use crate::tap::{DeviceMeter, TapReader};
 use crate::EngineError;
-use aitrack_model::{Project, Quantize, SceneId, Tick, TrackId};
+use aitrack_model::{DeviceId, Project, Quantize, SceneId, Tick, TrackId};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::Ordering;
@@ -313,6 +314,27 @@ impl EngineHandle {
         lock(&self.status.meters).master.take()
     }
 
+    /// A reader on the analysis ring: stereo frames of the Main output (or
+    /// of one track, see [`TapReader::set_source`]) for spectrum, loudness
+    /// and scope displays. The ring is written only while a reader has
+    /// enabled it, and never blocks the audio thread.
+    pub fn analysis_tap(&self) -> TapReader {
+        TapReader::new(self.status.tap.clone())
+    }
+
+    /// The latest `Processor::meter()` values of a device (spectrum, gain
+    /// reduction… see each stock plugin's meter layout), copied to `out`.
+    /// Returns the number of values; `0` for unknown devices and plugins
+    /// without display data. Reading keeps the device publishing for a
+    /// short while, so unwatched devices cost nothing.
+    pub fn device_meter(&self, device: DeviceId, out: &mut [f32]) -> usize {
+        let slot: Option<Arc<DeviceMeter>> = {
+            let bank = lock(&self.status.device_meters);
+            bank.binary_search_by_key(&device, |(id, _)| *id).ok().map(|i| bank[i].1.clone())
+        };
+        slot.map_or(0, |s| s.read(out))
+    }
+
     /// `(smoothed, peak since last read)` callback time / buffer time.
     pub fn cpu_load(&self) -> (f32, f32) {
         self.status.cpu()
@@ -550,10 +572,17 @@ impl Control {
             max_frames: self.max_frames,
             prev_meters,
             taps: Vec::new(),
+            analysis: Some(self.status.tap.clone()),
         };
         match compile(&project, &mut cx) {
             Ok(g) => {
                 *lock(&self.status.meters) = g.meters.clone();
+                let mut device_meters = Vec::new();
+                for t in &g.tracks {
+                    crate::graph::for_each_proc(&t.devices, &mut |p| device_meters.push((p.id, p.meter.clone())));
+                }
+                device_meters.sort_by_key(|(id, _)| *id);
+                *lock(&self.status.device_meters) = device_meters;
                 *lock(&self.status.session) = g.session_status.clone();
                 *lock(&self.status.track_latency) = g.track_latency.clone();
                 *lock(&self.shared.warnings) = g.warnings.clone();

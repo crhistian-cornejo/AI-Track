@@ -8,8 +8,8 @@
 //! the stubs.
 
 use aitrack_dsp::ParamInfo;
-use aitrack_model::{Key, PluginFormat, Project, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
-use std::collections::BTreeMap;
+use aitrack_model::{DeviceId, DeviceKind, Key, PluginFormat, Project, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -116,6 +116,24 @@ pub trait EngineBridge {
     fn take_messages(&mut self) -> Vec<String> {
         Vec::new()
     }
+
+    // ── Analysis (meter strip, device editors) ──
+    /// Turn the analysis tap on or off. Off, the audio thread skips it; it
+    /// also pauses by itself when nothing drains it (window hidden).
+    fn set_analysis(&mut self, _on: bool) {}
+    /// Tap the Main output (`None`) or one track's post-fader output.
+    fn set_analysis_source(&mut self, _track: Option<TrackId>) {}
+    /// Append the stereo frames produced since the last call (oldest first)
+    /// and return their sample rate. Call once per painted frame.
+    fn drain_analysis(&mut self, _out: &mut Vec<[f32; 2]>) -> u32 {
+        48_000
+    }
+    /// A stock device's display data (`Processor::meter()`: spectrum, gain
+    /// reduction… in the layout its plugin documents). Returns how many
+    /// values were written; 0 when the device has none.
+    fn device_meter(&mut self, _device: DeviceId, _out: &mut [f32]) -> usize {
+        0
+    }
 }
 
 /// Fake engine: the position follows the wall clock at the project tempo and
@@ -129,6 +147,14 @@ pub struct StubEngine {
     slots: BTreeMap<TrackId, SlotState>,
     clip_slots: BTreeMap<TrackId, Vec<SceneId>>,
     audio: AudioConfig,
+    /// Stock plugin id of every device, for the synthetic device meters.
+    devices: HashMap<DeviceId, String>,
+    analysis: bool,
+    analysis_at: Instant,
+    /// Frames of synthetic audio produced so far.
+    synth_pos: u64,
+    noise: u32,
+    born: Instant,
 }
 
 impl Default for StubEngine {
@@ -142,6 +168,139 @@ impl Default for StubEngine {
             slots: BTreeMap::new(),
             clip_slots: BTreeMap::new(),
             audio: AudioConfig::default(),
+            devices: HashMap::new(),
+            analysis: false,
+            analysis_at: Instant::now(),
+            synth_pos: 0,
+            noise: 0x1234_5678,
+            born: Instant::now(),
+        }
+    }
+}
+
+/// Frames of a synthetic four-on-the-floor loop (kick, off-beat bass, a
+/// detuned chord, hats) starting at frame `start` of a 48 kHz stream. The
+/// stub engine feeds this to the analysers so every meter has something to
+/// show without an audio device.
+pub fn synth_demo(start: u64, frames: usize, bpm: f64, seed: &mut u32, out: &mut Vec<[f32; 2]>) {
+    use std::f64::consts::TAU;
+    let sr = 48_000.0f64;
+    let beat_len = 60.0 / bpm.max(20.0);
+    let noise = |s: &mut u32| {
+        *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*s >> 8) as f32 / 8_388_608.0 - 1.0
+    };
+    let (mut prev_l, mut prev_r) = (0.0f32, 0.0f32);
+    for i in 0..frames as u64 {
+        let t = (start + i) as f64 / sr;
+        let beat = t / beat_len;
+        let in_beat = beat.fract() * beat_len;
+        // Kick: a sine falling from 120 Hz to 45 Hz.
+        let kick = ((TAU * (45.0 * in_beat + 2.5 * (1.0 - (-30.0 * in_beat).exp()))).sin() * (-14.0 * in_beat).exp() * 0.55) as f32;
+        // Bass on the off-beat.
+        let off = (beat.fract() - 0.5).max(0.0) * beat_len;
+        let gate = if beat.fract() >= 0.5 { (1.0 - (-off * 200.0).exp()) * (-off * 5.0).exp() } else { 0.0 };
+        let w = TAU * 55.0 * t;
+        let bass = ((w.sin() + 0.5 * (2.0 * w).sin() + 0.33 * (3.0 * w).sin()) * gate * 0.16) as f32;
+        // A minor chord, detuned apart between the channels.
+        let swell = 0.6 + 0.4 * (TAU * t / (8.0 * beat_len)).sin();
+        let (mut pad_l, mut pad_r) = (0.0f64, 0.0f64);
+        for f in [220.0, 261.63, 329.63, 440.0] {
+            pad_l += (TAU * f * 1.003 * t).sin();
+            pad_r += (TAU * f * 0.997 * t + 0.6).sin();
+        }
+        // Hats on the eighths, mostly uncorrelated.
+        let eighth = (beat * 2.0).fract() * beat_len * 0.5;
+        let hat_env = (-eighth * 70.0).exp() as f32 * if (beat * 2.0) as u64 % 2 == 1 { 0.16 } else { 0.07 };
+        let (nl, nr) = (noise(seed), noise(seed));
+        let (hl, hr) = (nl - prev_l, nr - prev_r);
+        prev_l = nl;
+        prev_r = nr;
+        let l = kick + bass + (pad_l * swell * 0.035) as f32 + hl * hat_env;
+        let r = kick + bass + (pad_r * swell * 0.035) as f32 + hr * hat_env;
+        out.push([l * 0.8, r * 0.8]);
+    }
+}
+
+/// Plausible `meter()` values for a stock plugin, in its documented layout.
+fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mut [f32]) -> usize {
+    let mut put = |values: &[f32]| {
+        let n = values.len().min(out.len());
+        out[..n].copy_from_slice(&values[..n]);
+        n
+    };
+    // A kick-shaped envelope per beat and a hat-shaped one per eighth.
+    let env = if playing { (-beat.fract() * 5.0).exp() } else { 0.0 };
+    let hat = if playing { (-(beat * 2.0).fract() * 6.0).exp() } else { 0.0 };
+    let level = if playing { -24.0 + 18.0 * env } else { -120.0 };
+    let spectrum = |i: usize| -> f32 {
+        if !playing {
+            return -120.0;
+        }
+        let f = 20.0 * 1000f32.powf(i as f32 / 127.0);
+        let oct = (f / 60.0).log2();
+        let body = -28.0 - 3.2 * oct.abs() + 3.0 * (secs * 2.3 + i as f32 * 0.37).sin();
+        let kick = 20.0 * env * (-(f / 55.0).log2().powi(2) * 1.5).exp();
+        let air = 12.0 * hat * ((f - 5000.0) / 6000.0).clamp(0.0, 1.0);
+        (body + kick + air).max(-110.0)
+    };
+    match plugin {
+        "fx.eq" => {
+            let mut v = [0.0f32; 265];
+            for (i, s) in v[128..256].iter_mut().enumerate() {
+                *s = spectrum(i);
+            }
+            for (b, d) in v[256..264].iter_mut().enumerate() {
+                *d = -3.0 * env * if b % 3 == 1 { 1.0 } else { 0.4 };
+            }
+            put(&v)
+        }
+        "fx.analyzer" => {
+            let mut v = [0.0f32; 139];
+            for (i, s) in v[..128].iter_mut().enumerate() {
+                *s = spectrum(i);
+            }
+            let lufs = if playing { -13.5 + 2.0 * env } else { -120.0 };
+            v[128..139].copy_from_slice(&[lufs, lufs - 0.8, lufs - 1.2, 6.5, -1.2, -1.4, 0.7 * env + 0.1, 0.66 * env + 0.1, 0.25, 0.24, 0.62]);
+            put(&v)
+        }
+        "fx.compressor" => put(&[-7.0 * env, level, level - 7.0 * env + 3.0]),
+        "fx.gate" => put(&[if env > 0.25 { 0.0 } else { -40.0 * (1.0 - env * 4.0) }, level, if env > 0.25 { 1.0 } else { 0.0 }]),
+        "fx.transient" => put(&[if playing { 6.0 * env - 2.0 * (1.0 - env) * hat } else { 0.0 }]),
+        "fx.limiter" => put(&[-4.0 * env, if playing { -1.0 } else { -120.0 }, if playing { -5.0 + 6.0 * env } else { -120.0 }]),
+        "fx.saturator" => put(&[0.7 * env, 0.6 * env, 0.6 * env, 0.3 * hat * env.max(0.2), 0.25 * hat]),
+        "fx.reverb" => put(&[0.3 * env + 0.1 * hat, 0.28 * env + 0.12 * hat, 2.4]),
+        "fx.delay" => put(&[0.3 * hat, 0.26 * (1.0 - hat) * env, 1.0 - 0.3 * env]),
+        "fx.chorus" => put(&[(secs * 0.8).fract()]),
+        "fx.utility" => put(&[0.7 * env, 0.64 * env, 0.55 + 0.3 * (secs * 0.7).sin()]),
+        "fx.filter" => put(&[0.0, 0.0, env]),
+        "instrument.wavetable" => put(&[if playing { 3.0 } else { 0.0 }, 0.5 * env, 0.46 * env]),
+        "instrument.sampler" => put(&[if playing { 1.0 } else { 0.0 }, if playing { beat.fract() } else { 0.0 }, 0.5 * env]),
+        "instrument.drum" => {
+            let mut v = [0.0f32; 18];
+            v[0] = if playing { 2.0 } else { 0.0 };
+            v[1] = if playing { ((beat * 2.0) as usize % 4) as f32 } else { -1.0 };
+            for (i, l) in v[2..].iter_mut().enumerate() {
+                *l = if i % 4 == 0 { env } else if i % 4 == 2 { hat * 0.7 } else { 0.0 };
+            }
+            put(&v)
+        }
+        _ => 0,
+    }
+}
+
+fn collect_devices(devices: &[aitrack_model::Device], out: &mut HashMap<DeviceId, String>) {
+    for d in devices {
+        match &d.kind {
+            DeviceKind::Stock { plugin_id } => {
+                out.insert(d.id, plugin_id.clone());
+            }
+            DeviceKind::Rack(r) => {
+                for c in &r.chains {
+                    collect_devices(&c.devices, out);
+                }
+            }
+            DeviceKind::Plugin { .. } => {}
         }
     }
 }
@@ -238,6 +397,10 @@ impl EngineBridge for StubEngine {
             .iter()
             .map(|t| (t.id, t.session_slots.keys().copied().collect()))
             .collect();
+        self.devices.clear();
+        for t in &project.tracks {
+            collect_devices(&t.devices, &mut self.devices);
+        }
     }
 
     fn meter(&self, track: TrackId) -> MeterLevel {
@@ -368,6 +531,38 @@ impl EngineBridge for StubEngine {
 
     fn export(&mut self, options: ExportOptions, _project: &Project, progress: ProgressFn) {
         stub_export(options, progress);
+    }
+
+    fn set_analysis(&mut self, on: bool) {
+        if on && !self.analysis {
+            self.analysis_at = Instant::now();
+        }
+        self.analysis = on;
+    }
+
+    fn drain_analysis(&mut self, out: &mut Vec<[f32; 2]>) -> u32 {
+        const SR: u32 = 48_000;
+        let now = Instant::now();
+        // A stalled UI resumes from now, as an overrun ring would.
+        let dt = now.duration_since(self.analysis_at).as_secs_f64().min(0.25);
+        self.analysis_at = now;
+        if !self.analysis {
+            return SR;
+        }
+        let frames = (dt * SR as f64).round() as usize;
+        if self.state.playing {
+            synth_demo(self.synth_pos, frames, self.bpm, &mut self.noise, out);
+        } else {
+            out.extend(std::iter::repeat_n([0.0; 2], frames));
+        }
+        self.synth_pos += frames as u64;
+        SR
+    }
+
+    fn device_meter(&mut self, device: DeviceId, out: &mut [f32]) -> usize {
+        let Some(plugin) = self.devices.get(&device) else { return 0 };
+        let beat = self.now_tick() as f32 / PPQ as f32;
+        stub_device_meter(plugin, self.state.playing, beat, self.born.elapsed().as_secs_f32(), out)
     }
 }
 
@@ -647,122 +842,11 @@ pub struct StubCatalog {
     external: Vec<ExternalPlugin>,
 }
 
-const WAVES: &[&str] = &["Saw", "Square", "Sine", "Wavetable"];
-const FILTERS: &[&str] = &["LP 24", "LP 12", "BP", "HP"];
-
-fn p(id: u32, name: &'static str, min: f32, max: f32, default: f32) -> ParamInfo {
-    ParamInfo::new(id, name, min, max, default)
-}
-
 impl Default for StubCatalog {
     fn default() -> Self {
-        use DeviceCategory::*;
-        let synth = vec![
-            p(0, "Osc A", 0., 3., 0.).short("Osc A").choices(WAVES),
-            p(1, "Osc B", 0., 3., 1.).short("Osc B").choices(WAVES),
-            p(2, "Detune", 0., 100., 12.).unit("ct").short("Detune"),
-            p(3, "Cutoff", 20., 20_000., 2_400.).unit("Hz").log().short("Cutoff"),
-            p(4, "Resonance", 0., 100., 18.).unit("%").short("Reso"),
-            p(5, "Filter", 0., 3., 0.).choices(FILTERS),
-            p(6, "Env Amount", -100., 100., 35.).unit("%").short("Env"),
-            p(7, "Attack", 0.1, 5_000., 4.).unit("ms").log().short("Attack"),
-            p(8, "Decay", 1., 5_000., 320.).unit("ms").log().short("Decay"),
-            p(9, "Sustain", 0., 100., 60.).unit("%").short("Sustain"),
-            p(10, "Release", 1., 8_000., 280.).unit("ms").log().short("Release"),
-            p(11, "Volume", -60., 6., -6.).unit("dB").short("Volume"),
-        ];
-        let sampler = vec![
-            p(0, "Start", 0., 100., 0.).unit("%"),
-            p(1, "Transpose", -24., 24., 0.).unit("st").short("Pitch"),
-            p(2, "Attack", 0.1, 2_000., 1.).unit("ms").log(),
-            p(3, "Release", 1., 4_000., 120.).unit("ms").log(),
-            p(4, "Cutoff", 20., 20_000., 20_000.).unit("Hz").log(),
-            p(5, "Volume", -60., 6., 0.).unit("dB"),
-        ];
-        let eq = vec![
-            p(0, "Low", -18., 18., 0.).unit("dB"),
-            p(1, "Low Freq", 20., 500., 90.).unit("Hz").log().short("L Freq"),
-            p(2, "Mid", -18., 18., 0.).unit("dB"),
-            p(3, "Mid Freq", 200., 8_000., 1_200.).unit("Hz").log().short("M Freq"),
-            p(4, "High", -18., 18., 0.).unit("dB"),
-            p(5, "High Freq", 2_000., 20_000., 8_000.).unit("Hz").log().short("H Freq"),
-            p(6, "Output", -18., 18., 0.).unit("dB"),
-        ];
-        let comp = vec![
-            p(0, "Threshold", -60., 0., -18.).unit("dB").short("Thresh"),
-            p(1, "Ratio", 1., 20., 4.).power(0.5),
-            p(2, "Attack", 0.05, 200., 10.).unit("ms").log(),
-            p(3, "Release", 5., 2_000., 120.).unit("ms").log(),
-            p(4, "Knee", 0., 24., 6.).unit("dB"),
-            p(5, "Makeup", 0., 24., 0.).unit("dB"),
-            p(6, "Mix", 0., 100., 100.).unit("%"),
-        ];
-        let limiter = vec![
-            p(0, "Ceiling", -12., 0., -0.3).unit("dB"),
-            p(1, "Gain", 0., 24., 0.).unit("dB"),
-            p(2, "Release", 1., 1_000., 60.).unit("ms").log(),
-            p(3, "Lookahead", 0.5, 5., 1.5).unit("ms").short("Look"),
-        ];
-        let reverb = vec![
-            p(0, "Size", 0., 100., 55.).unit("%"),
-            p(1, "Decay", 100., 20_000., 2_400.).unit("ms").log(),
-            p(2, "Pre-delay", 0., 250., 18.).unit("ms").short("Pre"),
-            p(3, "Damping", 0., 100., 40.).unit("%").short("Damp"),
-            p(4, "Width", 0., 100., 100.).unit("%"),
-            p(5, "Mix", 0., 100., 30.).unit("%"),
-        ];
-        let delay = vec![
-            p(0, "Time", 1., 2_000., 375.).unit("ms").log(),
-            p(1, "Feedback", 0., 100., 38.).unit("%").short("Fdbk"),
-            p(2, "Low Cut", 20., 2_000., 200.).unit("Hz").log().short("Lo Cut"),
-            p(3, "High Cut", 1_000., 20_000., 8_000.).unit("Hz").log().short("Hi Cut"),
-            p(4, "Ping-Pong", 0., 1., 1.).choices(&["Off", "On"]).short("Ping"),
-            p(5, "Mix", 0., 100., 25.).unit("%"),
-        ];
-        let saturator = vec![
-            p(0, "Drive", 0., 36., 6.).unit("dB"),
-            p(1, "Shape", 0., 3., 0.).choices(&["Soft", "Tape", "Tube", "Fold"]),
-            p(2, "Tone", -100., 100., 0.).unit("%"),
-            p(3, "Output", -24., 6., 0.).unit("dB"),
-            p(4, "Mix", 0., 100., 100.).unit("%"),
-        ];
-        let filter = vec![
-            p(0, "Cutoff", 20., 20_000., 1_000.).unit("Hz").log(),
-            p(1, "Resonance", 0., 100., 20.).unit("%").short("Reso"),
-            p(2, "Type", 0., 3., 0.).choices(FILTERS),
-            p(3, "Drive", 0., 24., 0.).unit("dB"),
-            p(4, "Mix", 0., 100., 100.).unit("%"),
-        ];
-        let chorus = vec![
-            p(0, "Rate", 0.01, 10., 0.6).unit("Hz").log(),
-            p(1, "Depth", 0., 100., 40.).unit("%"),
-            p(2, "Feedback", 0., 100., 10.).unit("%").short("Fdbk"),
-            p(3, "Mix", 0., 100., 50.).unit("%"),
-        ];
-        let utility = vec![
-            p(0, "Gain", -36., 36., 0.).unit("dB"),
-            p(1, "Width", 0., 200., 100.).unit("%"),
-            p(2, "Pan", -100., 100., 0.).unit("%"),
-            p(3, "Mono", 0., 1., 0.).choices(&["Off", "On"]),
-        ];
-        let stock = vec![
-            DeviceInfo { id: "instrument.wavetable", name: "Wavetable Synth", category: Instrument, tags: &["synth", "poly", "lead", "pad"], params: synth.clone(), is_instrument: true },
-            DeviceInfo { id: "instrument.bass", name: "Mono Bass", category: Instrument, tags: &["synth", "mono", "bass"], params: synth, is_instrument: true },
-            DeviceInfo { id: "instrument.sampler", name: "Sampler", category: Instrument, tags: &["sampler", "keys"], params: sampler.clone(), is_instrument: true },
-            DeviceInfo { id: "instrument.drum_sampler", name: "Drum Sampler", category: Drums, tags: &["drums", "one-shot"], params: sampler, is_instrument: true },
-            DeviceInfo { id: "fx.eq", name: "EQ Eight", category: Eq, tags: &["eq", "tone"], params: eq, is_instrument: false },
-            DeviceInfo { id: "fx.compressor", name: "Compressor", category: Dynamics, tags: &["dynamics", "glue"], params: comp, is_instrument: false },
-            DeviceInfo { id: "fx.limiter", name: "Limiter", category: Dynamics, tags: &["master", "loudness"], params: limiter, is_instrument: false },
-            DeviceInfo { id: "fx.reverb", name: "Reverb", category: Space, tags: &["space", "hall", "plate"], params: reverb, is_instrument: false },
-            DeviceInfo { id: "fx.delay", name: "Echo Delay", category: Space, tags: &["delay", "echo"], params: delay, is_instrument: false },
-            DeviceInfo { id: "fx.saturator", name: "Saturator", category: Distortion, tags: &["drive", "warmth"], params: saturator, is_instrument: false },
-            DeviceInfo { id: "fx.filter", name: "Auto Filter", category: Filter, tags: &["filter", "sweep"], params: filter, is_instrument: false },
-            DeviceInfo { id: "fx.chorus", name: "Chorus", category: Modulation, tags: &["width", "chorus"], params: chorus, is_instrument: false },
-            DeviceInfo { id: "fx.utility", name: "Utility", category: Utility, tags: &["gain", "width"], params: utility, is_instrument: false },
-            DeviceInfo { id: "rack.instrument", name: "Instrument Rack", category: Rack, tags: &["rack", "macros"], params: Vec::new(), is_instrument: true },
-            DeviceInfo { id: "rack.drum", name: "Drum Rack", category: Rack, tags: &["rack", "drums", "pads"], params: Vec::new(), is_instrument: true },
-            DeviceInfo { id: "rack.audio", name: "Audio Effect Rack", category: Rack, tags: &["rack", "macros"], params: Vec::new(), is_instrument: false },
-        ];
+        // The real stock devices: listing them needs no audio device, and the
+        // demo project (and every device editor) uses their parameter ids.
+        let stock = crate::real::plugins::stock_devices();
         let ext = |name: &str, vendor: &str, format, inst| ExternalPlugin {
             uid: format!("{vendor}.{name}").to_lowercase().replace(' ', "-"),
             name: name.into(),
@@ -1358,6 +1442,37 @@ mod tests {
         let found = lib.search("", Some(am));
         assert!(found.iter().all(|i| i.key.is_none_or(|k| k.mask() == am.mask())));
         assert!(lib.search("kick", None).iter().all(|i| i.name.to_lowercase().contains("kick") || i.category == "Kick"));
+    }
+
+    #[test]
+    fn stub_engine_feeds_the_analysers() {
+        let mut e = StubEngine::default();
+        let p = crate::demo::project();
+        e.update_project(&p);
+        let mut frames = Vec::new();
+        assert_eq!(e.drain_analysis(&mut frames), 48_000);
+        assert!(frames.is_empty(), "nothing while analysis is off");
+        e.set_analysis(true);
+        e.play();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        e.drain_analysis(&mut frames);
+        assert!(frames.len() > 400 && frames.len() < 48_000 / 3);
+        assert!(frames.iter().any(|f| f[0].abs() > 0.01));
+        assert!(frames.iter().all(|f| f[0].abs() <= 1.0 && f[1].abs() <= 1.0));
+        // Device meters follow each plugin's documented layout.
+        let eq = p.tracks.iter().flat_map(|t| &t.devices).find(|d| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id == "fx.eq")).unwrap().id;
+        let mut m = [0.0f32; 320];
+        assert_eq!(e.device_meter(eq, &mut m), 265);
+        assert!(m[128..256].iter().any(|v| *v > -60.0));
+        assert_eq!(e.device_meter(DeviceId(u64::MAX), &mut m), 0);
+        // The demo loop is deterministic and continuous across calls.
+        let (mut a, mut b, mut seed) = (Vec::new(), Vec::new(), 7u32);
+        synth_demo(0, 512, 128.0, &mut seed, &mut a);
+        synth_demo(512, 512, 128.0, &mut seed, &mut a);
+        let mut seed = 7u32;
+        synth_demo(0, 1024, 128.0, &mut seed, &mut b);
+        assert_eq!(a.len(), 1024);
+        assert!(a.iter().zip(&b).all(|(x, y)| (x[0] - y[0]).abs() < 0.2), "kick, bass and chord line up");
     }
 
     #[test]

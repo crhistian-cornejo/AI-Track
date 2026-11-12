@@ -24,6 +24,7 @@ pub mod rt;
 pub mod sample_cache;
 pub mod shared;
 pub mod status;
+pub mod tap;
 pub mod thread_priority;
 
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub use rt::{AudioProcessor, MidiMessage};
 pub use sample_cache::{DecodedAudio, SampleCache};
 pub use shared::{ProcessorPool, SharedProcessor};
 pub use status::{ClipSlotStatus, MeterReading, SlotState};
+pub use tap::{AnalysisTap, DeviceMeter, TapReader, DEVICE_METER_LEN, TAP_FRAMES};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

@@ -16,6 +16,7 @@
 pub mod buffer;
 pub mod event;
 pub mod param;
+pub mod response;
 
 // DSP primitives (allocation only in constructors / `prepare`).
 pub mod biquad;

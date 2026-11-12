@@ -147,6 +147,7 @@ pub fn render(
         max_frames: block,
         prev_meters: None,
         taps: stems.to_vec(),
+        analysis: None,
     };
     let graph = compile(project, &mut cx)?;
     let latency = graph.total_latency as usize;

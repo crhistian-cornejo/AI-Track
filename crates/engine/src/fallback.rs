@@ -304,6 +304,13 @@ impl Processor for TestGain {
     fn get_param(&self, id: u32) -> f32 {
         if id == 0 { self.gain } else { 0.0 }
     }
+    /// `[gain, 42]`, so tests can read display data through the engine.
+    fn meter(&self, out: &mut [f32]) -> usize {
+        let v = [self.gain, 42.0];
+        let n = v.len().min(out.len());
+        out[..n].copy_from_slice(&v[..n]);
+        n
+    }
 }
 
 // ───────────────────────────── Latency ─────────────────────────────

@@ -17,6 +17,7 @@ use crate::clip::{ActiveNotes, CompiledClip, EventList, Rng, TimeCtx};
 use crate::delay::DelayLine;
 use crate::shared::SharedProcessor;
 use crate::status::{MeterBank, SessionStatus, NO_SCENE, STOP_SCENE};
+use crate::tap::{AnalysisTap, DeviceMeter, DEVICE_METER_LEN};
 use aitrack_dsp::{db_to_gain, AudioBuffer, Event, EventKind, ProcessContext, Transport};
 use aitrack_model::{AutomationLane, DeviceId, FollowAction, LaunchMode, Monitor, Quantize, RackKind, SceneId, TempoMap, Tick, TrackId, TrackKind, PPQ};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,8 @@ pub(crate) struct ProcNode {
     pub enabled: Arc<AtomicBool>,
     pub init_params: Vec<(u32, f32)>,
     pub is_instrument: bool,
+    /// Display data (`Processor::meter`) for the UI.
+    pub meter: Arc<DeviceMeter>,
 }
 
 pub(crate) struct RackNode {
@@ -149,7 +152,7 @@ impl RackNode {
     }
 }
 
-fn for_each_proc(devs: &[DeviceNode], f: &mut impl FnMut(&ProcNode)) {
+pub(crate) fn for_each_proc(devs: &[DeviceNode], f: &mut impl FnMut(&ProcNode)) {
     for d in devs {
         match d {
             DeviceNode::Proc(p) => f(p),
@@ -342,6 +345,8 @@ pub(crate) struct TrackNode {
     pub meter_acc: MeterAcc,
     /// Offline stem capture (post-fader, aligned with the output bus).
     pub tap: Option<Box<TapNode>>,
+    /// The UI's analysis ring, fed while it asks for this track.
+    pub analysis: Option<Arc<AnalysisTap>>,
 }
 
 /// Captures a track's post-fader signal for stem export, delayed so it lines
@@ -602,6 +607,18 @@ impl CompiledGraph {
         }
         let (peak, rms) = self.out_acc.finish(sr);
         self.meters.master.publish(peak, rms);
+        // Device display data, only for the devices a UI is looking at.
+        let mut scratch = [0.0f32; DEVICE_METER_LEN];
+        for t in &self.tracks {
+            for_each_proc(&t.devices, &mut |p| {
+                if p.meter.wanted() {
+                    // SAFETY: audio thread owns the installed graph.
+                    let proc = unsafe { p.proc.get_mut() };
+                    let n = proc.meter(&mut scratch).min(DEVICE_METER_LEN);
+                    p.meter.publish(&scratch[..n]);
+                }
+            });
+        }
     }
 
     /// Process one segment (no transport discontinuity inside it).
@@ -818,6 +835,11 @@ fn process_track(
     }
 
     t.meter_acc.add(&t.buf);
+    if let Some(a) = &t.analysis
+        && a.wants_track(t.id)
+    {
+        a.write(t.buf.channel(0), t.buf.channel(1));
+    }
     if let Some(tap) = t.tap.as_deref_mut() {
         tap.scratch.set_frames(n);
         tap.scratch.copy_from(&t.buf);

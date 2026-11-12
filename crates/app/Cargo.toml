@@ -34,6 +34,8 @@ serde_json.workspace = true
 # Theme folder hot reload (CC0).
 notify = "8.2"
 async-channel = "2"
+# Process CPU and memory for the status bar. MIT.
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Background images: decode, downscale and pre-blur once, off the UI thread.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 

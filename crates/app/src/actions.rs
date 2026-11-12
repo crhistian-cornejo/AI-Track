@@ -22,6 +22,9 @@ actions!(
         Escape,
         OpenPreferences,
         ExportAudio,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         Quit,
     ]
 );
@@ -51,6 +54,10 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("escape", Escape, Some(CTX)),
         KeyBinding::new(&format!("{m}-,"), OpenPreferences, Some("Workspace")),
         KeyBinding::new(&format!("{m}-shift-e"), ExportAudio, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-="), ZoomIn, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-+"), ZoomIn, Some("Workspace")),
+        KeyBinding::new(&format!("{m}--"), ZoomOut, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-0"), ZoomReset, Some("Workspace")),
         KeyBinding::new(&format!("{m}-q"), Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());

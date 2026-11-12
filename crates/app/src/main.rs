@@ -16,6 +16,7 @@ mod paint;
 mod real;
 mod state;
 mod theme;
+mod usage;
 mod views;
 mod widgets;
 mod workspace;

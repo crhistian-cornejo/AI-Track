@@ -117,6 +117,8 @@ pub struct Workspace {
     pub fx: views::device_ui::UiState,
     /// The meter strip under the top bar.
     pub meters: views::meters::MeterStrip,
+    /// CPU and memory of this process, for the status bar.
+    pub usage: crate::usage::Usage,
     pub bottom_h: f32,
     pub bottom_open: bool,
     pub browser_open: bool,
@@ -233,6 +235,7 @@ impl Workspace {
             menu: None,
             fx: views::device_ui::UiState::default(),
             meters: views::meters::MeterStrip::default(),
+            usage: crate::usage::Usage::default(),
             bottom_h: 300.,
             bottom_open: true,
             browser_open: true,
@@ -332,6 +335,10 @@ impl Workspace {
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         self.audition.retry(|t, k, v| self.b.engine.audition_note(t, k, v));
         let mut changed = self.b.engine.idle();
+        // The usage read-out moves about once a second even when nothing else does.
+        let (cpu, mem) = (self.usage.cpu, self.usage.memory);
+        self.usage.tick();
+        changed |= (self.usage.cpu - cpu).abs() >= 0.005 || self.usage.memory.abs_diff(mem) >= 4 * 1024 * 1024;
         changed |= self.b.plugins.poll();
         changed |= self.b.library.poll();
         if let Some(r) = self.b.library.organize_result() {
@@ -1198,7 +1205,75 @@ impl Workspace {
             .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
             .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))
             .child(crate::widgets::label(self.b.engine.status_label(), TEXT_SM, pal.faint))
+            .child(self.render_usage())
+            .child(self.render_zoom(cx))
             .into_any_element()
+    }
+
+    /// What AI-Track is using: audio engine load, process CPU and memory.
+    fn render_usage(&mut self) -> AnyElement {
+        let pal = p();
+        let dsp = self.b.engine.cpu_load().clamp(0., 1.);
+        let cpu = self.usage.cpu;
+        let hot = |v: f32| if v > 0.8 { pal.record } else if v > 0.5 { pal.meter_mid } else { pal.muted };
+        let cell = |name: &'static str, value: String, color: gpui::Hsla| {
+            div().flex().items_center().gap(px(SP1)).child(crate::widgets::label(name, TEXT_XS, pal.faint)).child(crate::widgets::mono(value, TEXT_SM, color))
+        };
+        div()
+            .id("usage")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(SP3))
+            .tooltip(crate::widgets::tip("Resource use: audio engine load, this app's CPU share and memory", None))
+            .child(cell("DSP", format!("{:>2.0}%", dsp * 100.), hot(dsp)))
+            .child(cell("CPU", format!("{:>2.0}%", cpu * 100.), hot(cpu)))
+            .child(cell("RAM", self.usage.memory_label(), pal.muted))
+            .into_any_element()
+    }
+
+    /// The app zoom: − 100% +. Clicking the value resets it.
+    fn render_zoom(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = p();
+        let scale = self.look.app.ui_scale;
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                crate::widgets::sized_icon_button("zoom-out", Icon::Minus, false, 18., 10.)
+                    .tooltip(crate::widgets::tip("Zoom the interface out", Some("Ctrl+-")))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(-1, cx))),
+            )
+            .child(
+                div()
+                    .id("zoom-value")
+                    .w(px(40.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(r_sm()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.08)))
+                    .tooltip(crate::widgets::tip("Interface zoom (click to reset)", Some("Ctrl+0")))
+                    .child(crate::widgets::mono(format!("{:.0}%", scale * 100.), TEXT_SM, pal.muted))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(0, cx))),
+            )
+            .child(
+                crate::widgets::sized_icon_button("zoom-in", Icon::Add, false, 18., 10.)
+                    .tooltip(crate::widgets::tip("Zoom the interface in", Some("Ctrl++")))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Step the interface zoom by 10 % (`0` resets to 100 %), within 80–150 %.
+    pub fn zoom_by(&mut self, step: i32, cx: &mut Context<Self>) {
+        self.set_look(false, cx, |a| {
+            a.ui_scale = if step == 0 { 1. } else { ((a.ui_scale + step as f32 * 0.1) * 10.).round().clamp(8., 15.) / 10. };
+        });
     }
 
     /// A dismissable strip under the top bar (no audio device and similar).
@@ -1452,6 +1527,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_ai))
             .on_action(cx.listener(Self::toggle_browser))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(0, cx)))
             .on_action(cx.listener(|this, _: &OpenPreferences, _, cx| this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Appearance), cx)))
             .on_action(cx.listener(|this, _: &ExportAudio, _, cx| this.open_export(cx)))
             .on_action(cx.listener(|this, _: &TabDevices, _, cx| this.set_tab(BottomTab::Devices, cx)))

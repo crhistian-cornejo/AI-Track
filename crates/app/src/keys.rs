@@ -249,6 +249,7 @@ pub static TABLE: &[Entry] = &[
     main("ShowMixer", "Mixer", "Show or hide the mixer.", C::Views, W, &["mod-alt-m"]),
     main("ToggleDetail", "Detail Panel", "Show or hide the bottom detail panel.", C::Views, W, &["mod-alt-l"]),
     main("TogglePalette", "Search", "Search samples, devices, presets, packs and commands; arrows audition, Enter adds to the selected track.", C::Views, W, &["mod-k"]),
+    main("AddLibraryFolder", "Add Library Folder", "Add a folder on this computer or Google Drive, Dropbox, OneDrive or iCloud Drive to the sample library.", C::Views, W, &[]),
     main("ToggleAssistant", "Assistant", "Show or hide the AI assistant.", C::Views, W, &["mod-i"]),
     cmd(Cmd::FocusSearch, "Find", "Open the search palette.", C::Views, &["mod-f"]),
     cmd(Cmd::Fullscreen, "Full Screen", "Switch full screen on or off.", C::Views, &["f11"]),
@@ -418,9 +419,11 @@ mod tests {
                 }
             }
         }
-        // Every command of the table has a row, and a key.
+        // Every command of the table has a row, and a key, except the few
+        // reached only from the palette and menus.
+        const KEYLESS: &[Bound] = &[Bound::Action("AddLibraryFolder")];
         for e in TABLE {
-            assert!(!e.keys.is_empty(), "{} has no key", e.label);
+            assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);
         }
     }

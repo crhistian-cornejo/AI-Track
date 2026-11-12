@@ -173,11 +173,14 @@ fn volume_envelope_follows_gain_at() {
 // ───────────────────────────── Loops ─────────────────────────────
 
 /// A clip over a 12 000-frame file (half a beat, 480 ticks) that starts
-/// `offset` ticks in and is dragged out to `length` with
-/// [`ops::resize_end`], which makes it loop from its offset to the file's end.
+/// `offset` ticks in, loops ([`ops::toggle_loop`]) and is dragged out to
+/// `length` with [`ops::resize_end`], so it loops from its offset to the
+/// file's end.
 fn stretched(data: Vec<f32>, offset: Tick, length: Tick) -> (P, SampleCache, TrackId, ClipId) {
     assert_eq!(data.len(), 12_000);
     let (mut b, samples, t, cid) = one_clip(data, |s| Clip { offset, ..Clip::new("c", Color(0), s, 480 - offset) });
+    let cmd = ops::toggle_loop(&b.p, cid).expect("loop");
+    edit(&mut b.p, cmd);
     let cmd = ops::resize_end(&b.p, cid, length).expect("resize");
     edit(&mut b.p, cmd);
     assert_eq!(b.p.clips[&cid].looping, Some(LoopRegion { start: offset, end: 480 }));
@@ -412,6 +415,8 @@ fn export_renders_a_faded_looped_clip() {
         .insert(sid, Source::Audio(AudioSource { path, hash: None, sample_rate: 48_000, channels: 2, frames: 12_000, warp: Warp::default(), key: None }));
     let cid = add_clip(&mut b, Clip::new("c", Color(0), sid, 480));
     b.place(t, cid, 0);
+    let cmd = ops::toggle_loop(&b.p, cid).expect("loop");
+    edit(&mut b.p, cmd);
     let cmd = ops::resize_end(&b.p, cid, 2 * PPQ).expect("resize");
     edit(&mut b.p, cmd);
     let cmd = ops::set_fades(&b.p, cid, Fade { length: 600, curve: 0.5 }, Fade { length: 300, curve: 0.0 }).expect("fades");

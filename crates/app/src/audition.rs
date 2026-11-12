@@ -1,6 +1,8 @@
+use aitrack_library::{Analyzer, HydrateEvent, HydrateJob};
 use aitrack_model::TrackId;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const MOUSE: &str = "@mouse";
@@ -127,10 +129,108 @@ impl SampleAudition {
         self.pending.is_some()
     }
 
+    /// The row playing (or waiting for its download to play).
+    pub fn current(&self) -> Option<&Path> {
+        self.playing.as_deref()
+    }
+
     /// Stopped (palette closed, or a non-sample row selected).
     pub fn stop(&mut self) -> bool {
         self.pending = None;
         self.playing.take().is_some()
+    }
+}
+
+/// Where an online-only sample stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FetchState {
+    /// Still in the cloud; nothing asked for.
+    Remote,
+    /// Downloading; the fraction once the size is known.
+    Downloading(Option<f32>),
+    /// On disk now.
+    Local,
+    Failed(String),
+}
+
+/// What finished since the last [`CloudFetches::poll`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fetched {
+    Ready(PathBuf),
+    Failed(PathBuf, String),
+}
+
+/// Online-only samples being downloaded because they were auditioned or
+/// dragged: one [`HydrateJob`] each (its own thread; the UI never reads a
+/// placeholder), analysed into the user library once local.
+#[derive(Default)]
+pub struct CloudFetches {
+    jobs: HashMap<PathBuf, (HydrateJob, Option<f32>)>,
+    local: HashSet<PathBuf>,
+    failed: HashMap<PathBuf, String>,
+}
+
+impl CloudFetches {
+    /// Starts downloading `path` unless it is under way or already here.
+    /// `index`: the library to analyse it into afterwards. `true` when a
+    /// download was started.
+    pub fn start(&mut self, path: &Path, index: Option<(PathBuf, Arc<dyn Analyzer>)>) -> bool {
+        if self.local.contains(path) || self.jobs.contains_key(path) {
+            return false;
+        }
+        self.failed.remove(path);
+        self.jobs.insert(path.to_owned(), (HydrateJob::spawn(path.to_owned(), index), None));
+        true
+    }
+
+    pub fn state(&self, path: &Path) -> FetchState {
+        if self.local.contains(path) {
+            FetchState::Local
+        } else if let Some((_, f)) = self.jobs.get(path) {
+            FetchState::Downloading(*f)
+        } else if let Some(e) = self.failed.get(path) {
+            FetchState::Failed(e.clone())
+        } else {
+            FetchState::Remote
+        }
+    }
+
+    /// Whether a row flagged online-only still has to be downloaded.
+    pub fn needs_fetch(&self, path: &Path) -> bool {
+        !self.local.contains(path)
+    }
+
+    pub fn running(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    /// Takes the jobs' news: progress, and what finished.
+    pub fn poll(&mut self) -> (bool, Vec<Fetched>) {
+        let mut changed = false;
+        let mut out = Vec::new();
+        for (path, (job, fraction)) in &mut self.jobs {
+            while let Ok(ev) = job.events.try_recv() {
+                changed = true;
+                match ev {
+                    HydrateEvent::Progress { done, total } => *fraction = (total > 0).then(|| done as f32 / total as f32),
+                    HydrateEvent::Ready(_) => out.push(Fetched::Ready(path.clone())),
+                    HydrateEvent::Failed(e) => out.push(Fetched::Failed(path.clone(), e)),
+                }
+            }
+        }
+        for f in &out {
+            match f {
+                Fetched::Ready(p) => {
+                    self.jobs.remove(p);
+                    self.local.insert(p.clone());
+                }
+                Fetched::Failed(p, e) => {
+                    self.jobs.remove(p);
+                    self.failed.insert(p.clone(), e.clone());
+                }
+            }
+        }
+        (changed, out)
     }
 }
 
@@ -165,6 +265,42 @@ mod tests {
         assert_eq!(a.replay(Path::new("b")), PathBuf::from("b"));
         assert!(!a.is_pending());
         assert_eq!(a.select(Path::new("b"), true, t0), None, "already playing");
+    }
+
+    #[test]
+    fn cloud_fetch_downloads_once_and_reports() {
+        let dir = std::env::temp_dir().join(format!("aitrack-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Loop 120bpm.wav");
+        std::fs::write(&f, vec![1u8; 300_000]).unwrap();
+        let mut fetches = CloudFetches::default();
+        assert_eq!(fetches.state(&f), FetchState::Remote);
+        assert!(fetches.start(&f, None));
+        assert!(!fetches.start(&f, None), "one download per file");
+        assert!(matches!(fetches.state(&f), FetchState::Downloading(_)));
+        let t0 = Instant::now();
+        let mut done = Vec::new();
+        while done.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+            done = fetches.poll().1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(done, vec![Fetched::Ready(f.clone())]);
+        assert_eq!(fetches.state(&f), FetchState::Local);
+        assert!(!fetches.needs_fetch(&f) && !fetches.running());
+        assert!(!fetches.start(&f, None), "already here");
+
+        let missing = dir.join("gone.wav");
+        fetches.start(&missing, None);
+        let t0 = Instant::now();
+        let mut done = Vec::new();
+        while done.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+            done = fetches.poll().1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(&done[..], [Fetched::Failed(p, _)] if *p == missing));
+        assert!(matches!(fetches.state(&missing), FetchState::Failed(_)));
+        assert!(fetches.start(&missing, None), "a failed download can be retried");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

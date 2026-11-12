@@ -50,6 +50,8 @@ pub struct SampleRow {
     pub bpm: Option<f32>,
     pub is_loop: bool,
     pub favorite: bool,
+    /// Online-only in a cloud folder: listed by name, downloaded when played.
+    pub cloud: bool,
     /// Text relevance, higher first.
     pub score: f32,
 }
@@ -88,6 +90,7 @@ impl SampleRow {
             bpm: s.bpm,
             is_loop: s.is_loop(),
             favorite: s.favorite,
+            cloud: s.cloud,
             score: 0.,
         }
     }
@@ -106,6 +109,7 @@ impl SampleRow {
             bpm: it.bpm,
             is_loop: it.is_loop,
             favorite: it.favorite,
+            cloud: false,
             score: 0.,
         }
     }
@@ -222,7 +226,7 @@ impl Worker {
         let (out, rx) = unbounded();
         let run = move || {
             let open = |p: &PathBuf| Library::open(p).map_err(|e| log::warn!("palette: {}: {e}", p.display())).ok();
-            let libs = [factory.as_ref().and_then(open), user.is_file().then(|| open(&user)).flatten()];
+            let mut libs = [factory.as_ref().and_then(open), user.is_file().then(|| open(&user)).flatten()];
             if libs.iter().all(Option::is_none) {
                 // The UI searches the bridge itself from now on; an empty
                 // answer from here would overwrite its results.
@@ -232,6 +236,10 @@ impl Worker {
             while let Ok(mut q) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     q = newer;
+                }
+                // The first folder added creates the user library.
+                if libs[USER].is_none() && user.is_file() {
+                    libs[USER] = open(&user);
                 }
                 let sq = search_query(&q);
                 let mut rows = Vec::new();
@@ -295,6 +303,7 @@ mod tests {
             bpm: None,
             is_loop: false,
             favorite: false,
+            cloud: false,
             score: 0.,
         }
     }

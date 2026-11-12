@@ -262,6 +262,9 @@ impl AppState {
     /// insert marker moves to the end of what was copied, so Paste lays the
     /// copy right after it.
     pub fn copy(&mut self) -> bool {
+        if let Some(done) = self.copy_auto_range() {
+            return done;
+        }
         if let Some((_, _, sel)) = self.note_selection() {
             let first = sel.iter().map(|n| n.start).min().unwrap_or(0);
             let last = sel.iter().map(Note::end).max().unwrap_or(first);
@@ -286,6 +289,9 @@ impl AppState {
 
     /// Ctrl+X: Copy, then Delete. The marker stays where the cut began.
     pub fn cut(&mut self) -> bool {
+        if let Some(done) = self.cut_auto_range() {
+            return done;
+        }
         let notes = self.note_selection().map(|(_, _, sel)| sel.iter().map(|n| n.start).min().unwrap_or(0));
         let start = self.selection_span().map(|s| s.0);
         if !self.copy() {
@@ -349,6 +355,9 @@ impl AppState {
     /// of the pasted range, so pasting again lays the next copy after it.
     /// Notes land on the piano roll's marker in the open clip.
     pub fn paste(&mut self) -> bool {
+        if let Some(done) = self.paste_auto_range() {
+            return done;
+        }
         match self.ed.clipboard.clone() {
             None => false,
             Some(Clipboard::Notes { span, notes }) => {

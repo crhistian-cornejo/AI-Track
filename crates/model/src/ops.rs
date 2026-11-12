@@ -113,22 +113,39 @@ pub fn toggle_loop(p: &Project, clip: ClipId) -> Option<Command> {
     }
 }
 
-/// The right-edge drag. An audio clip stretched past the end of its file
-/// starts looping from its offset to the file's end; pulled back inside the
-/// file, that automatic loop goes away again. A clip that already loops, and
-/// any notes clip, only changes length.
+/// Source ticks an audio clip plays per tick of clip time: its transpose and
+/// detune as a speed (Re-Pitch). 1 for a notes clip.
+pub fn clip_rate(p: &Project, clip: ClipId) -> f64 {
+    match p.clips.get(&clip).and_then(|c| p.sources.get(&c.source)) {
+        Some(Source::Audio(a)) => a.warp.pitch_ratio().max(1e-6),
+        _ => 1.0,
+    }
+}
+
+/// How much clip time an audio clip has from its offset to the end of its
+/// file (playback speed included); `None` for a notes clip or a file of
+/// unknown length. A one-shot clip never grows past this.
+pub fn file_room(p: &Project, clip: ClipId) -> Option<Tick> {
+    let src = source_len(p, clip)?;
+    let offset = p.clips.get(&clip)?.offset;
+    Some((((src - offset) as f64) / clip_rate(p, clip)).floor().max(0.0) as Tick)
+}
+
+/// The right-edge drag, as in Live. A clip that loops repeats its loop for
+/// as long as it is made; a one-shot audio clip (loop off) only shortens or
+/// restores its tail, up to the end of its file: it never grows past the
+/// file and never starts looping by itself. The fades stay at their edges
+/// (the fade-out shapes the cut tail) and only shrink when the clip gets too
+/// short for them. A notes clip only changes length.
 pub fn resize_end(p: &Project, clip: ClipId, new_length: Tick) -> Option<Command> {
     let mut new = p.clips.get(&clip)?.clone();
-    new.length = new_length.max(MIN_CLIP_LEN);
-    if let Some(src) = source_len(p, clip) {
-        let auto = LoopRegion { start: new.offset, end: src };
-        let past_file = new.offset + new.length > src;
-        match new.looping {
-            None if past_file && src - new.offset >= MIN_CLIP_LEN => new.looping = Some(auto),
-            Some(l) if l == auto && !past_file => new.looping = None,
-            _ => {}
-        }
+    let mut length = new_length.max(MIN_CLIP_LEN);
+    if new.looping.is_none_or(|l| l.end <= l.start)
+        && let Some(room) = file_room(p, clip)
+    {
+        length = length.min(room.max(MIN_CLIP_LEN));
     }
+    new.length = length;
     clamp_fades(&mut new, Edge::End);
     update(p, clip, new)
 }
@@ -147,14 +164,15 @@ pub fn trim_start(p: &Project, track: TrackId, placement: PlacementId, new_start
     // negative until [`rebase_notes`] moves the notes instead); audio cannot
     // start before its file.
     let notes = matches!(p.sources.get(&old.source), Some(Source::Notes(_)));
+    let rate = clip_rate(p, place.clip);
     if !in_loop(old) && !notes {
-        delta = delta.max(-old.offset);
+        delta = delta.max(-((old.offset as f64 / rate).floor() as Tick));
     }
     if delta == 0 {
         return None;
     }
     let mut new = old.clone();
-    new.offset = advance(old, delta);
+    new.offset = advance(old, delta, rate).max(if in_loop(old) || notes { Tick::MIN } else { 0 });
     new.length -= delta;
     shift_envelope(&mut new, -delta);
     clamp_fades(&mut new, Edge::Start);
@@ -162,6 +180,96 @@ pub fn trim_start(p: &Project, track: TrackId, placement: PlacementId, new_start
         Command::UpdateClip { id: place.clip, clip: Box::new(new) },
         Command::MovePlacement { track, id: placement, to_track: track, start: place.start + delta, lane: place.lane },
     ])
+}
+
+/// `clip` stretched in time to `new_length` ticks, Re-Pitch style (FL
+/// Studio's stretch, Live's Re-Pitch warp): the audio is resampled to fit
+/// and its pitch follows. `warp` is its file's warp; `bpm` the project
+/// tempo. The file is warped at an original tempo scaled by the stretch, so
+/// it plays slower when longer; offset, loop, fades and envelopes (in source
+/// or clip ticks) scale with it, so the clip plays exactly the same audio,
+/// slower or faster. Transpose and detune stay on top. `None` for an empty
+/// clip or a length below [`MIN_CLIP_LEN`].
+pub fn stretched(clip: &Clip, warp: &Warp, bpm: f64, new_length: Tick) -> Option<(Clip, Warp)> {
+    if clip.length <= 0 || new_length < MIN_CLIP_LEN || bpm.is_nan() || bpm <= 0.0 {
+        return None;
+    }
+    let k = new_length as f64 / clip.length as f64;
+    let scale = |t: Tick| (t as f64 * k).round() as Tick;
+    let mut c = clip.clone();
+    c.offset = scale(clip.offset);
+    c.length = new_length;
+    c.looping = clip.looping.map(|l| LoopRegion { start: scale(l.start), end: scale(l.end) });
+    c.fade_in.length = scale(clip.fade_in.length);
+    c.fade_out.length = scale(clip.fade_out.length);
+    for lane in &mut c.envelopes {
+        for pt in &mut lane.points {
+            pt.tick = scale(pt.tick);
+        }
+    }
+    clamp_fades(&mut c, Edge::End);
+    let original = match warp.original_bpm {
+        Some(b) if warp.enabled && b > 0.0 => b,
+        _ => bpm,
+    };
+    let mut w = warp.clone();
+    w.enabled = true;
+    w.mode = WarpMode::Repitch;
+    w.original_bpm = Some(original * k);
+    for m in &mut w.markers {
+        m.1 = scale(m.1);
+    }
+    Some((c, w))
+}
+
+/// How much a clip is stretched: its playback speed from warping relative to
+/// the file as recorded at the project tempo (1 = not stretched, 0.5 = half
+/// speed, twice as long). Transpose is not included.
+pub fn stretch_factor(warp: &Warp, bpm: f64) -> f64 {
+    match warp.original_bpm {
+        Some(b) if warp.enabled && b > 0.0 && bpm > 0.0 => b / bpm,
+        _ => 1.0,
+    }
+}
+
+/// The commands that take clip `id` to `origin` (with its file's warp
+/// `origin_warp`) stretched to `new_length` (see [`stretched`]). Only this
+/// clip changes: a file it shares with other clips is copied for it first,
+/// as a transpose is. With `keep_end` (the left edge) every placement of the
+/// clip keeps its end where it was and moves its start instead. `origin` is
+/// the clip as the drag found it, so every move of a drag starts from the
+/// same state; back at the original length the clip and warp are restored.
+pub fn stretch(p: &mut Project, id: ClipId, origin: &Clip, origin_warp: &Warp, new_length: Tick, keep_end: Option<&[(TrackId, PlacementId, Tick)]>) -> Option<Vec<Command>> {
+    let now = p.clips.get(&id)?.clone();
+    let Some(Source::Audio(file)) = p.sources.get(&now.source).cloned() else { return None };
+    let (mut clip, warp) = if new_length == origin.length {
+        (origin.clone(), origin_warp.clone())
+    } else {
+        stretched(origin, origin_warp, p.tempo.initial_bpm(), new_length)?
+    };
+    let mut cmds = Vec::new();
+    let shared = p.clips.iter().any(|(other, c)| *other != id && c.source == now.source);
+    if warp == file.warp {
+        clip.source = now.source;
+    } else if shared {
+        let source = p.alloc_source_id();
+        cmds.push(Command::AddSource { id: source, source: Box::new(Source::Audio(AudioSource { warp, ..file })) });
+        clip.source = source;
+    } else {
+        cmds.push(Command::SetWarp { source: now.source, warp: Box::new(warp) });
+        clip.source = now.source;
+    }
+    if clip != now {
+        cmds.push(Command::UpdateClip { id, clip: Box::new(clip) });
+    }
+    for &(track, placement, start) in keep_end.unwrap_or(&[]) {
+        let Some(pl) = find_placement(p, track, placement) else { continue };
+        let to = (start + origin.length - new_length).max(0);
+        if pl.start != to {
+            cmds.push(Command::MovePlacement { track, id: placement, to_track: track, start: to, lane: pl.lane });
+        }
+    }
+    (!cmds.is_empty()).then_some(cmds)
 }
 
 /// Keep only clip time `from..to` (the sample editor's "crop to selection").
@@ -172,7 +280,7 @@ pub fn crop(p: &Project, clip: ClipId, from: Tick, to: Tick) -> Option<Command> 
         return None;
     }
     let mut new = old.clone();
-    new.offset = advance(old, from);
+    new.offset = advance(old, from, clip_rate(p, clip));
     new.length = to - from;
     shift_envelope(&mut new, -from);
     clamp_fades(&mut new, Edge::End);
@@ -219,7 +327,7 @@ pub fn split_placement(p: &mut Project, track: TrackId, placement: PlacementId, 
         return None;
     }
     let mut left = Clip { length: cut, fade_out: Fade::default(), ..old.clone() };
-    let mut right = Clip { offset: advance(&old, cut), length: old.length - cut, fade_in: Fade::default(), ..old.clone() };
+    let mut right = Clip { offset: advance(&old, cut, clip_rate(p, place.clip)), length: old.length - cut, fade_in: Fade::default(), ..old.clone() };
     for (i, lane) in old.envelopes.iter().enumerate() {
         if lane.target == AutomationTarget::Volume {
             let (before, after) = split_points(lane, cut);
@@ -484,9 +592,10 @@ fn in_loop(c: &Clip) -> bool {
 }
 
 /// The source position `delta` ticks of clip time after the clip's offset
-/// (before it when negative), wrapped inside the loop as playback does.
-fn advance(c: &Clip, delta: Tick) -> Tick {
-    let pos = c.offset + delta;
+/// (before it when negative) at `rate` source ticks per clip tick, wrapped
+/// inside the loop as playback does.
+fn advance(c: &Clip, delta: Tick, rate: f64) -> Tick {
+    let pos = c.offset + (delta as f64 * rate).round() as Tick;
     match c.looping.filter(|l| l.end > l.start) {
         Some(l) if pos >= l.end || (delta < 0 && c.offset >= l.start) => l.start + (pos - l.start).rem_euclid(l.end - l.start),
         _ => pos,
@@ -732,48 +841,157 @@ mod tests {
     }
 
     #[test]
-    fn stretching_audio_past_its_file_loops_it() {
+    fn a_one_shot_never_grows_past_its_file_or_loops_by_itself() {
         let mut f = fixture(Some(8), 4 * BEAT);
         let clip = f.clip;
         edit(&mut f, |c| {
             c.offset = 2 * BEAT;
             c.fade_out.length = BEAT;
         });
+        assert_eq!(file_room(&f.p, clip), Some(6 * BEAT));
         // Inside the file: only the length changes.
-        let cmd = resize_end(&f.p, clip, 6 * BEAT).unwrap();
+        let cmd = resize_end(&f.p, clip, 5 * BEAT).unwrap();
+        round_trip(&mut f.p, vec![cmd], |p| {
+            assert_eq!((p.clips[&clip].length, p.clips[&clip].looping), (5 * BEAT, None));
+        });
+        // Past the file: it stops at the end of the file and does not loop.
+        let cmd = resize_end(&f.p, clip, 20 * BEAT).unwrap();
         round_trip(&mut f.p, vec![cmd], |p| {
             assert_eq!((p.clips[&clip].length, p.clips[&clip].looping), (6 * BEAT, None));
+            assert_eq!(p.clips[&clip].fade_out.length, BEAT, "the fade-out stays at the end");
         });
-        // Past the file: it loops what it was showing.
-        let auto = LoopRegion { start: 2 * BEAT, end: 8 * BEAT };
-        let cmd = resize_end(&f.p, clip, 20 * BEAT).unwrap();
-        round_trip(&mut f.p, vec![cmd.clone()], |p| {
-            assert_eq!((p.clips[&clip].length, p.clips[&clip].looping), (20 * BEAT, Some(auto)));
-        });
-        cmd.apply(&mut f.p).unwrap();
-        // Longer still keeps the loop; back inside the file removes it.
-        let cmd = resize_end(&f.p, clip, 30 * BEAT).unwrap();
-        round_trip(&mut f.p, vec![cmd], |p| assert_eq!(p.clips[&clip].looping, Some(auto)));
-        let cmd = resize_end(&f.p, clip, 3 * BEAT).unwrap();
+        // Shortening cuts the tail: the fade-out shapes the cut, the fade-in the attack.
+        edit(&mut f, |c| c.fade_in.length = BEAT);
+        let cmd = resize_end(&f.p, clip, 3 * BEAT / 2).unwrap();
         round_trip(&mut f.p, vec![cmd], |p| {
-            assert_eq!((p.clips[&clip].length, p.clips[&clip].looping), (3 * BEAT, None));
-        });
-        // A loop the user set is left alone.
-        let own = LoopRegion { start: 2 * BEAT, end: 4 * BEAT };
-        edit(&mut f, |c| c.looping = Some(own));
-        let cmd = resize_end(&f.p, clip, BEAT).unwrap();
-        round_trip(&mut f.p, vec![cmd], |p| {
-            assert_eq!(p.clips[&clip].looping, Some(own));
-            assert_eq!(p.clips[&clip].fade_out.length, BEAT, "the fade fits the shorter clip");
+            let c = &p.clips[&clip];
+            assert_eq!((c.length, c.fade_in.length, c.fade_out.length), (3 * BEAT / 2, BEAT, BEAT / 2), "the fade at the moved edge gives way");
+            assert_eq!(c.gain_at(3 * BEAT / 2), 0.0, "the cut tail fades to silence");
+            assert_eq!(c.gain_at(0), 0.0, "the attack still fades in");
         });
         // Never shorter than the minimum, and fades shrink with the clip.
         let cmd = resize_end(&f.p, clip, 0).unwrap();
         round_trip(&mut f.p, vec![cmd], |p| {
             assert_eq!(p.clips[&clip].length, MIN_CLIP_LEN);
-            assert_eq!(p.clips[&clip].fade_out.length, MIN_CLIP_LEN);
+            assert_eq!(p.clips[&clip].fade_in.length + p.clips[&clip].fade_out.length, MIN_CLIP_LEN);
         });
-        assert_eq!(resize_end(&f.p, clip, 20 * BEAT), None, "already that long");
+        // At the end of the file already: nothing to do.
+        edit(&mut f, |c| c.length = 6 * BEAT);
+        assert_eq!(resize_end(&f.p, clip, 20 * BEAT), None);
         assert_eq!(resize_end(&f.p, ClipId(9999), BEAT), None);
+        // Transposed up an octave the file plays twice as fast: half the room.
+        let src = f.p.clips[&clip].source;
+        if let Some(Source::Audio(a)) = f.p.sources.get_mut(&src) {
+            a.warp.transpose = 12.0;
+        }
+        edit(&mut f, |c| c.length = BEAT);
+        assert_eq!(file_room(&f.p, clip), Some(3 * BEAT));
+        let cmd = resize_end(&f.p, clip, 20 * BEAT).unwrap();
+        round_trip(&mut f.p, vec![cmd], |p| assert_eq!(p.clips[&clip].length, 3 * BEAT));
+    }
+
+    #[test]
+    fn a_looping_clip_repeats_its_loop_when_made_longer() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let clip = f.clip;
+        let own = LoopRegion { start: 2 * BEAT, end: 4 * BEAT };
+        edit(&mut f, |c| {
+            c.looping = Some(own);
+            c.fade_out.length = BEAT;
+        });
+        let cmd = resize_end(&f.p, clip, 30 * BEAT).unwrap();
+        round_trip(&mut f.p, vec![cmd], |p| assert_eq!((p.clips[&clip].length, p.clips[&clip].looping), (30 * BEAT, Some(own))));
+        let cmd = resize_end(&f.p, clip, BEAT).unwrap();
+        round_trip(&mut f.p, vec![cmd], |p| {
+            assert_eq!(p.clips[&clip].looping, Some(own));
+            assert_eq!(p.clips[&clip].fade_out.length, BEAT, "the fade fits the shorter clip");
+        });
+    }
+
+    #[test]
+    fn stretching_resamples_the_clip_to_its_new_length() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let clip = f.clip;
+        edit(&mut f, |c| {
+            c.offset = BEAT;
+            c.fade_in.length = BEAT / 2;
+            c.fade_out.length = BEAT;
+            c.envelopes.push(envelope(&[(0, 1.0), (2 * BEAT, 0.5)]));
+        });
+        let origin = f.p.clips[&clip].clone();
+        let warp = Warp { transpose: 3.0, ..Warp::default() };
+        // Twice as long: the file runs at an original tempo of 240 at 120.
+        let (c, w) = stretched(&origin, &warp, 120.0, 8 * BEAT).unwrap();
+        assert_eq!((c.offset, c.length, c.fade_in.length, c.fade_out.length), (2 * BEAT, 8 * BEAT, BEAT, 2 * BEAT));
+        assert_eq!(c.envelopes[0].points.iter().map(|pt| pt.tick).collect::<Vec<_>>(), vec![0, 4 * BEAT]);
+        assert!(w.enabled && w.mode == WarpMode::Repitch);
+        assert_eq!((w.original_bpm, w.transpose), (Some(240.0), 3.0), "transpose stays on top");
+        assert_eq!(stretch_factor(&w, 120.0), 2.0);
+        // It still plays the same audio: offset and end in seconds of the file are unchanged.
+        let file = |c: &Clip, w: &Warp| {
+            let mut a = match &f.p.sources[&c.source] { Source::Audio(a) => a.clone(), _ => unreachable!() };
+            a.warp = w.clone();
+            let len = a.length_ticks(120.0) as f64;
+            (c.offset as f64 / len, (c.offset as f64 + c.length as f64) / len)
+        };
+        assert_eq!(file(&c, &w), file(&origin, &Warp::default()));
+        // Stretched again from a stretched one: the factors multiply.
+        let (_, w2) = stretched(&c, &w, 120.0, 4 * BEAT).unwrap();
+        assert_eq!(w2.original_bpm, Some(120.0));
+        assert_eq!(stretched(&origin, &warp, 120.0, 0), None);
+        assert_eq!(stretch_factor(&Warp::default(), 120.0), 1.0);
+    }
+
+    #[test]
+    fn a_stretch_copies_a_shared_file_and_undoes_in_one_go() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let (clip, track, placement) = (f.clip, f.track, f.placement);
+        let src = f.p.clips[&clip].source;
+        // A second clip on the same file.
+        let twin = f.p.alloc_clip_id();
+        let twin_clip = Clip::new("twin", Color(0), src, 4 * BEAT);
+        f.p.clips.insert(twin, twin_clip.clone());
+        let origin = f.p.clips[&clip].clone();
+        let cmds = stretch(&mut f.p, clip, &origin, &Warp::default(), 2 * BEAT, None).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let c = &p.clips[&clip];
+            assert_ne!(c.source, src, "the stretched clip got its own copy of the file");
+            assert_eq!(c.length, 2 * BEAT);
+            assert!(matches!(&p.sources[&c.source], Source::Audio(a) if a.warp.original_bpm == Some(60.0)));
+            assert!(matches!(&p.sources[&src], Source::Audio(a) if a.warp == Warp::default()), "the other clip is untouched");
+            assert_eq!(p.clips[&twin], twin_clip);
+        });
+        // Alone on its file, from the left edge: the warp is set in place and the clip keeps its end.
+        f.p.clips.remove(&twin);
+        let cmds = stretch(&mut f.p, clip, &origin, &Warp::default(), 6 * BEAT, Some(&[(track, placement, 4 * BEAT)])).unwrap();
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetWarp { .. })));
+        round_trip(&mut f.p, cmds, |p| {
+            assert_eq!(p.clips[&clip].source, src);
+            assert_eq!(p.track(track).unwrap().arrangement[0].start, 2 * BEAT, "the end stayed at beat 8");
+        });
+        // Back at the original length nothing changes.
+        assert_eq!(stretch(&mut f.p, clip, &origin, &Warp::default(), 4 * BEAT, None), None);
+    }
+
+    #[test]
+    fn edges_of_a_transposed_clip_keep_the_audio_in_place() {
+        let mut f = fixture(Some(8), 2 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        let src = f.p.clips[&clip].source;
+        if let Some(Source::Audio(a)) = f.p.sources.get_mut(&src) {
+            a.warp.transpose = 12.0;
+        }
+        edit(&mut f, |c| c.offset = 2 * BEAT);
+        // One beat of clip time is two beats of the file an octave up.
+        let cmds = trim_start(&f.p, track, placement, 5 * BEAT).unwrap();
+        round_trip(&mut f.p, cmds, |p| assert_eq!((p.clips[&clip].offset, p.clips[&clip].length), (4 * BEAT, BEAT)));
+        // Revealed to the start of the file: one beat of clip time back.
+        let cmds = trim_start(&f.p, track, placement, 0).unwrap();
+        round_trip(&mut f.p, cmds, |p| assert_eq!((p.clips[&clip].offset, p.clips[&clip].length), (0, 3 * BEAT)));
+        // A split halfway: the right half starts two beats into the file later.
+        let split = split_placement(&mut f.p.clone(), track, placement, 5 * BEAT).unwrap();
+        let right = split.commands.iter().find_map(|c| match c { Command::AddClip { clip, .. } => Some(clip.offset), _ => None });
+        assert_eq!(right, Some(4 * BEAT));
     }
 
     #[test]

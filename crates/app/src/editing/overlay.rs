@@ -154,23 +154,31 @@ impl Overlay {
         }
     }
 
-    /// The insert marker: a thin line through the canvas.
+    /// The insert marker: a line through the canvas in the text colour, so
+    /// it stands apart from the grid and from the accent-coloured playhead
+    /// (Live's insert marker), with a soft halo to read on busy clips.
     pub fn paint_marker(&self, window: &mut Window, o: Point<Pixels>, w: f32, h: f32) {
         if self.marker >= 0. && self.marker <= w {
-            window.paint_quad(paint::fill_rect(at(o, self.marker, 0., 1., h), content(0.7)));
+            window.paint_quad(paint::fill_rect(at(o, self.marker - 1., 0., 3., h), shadow(0.25)));
+            window.paint_quad(paint::fill_rect(at(o, self.marker, 0., 1., h), marker_color()));
         }
     }
 
-    /// The insert marker on the ruler: a pole with a small flag at its top
-    /// (above the labels, so it never covers a bar number).
+    /// The insert marker on the ruler, where playback starts: a pole with a
+    /// flag at its top (above the labels, so it never covers a bar number).
     pub fn paint_marker_flag(&self, window: &mut Window, o: Point<Pixels>, w: f32, h: f32) {
         if self.marker < 0. || self.marker > w {
             return;
         }
         let x = self.marker;
-        window.paint_quad(paint::fill_rect(at(o, x, 1., 1., h - 1.), content(0.7)));
-        paint::polygon(window, &[point(o.x + px(x), o.y + px(1.)), point(o.x + px(x + 7.), o.y + px(4.5)), point(o.x + px(x), o.y + px(8.))], content(0.7));
+        window.paint_quad(paint::fill_rect(at(o, x, 1., 1., h - 1.), marker_color()));
+        paint::polygon(window, &[point(o.x + px(x), o.y + px(1.)), point(o.x + px(x + 8.), o.y + px(5.)), point(o.x + px(x), o.y + px(9.))], marker_color());
     }
+}
+
+/// The insert marker's colour: the text colour, nearly opaque.
+fn marker_color() -> Hsla {
+    with_alpha(p().text, 0.9)
 }
 
 /// Where a looping clip starts over, in pixels from its left edge: the

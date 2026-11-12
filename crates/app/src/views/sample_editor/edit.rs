@@ -11,7 +11,7 @@
 //! The moves of one drag are coalesced into one undo step ([`apply`]); the
 //! one-shot edits (split, crop, loop, reset…) are sealed steps of their own.
 
-use super::geom::{curve_through, end_u};
+use super::geom::{clip_time, curve_through};
 use crate::state::AppState;
 use crate::views::arrange_clips::edit::{move_others, other_placements};
 use aitrack_model::ops::{self, MIN_CLIP_LEN};
@@ -44,13 +44,15 @@ pub fn placement_of(s: &AppState, clip: ClipId) -> Option<Placed> {
 }
 
 /// One state a drag asks for. Positions are unrolled source ticks (see
-/// `geom`), already snapped; gains are linear 0..=1.
+/// `geom`: on a transposed clip they are converted to clip time at its
+/// speed), already snapped; gains are linear 0..=1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
     /// The start marker: trims or reveals audio, which stays where it is on
     /// the timeline in every placement of the clip.
     Start(Tick),
-    /// The end marker; past the end of the file the clip starts looping.
+    /// The end marker. A one-shot clip (loop off) stops at the end of its
+    /// file; a looping one repeats its loop as far as it is pulled.
     End(Tick),
     /// Where the fade-in ends.
     FadeIn(Tick),
@@ -159,6 +161,10 @@ impl Snapshot {
     fn wanted(&self, g: Gesture) -> Option<Vec<Command>> {
         let (p, id, c) = (&self.scratch, self.id, &self.clip);
         let one = |cmd: Option<Command>| cmd.map(|cmd| vec![cmd]);
+        // Axis positions are source ticks; a transposed clip reads them at its
+        // own speed, so they turn into clip time through its rate.
+        let rate = ops::clip_rate(p, id);
+        let t = |u: Tick| clip_time(u, c.offset, rate);
         match g {
             Gesture::Start(u) => {
                 // Inside a loop the model wraps the offset around; the marker
@@ -167,17 +173,17 @@ impl Snapshot {
                     Some(l) => u.clamp(if c.offset >= l.start { l.start } else { 0 }, (l.end - MIN_CLIP_LEN).max(0)),
                     None => u.max(0),
                 };
-                let mut cmds = ops::trim_start(p, self.track, self.placement, self.start + (u - c.offset))?;
+                let mut cmds = ops::trim_start(p, self.track, self.placement, self.start + t(u))?;
                 // The stand-in placement of a session clip is ours alone.
                 if self.place.is_none() {
                     cmds.retain(|cmd| matches!(cmd, Command::UpdateClip { .. }));
                 }
                 Some(cmds)
             }
-            Gesture::End(u) => one(ops::resize_end(p, id, u - c.offset)),
+            Gesture::End(u) => one(ops::resize_end(p, id, t(u))),
             Gesture::Length(len) => one(ops::resize_end(p, id, len)),
-            Gesture::FadeIn(u) => one(ops::set_fades(p, id, Fade { length: (u - c.offset).max(0), ..c.fade_in }, c.fade_out)),
-            Gesture::FadeOut(u) => one(ops::set_fades(p, id, c.fade_in, Fade { length: (end_u(c) - u).max(0), ..c.fade_out })),
+            Gesture::FadeIn(u) => one(ops::set_fades(p, id, Fade { length: t(u).max(0), ..c.fade_in }, c.fade_out)),
+            Gesture::FadeOut(u) => one(ops::set_fades(p, id, c.fade_in, Fade { length: (c.length - t(u)).max(0), ..c.fade_out })),
             Gesture::FadeInCurve(mid) => one(ops::set_fades(p, id, Fade { curve: curve_through(mid), ..c.fade_in }, c.fade_out)),
             Gesture::FadeOutCurve(mid) => one(ops::set_fades(p, id, c.fade_in, Fade { curve: curve_through(mid), ..c.fade_out })),
             Gesture::Point { index, u, value } => {
@@ -185,7 +191,7 @@ impl Snapshot {
                 let old = *points.get(index)?;
                 let after = index.checked_sub(1).and_then(|i| points.get(i)).map_or(0, |prev| prev.tick + 1).max(0);
                 let before = points.get(index + 1).map_or(c.length, |next| next.tick - 1).min(c.length);
-                let tick = if after <= before { (u - c.offset).clamp(after, before) } else { old.tick };
+                let tick = if after <= before { t(u).clamp(after, before) } else { old.tick };
                 points[index] = AutomationPoint { tick, value: value.clamp(0., 1.), curve: old.curve };
                 one(ops::set_volume_envelope(p, id, points))
             }
@@ -250,7 +256,7 @@ fn sealed(s: &mut AppState, label: &str, cmds: Vec<Command>) -> bool {
 /// dragging it on in the same press is one undo step.
 pub fn add_point(s: &mut AppState, clip: ClipId, u: Tick, value: f32) -> Option<usize> {
     let c = s.project.clips.get(&clip)?;
-    let tick = (u - c.offset).clamp(0, c.length);
+    let tick = clip_time(u, c.offset, ops::clip_rate(&s.project, clip)).clamp(0, c.length);
     let mut points = c.volume_envelope().map(|lane| lane.points.clone()).unwrap_or_default();
     points.push(AutomationPoint { tick, value: value.clamp(0., 1.), curve: 0. });
     let cmd = ops::set_volume_envelope(&s.project, clip, points)?;
@@ -295,7 +301,7 @@ pub fn reset_shaping(s: &mut AppState, clip: ClipId) -> bool {
 pub fn split(s: &mut AppState, clip: ClipId, u: Tick) -> Result<(), &'static str> {
     let offset = s.project.clips.get(&clip).ok_or("There is no clip to split")?.offset;
     let place = placement_of(s, clip).ok_or("Place the clip in the arrangement to split it")?;
-    let at = place.start + (u - offset);
+    let at = place.start + clip_time(u, offset, ops::clip_rate(&s.project, clip));
     let split = ops::split_placement(&mut s.project, place.track, place.placement, at).ok_or("Put the cursor inside the clip to split it")?;
     if !sealed(s, "Split clip", split.commands) {
         return Err("The clip could not be split");
@@ -309,8 +315,9 @@ pub fn split(s: &mut AppState, clip: ClipId, u: Tick) -> Result<(), &'static str
 /// where it was on the timeline, in every placement of the clip.
 pub fn crop(s: &mut AppState, clip: ClipId, a: Tick, b: Tick) -> bool {
     let Some(c) = s.project.clips.get(&clip) else { return false };
-    let from = (a.min(b) - c.offset).clamp(0, c.length);
-    let to = (a.max(b) - c.offset).clamp(0, c.length);
+    let rate = ops::clip_rate(&s.project, clip);
+    let from = clip_time(a.min(b), c.offset, rate).clamp(0, c.length);
+    let to = clip_time(a.max(b), c.offset, rate).clamp(0, c.length);
     let Some(cmd) = ops::crop(&s.project, clip, from, to) else { return false };
     let mut cmds = vec![cmd];
     if from > 0 {
@@ -507,18 +514,71 @@ mod tests {
         f.drag(&[Gesture::Start(-3 * BEAT)]);
         assert_eq!((f.clip().offset, f.start()), (0, 16 * BEAT));
 
-        // The end marker: shorter, then out past the end of the file, which loops it.
+        // The end marker: shorter, then out past the end of the file, where a
+        // one-shot clip stops: it never loops by itself.
         let moves = [Gesture::End(2 * BEAT), Gesture::End(6 * BEAT), Gesture::End(20 * BEAT)];
         assert_eq!(f.drag(&moves), 1);
-        assert_eq!(f.clip().length, 20 * BEAT);
-        assert_eq!(f.clip().looping, Some(LoopRegion { start: 0, end: 8 * BEAT }));
+        assert_eq!((f.clip().length, f.clip().looping), (8 * BEAT, None));
         assert_eq!(f.clip().fade_out.length, BEAT, "the fade survived the short stretch of the drag");
         assert_eq!(f.s.history.undo_label(), Some("Resize clip"));
-        // Back inside the file the automatic loop goes away again.
+        // Shortened, the tail is cut and the fade-out moves with the end.
         assert_eq!(f.drag(&[Gesture::End(5 * BEAT)]), 1);
-        assert_eq!((f.clip().length, f.clip().looping), (5 * BEAT, None));
+        assert_eq!((f.clip().length, f.clip().looping, f.clip().fade_out.length), (5 * BEAT, None, BEAT));
         assert!(f.s.undo() && f.s.undo());
         assert_eq!((f.clip(), f.start()), (&before, 16 * BEAT));
+        // With the loop switched on, the end marker repeats the loop instead.
+        assert!(toggle_loop(&mut f.s, f.clip));
+        assert_eq!(f.drag(&[Gesture::End(20 * BEAT)]), 1);
+        assert_eq!((f.clip().length, f.clip().looping), (20 * BEAT, Some(LoopRegion { start: 0, end: 4 * BEAT })));
+    }
+
+    #[test]
+    fn the_start_marker_of_a_transposed_clip_lands_where_it_is_dropped() {
+        let mut f = fixture(true);
+        let clip = f.clip;
+        f.s.seal();
+        assert!(f.s.set_clip_warp("t", clip, |w| w.transpose = 12.));
+        f.s.seal();
+        // Two beats of the file an octave up are one beat of the timeline.
+        assert_eq!(f.drag(&[Gesture::Start(2 * BEAT)]), 1);
+        assert_eq!((f.clip().offset, f.clip().length, f.start()), (2 * BEAT, 3 * BEAT, 17 * BEAT));
+    }
+
+    #[test]
+    fn every_marker_of_a_transposed_clip_lands_where_it_is_dropped() {
+        use super::super::geom::{end_u, on_axis};
+        let mut f = fixture(true);
+        let clip = f.clip;
+        f.s.seal();
+        assert!(f.s.set_clip_warp("t", clip, |w| w.transpose = 12.));
+        f.s.seal();
+        let axis = |f: &Fixture| on_axis(f.clip(), ops::clip_rate(&f.s.project, f.clip));
+        // Four beats of clip time an octave up read the whole 8-beat file: the end marker is drawn at its end.
+        assert_eq!(end_u(&axis(&f)), 8 * BEAT);
+        // The end marker dropped at beat 6 of the file: three beats of clip time, and it is drawn at 6.
+        assert_eq!(f.drag(&[Gesture::End(6 * BEAT)]), 1);
+        assert_eq!((f.clip().length, end_u(&axis(&f))), (3 * BEAT, 6 * BEAT));
+        // Past the file it stops at the file's end, which is where it is drawn.
+        f.drag(&[Gesture::End(20 * BEAT)]);
+        assert_eq!((f.clip().length, end_u(&axis(&f))), (4 * BEAT, 8 * BEAT));
+        // The fade handles: a beat of the file is half a beat of clip time.
+        assert_eq!(f.drag(&[Gesture::FadeIn(BEAT)]), 1);
+        assert_eq!((f.clip().fade_in.length, axis(&f).fade_in.length), (BEAT / 2, BEAT));
+        assert_eq!(f.drag(&[Gesture::FadeOut(7 * BEAT)]), 1);
+        assert_eq!((f.clip().fade_out.length, end_u(&axis(&f)) - axis(&f).fade_out.length), (BEAT / 2, 7 * BEAT));
+        // A volume breakpoint drawn at beat 4 of the file sits two beats into the clip, and is drawn at 4.
+        f.s.seal();
+        let index = add_point(&mut f.s, clip, 4 * BEAT, 0.5).unwrap();
+        f.s.seal();
+        assert_eq!((points(f.clip())[index].0, super::super::geom::envelope(&axis(&f))[index].tick), (2 * BEAT, 4 * BEAT));
+        assert_eq!(f.drag(&[Gesture::Point { index, u: 6 * BEAT, value: 0.5 }]), 1);
+        assert_eq!(points(f.clip())[index], (3 * BEAT, 0.5));
+        // Split at the cursor on beat 4 of the file: the left half is two beats of the timeline.
+        assert_eq!(split(&mut f.s, clip, 4 * BEAT), Ok(()));
+        assert_eq!(f.clip().length, 2 * BEAT);
+        // Crop to beats 1..3 of the file: one beat of the timeline, starting half a beat in.
+        assert!(crop(&mut f.s, clip, BEAT, 3 * BEAT));
+        assert_eq!((f.clip().offset, f.clip().length, f.start()), (BEAT, BEAT, 16 * BEAT + BEAT / 2));
     }
 
     #[test]

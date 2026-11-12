@@ -8,7 +8,8 @@
 //!   to the audio thread through an `rtrb` queue.
 //! * **control** (`aitrack-engine-control`) — compiles graphs, keeps the
 //!   processor pool and sample cache, owns the audio stream and MIDI ports,
-//!   reopens the device when it is lost, recompiles when plugin latency
+//!   reopens the device when it is lost or the system default output
+//!   changes (see [`DeviceWatch`]), recompiles when plugin latency
 //!   changes or samples finish loading.
 //! * **graveyard** (`aitrack-engine-graveyard`) — drops retired graphs (and
 //!   with them, possibly the last reference to a plugin) off the audio and
@@ -23,13 +24,13 @@ use crate::midi_io::{self, MidiConnection, MidiPortInfo};
 use crate::rt::{AudioProcessor, InputQueue, MidiMessage, RtCommand, RtQueues, TransportInit};
 use crate::sample_cache::SampleCache;
 use crate::shared::{ProcessorPool, SharedProcessor};
-use crate::status::{ClipSlotStatus, MeterReading, SharedStatus};
+use crate::status::{ClipSlotStatus, LatencyReport, MeterReading, PlayheadAnchor, SharedStatus};
 use crate::tap::{DeviceMeter, TapReader};
 use crate::EngineError;
 use aitrack_model::{DeviceId, Project, Quantize, SceneId, Tick, TrackId};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -54,11 +55,23 @@ pub struct EngineConfig {
     pub midi_inputs: Vec<String>,
     /// Count-in bars before playback (0 = off).
     pub count_in_bars: u32,
+    /// Open the device on the control thread instead of inside
+    /// [`Engine::new`], so a slow driver (Bluetooth, a sleeping USB box)
+    /// cannot stall the caller. Watch [`EngineHandle::audio_generation`]
+    /// and [`EngineHandle::last_error`] for the outcome.
+    pub open_in_background: bool,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { audio: Some(AudioConfig::default()), headless_sample_rate: 48_000.0, max_block: 1024, midi_inputs: Vec::new(), count_in_bars: 0 }
+        Self {
+            audio: Some(AudioConfig::default()),
+            headless_sample_rate: 48_000.0,
+            max_block: 1024,
+            midi_inputs: Vec::new(),
+            count_in_bars: 0,
+            open_in_background: false,
+        }
     }
 }
 
@@ -86,6 +99,8 @@ struct HandleShared {
     warnings: Mutex<Vec<String>>,
     active_audio: Mutex<Option<ActiveAudio>>,
     config: Mutex<Option<AudioConfig>>,
+    /// Bumped every time the device is opened, reopened or closed.
+    generation: AtomicU64,
 }
 
 /// Engine entry point.
@@ -108,6 +123,7 @@ impl Engine {
             warnings: Mutex::new(Vec::new()),
             active_audio: Mutex::new(None),
             config: Mutex::new(config.audio.clone()),
+            generation: AtomicU64::new(0),
         });
         let (tx, rx) = unbounded::<Msg>();
         let (grave_tx, grave_rx) = unbounded::<Box<CompiledGraph>>();
@@ -145,9 +161,11 @@ impl Engine {
             assumed_latency: Vec::new(),
             dirty: false,
             count_in: config.count_in_bars,
-            last_reopen: None,
+            watch: DeviceWatch::default(),
         };
         let manual = match &config.audio {
+            // `check_device` opens it on the control thread's first tick.
+            Some(_) if config.open_in_background => None,
             Some(cfg) => {
                 if let Err(e) = control.open_audio(cfg.clone()) {
                     log::error!("could not open audio device: {e}");
@@ -395,10 +413,48 @@ impl EngineHandle {
 
     /// Switch device / rate / buffer size (or `None` to close audio). Plugin
     /// instances are kept and re-prepared; the transport position is kept.
+    /// Blocks until the device is open; UIs use
+    /// [`set_device_async`](Self::set_device_async).
     pub fn set_device(&self, config: Option<AudioConfig>) -> Result<Option<ActiveAudio>, EngineError> {
+        self.set_device_async(config).wait(Duration::from_secs(20))
+    }
+
+    /// Like [`set_device`](Self::set_device) without waiting: the device is
+    /// reopened on the control thread and the request reports when done.
+    pub fn set_device_async(&self, config: Option<AudioConfig>) -> DeviceRequest {
         let (tx, rx) = bounded(1);
-        self.tx.send(Msg::SetAudio(config, tx)).map_err(|_| EngineError::Disconnected)?;
-        rx.recv_timeout(Duration::from_secs(20)).map_err(|_| EngineError::Disconnected)?
+        if self.tx.send(Msg::SetAudio(config, tx.clone())).is_err() {
+            let _ = tx.send(Err(EngineError::Disconnected));
+        }
+        DeviceRequest { rx }
+    }
+
+    /// Changes whenever the device is opened, reopened (lost, rerouted,
+    /// came back) or closed: re-read [`active_audio`](Self::active_audio).
+    pub fn audio_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// Buffer, device, input and plugin latency as measured right now.
+    pub fn latency_report(&self) -> LatencyReport {
+        self.status.io.snapshot(self.sample_rate(), self.latency())
+    }
+
+    /// The audio thread's last playhead anchor (see [`PlayheadAnchor`]).
+    pub fn playhead_anchor(&self) -> PlayheadAnchor {
+        self.status.anchor.read()
+    }
+
+    /// The song position reaching the speakers now, in ticks: the audible
+    /// (PDC-compensated) position interpolated between callbacks and moved
+    /// back by the measured output latency (buffer + device + Bluetooth).
+    /// This is what a playhead should draw.
+    pub fn heard_position_ticks(&self) -> f64 {
+        let a = self.status.anchor.read();
+        if !a.playing {
+            return self.position_ticks();
+        }
+        a.heard_at(self.status.now_nanos(), self.latency_report().output_seconds())
     }
 
     pub fn midi_inputs(&self) -> Vec<MidiPortInfo> {
@@ -413,6 +469,117 @@ impl EngineHandle {
 
     pub fn close_midi_input(&self, port_id: &str) {
         let _ = self.tx.send(Msg::CloseMidi(port_id.to_string()));
+    }
+}
+
+/// A device switch in flight ([`EngineHandle::set_device_async`]).
+pub struct DeviceRequest {
+    rx: Receiver<Result<Option<ActiveAudio>, EngineError>>,
+}
+
+impl DeviceRequest {
+    /// The result once the control thread is done; `None` while it works.
+    pub fn poll(&self) -> Option<Result<Option<ActiveAudio>, EngineError>> {
+        match self.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(EngineError::Disconnected)),
+        }
+    }
+
+    pub fn wait(self, timeout: Duration) -> Result<Option<ActiveAudio>, EngineError> {
+        self.rx.recv_timeout(timeout).map_err(|_| EngineError::Disconnected)?
+    }
+}
+
+/// Why the control thread should rebuild the audio stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reopen {
+    /// The device vanished or its stream became invalid.
+    Lost,
+    /// Audio is wanted but no stream is open (an earlier open failed).
+    Retry,
+    /// The system default output changed under a default-following stream.
+    Rerouted,
+    /// The device the user picked is back after a fallback.
+    WantedBack,
+}
+
+/// When to rebuild the stream after device events. Pure timing logic, so
+/// the state machine is tested without hardware.
+///
+/// * Lost / no stream: reopen at once, then at most once per [`RETRY`].
+/// * Rerouted: wait until the reroutes have been quiet for [`SETTLE`]
+///   (connecting Bluetooth headphones switches the default two or three
+///   times); the OS keeps the old stream playing meanwhile.
+/// * Running on a fallback: look for the wanted device every [`PROBE`].
+#[derive(Debug, Default)]
+pub(crate) struct DeviceWatch {
+    last_attempt: Option<Instant>,
+    reroute_since: Option<Instant>,
+    last_probe: Option<Instant>,
+}
+
+pub(crate) const RETRY: Duration = Duration::from_secs(1);
+pub(crate) const SETTLE: Duration = Duration::from_millis(400);
+pub(crate) const PROBE: Duration = Duration::from_secs(2);
+
+/// What the control thread saw this tick.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DeviceEvents {
+    pub want_audio: bool,
+    pub have_stream: bool,
+    pub lost: bool,
+    pub rerouted: bool,
+    pub follows_default: bool,
+    pub wanted_missing: bool,
+}
+
+impl DeviceWatch {
+    /// Decide this tick; `wanted_present` is asked only when a probe is due.
+    pub fn poll(&mut self, now: Instant, ev: DeviceEvents, wanted_present: impl FnOnce() -> bool) -> Option<Reopen> {
+        if !ev.want_audio {
+            *self = Self::default();
+            return None;
+        }
+        if ev.lost || !ev.have_stream {
+            if self.last_attempt.is_some_and(|t| now.duration_since(t) < RETRY) {
+                return None;
+            }
+            self.last_attempt = Some(now);
+            self.reroute_since = None;
+            return Some(if ev.lost { Reopen::Lost } else { Reopen::Retry });
+        }
+        if ev.rerouted && ev.follows_default {
+            self.reroute_since = Some(now);
+        }
+        if let Some(t) = self.reroute_since
+            && now.duration_since(t) >= SETTLE {
+                self.reroute_since = None;
+                self.last_attempt = Some(now);
+                return Some(Reopen::Rerouted);
+            }
+        if ev.wanted_missing && self.reroute_since.is_none() {
+            if self.last_probe.is_some_and(|t| now.duration_since(t) < PROBE) {
+                return None;
+            }
+            self.last_probe = Some(now);
+            if wanted_present() {
+                self.last_attempt = Some(now);
+                return Some(Reopen::WantedBack);
+            }
+        }
+        None
+    }
+
+    /// The device was opened by the user (Preferences): start over.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A reopen succeeded: the next failure may retry at once.
+    pub fn opened(&mut self) {
+        self.last_attempt = None;
     }
 }
 
@@ -449,12 +616,14 @@ struct Control {
     assumed_latency: Vec<(Arc<SharedProcessor>, u32)>,
     dirty: bool,
     count_in: u32,
-    last_reopen: Option<Instant>,
+    watch: DeviceWatch,
 }
 
 impl Control {
     fn run(mut self, rx: Receiver<Msg>) {
         let mut last_latency_check = Instant::now();
+        // Opens the device right away when `open_in_background` left it to us.
+        self.check_device();
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(msg) => {
@@ -514,7 +683,7 @@ impl Control {
             Msg::SetAudio(cfg, reply) => {
                 *lock(&self.shared.config) = cfg.clone();
                 self.audio = cfg.clone();
-                self.last_reopen = None;
+                self.watch.reset();
                 let res = match cfg {
                     Some(c) => self.open_audio(c).map(Some),
                     None => {
@@ -670,12 +839,17 @@ impl Control {
     fn close_audio(&mut self) {
         self.stream = None;
         *lock(&self.shared.active_audio) = None;
+        self.status.io.reset();
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn open_audio(&mut self, cfg: AudioConfig) -> Result<ActiveAudio, EngineError> {
         // Tear the old stream down first: after this no graph is running,
         // so pooled processors may be re-prepared on this thread.
-        self.stream = None;
+        if self.stream.take().is_some() {
+            *lock(&self.shared.active_audio) = None;
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        }
         let prepared = audio_io::prepare(&cfg)?;
         let sr = prepared.sample_rate as f64;
         if (sr - self.sample_rate).abs() > 0.5 {
@@ -701,32 +875,48 @@ impl Control {
         }
         *lock(&self.shared.active_audio) = Some(active.clone());
         self.stream = Some(stream);
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
         Ok(active)
     }
 
-    /// Reopen the device after it was lost (unplugged, driver reset).
+    /// Rebuild the stream when the device was lost (unplugged, driver
+    /// reset, sample rate changed under it), the system default output
+    /// moved (headphones, Bluetooth), an earlier open failed, or the device
+    /// the user picked came back. Runs on the control thread, never the UI's.
     fn check_device(&mut self) {
-        let lost = self.stream.as_ref().is_some_and(|s| s.lost.load(Ordering::Acquire));
-        let want_audio = self.audio.is_some() && self.stream.is_none();
-        if !lost && !want_audio {
-            return;
+        let stream = self.stream.as_ref();
+        let active = stream.map(|s| &s.active);
+        let ev = DeviceEvents {
+            want_audio: self.audio.is_some(),
+            have_stream: stream.is_some(),
+            lost: stream.is_some_and(|s| s.lost.load(Ordering::Acquire)),
+            rerouted: stream.is_some_and(|s| s.rerouted.swap(false, Ordering::AcqRel)),
+            follows_default: active.is_some_and(|a| a.follows_default),
+            wanted_missing: active.is_some_and(|a| a.wanted_missing),
+        };
+        let cfg = self.audio.clone();
+        let Some(reason) = self.watch.poll(Instant::now(), ev, || cfg.as_ref().is_some_and(audio_io::output_present)) else { return };
+        let Some(cfg) = cfg else { return };
+        match reason {
+            Reopen::Lost => log::warn!("audio device lost; reopening"),
+            Reopen::Rerouted => log::info!("default output changed; reopening on the new device"),
+            Reopen::WantedBack => log::info!("audio device is back; switching to it"),
+            Reopen::Retry => {}
         }
-        if lost {
-            log::warn!("audio device lost; reopening");
+        if reason == Reopen::Lost {
             self.stream = None;
             *lock(&self.shared.active_audio) = None;
+            self.shared.generation.fetch_add(1, Ordering::AcqRel);
         }
-        if self.last_reopen.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-            return;
-        }
-        self.last_reopen = Some(Instant::now());
-        let Some(cfg) = self.audio.clone() else { return };
         match self.open_audio(cfg.clone()).or_else(|_| {
             // Fall back to the default device of the same host.
             self.open_audio(AudioConfig { output_device: None, output_device_name: None, input_device: None, input_device_name: None, ..cfg })
         }) {
             // The persisted config keeps the user's preferred device.
-            Ok(_) => self.last_reopen = None,
+            Ok(_) => {
+                self.watch.opened();
+                *lock(&self.shared.last_error) = None;
+            }
             Err(e) => *lock(&self.shared.last_error) = Some(e.to_string()),
         }
     }
@@ -743,5 +933,115 @@ fn collect_latency(devs: &[crate::graph::DeviceNode], out: &mut Vec<(Arc<SharedP
             }
             crate::graph::DeviceNode::Missing(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev() -> DeviceEvents {
+        DeviceEvents { want_audio: true, have_stream: true, ..DeviceEvents::default() }
+    }
+
+    #[test]
+    fn healthy_stream_does_nothing() {
+        let mut w = DeviceWatch::default();
+        let t = Instant::now();
+        assert_eq!(w.poll(t, ev(), || panic!("no probe")), None);
+        assert_eq!(w.poll(t, DeviceEvents::default(), || panic!("no probe")), None, "audio off");
+    }
+
+    #[test]
+    fn lost_device_reopens_at_once_then_backs_off() {
+        let mut w = DeviceWatch::default();
+        let t = Instant::now();
+        let lost = DeviceEvents { lost: true, ..ev() };
+        assert_eq!(w.poll(t, lost, || false), Some(Reopen::Lost));
+        // The reopen failed: no stream now; wait RETRY before trying again.
+        let none = DeviceEvents { have_stream: false, ..ev() };
+        assert_eq!(w.poll(t + Duration::from_millis(500), none, || false), None);
+        assert_eq!(w.poll(t + RETRY, none, || false), Some(Reopen::Retry));
+        // Success clears the back-off.
+        w.opened();
+        assert_eq!(w.poll(t + RETRY + Duration::from_millis(10), lost, || false), Some(Reopen::Lost));
+    }
+
+    #[test]
+    fn reroutes_settle_before_one_rebuild() {
+        let mut w = DeviceWatch::default();
+        let t = Instant::now();
+        let follow = DeviceEvents { follows_default: true, ..ev() };
+        let reroute = DeviceEvents { rerouted: true, ..follow };
+        assert_eq!(w.poll(t, reroute, || false), None);
+        // A second switch 200 ms later restarts the wait.
+        assert_eq!(w.poll(t + Duration::from_millis(200), reroute, || false), None);
+        assert_eq!(w.poll(t + Duration::from_millis(500), follow, || false), None);
+        assert_eq!(w.poll(t + Duration::from_millis(200) + SETTLE, follow, || false), Some(Reopen::Rerouted));
+        assert_eq!(w.poll(t + Duration::from_secs(5), follow, || false), None, "once");
+    }
+
+    #[test]
+    fn reroute_of_a_pinned_device_is_ignored() {
+        let mut w = DeviceWatch::default();
+        let t = Instant::now();
+        let pinned = DeviceEvents { rerouted: true, ..ev() };
+        assert_eq!(w.poll(t, pinned, || false), None);
+        assert_eq!(w.poll(t + SETTLE * 2, ev(), || false), None);
+    }
+
+    #[test]
+    fn wanted_device_is_probed_and_reclaimed() {
+        let mut w = DeviceWatch::default();
+        let t = Instant::now();
+        let fallback = DeviceEvents { wanted_missing: true, follows_default: true, ..ev() };
+        assert_eq!(w.poll(t, fallback, || false), None);
+        // Not probed again before PROBE.
+        assert_eq!(w.poll(t + Duration::from_millis(100), fallback, || panic!("too soon")), None);
+        assert_eq!(w.poll(t + PROBE, fallback, || true), Some(Reopen::WantedBack));
+    }
+
+    /// Needs an output device: `cargo test -p aitrack-engine -- --ignored real_device`.
+    #[test]
+    #[ignore]
+    fn real_device_opens_in_background_and_reports_latency() {
+        let cfg = EngineConfig { audio: Some(AudioConfig::default()), open_in_background: true, ..EngineConfig::default() };
+        let started = Instant::now();
+        let (h, _) = Engine::new(cfg, Arc::new(crate::NullFactory)).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50), "Engine::new did not wait for the device");
+        h.update_project(&aitrack_model::Project::new("t"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (h.active_audio().is_none() || h.latency_report().output_frames == 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let a = h.active_audio().expect("device opened");
+        let r = h.latency_report();
+        eprintln!("opened {} after {:?}: {a:?}\n{r:?}\nbuffer {:.2} ms, output {:.2} ms (device {:.2} ms)", a.output_device, started.elapsed(), r.buffer_ms(), r.output_ms(), r.device_output_ms());
+        assert_eq!(r.buffer_frames, a.buffer_size.unwrap_or(r.buffer_frames));
+        assert!(r.output_frames >= r.buffer_frames);
+        assert!(h.audio_generation() >= 1);
+        h.play();
+        std::thread::sleep(Duration::from_millis(300));
+        let engine = h.position_ticks();
+        let heard = h.heard_position_ticks();
+        eprintln!("engine {engine:.1} ticks, heard {heard:.1} ticks");
+        assert!(heard <= engine + 1.);
+        // Switching buffer size reopens off the caller's thread.
+        let req = h.set_device_async(Some(AudioConfig { buffer_size: Some(128), ..AudioConfig::default() }));
+        let a2 = req.wait(Duration::from_secs(10)).unwrap().unwrap();
+        eprintln!("reopened at buffer {:?}", a2.buffer_size);
+    }
+
+    #[test]
+    fn async_device_switch_reports_disconnect_without_a_device() {
+        // Headless engine: closing audio answers on the control thread.
+        let (h, _p) = Engine::new(EngineConfig::headless(48_000.), Arc::new(crate::NullFactory)).unwrap();
+        let g = h.audio_generation();
+        let req = h.set_device_async(None);
+        let r = req.wait(Duration::from_secs(5)).expect("closed");
+        assert!(r.is_none());
+        assert!(h.audio_generation() > g, "closing bumps the generation");
+        assert_eq!(h.latency_report().output_frames, 0);
+        assert!(!h.playhead_anchor().playing);
     }
 }

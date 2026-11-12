@@ -10,7 +10,13 @@
 //! on its chain, all through commands) or runs the command; samples drag
 //! onto the arrangement; Escape closes. Searches run off the UI thread
 //! ([`search`], [`aitrack_splice::Service`]); waveforms and thumbnails too.
+//!
+//! Online-only samples of cloud folders ([`cloud`]) carry a cloud badge, get
+//! no waveform or cover (both would download them), and download on their
+//! own thread when auditioned or dragged, playing once they land.
 
+pub mod cloud;
+pub mod libraries;
 pub mod packs;
 pub mod peaks;
 pub mod search;
@@ -18,7 +24,7 @@ pub mod settings;
 pub mod splice;
 pub mod thumbs;
 
-use crate::audition::SampleAudition;
+use crate::audition::{CloudFetches, FetchState, Fetched, SampleAudition};
 use crate::bridge::ExternalPlugin;
 use crate::icons::{Icon, icon};
 use crate::keys::{Bound, TABLE};
@@ -34,8 +40,12 @@ use gpui::{
 };
 use packs::{InstallState, PackKind};
 use search::{KindFilter, SampleQuery, SampleRow};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// The badge of online-only samples and cloud folders.
+pub(crate) const CLOUD_ICON: Icon = Icon::Cloud;
 
 const CARD_W: f32 = 880.;
 const LIST_H: f32 = 432.;
@@ -131,6 +141,10 @@ pub struct PresetRow {
     pub path: String,
     pub name: String,
     pub category: String,
+    /// Search words beyond the name (a Vault preset's character tags and engine).
+    pub tags: Vec<String>,
+    /// A short badge (a Vault preset's engine).
+    pub badge: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +157,16 @@ pub enum Item {
     Command(usize),
     /// Index into the pack list.
     Pack(usize),
+    /// "Add library folder…" and its one-click cloud choices.
+    Library(LibraryChoice),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LibraryChoice {
+    /// Opens the "Add library…" picker.
+    Picker,
+    /// Adds this detected cloud folder.
+    Cloud(aitrack_library::CloudFolder),
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +208,15 @@ pub struct PaletteState {
     presets: Option<Vec<PresetRow>>,
     scroll: ScrollHandle,
     pub audition: SampleAudition,
+    /// Cloud folders found on this machine (the "Add library…" picker).
+    pub cloud: cloud::CloudPanel,
+    /// The user's own folders: "Add library…" and "Your libraries".
+    pub libraries: libraries::Libraries,
+    /// Online-only samples downloading because they were played or dragged.
+    pub fetches: CloudFetches,
+    /// The user library, which downloaded samples are analysed into
+    /// (`None` with stub bridges).
+    user_db: Option<PathBuf>,
 }
 
 impl PaletteState {
@@ -328,17 +361,23 @@ fn ensure(ws: &mut Workspace) {
         let user = crate::appearance::config_dir().join("library.db");
         let stubs = std::env::var_os("AITRACK_STUBS").is_some();
         pal.no_index = stubs;
+        pal.user_db = (!stubs).then(|| user.clone());
         pal.worker = Some(if stubs { search::Worker::spawn(None, std::path::PathBuf::new()) } else { search::Worker::spawn(factory, user) });
     }
+    let user_db = pal.user_db.clone();
+    pal.cloud.load(user_db.clone());
+    pal.libraries.load(user_db);
     pal.peaks.get_or_insert_with(Default::default);
     pal.thumbs.get_or_insert_with(Default::default);
     pal.covers.get_or_insert_with(Default::default);
     pal.packs.get_or_insert_with(Default::default);
     if pal.presets.is_none() {
         let mut list = Vec::new();
+        let vault = ws.fx.vault.presets();
         for d in ws.b.plugins.stock_devices() {
             for p in ws.b.plugins.presets(d.id) {
-                list.push(PresetRow { plugin_id: d.id, plugin: d.name, path: p.path, name: p.name, category: p.category });
+                let (tags, badge) = preset_meta(&vault, &p.path);
+                list.push(PresetRow { plugin_id: d.id, plugin: d.name, path: p.path, name: p.name, category: p.category, tags, badge });
             }
         }
         ws.palette.presets = Some(list);
@@ -441,9 +480,24 @@ fn device_rows(ws: &Workspace, q: &str) -> Vec<DeviceRow> {
     ranked(stock.chain(ext))
 }
 
+/// Search tags and badge of a preset: a Vault preset's character tags and
+/// engine (from the instrument's browser metadata), nothing for the rest.
+fn preset_meta(vault: &[aitrack_stock::instrument::vault::PresetInfo], path: &str) -> (Vec<String>, Option<&'static str>) {
+    use crate::views::device_window::vault::browse;
+    let Some(v) = vault.iter().find(|v| v.path == path) else { return (Vec::new(), None) };
+    let mut tags = v.tags.clone();
+    tags.push(browse::engine_name(v.engine).to_owned());
+    tags.extend(aitrack_stock::instrument::vault::ENGINE_TAGS.get(v.engine).map(|t| (*t).to_owned()));
+    (tags, Some(browse::engine_badge(v.engine)))
+}
+
 fn preset_rows(ws: &Workspace, q: &str) -> Vec<PresetRow> {
     let Some(list) = &ws.palette.presets else { return Vec::new() };
-    ranked(list.iter().filter_map(|p| Some((text_score(q, &p.name, &[p.plugin, &p.category, "preset"])?, p.clone()))))
+    ranked(list.iter().filter_map(|p| {
+        let mut extra: Vec<&str> = vec![p.plugin, &p.category, "preset"];
+        extra.extend(p.tags.iter().map(String::as_str));
+        Some((text_score(q, &p.name, &extra)?, p.clone()))
+    }))
 }
 
 fn command_rows(q: &str) -> Vec<usize> {
@@ -501,23 +555,36 @@ pub fn rebuild(ws: &mut Workspace) {
     match tab {
         Tab::All => {
             if !q.is_empty() {
-                section(&mut rows, "Commands", command_rows(&q).into_iter().map(Item::Command).collect(), ALL_COMMANDS, true);
+                let mut cmds: Vec<Item> = library_rows(ws, &q).into_iter().map(Item::Library).collect();
+                cmds.extend(command_rows(&q).into_iter().map(Item::Command));
+                section(&mut rows, "Commands", cmds, ALL_COMMANDS, true);
             }
             section(&mut rows, "Devices", device_rows(ws, &q).into_iter().map(Item::Device).collect(), ALL_DEVICES, true);
             if !q.is_empty() {
                 section(&mut rows, "Presets", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), ALL_PRESETS, true);
             }
-            section(&mut rows, "Samples", samples(), ALL_SAMPLES, true);
+            let (yours, factory) = split_yours(samples());
+            section(&mut rows, "Yours", yours, ALL_SAMPLES / 2, true);
+            section(&mut rows, "Samples", factory, ALL_SAMPLES, true);
             if !q.is_empty() {
                 section(&mut rows, "Splice", splice_items(ws), ALL_SPLICE, true);
                 section(&mut rows, "Packs", pack_rows(ws, &q).into_iter().map(Item::Pack).collect(), 4, true);
             }
         }
-        Tab::Samples | Tab::InKey => section(&mut rows, "", samples(), search::SHOWN, false),
+        Tab::Samples | Tab::InKey => {
+            let (yours, factory) = split_yours(samples());
+            let both = !yours.is_empty() && !factory.is_empty();
+            section(&mut rows, "Yours", yours, search::SHOWN, both);
+            section(&mut rows, "Factory sounds", factory, search::SHOWN, both);
+        }
         Tab::Splice => section(&mut rows, "", splice_items(ws), 100, false),
         Tab::Devices => section(&mut rows, "", device_rows(ws, &q).into_iter().map(Item::Device).collect(), 400, false),
         Tab::Presets => section(&mut rows, "", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), 400, false),
-        Tab::Commands => section(&mut rows, "", command_rows(&q).into_iter().map(Item::Command).collect(), 400, false),
+        Tab::Commands => {
+            let mut cmds: Vec<Item> = library_rows(ws, &q).into_iter().map(Item::Library).collect();
+            cmds.extend(command_rows(&q).into_iter().map(Item::Command));
+            section(&mut rows, "", cmds, 400, false);
+        }
         Tab::Packs => section(&mut rows, "", pack_rows(ws, &q).into_iter().map(Item::Pack).collect(), 400, false),
     }
     let pal = &mut ws.palette;
@@ -525,6 +592,11 @@ pub fn rebuild(ws: &mut Workspace) {
     if !matches!(pal.rows.get(pal.selected), Some(Row::Item(_))) {
         pal.selected = first_item(&pal.rows);
     }
+}
+
+/// The user's own samples (bridge index 1) apart from the factory bank's.
+fn split_yours(items: Vec<Item>) -> (Vec<Item>, Vec<Item>) {
+    items.into_iter().partition(|it| matches!(it, Item::Sample(r) if r.id >> 48 == 1))
 }
 
 /// Search the library bridge directly (stub bridges have no index).
@@ -544,6 +616,14 @@ fn bridge_search(ws: &mut Workspace) {
         .filter(|r| all || kind == KindFilter::All || (kind == KindFilter::Loops) == r.is_loop)
         .filter(|r| all || bpm.is_none_or(|(a, b)| r.bpm.is_some_and(|x| x >= a.min(b) as f32 && x <= a.max(b) as f32)))
         .collect();
+    let mut rows = rows;
+    if cloud::dev_view() {
+        // Screenshots: every third demo row is one of "yours", online-only.
+        rows.iter_mut().skip(1).step_by(3).for_each(|r| {
+            r.cloud = true;
+            r.id |= 1 << 48;
+        });
+    }
     let q = SampleQuery { text: ws.palette.query.clone(), tags: if all { Vec::new() } else { tags }, ..Default::default() };
     let (rows, tags) = search::finish(rows, &q);
     ws.palette.samples = rows;
@@ -613,8 +693,42 @@ pub fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
             ws.toast(m, cx);
         }
     }
+    changed |= ws.palette.cloud.poll();
+    let scanning = ws.b.library.scan_status().running;
+    let (lib_news, scan_done) = ws.palette.libraries.poll(scanning, ws.palette.user_db.clone());
+    changed |= lib_news || scanning;
+    if scan_done && ws.palette.open {
+        // New samples are in: search again.
+        refresh(ws);
+        changed = true;
+    }
+    let (fetch_news, fetched) = ws.palette.fetches.poll();
+    changed |= fetch_news || ws.palette.fetches.running();
+    let mut requery = false;
+    for f in fetched {
+        match f {
+            Fetched::Ready(path) => {
+                for s in ws.palette.samples.iter_mut().filter(|s| s.path == path) {
+                    s.cloud = false;
+                }
+                if ws.palette.open && ws.palette.audition.current() == Some(path.as_path()) {
+                    ws.b.engine.preview(Some(&path));
+                }
+                requery = true;
+            }
+            Fetched::Failed(path, e) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ws.toast(format!("Could not download {name} from the cloud: {e}"), cx);
+            }
+        }
+    }
+    if requery && ws.palette.open {
+        // Its key, tempo and length are known now.
+        refresh(ws);
+        changed = true;
+    }
     if let Some(path) = ws.palette.audition.due(Instant::now()) {
-        ws.b.engine.preview(Some(&path));
+        play(ws, &path);
     }
     changed |= ws.palette.audition.is_pending();
     if rebuild_rows {
@@ -624,12 +738,36 @@ pub fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     changed && ws.palette.open
 }
 
+/// The listed online-only row at `path` that still has to be downloaded.
+fn remote_row(ws: &Workspace, path: &Path) -> Option<u64> {
+    ws.palette.samples.iter().find(|r| r.cloud && r.path == path).map(|r| r.id).filter(|_| ws.palette.fetches.needs_fetch(path))
+}
+
+/// Starts downloading an online-only sample; one from the user library is
+/// analysed into it once it is local.
+fn fetch(ws: &mut Workspace, id: u64, path: &Path) {
+    let index = ws.palette.user_db.clone().filter(|_| id >> 48 == 1).map(|db| (db, Arc::new(crate::real::library::AiAnalyzer) as Arc<dyn aitrack_library::Analyzer>));
+    ws.palette.fetches.start(path, index);
+}
+
+/// Plays `path`; an online-only sample downloads first and plays when it
+/// lands, if it is still the one selected.
+fn play(ws: &mut Workspace, path: &Path) {
+    match remote_row(ws, path) {
+        Some(id) => {
+            ws.b.engine.preview(None);
+            fetch(ws, id, path);
+        }
+        None => ws.b.engine.preview(Some(path)),
+    }
+}
+
 /// Audition the selected row (samples and Splice previews).
 fn audition_selected(ws: &mut Workspace, immediate: bool) {
     match ws.palette.selected_item().cloned() {
         Some(Item::Sample(r)) => {
             if let Some(path) = ws.palette.audition.select(&r.path, immediate, Instant::now()) {
-                ws.b.engine.preview(Some(&path));
+                play(ws, &path);
             }
         }
         Some(Item::Splice(s)) => {
@@ -654,7 +792,7 @@ fn replay_selected(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     match ws.palette.selected_item().cloned() {
         Some(Item::Sample(r)) => {
             let path = ws.palette.audition.replay(&r.path);
-            ws.b.engine.preview(Some(&path));
+            play(ws, &path);
         }
         Some(Item::Splice(s)) => {
             ws.palette.audition.stop();
@@ -792,8 +930,72 @@ fn activate(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>
             }
         }
         Item::Pack(i) => pack_action(ws, i, window, cx),
+        Item::Library(LibraryChoice::Picker) => open_add_library(ws, window, cx),
+        Item::Library(LibraryChoice::Cloud(f)) => libraries::add_cloud(ws, &f, cx),
     }
     cx.notify();
+}
+
+/// Opens the palette on the Packs tab with the "Add library…" picker open
+/// (the palette's "Add library folder" entry; also meant for a menu or
+/// shortcut action).
+pub fn open_add_library(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    ensure(ws);
+    ws.palette.libraries.picker = true;
+    ws.palette.query.clear();
+    ws.search.update(cx, |s, cx| s.set_text("", cx));
+    if !ws.palette.open {
+        open(ws, window, cx);
+    }
+    set_tab(ws, Tab::Packs, cx);
+}
+
+/// The palette's own "Add library folder…" command and, for a query
+/// naming a provider, its detected folders not added yet.
+fn library_rows(ws: &Workspace, q: &str) -> Vec<LibraryChoice> {
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let words = ["library", "folder", "import", "samples", "cloud", "dropbox", "onedrive", "google drive", "icloud"];
+    if text_score(q, "Add library folder", &words).is_some() {
+        out.push(LibraryChoice::Picker);
+    }
+    let roots: Vec<std::path::PathBuf> = ws.palette.libraries.roots.iter().map(|r| r.path.clone()).collect();
+    for r in &ws.palette.cloud.rows {
+        if !r.added && !cloud::covered(&r.folder.path, &roots) && text_score(q, &format!("Add {} library", r.folder.label), &["cloud", "folder"]).is_some() {
+            out.push(LibraryChoice::Cloud(r.folder.clone()));
+        }
+    }
+    out
+}
+
+fn render_library_choice(ws: &Workspace, i: usize, c: &LibraryChoice, selected: bool, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let n = ws.palette.cloud.rows.len();
+    let (title, help, badge) = match c {
+        LibraryChoice::Picker => (
+            "Add library folder…".to_owned(),
+            if n > 0 { format!("Library · a folder on this computer, or one of the {n} cloud folders found") } else { "Library · a folder on this computer or in the cloud".to_owned() },
+            div().w(px(48.)).flex_none().flex().justify_center().child(icon(Icon::FolderOpen, 14., pal.muted)).into_any_element(),
+        ),
+        LibraryChoice::Cloud(f) => (
+            format!("Add {} library", f.label),
+            format!("Library · {} · online-only files download when you play them", f.path.display()),
+            div().w(px(48.)).flex_none().flex().justify_center().child(icon(CLOUD_ICON, 14., pal.accent)).into_any_element(),
+        ),
+    };
+    row_shell(i, selected, ITEM_ROW_H)
+        .child(badge)
+        .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(title, TEXT_MD, pal.text)).child(label(crate::paint::fit(&help, 600., TEXT_XS), TEXT_XS, pal.faint)))
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+            this.palette.selected = i;
+            if e.click_count >= 2 {
+                activate(this, window, cx);
+            }
+            cx.notify();
+        }))
+        .into_any_element()
 }
 
 fn pack_action(ws: &mut Workspace, i: usize, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -944,6 +1146,23 @@ fn mini_wave(bars: Option<Arc<Vec<f32>>>, color: Hsla) -> AnyElement {
     .into_any_element()
 }
 
+/// In place of the waveform of an online-only sample: where its download is.
+fn cloud_status(state: &FetchState) -> AnyElement {
+    let pal = p();
+    let body = match state {
+        FetchState::Downloading(f) => div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(label(f.map_or("Downloading…".into(), |f| format!("Downloading {:.0}%", f * 100.)), TEXT_XS, pal.muted))
+            .child(widgets::hbar(f.unwrap_or(0.), WAVE_W, 3., pal.accent))
+            .into_any_element(),
+        FetchState::Failed(_) => label("Download failed", TEXT_XS, pal.record).into_any_element(),
+        FetchState::Remote | FetchState::Local => div().flex().items_center().gap(px(SP1)).child(icon(CLOUD_ICON, 12., pal.faint)).child(label("Online only", TEXT_XS, pal.faint)).into_any_element(),
+    };
+    div().w(px(WAVE_W)).h(px(24.)).flex_none().flex().items_center().child(body).into_any_element()
+}
+
 fn row_shell(i: usize, selected: bool, h: f32) -> Stateful<Div> {
     div()
         .id(("palette-row", i))
@@ -967,10 +1186,14 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
     let pal = p();
     let song = ws.s.project.scale;
     let in_key = r.key.zip(song).is_some_and(|(a, b)| keys_match(a, b));
-    let bars = ws.palette.peaks.as_mut().and_then(|pk| pk.get(&r.path));
-    let cover = ws.palette.covers.as_mut().and_then(|c| c.get(&r.path, r.pack.as_deref()));
+    // Online-only: its waveform and cover would have to be downloaded.
+    let fetch_state = if r.cloud { ws.palette.fetches.state(&r.path) } else { FetchState::Local };
+    let remote = fetch_state != FetchState::Local;
+    let bars = if remote { None } else { ws.palette.peaks.as_mut().and_then(|pk| pk.get(&r.path)) };
+    let cover = if remote { None } else { ws.palette.covers.as_mut().and_then(|c| c.get(&r.path, r.pack.as_deref())) };
     let item = r.item();
     let weak = cx.entity().downgrade();
+    let (drag_id, drag_path) = (r.id, r.path.clone());
     let tags = &ws.palette.tags;
     let mut chips = div().flex().items_center().gap(px(SP1)).overflow_hidden();
     for t in r.tags.iter().take(4) {
@@ -987,11 +1210,11 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
                 .flex_col()
                 .gap(px(2.))
                 .overflow_hidden()
-                .child(label(r.name.clone(), TEXT_MD, pal.text))
+                .child(div().flex().items_center().gap(px(SP1)).child(label(r.name.clone(), TEXT_MD, pal.text)).when(remote, |d| d.child(icon(CLOUD_ICON, 12., pal.muted))))
                 .child(chips),
         )
-        .child(mini_wave(bars, if selected { pal.accent } else { content(0.45) }))
-        .child(column(TIME_W, mono(format!("{:.1}s", r.duration), TEXT_SM, pal.muted)))
+        .child(if remote { cloud_status(&fetch_state) } else { mini_wave(bars, if selected { pal.accent } else { content(0.45) }) })
+        .child(column(TIME_W, mono(if r.duration > 0. { format!("{:.1}s", r.duration) } else { "–".into() }, TEXT_SM, pal.muted)))
         .child(column(KEY_W, mono(r.key.map(short_key).unwrap_or_else(|| "–".into()), TEXT_SM, if in_key { pal.accent } else { pal.muted })))
         .child(column(BPM_W, mono(r.bpm.map_or("–".into(), |b| format!("{b:.0}")), TEXT_SM, pal.muted)))
         .child({
@@ -1013,13 +1236,21 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
         .on_mouse_down(MouseButton::Right, cx.listener(|this, e: &MouseDownEvent, _, cx| {
             this.open_menu(crate::workspace::MenuKind::LibraryContext, e.position, cx);
         }))
-        .tooltip(widgets::tip_owned(format!("{}\n{}\nClick to audition · Enter or double-click to add · drag onto the arrangement", r.category, r.path.display())))
+        .tooltip(widgets::tip_owned(format!(
+            "{}\n{}\n{}Click to audition · Enter or double-click to add · drag onto the arrangement",
+            r.category,
+            r.path.display(),
+            if remote { "Online only: it downloads when you play or drag it\n" } else { "" }
+        )))
         .on_drag(DraggedSample(item), move |d: &DraggedSample, _, _, cx| {
             // The palette gets out of the way so the drop lands on the lanes.
             let _ = weak.update(cx, |ws, cx| {
                 ws.palette.open = false;
                 ws.palette.audition.stop();
                 ws.b.engine.preview(None);
+                if remote_row(ws, &drag_path).is_some() {
+                    fetch(ws, drag_id, &drag_path);
+                }
                 cx.notify();
             });
             cx.new(|_| d.clone())
@@ -1148,6 +1379,7 @@ fn render_preset(i: usize, pr: &PresetRow, selected: bool, cx: &mut Context<Work
     row_shell(i, selected, ITEM_ROW_H)
         .child(div().w(px(48.)).flex_none().flex().justify_center().child(icon(Icon::Sliders, 14., pal.muted)))
         .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(pr.name.clone(), TEXT_MD, pal.text)).child(label(format!("{} · {}", pr.plugin, pr.category), TEXT_XS, pal.faint)))
+        .when_some(pr.badge, |d, b| d.child(widgets::badge(b, pal.accent2)))
         .child(widgets::badge("Preset", pal.muted))
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
             this.palette.selected = i;
@@ -1548,11 +1780,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let rows = ws.palette.rows.clone();
     let selected = ws.palette.selected;
     let mut list = div().id("palette-results").h(px(LIST_H)).overflow_y_scroll().track_scroll(&ws.palette.scroll).px(px(SP2)).py(px(SP1)).flex().flex_col();
+    let add_bar = libraries::add_bar(ws, cx);
+    let yours = libraries::list_section(ws, cx);
     let labels = packs::labels_section(ws, cx);
-    if rows.is_empty() && labels.is_none() {
-        list = list.child(empty_state(ws, cx));
+    if rows.is_empty() && labels.is_none() && yours.is_none() {
+        list = list.children(add_bar).child(empty_state(ws, cx));
+    } else {
+        list = list.children(add_bar).children(yours).children(labels);
     }
-    list = list.children(labels);
     for (i, row) in rows.iter().enumerate() {
         let sel = i == selected;
         list = list.child(match row {
@@ -1563,6 +1798,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             Row::Item(Item::Preset(pr)) => render_preset(i, pr, sel, cx),
             Row::Item(Item::Command(c)) => render_command(i, *c, sel, cx),
             Row::Item(Item::Pack(k)) => render_pack(ws, i, *k, sel, cx),
+            Row::Item(Item::Library(c)) => render_library_choice(ws, i, c, sel, cx),
         });
     }
     let samples_tab = tab.samples();
@@ -1621,6 +1857,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vault_presets_are_found_by_engine_and_character() {
+        let vault = aitrack_stock::instrument::vault::preset_info();
+        let organ = vault.iter().find(|p| p.engine == aitrack_stock::instrument::vault::params::engine::ORGAN).expect("an organ preset");
+        let (tags, badge) = preset_meta(&vault, &organ.path);
+        assert_eq!(badge, Some("Organ"));
+        let extra: Vec<&str> = tags.iter().map(String::as_str).collect();
+        assert!(text_score("drawbar", &organ.name, &extra).is_some(), "the engine name is a search word");
+        let tag = organ.tags.first().expect("a character tag");
+        assert!(text_score(tag, &organ.name, &extra).is_some(), "character tags are search words");
+        assert_eq!(preset_meta(&vault, "fx.eq/Mix/Air.json"), (Vec::new(), None), "other presets get nothing extra");
+    }
 
     #[test]
     fn text_score_needs_every_word() {

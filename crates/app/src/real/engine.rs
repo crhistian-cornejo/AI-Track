@@ -6,14 +6,22 @@
 //! cached, so the many views that ask during one paint all see the same
 //! values. Export runs on its own thread with fresh processor instances.
 //!
+//! Nothing here blocks the UI thread on the audio device: the engine opens
+//! it on its control thread (also when switching devices), the device list
+//! is enumerated on a worker thread, and results are picked up in [`tick`].
+//! The playhead is the *heard* position: the engine's audible position
+//! moved back by the measured output latency (buffer + device + Bluetooth),
+//! so it lines up with the speakers.
+//!
 //! [`tick`]: EngineBridge::tick
 
 use super::plugins::PluginRuntime;
 use super::settings::Settings;
 use crate::bridge::*;
+use aitrack_engine::engine::DeviceRequest;
 use aitrack_engine::{
-    ActiveAudio, ChannelSelection, ClipSlotStatus, Engine, EngineConfig, EngineError, EngineHandle, FactoryStack, Lame, Mp3Tags,
-    RenderOptions, RenderRange, ShareMode, TapReader, WavFormat,
+    ActiveAudio, AudioDeviceInfo, ChannelSelection, ClipSlotStatus, Engine, EngineConfig, EngineError, EngineHandle, FactoryStack, Lame,
+    Mp3Tags, RenderOptions, RenderRange, ShareMode, TapReader, WavFormat,
 };
 use aitrack_model::{DeviceId, Project, SceneId, Tick, TrackId};
 use std::collections::HashMap;
@@ -26,6 +34,73 @@ const TAP_IDLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Meters fall at this rate after a peak (dB per second).
 const METER_FALL_DB_S: f32 = 26.;
+
+/// How often the device list is re-enumerated (on a worker thread) so
+/// hot-plugged interfaces and Bluetooth headphones show up in Preferences.
+const DEVICE_RESCAN: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Longest hold-back for meters and analysis (beyond this the output is
+/// broken, not slow).
+const MAX_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Peak per track taken in one frame.
+type Peaks = Vec<(TrackId, [f32; 2])>;
+
+/// Meter peaks wait here until the audio they measured reaches the speakers.
+#[derive(Default)]
+struct MeterDelay {
+    queue: std::collections::VecDeque<(Instant, Peaks)>,
+}
+
+impl MeterDelay {
+    /// Queue `readings` taken at `now`; return the peak per track of every
+    /// reading at least `delay` old (each reading is released once).
+    fn push(&mut self, now: Instant, readings: Peaks, delay: std::time::Duration) -> HashMap<TrackId, [f32; 2]> {
+        self.queue.push_back((now, readings));
+        let mut due: HashMap<TrackId, [f32; 2]> = HashMap::new();
+        while let Some((at, _)) = self.queue.front() {
+            if now.duration_since(*at) < delay.min(MAX_HOLD) {
+                break;
+            }
+            let (_, r) = self.queue.pop_front().expect("front");
+            for (id, p) in r {
+                let d = due.entry(id).or_default();
+                d[0] = d[0].max(p[0]);
+                d[1] = d[1].max(p[1]);
+            }
+        }
+        due
+    }
+}
+
+/// Analysis frames wait here until they are heard: the newest `hold`
+/// frames stay back, the rest go to the meter strip.
+#[derive(Default)]
+struct TapDelay {
+    stage: std::collections::VecDeque<[f32; 2]>,
+}
+
+impl TapDelay {
+    fn pass(&mut self, fresh: &[[f32; 2]], hold: usize, out: &mut Vec<[f32; 2]>) {
+        self.stage.extend(fresh.iter().copied());
+        let release = self.stage.len().saturating_sub(hold);
+        out.extend(self.stage.drain(..release));
+    }
+}
+
+/// The device list from a worker thread: `(hosts, devices)`.
+type DeviceScan = crossbeam_channel::Receiver<(Vec<String>, Vec<AudioDeviceInfo>)>;
+
+fn scan_devices() -> Option<DeviceScan> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("aitrack-audio-devices".into())
+        .spawn(move || {
+            let _ = tx.send((aitrack_engine::audio_io::hosts(), aitrack_engine::audio_io::devices()));
+        })
+        .ok()?;
+    Some(rx)
+}
 
 struct Frame {
     at: Instant,
@@ -58,6 +133,17 @@ pub struct RealEngine {
     lame: OnceLock<Result<(), String>>,
     messages: Vec<String>,
     preview: super::preview::Preview,
+    /// Device enumeration in flight, and when the last one started.
+    scan: Option<DeviceScan>,
+    scanned_at: Instant,
+    /// Device switch in flight: the request and the config it applies.
+    pending: Option<(DeviceRequest, AudioConfig, aitrack_engine::AudioConfig)>,
+    /// Last [`EngineHandle::audio_generation`] seen.
+    generation: u64,
+    latency_seen: aitrack_engine::status::LatencyReport,
+    meter_delay: MeterDelay,
+    tap_delay: TapDelay,
+    tap_fresh: Vec<[f32; 2]>,
     /// The UI's cursor into the engine's analysis ring.
     tap: TapReader,
     analysis: bool,
@@ -155,7 +241,9 @@ fn lame_missing_message() -> String {
 impl RealEngine {
     pub fn new(live: Arc<FactoryStack>, export_factory: Arc<FactoryStack>, rt: Arc<PluginRuntime>, settings: Settings) -> Self {
         let app_config = from_engine(&settings.audio);
-        let config = EngineConfig { audio: Some(settings.audio.clone()), ..EngineConfig::default() };
+        // The device opens on the engine's control thread: a slow driver
+        // must not hold up the first frame. `tick` picks the result up.
+        let config = EngineConfig { audio: Some(settings.audio.clone()), open_in_background: true, ..EngineConfig::default() };
         let (handle, banner) = match Engine::new(config, live.clone()) {
             Ok((h, _)) => {
                 let banner = h.last_error().map(|e| no_device_banner(&e));
@@ -194,26 +282,76 @@ impl RealEngine {
             lame: OnceLock::new(),
             messages: Vec::new(),
             preview: super::preview::Preview::new(),
+            scan: None,
+            scanned_at: Instant::now(),
+            pending: None,
+            generation: 0,
+            latency_seen: Default::default(),
+            meter_delay: MeterDelay::default(),
+            tap_delay: TapDelay::default(),
+            tap_fresh: Vec::new(),
         };
-        if let Some(a) = &this.active {
-            this.app_config.sample_rate = a.sample_rate;
-            if let Some(b) = a.buffer_size {
-                this.app_config.buffer_size = b;
-            }
-            this.messages.extend(a.notes.iter().cloned());
-        }
+        this.adopt_active();
         this.refresh_devices();
         this
     }
 
+    /// Take the device the engine has open now (after a start, a switch or
+    /// an automatic reopen) into the app's view of the settings.
+    fn adopt_active(&mut self) {
+        self.generation = self.handle.audio_generation();
+        self.active = self.handle.active_audio();
+        if let Some(a) = &self.active {
+            self.app_config.sample_rate = a.sample_rate;
+            if let Some(b) = a.buffer_size {
+                self.app_config.buffer_size = b;
+            }
+            self.messages.extend(a.notes.iter().cloned());
+            self.banner = None;
+            // The browser preview plays where the engine plays.
+            self.preview.set_device((!a.follows_default).then(|| (a.host.clone(), a.output_device_id.clone())));
+        }
+    }
+
+    /// Start enumerating devices on a worker thread (no-op while one runs).
     fn refresh_devices(&mut self) {
+        if self.scan.is_none() {
+            self.scan = scan_devices();
+            self.scanned_at = Instant::now();
+        }
+    }
+
+    /// Pick up a finished enumeration; `true` when the list changed.
+    fn poll_devices(&mut self) -> bool {
+        let Some(rx) = &self.scan else {
+            if self.scanned_at.elapsed() > DEVICE_RESCAN {
+                self.refresh_devices();
+            }
+            return false;
+        };
+        match rx.try_recv() {
+            Ok((hosts, devices)) => {
+                self.scan = None;
+                let before = (self.hosts.clone(), self.devices.clone());
+                self.apply_devices(hosts, devices);
+                before != (self.hosts.clone(), self.devices.clone())
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => false,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.scan = None;
+                false
+            }
+        }
+    }
+
+    fn apply_devices(&mut self, engine_hosts: Vec<String>, engine_devices: Vec<AudioDeviceInfo>) {
         let mut hosts = Vec::new();
-        for h in self.handle.hosts() {
-            hosts.extend_from_slice(hosts_for(&h));
+        for h in &engine_hosts {
+            hosts.extend_from_slice(hosts_for(h));
         }
         self.hosts = hosts;
         let mut out = Vec::new();
-        for d in self.handle.devices() {
+        for d in engine_devices {
             for &host in hosts_for(&d.host) {
                 let mut rates = d.sample_rates.clone();
                 if rates.is_empty() {
@@ -235,6 +373,49 @@ impl RealEngine {
         self.devices = out;
     }
 
+    /// The outcome of a device switch, of the background open at start-up,
+    /// or of an automatic reopen (device lost, default output changed).
+    /// `true` when something the settings page shows changed.
+    fn poll_audio(&mut self) -> bool {
+        let mut changed = false;
+        if let Some((req, _, _)) = &self.pending
+            && let Some(result) = req.poll() {
+                let (_, config, engine_cfg) = self.pending.take().expect("pending");
+                match result {
+                    Ok(_) => {
+                        self.app_config = config;
+                        self.settings.audio = engine_cfg;
+                        self.settings.save();
+                        self.adopt_active();
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        self.banner = Some(no_device_banner(&msg));
+                        self.messages.push(format!("Audio device: {msg}"));
+                    }
+                }
+                self.refresh_devices();
+                changed = true;
+            }
+        if self.pending.is_none() && self.handle.audio_generation() != self.generation {
+            changed = true;
+            self.adopt_active();
+            if self.active.is_none()
+                && let Some(e) = self.handle.last_error() {
+                    self.banner = Some(no_device_banner(&e));
+                }
+            // A device came or went: list what is there now.
+            self.refresh_devices();
+        }
+        // The first callbacks of a new stream bring the measured latency.
+        let lat = self.handle.latency_report();
+        if lat != self.latency_seen {
+            self.latency_seen = lat;
+            changed = true;
+        }
+        changed
+    }
+
     fn session_rate(&self) -> u32 {
         match self.handle.sample_rate() {
             0 => self.app_config.sample_rate,
@@ -252,6 +433,18 @@ impl RealEngine {
             E::Queued => Some(SlotState::Queued { scene: s.scene }),
             E::Stopped => None,
         }
+    }
+}
+
+/// The engine's latency figures as the settings page shows them.
+fn latency_of(r: &aitrack_engine::status::LatencyReport) -> AudioLatency {
+    AudioLatency {
+        sample_rate: r.sample_rate,
+        buffer_frames: r.buffer_frames,
+        output_ms: r.output_ms(),
+        input_ms: r.input_ms(),
+        device_output_ms: r.device_output_ms(),
+        plugin_ms: r.plugin_ms(),
     }
 }
 
@@ -329,13 +522,26 @@ impl EngineBridge for RealEngine {
         let now = Instant::now();
         let dt = now.duration_since(self.frame.at).as_secs_f32().min(0.5);
         self.frame.at = now;
-        let position = self.handle.position_ticks().max(0.) as Tick;
+        self.poll_audio();
+        self.poll_devices();
+        let position = self.handle.heard_position_ticks().max(0.) as Tick;
         self.frame.transport = TransportState { playing: self.handle.is_playing(), position, ..self.frame.transport };
         self.frame.cpu = self.handle.cpu_load().0.clamp(0., 1.);
         let fall = 10f32.powf(-METER_FALL_DB_S * dt / 20.);
+        // Meters show what the speakers play now, not what the engine just
+        // rendered (with Bluetooth that is a few hundred ms apart).
+        let readings = self
+            .tracks
+            .iter()
+            .map(|&id| {
+                let reading = if Some(id) == self.main_track { Some(self.handle.master_meter()) } else { self.handle.meters(id) };
+                (id, reading.map_or([0.; 2], |r| r.peak))
+            })
+            .collect();
+        let delay = std::time::Duration::from_secs_f64(self.latency_seen.output_seconds());
+        let due = self.meter_delay.push(now, readings, delay);
         for &id in &self.tracks {
-            let reading = if Some(id) == self.main_track { Some(self.handle.master_meter()) } else { self.handle.meters(id) };
-            let peak = reading.map_or([0.; 2], |r| r.peak);
+            let peak = due.get(&id).copied().unwrap_or([0.; 2]);
             let m = self.frame.meters.entry(id).or_default();
             m.left = peak[0].max(m.left * fall).min(1.5);
             m.right = peak[1].max(m.right * fall).min(1.5);
@@ -365,12 +571,17 @@ impl EngineBridge for RealEngine {
 
     fn idle(&mut self) -> bool {
         self.preview.collect();
+        let errors = self.preview.take_errors();
+        let mut changed = !errors.is_empty();
+        self.messages.extend(errors);
+        changed |= self.poll_audio();
+        changed |= self.poll_devices();
         // Nobody drained the tap for a while (window hidden or minimised):
         // stop feeding it until the next drain.
         if self.tap.is_enabled() && self.tap_drained.elapsed() > TAP_IDLE {
             self.tap.set_enabled(false);
         }
-        self.rt.idle()
+        self.rt.idle() || changed
     }
 
     fn set_analysis(&mut self, on: bool) {
@@ -388,8 +599,12 @@ impl EngineBridge for RealEngine {
         if self.analysis && !self.tap.is_enabled() {
             self.tap.set_enabled(true);
         }
-        self.tap.read(out);
-        self.session_rate()
+        self.tap_fresh.clear();
+        self.tap.read(&mut self.tap_fresh);
+        let rate = self.session_rate();
+        let hold = (self.latency_seen.output_frames as usize).min(rate as usize * MAX_HOLD.as_millis() as usize / 1000);
+        self.tap_delay.pass(&self.tap_fresh, hold, out);
+        rate
     }
 
     fn device_meter(&mut self, device: DeviceId, out: &mut [f32]) -> usize {
@@ -456,34 +671,23 @@ impl EngineBridge for RealEngine {
             config.buffer_size = config.buffer_size.clamp(d.buffer_range.0, d.buffer_range.1);
             config.output_channels.retain(|c| *c < d.output_channels);
         }
+        // Opening a device can take a while (Bluetooth: up to a second);
+        // the engine does it on its control thread and `tick` applies the
+        // result. The settings page shows the request right away.
         let engine_cfg = to_engine(&config);
-        match self.handle.set_device(Some(engine_cfg.clone())) {
-            Ok(active) => {
-                if let Some(a) = &active {
-                    config.sample_rate = a.sample_rate;
-                    if let Some(b) = a.buffer_size {
-                        config.buffer_size = b;
-                    }
-                    self.messages.extend(a.notes.iter().cloned());
-                }
-                self.active = active;
-                self.banner = None;
-                self.app_config = config.clone();
-                self.settings.audio = engine_cfg;
-                self.settings.save();
-                Ok(config)
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.banner = Some(no_device_banner(&msg));
-                self.app_config = config;
-                Err(msg)
-            }
-        }
+        let request = self.handle.set_device_async(Some(engine_cfg.clone()));
+        self.app_config = config.clone();
+        self.pending = Some((request, config.clone(), engine_cfg));
+        Ok(config)
     }
 
     fn test_tone(&mut self) {
         self.messages.push("The test tone is not available in this engine build yet".into());
+    }
+
+    fn audio_latency(&self) -> Option<AudioLatency> {
+        self.active.as_ref()?;
+        Some(latency_of(&self.handle.latency_report()))
     }
 
     fn export(&mut self, options: ExportOptions, project: &Project, mut progress: ProgressFn) {
@@ -569,14 +773,31 @@ impl EngineBridge for RealEngine {
         match &self.active {
             Some(a) => {
                 let buf = a.buffer_size.map(|b| format!(" · {b}")).unwrap_or_default();
-                format!("{} · {:.1} kHz{buf}", a.host, a.sample_rate as f32 / 1000.).replace(".0 kHz", " kHz")
+                let lat = self.handle.latency_report();
+                let out = if lat.output_frames > 0 { format!(" · {:.1} ms out", lat.output_ms()) } else { String::new() };
+                format!("{} · {} · {:.1} kHz{buf}{out}", a.host, a.output_device, a.sample_rate as f32 / 1000.).replace(".0 kHz", " kHz")
             }
+            None if self.pending.is_some() => "Opening the audio device…".into(),
             None => "No audio device".into(),
         }
     }
 
     fn open_editor(&mut self, device: DeviceId) -> Result<(), String> {
         self.rt.open_editor(device)
+    }
+
+    fn plugin_states(&mut self) -> Vec<(DeviceId, Vec<u8>)> {
+        let states = self.rt.capture_states();
+        // These bytes come from the live plugins: when the app writes them
+        // into the project, the engine must not rebuild (or reload) them.
+        for (device, state) in &states {
+            aitrack_engine::shared::note_applied_state(*device, state);
+        }
+        states
+    }
+
+    fn take_plugin_edits(&mut self) -> Vec<crate::bridge::PluginEdit> {
+        self.rt.take_edits()
     }
 
     fn sandbox_plugins(&self) -> bool {
@@ -616,5 +837,59 @@ mod tests {
         assert_eq!(e.input_channels, ChannelSelection { first: 2, count: 2 });
         assert!(e.input_enabled);
         assert_eq!(from_engine(&e), c);
+    }
+
+    #[test]
+    fn meters_wait_for_the_output_latency() {
+        let mut d = MeterDelay::default();
+        let t = Instant::now();
+        let id = TrackId(1);
+        let ms = std::time::Duration::from_millis;
+        // 100 ms of latency: a peak read now shows 100 ms later, once.
+        assert!(d.push(t, vec![(id, [0.8, 0.5])], ms(100)).is_empty());
+        assert!(!d.push(t + ms(50), vec![(id, [0.1, 0.1])], ms(100)).contains_key(&id));
+        assert_eq!(d.push(t + ms(160), vec![(id, [0.; 2])], ms(100)).get(&id), Some(&[0.8, 0.5]));
+        assert_eq!(d.push(t + ms(170), vec![], ms(100)).get(&id), None);
+        // No latency: straight through. Absurd latency is capped.
+        let mut d = MeterDelay::default();
+        assert_eq!(d.push(t, vec![(id, [0.3, 0.2])], ms(0)).get(&id), Some(&[0.3, 0.2]));
+        assert!(d.push(t, vec![(id, [0.3, 0.2])], ms(10_000)).is_empty());
+        assert!(d.push(t + MAX_HOLD, vec![], ms(10_000)).contains_key(&id));
+    }
+
+    #[test]
+    fn analysis_frames_are_held_back_by_the_latency() {
+        let mut d = TapDelay::default();
+        let mut out = Vec::new();
+        let frames: Vec<[f32; 2]> = (0..10).map(|i| [i as f32, 0.]).collect();
+        d.pass(&frames, 4, &mut out);
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[5][0], 5.);
+        out.clear();
+        d.pass(&frames[..2], 4, &mut out);
+        assert_eq!(out.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![6., 7.]);
+        // Latency dropped (wired headphones): the backlog flushes.
+        out.clear();
+        d.pass(&[], 0, &mut out);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn latency_figures_reach_the_settings_page() {
+        let r = aitrack_engine::status::LatencyReport {
+            sample_rate: 48_000,
+            buffer_frames: 256,
+            output_frames: 480,
+            input_frames: 288,
+            input_buffer_frames: 256,
+            plugin_frames: 48,
+        };
+        let l = latency_of(&r);
+        assert_eq!(l.buffer_frames, 256);
+        assert!((l.output_ms - 10.).abs() < 1e-4);
+        assert!((l.device_output_ms - 224. / 48.).abs() < 1e-3);
+        assert!((l.input_ms - 6.).abs() < 1e-4);
+        assert!((l.plugin_ms - 1.).abs() < 1e-4);
+        assert!((l.round_trip_ms() - 16.).abs() < 1e-3);
     }
 }

@@ -1222,3 +1222,4 @@ fn audio_config_serializes() {
 }
 
 mod clips;
+mod device_state;

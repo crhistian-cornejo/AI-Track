@@ -43,8 +43,9 @@ fn main() {
         assets::load_fonts(cx);
         actions::bind(cx);
         keys::bind(cx);
+        // Quit with the main window: device windows alone do not keep the app open.
         cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
+            if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {
                 cx.quit();
             }
         })

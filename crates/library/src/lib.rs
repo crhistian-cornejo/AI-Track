@@ -3,6 +3,8 @@
 //! - [`Library`]: the SQLite index (samples, roots, packs, FTS5, embeddings).
 //! - [`scan`]: incremental scanning on a background thread, with progress and cancel.
 //! - [`watch`]: file watcher that keeps the index in sync.
+//! - [`cloud`]: Dropbox / OneDrive / Google Drive / iCloud folders, online-only
+//!   files indexed by name and downloaded on demand.
 //! - [`parse`]: key/BPM/category/genre hints from file and folder names (EN + ES).
 //! - [`analyze`]: the [`Analyzer`] trait and the built-in [`BasicAnalyzer`].
 //! - [`query`]: search with filters, key compatibility and [`Library::recommend`].
@@ -18,6 +20,7 @@
 #[cfg(feature = "ai")]
 pub mod ai;
 pub mod analyze;
+pub mod cloud;
 pub mod cover;
 pub mod db;
 pub mod error;
@@ -42,7 +45,8 @@ pub use rusqlite;
 #[cfg(feature = "ai")]
 pub use ai::AiDetector;
 pub use analyze::{Analysis, Analyzer, AudioInfo, BasicAnalyzer, Source};
-pub use db::{Library, PackInfo, Preset, Root, RootId, RootKind, Sample, SampleId};
+pub use cloud::{CloudFolder, HydrateEvent, HydrateJob, OsProbe, PlaceholderProbe, Provider};
+pub use db::{Library, PackInfo, Preset, Root, RootId, RootKind, RootStats, Sample, SampleId};
 pub use error::{LibraryError, Result};
 pub use hub::{BundledPack, HubEntry, Manifest};
 pub use labels::{Genre, LABELS, Label};

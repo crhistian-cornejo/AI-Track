@@ -47,6 +47,11 @@ pub enum Request {
     OpenEditor,
     CloseEditor,
     Shutdown,
+    /// Test hook: the host answers `Ok`, then its main thread stops (like an
+    /// editor stuck in its own draw loop), so the parent's watchdog can be
+    /// exercised.
+    #[doc(hidden)]
+    Freeze,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +62,13 @@ pub enum Response {
     State { data: Vec<u8> },
     Ok,
     Error { message: String },
+    /// Heartbeat from the host's main loop, every [`HEARTBEAT`]. Not an
+    /// answer to a request.
+    Alive,
 }
+
+/// How often the host's main loop reports [`Response::Alive`].
+pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireParam {

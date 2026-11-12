@@ -3,6 +3,12 @@
 //! Events are debounced (files being copied fire many events) and applied on
 //! a worker thread with its own connection: new/changed audio is analysed,
 //! removed files or folders are marked missing.
+//!
+//! Cloud folders work too: an online-only file that shows up (or a file
+//! that gets evicted) is indexed by name without being read, an iCloud stub
+//! (`.Kick.wav.icloud`) counts as its file, and a download finishing fires a
+//! change that analyses the now local file. A root that cannot be watched
+//! (a provider folder that is offline) is skipped, not fatal.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -14,9 +20,15 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::analyze::Analyzer;
+use crate::cloud::{OsProbe, PlaceholderProbe, icloud_stub_target};
 use crate::db::{Library, SampleId};
 use crate::error::Result;
 use crate::scan::is_audio;
+
+/// An audio file, or an iCloud stub standing for one.
+fn indexable(p: &std::path::Path) -> bool {
+    is_audio(p) || icloud_stub_target(p).is_some_and(|real| is_audio(&real))
+}
 
 /// What the watcher did, for the UI to refresh.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,13 +48,20 @@ pub struct LibraryWatcher {
 impl LibraryWatcher {
     /// Watches every root of the library at `db_path` that has `watch` set.
     pub fn start(db_path: PathBuf, analyzer: Arc<dyn Analyzer>, debounce: Duration) -> Result<Self> {
+        Self::start_with(db_path, analyzer, Arc::new(OsProbe), debounce)
+    }
+
+    /// [`LibraryWatcher::start`] with the online-only check of `probe`.
+    pub fn start_with(db_path: PathBuf, analyzer: Arc<dyn Analyzer>, probe: Arc<dyn PlaceholderProbe>, debounce: Duration) -> Result<Self> {
         let roots = Library::open(&db_path)?.roots()?;
         let (raw_tx, raw_rx) = unbounded::<notify::Result<notify::Event>>();
         let mut watcher = notify::recommended_watcher(move |ev| {
             let _ = raw_tx.send(ev);
         })?;
         for r in roots.iter().filter(|r| r.watch && r.path.is_dir()) {
-            watcher.watch(&r.path, RecursiveMode::Recursive)?;
+            if let Err(e) = watcher.watch(&r.path, RecursiveMode::Recursive) {
+                log::warn!("library: not watching {}: {e}", r.path.display());
+            }
         }
         let (out_tx, out_rx) = unbounded();
         let (stop_tx, stop_rx) = unbounded::<()>();
@@ -80,19 +99,21 @@ impl LibraryWatcher {
                     }
                     let mut indexed = Vec::new();
                     let mut removed = 0;
-                    for p in std::mem::take(&mut pending) {
-                        if p.is_file() {
-                            if is_audio(&p) {
-                                match lib.index_file(analyzer.as_ref(), &p) {
-                                    Ok(Some(id)) => indexed.push(id),
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        let _ = out_tx.send(WatchEvent::Error(e.to_string()));
-                                    }
-                                }
+                    let batch = std::mem::take(&mut pending);
+                    // Removals first: an evicted iCloud file disappears and its
+                    // stub appears in the same batch, and the stub must win.
+                    for p in batch.iter().filter(|p| !p.exists()) {
+                        // A stub gone without its file: deleted in the cloud.
+                        let gone = icloud_stub_target(p).filter(|real| !real.exists());
+                        removed += lib.forget_path(gone.as_deref().unwrap_or(p)).unwrap_or(0);
+                    }
+                    for p in batch.iter().filter(|p| p.is_file() && indexable(p)) {
+                        match lib.index_file_with(analyzer.as_ref(), probe.as_ref(), p) {
+                            Ok(Some(id)) => indexed.push(id),
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = out_tx.send(WatchEvent::Error(e.to_string()));
                             }
-                        } else if !p.exists() {
-                            removed += lib.forget_path(&p).unwrap_or(0);
                         }
                     }
                     if !indexed.is_empty() {

@@ -52,7 +52,9 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
     let state = |f: fn(&aitrack_model::Clip) -> bool| clips.iter().filter_map(|(_, pl, _)| ws.s.project.clips.get(&pl.clip)).any(f);
     let looping = state(|c| c.looping.is_some());
     let muted = !clips.is_empty() && !state(|c| !c.muted);
-    widgets::menu_card("clip-menu", 232.)
+    // The clip under the mouse, when it is audio and other clips play its file too.
+    let sample = ws.s.selected_placement.and_then(|(_, id)| ws.s.placement(id)).map(|(_, pl, _)| pl.clip).filter(|c| ws.s.sample_targets(*c).len() > 1);
+    let card = widgets::menu_card("clip-menu", 232.)
         .child(command("clip-cut", Icon::Scissors, "Cut", Cmd::Cut, cx))
         .child(command("clip-copy", Icon::Copy, "Copy", Cmd::Copy, cx))
         .child(command("clip-paste", Icon::Paste, "Paste", Cmd::Paste, cx))
@@ -73,6 +75,17 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         .child(command("clip-rename", Icon::Pencil, "Rename", Cmd::Rename, cx))
         .child(action("clip-active", Icon::Power, if muted { "Activate" } else { "Deactivate" }, keys::action_hint("ToggleActive"), false, cx, |this, _, _| {
             this.s.toggle_clips_active();
+        }));
+    let Some(clip) = sample else { return card.into_any_element() };
+    // Transpose, detune and reverse of this clip on every clip of its sample.
+    card.child(widgets::divider_h())
+        .child(action("clip-sample-all", Icon::Waveform, "Apply to All Clips of This Sample", None, false, cx, move |this, _, cx| {
+            let n = this.s.sample_targets(clip).len();
+            if this.s.match_sample_pitch(clip) {
+                this.toast(format!("Pitch applied to all {n} clips of this sample"), cx);
+            } else {
+                this.toast("Every clip of this sample already has this pitch", cx);
+            }
         }))
         .into_any_element()
 }

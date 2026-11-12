@@ -4,6 +4,10 @@
 //! analysed by an older analyzer version, or when `force` is set. Files that
 //! disappeared are marked `missing` (kept for relinking by hash) rather than
 //! deleted.
+//!
+//! Online-only files in cloud folders (see [`crate::cloud`]) are never read:
+//! a [`PlaceholderProbe`] spots them from their metadata, and they are
+//! indexed from their names alone and flagged `cloud` until they are local.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -15,11 +19,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, unbounded};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::analyze::Analyzer;
+use crate::analyze::{Analysis, Analyzer, AudioInfo, analysis_from_hints};
+use crate::cloud::{OsProbe, PlaceholderProbe, icloud_stub_target};
 use crate::db::{Library, PackInfo, Root, RootId, SampleId, now, rel_string};
 use crate::error::{LibraryError, Result};
 use crate::parse::{NameHints, parse_path};
@@ -106,7 +111,23 @@ pub struct ScanStats {
     pub missing: u64,
     pub errors: u64,
     pub presets: u64,
+    /// Online-only files seen (indexed by name, not read).
+    pub cloud: u64,
     pub cancelled: bool,
+}
+
+/// Analyzer id stored on rows indexed from the name of an online-only file.
+pub const CLOUD_ANALYZER: &str = "cloud-name";
+
+/// What the name of an online-only file says, without its audio: a tempo in
+/// the name makes it a loop (there is no length to check it against).
+pub(crate) fn placeholder_analysis(hints: &NameHints) -> Analysis {
+    let mut a = analysis_from_hints(AudioInfo::default(), hints);
+    if hints.kind.is_none() && hints.bpm.is_some() {
+        a.kind = crate::taxonomy::SampleKind::Loop;
+        a.loop_family = Some(crate::taxonomy::loop_family(a.category, hints.subcategory, hints.top_loop));
+    }
+    a
 }
 
 /// The pack a file belongs to: its first folder under the root, or the
@@ -195,6 +216,18 @@ impl Library {
         progress: &mut dyn FnMut(&ScanProgress),
         cancel: &AtomicBool,
     ) -> Result<ScanStats> {
+        self.scan_with(analyzer, &OsProbe, opts, progress, cancel)
+    }
+
+    /// [`Library::scan`] with the online-only check of `probe`.
+    pub fn scan_with(
+        &self,
+        analyzer: &dyn Analyzer,
+        probe: &dyn PlaceholderProbe,
+        opts: &ScanOptions,
+        progress: &mut dyn FnMut(&ScanProgress),
+        cancel: &AtomicBool,
+    ) -> Result<ScanStats> {
         let mut stats = ScanStats::default();
         let roots: Vec<Root> = self
             .roots()?
@@ -202,7 +235,7 @@ impl Library {
             .filter(|r| opts.roots.as_ref().is_none_or(|ids| ids.contains(&r.id)))
             .collect();
         for root in roots {
-            self.scan_root(&root, analyzer, opts, progress, cancel, &mut stats)?;
+            self.scan_root(&root, analyzer, probe, opts, progress, cancel, &mut stats)?;
             if stats.cancelled {
                 break;
             }
@@ -210,10 +243,12 @@ impl Library {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_root(
         &self,
         root: &Root,
         analyzer: &dyn Analyzer,
+        probe: &dyn PlaceholderProbe,
         opts: &ScanOptions,
         progress: &mut dyn FnMut(&ScanProgress),
         cancel: &AtomicBool,
@@ -223,11 +258,11 @@ impl Library {
             log::warn!("library root missing: {}", root.path.display());
             return Ok(());
         }
-        // Existing rows: rel → (size, mtime, version, status).
-        let mut existing: HashMap<String, (u64, i64, u32, String)> = HashMap::new();
+        // Existing rows: rel → (size, mtime, version, status, cloud).
+        let mut existing: HashMap<String, (u64, i64, u32, String, bool)> = HashMap::new();
         {
             let mut st = self.conn.prepare(
-                "SELECT rel_path, size, mtime, analysis_version, status, COALESCE(analyzer, '')
+                "SELECT rel_path, size, mtime, analysis_version, status, COALESCE(analyzer, ''), cloud
                  FROM samples WHERE root_id = ?1",
             )?;
             let rows = st.query_map([root.id.0], |r| {
@@ -238,24 +273,34 @@ impl Library {
                     r.get::<_, i64>(3)? as u32,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
                 ))
             })?;
             for row in rows {
-                let (rel, size, mtime, ver, status, an) = row?;
+                let (rel, size, mtime, ver, status, an, cloud) = row?;
                 // A row analysed by a different analyzer counts as stale.
                 let ver = if an == analyzer.id() || status == "error" { ver } else { 0 };
-                existing.insert(rel, (size, mtime, ver, status));
+                existing.insert(rel, (size, mtime, ver, status, cloud));
             }
         }
 
         let mut audio_files = Vec::new();
         let mut preset_files = Vec::new();
+        // Evicted iCloud files: the file they stand for → the stub.
+        let mut stubs: HashMap<PathBuf, PathBuf> = HashMap::new();
         for entry in WalkDir::new(&root.path).follow_links(false).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
             let p = entry.path();
             let rel_p = p.strip_prefix(&root.path).unwrap_or(p);
+            if let Some(real) = icloud_stub_target(p) {
+                let rel_real = real.strip_prefix(&root.path).unwrap_or(&real);
+                if is_audio(rel_real) && !is_junk(rel_real) {
+                    stubs.insert(real, entry.into_path());
+                }
+                continue;
+            }
             if is_junk(rel_p) {
                 continue;
             }
@@ -265,6 +310,11 @@ impl Library {
                 preset_files.push(entry.into_path());
             }
         }
+        // A stub next to its file is a download in progress: the file wins.
+        for f in &audio_files {
+            stubs.remove(f);
+        }
+        audio_files.extend(stubs.keys().cloned());
         audio_files.sort();
 
         let total = audio_files.len() as u64;
@@ -286,16 +336,32 @@ impl Library {
             let rel = rel_string(path.strip_prefix(&root.path).unwrap_or(path));
             seen.insert(rel.clone());
             stats.seen += 1;
-            let Ok(md) = std::fs::metadata(path) else { continue };
-            let size = md.len();
+            let stub = stubs.get(path);
+            let Ok(md) = std::fs::metadata(stub.unwrap_or(path)) else { continue };
+            // A stub's own size is its plist's, not the audio's.
+            let size = if stub.is_some() { 0 } else { md.len() };
             let mtime = mtime_of(&md);
             let prev = existing.get(&rel);
-            if let Some((psize, pmtime, pver, status)) = prev
+            if stub.is_some() || probe.is_placeholder(path, &md) {
+                stats.cloud += 1;
+                self.index_placeholder(root, &rel, path, size, mtime, prev, &mut packs, stats)?;
+                in_tx += 1;
+                if in_tx >= 200 {
+                    self.conn.execute_batch("COMMIT; BEGIN")?;
+                    in_tx = 0;
+                }
+                continue;
+            }
+            if let Some((psize, pmtime, pver, status, cloud)) = prev
                 && !opts.force
                 && *psize == size
                 && *pmtime == mtime
                 && (status == "error" || *pver >= analyzer.version())
             {
+                if *cloud {
+                    // Downloaded since: the analysis it had before it was evicted holds.
+                    self.set_cloud(root.id, &rel, false)?;
+                }
                 if status == "missing" {
                     self.conn.execute(
                         "UPDATE samples SET status='ok' WHERE root_id=?1 AND rel_path=?2",
@@ -333,7 +399,7 @@ impl Library {
         }
 
         if !stats.cancelled {
-            for (rel, (.., status)) in &existing {
+            for (rel, (_, _, _, status, _)) in &existing {
                 if !seen.contains(rel) && status != "missing" {
                     self.conn.execute(
                         "UPDATE samples SET status='missing' WHERE root_id=?1 AND rel_path=?2",
@@ -352,6 +418,68 @@ impl Library {
         }
         self.conn.execute_batch("COMMIT")?;
         progress(&ScanProgress { root: Some(root.id), done: total, total, current: None });
+        Ok(())
+    }
+
+    /// Indexes an online-only file from its name. A row whose file only got
+    /// evicted (same size and date) keeps its analysis and is just flagged.
+    #[allow(clippy::too_many_arguments)]
+    fn index_placeholder(
+        &self,
+        root: &Root,
+        rel: &str,
+        path: &Path,
+        size: u64,
+        mtime: i64,
+        prev: Option<&(u64, i64, u32, String, bool)>,
+        packs: &mut PackCache<'_>,
+        stats: &mut ScanStats,
+    ) -> Result<()> {
+        if let Some((psize, pmtime, _, status, cloud)) = prev
+            && status != "error"
+            // Size 0 is an iCloud stub, whose audio size is unknown: whatever
+            // the row knew about the file still holds.
+            && ((*psize == size && *pmtime == mtime) || size == 0)
+        {
+            if !*cloud {
+                self.set_cloud(root.id, rel, true)?;
+            }
+            if status == "missing" {
+                self.conn.execute("UPDATE samples SET status='ok' WHERE root_id=?1 AND rel_path=?2", params![root.id.0, rel])?;
+                let id: i64 = self.conn.query_row(
+                    "SELECT id FROM samples WHERE root_id=?1 AND rel_path=?2",
+                    params![root.id.0, rel],
+                    |r| r.get(0),
+                )?;
+                self.refresh_fts(SampleId(id))?;
+            }
+            stats.unchanged += 1;
+            return Ok(());
+        }
+        let pack_id = pack_id_for(&root.path, rel);
+        let pack = match &pack_id {
+            Some(id) => packs.get(id)?.cloned(),
+            None => None,
+        };
+        let a = placeholder_analysis(&hints_for(&root.path, rel, path, pack.as_ref()));
+        self.upsert_analysis(
+            root.id,
+            rel,
+            size,
+            mtime,
+            None,
+            &a,
+            pack_id.as_deref(),
+            pack.as_ref().and_then(|p| p.license.as_deref()),
+            CLOUD_ANALYZER,
+            0,
+        )?;
+        self.set_cloud(root.id, rel, true)?;
+        if prev.is_some() {
+            stats.updated += 1;
+        } else {
+            stats.added += 1;
+        }
         Ok(())
     }
 
@@ -432,8 +560,17 @@ impl Library {
         Ok(seen.len() as u64)
     }
 
-    /// (Re)indexes a single file inside a known root. Used by the watcher.
+    /// (Re)indexes a single file inside a known root. Used by the watcher
+    /// and after a cloud download.
     pub fn index_file(&self, analyzer: &dyn Analyzer, path: &Path) -> Result<Option<SampleId>> {
+        self.index_file_with(analyzer, &OsProbe, path)
+    }
+
+    /// [`Library::index_file`] with the online-only check of `probe`. An
+    /// online-only file (or an iCloud stub) is indexed by name, unread.
+    pub fn index_file_with(&self, analyzer: &dyn Analyzer, probe: &dyn PlaceholderProbe, path: &Path) -> Result<Option<SampleId>> {
+        let stub = icloud_stub_target(path).map(|real| (real, path.to_path_buf()));
+        let path = stub.as_ref().map_or(path, |(real, _)| real.as_path());
         if !is_audio(path) {
             return Ok(None);
         }
@@ -442,9 +579,19 @@ impl Library {
         if is_junk(rel_p) {
             return Ok(None);
         }
-        let md = std::fs::metadata(path)?;
         let rel = rel_string(rel_p);
         let mut packs = PackCache { lib: self, map: HashMap::new() };
+        if let Some((_, stub_path)) = &stub {
+            if path.exists() {
+                return Ok(None); // the download landed; the file's own event indexes it
+            }
+            let md = std::fs::metadata(stub_path)?;
+            return self.index_one_placeholder(&root, &rel, path, 0, mtime_of(&md), &mut packs);
+        }
+        let md = std::fs::metadata(path)?;
+        if probe.is_placeholder(path, &md) {
+            return self.index_one_placeholder(&root, &rel, path, md.len(), mtime_of(&md), &mut packs);
+        }
         match self.analyze_one(&root, &rel, path, md.len(), mtime_of(&md), analyzer, &mut packs) {
             Ok(id) => Ok(Some(id)),
             Err(e) => {
@@ -452,6 +599,23 @@ impl Library {
                 Ok(None)
             }
         }
+    }
+
+    fn index_one_placeholder(&self, root: &Root, rel: &str, path: &Path, size: u64, mtime: i64, packs: &mut PackCache<'_>) -> Result<Option<SampleId>> {
+        let prev: Option<(u64, i64, u32, String, bool)> = self
+            .conn
+            .query_row(
+                "SELECT size, mtime, analysis_version, status, cloud FROM samples WHERE root_id=?1 AND rel_path=?2",
+                params![root.id.0, rel],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        self.index_placeholder(root, rel, path, size, mtime, prev.as_ref(), packs, &mut ScanStats::default())?;
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM samples WHERE root_id=?1 AND rel_path=?2", params![root.id.0, rel], |r| r.get(0))
+            .optional()?
+            .map(SampleId))
     }
 
     /// Marks a removed file, or everything under a removed folder, as missing.

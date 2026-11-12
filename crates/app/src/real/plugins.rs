@@ -4,18 +4,23 @@
 //! * [`StockFactory`]: `DeviceKind::Stock` → `aitrack_stock::create`.
 //! * [`HostedFactory`]: `DeviceKind::Plugin` → a VST3/CLAP plugin, in this
 //!   process (loaded on the main thread, see [`MainThread`]) or in the
-//!   `aitrack-plugin-host` sandbox when the setting is on.
+//!   `aitrack-plugin-host` sandbox when the setting is on. In process, an
+//!   editor that never returns from its own drawing (Dragonfly Early
+//!   Reflections on macOS) freezes this UI for good; in the sandbox the
+//!   host's watchdog kills that process, the device goes silent and
+//!   [`PluginRuntime::idle`] tells the user. The sandbox is the safe choice
+//!   for plugins whose editors misbehave.
 //! * [`RealCatalog`]: stock devices with their real `ParamInfo`s, factory
 //!   presets, and the plugin scan (background thread, cached in the app
 //!   data folder).
 
 use super::main_thread::MainThread;
-use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PresetInfo, ScanStatus};
+use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PresetInfo, ScanStatus};
 use aitrack_dsp::{Category, PluginInfo, ProcessContext, Processor};
 use aitrack_engine::ProcessorFactory;
 use aitrack_host::sandbox::{SandboxEditor, SandboxedPlugin};
 use aitrack_host::scan::Scanner;
-use aitrack_host::{HostedPlugin, HostedPluginInfo, PluginController};
+use aitrack_host::{HostedPlugin, HostedPluginInfo, ParamEdit, ParamEditKind, PluginController};
 use aitrack_model::{Device, DeviceId, DeviceKind};
 use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::{Mutex, RwLock};
@@ -89,6 +94,9 @@ pub fn stock_devices() -> Vec<DeviceInfo> {
 struct Instances {
     controllers: HashMap<DeviceId, (u64, PluginController)>,
     sandboxed: HashMap<DeviceId, (u64, SandboxEditor)>,
+    /// Edits made in each plugin's own GUI (lock-free queues filled on the
+    /// audio thread), drained on the UI tick.
+    edits: HashMap<DeviceId, (u64, rtrb::Consumer<ParamEdit>)>,
 }
 
 /// State shared by the hosted plugin factories, the catalogue and the UI.
@@ -99,7 +107,23 @@ pub struct PluginRuntime {
     instances: Mutex<Instances>,
     pub sandbox: AtomicBool,
     messages: Mutex<Vec<String>>,
+    /// GUI edits drained from the queues, waiting for the UI to turn them
+    /// into commands.
+    edits: Mutex<Vec<PluginEdit>>,
     next_token: AtomicU64,
+}
+
+/// More than this many pending GUI edits (nobody draining) are dropped,
+/// oldest first.
+const MAX_PENDING_EDITS: usize = 8192;
+
+fn plugin_edit(device: DeviceId, e: ParamEdit) -> PluginEdit {
+    let kind = match e.kind {
+        ParamEditKind::Begin => PluginEditKind::Begin,
+        ParamEditKind::Value => PluginEditKind::Value,
+        ParamEditKind::End => PluginEditKind::End,
+    };
+    PluginEdit { device, param: e.id, value: e.value, kind }
 }
 
 impl PluginRuntime {
@@ -110,6 +134,7 @@ impl PluginRuntime {
             instances: Mutex::new(Instances::default()),
             sandbox: AtomicBool::new(sandbox),
             messages: Mutex::new(Vec::new()),
+            edits: Mutex::new(Vec::new()),
             next_token: AtomicU64::new(1),
         })
     }
@@ -148,14 +173,54 @@ impl PluginRuntime {
         })
     }
 
-    /// Main thread: run queued plugin work and editor housekeeping.
+    /// Main thread: run queued plugin work and editor housekeeping, and
+    /// report sandboxed plugins whose host stopped responding.
     pub fn idle(&self) -> bool {
         let ran = self.main.pump();
+        let hung: Vec<&'static str> = self.instances.lock().sandboxed.values().filter(|(_, e)| e.take_hung()).map(|(_, e)| e.name()).collect();
+        for name in &hung {
+            self.message(format!("{name} stopped responding and was closed. It stays silent until you remove it and add it again."));
+        }
         let controllers: Vec<PluginController> = self.instances.lock().controllers.values().map(|(_, c)| c.clone()).collect();
         for c in controllers {
             c.idle();
         }
-        ran > 0
+        let mut drained = Vec::new();
+        for (device, (_, queue)) in self.instances.lock().edits.iter_mut() {
+            while let Ok(e) = queue.pop() {
+                drained.push(plugin_edit(*device, e));
+            }
+        }
+        let got = !drained.is_empty();
+        if got {
+            let mut edits = self.edits.lock();
+            edits.extend(drained);
+            let excess = edits.len().saturating_sub(MAX_PENDING_EDITS);
+            edits.drain(..excess);
+        }
+        ran > 0 || got || !hung.is_empty()
+    }
+
+    /// Edits made in plugin editors since the last call, oldest first.
+    pub fn take_edits(&self) -> Vec<PluginEdit> {
+        std::mem::take(&mut *self.edits.lock())
+    }
+
+    /// Main thread: the current state of every live in-process plugin, so
+    /// the project can store it before saving. Plugins that fail to save
+    /// are left out (their stored state stays as it was).
+    pub fn capture_states(&self) -> Vec<(DeviceId, Vec<u8>)> {
+        let controllers: Vec<(DeviceId, PluginController)> =
+            self.instances.lock().controllers.iter().map(|(d, (_, c))| (*d, c.clone())).collect();
+        let mut out = Vec::with_capacity(controllers.len());
+        for (device, c) in controllers {
+            match c.save_state() {
+                Ok(state) if !state.is_empty() => out.push((device, state)),
+                Ok(_) => {}
+                Err(e) => log::warn!("saving the state of {}: {e}", c.info().name),
+            }
+        }
+        out
     }
 
     /// Main thread: open a hosted device's editor.
@@ -188,6 +253,9 @@ impl PluginRuntime {
         if i.sandboxed.get(&device).is_some_and(|(t, _)| *t == token) {
             i.sandboxed.remove(&device);
         }
+        if i.edits.get(&device).is_some_and(|(t, _)| *t == token) {
+            i.edits.remove(&device);
+        }
     }
 }
 
@@ -211,9 +279,13 @@ impl ProcessorFactory for HostedFactory {
         let token = self.rt.token();
         if self.rt.sandbox.load(Ordering::Relaxed) {
             return match SandboxedPlugin::spawn(&info) {
-                Ok(p) => {
+                Ok(mut p) => {
                     if self.live {
-                        self.rt.instances.lock().sandboxed.insert(device.id, (token, p.editor_handle()));
+                        let mut i = self.rt.instances.lock();
+                        i.sandboxed.insert(device.id, (token, p.editor_handle()));
+                        if let Some(q) = p.take_param_edits() {
+                            i.edits.insert(device.id, (token, q));
+                        }
                     }
                     Some(Box::new(Tracked { inner: p, rt: self.rt.clone(), key: self.live.then_some((device.id, token)) }))
                 }
@@ -225,10 +297,14 @@ impl ProcessorFactory for HostedFactory {
         }
         let loaded = self.rt.main.run(LOAD_TIMEOUT, move || HostedPlugin::load(&info).map_err(|e| e.to_string()));
         match loaded {
-            Some(Ok(plugin)) => {
+            Some(Ok(mut plugin)) => {
                 let controller = plugin.controller();
                 if self.live {
-                    self.rt.instances.lock().controllers.insert(device.id, (token, controller.clone()));
+                    let mut i = self.rt.instances.lock();
+                    i.controllers.insert(device.id, (token, controller.clone()));
+                    if let Some(q) = plugin.take_param_edits() {
+                        i.edits.insert(device.id, (token, q));
+                    }
                 }
                 let info = plugin.info().clone();
                 Some(Box::new(MainThreadPlugin {

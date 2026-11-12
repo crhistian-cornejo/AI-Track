@@ -34,6 +34,7 @@ pub mod sampler;
 pub mod saturator;
 pub mod shaper;
 pub mod utility;
+pub mod vault;
 pub mod wavetable;
 
 use crate::bridge::{EngineBridge, PluginCatalog};
@@ -44,7 +45,7 @@ use aitrack_dsp::ParamInfo;
 use aitrack_model::{Command, Device, DeviceId};
 use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, FocusHandle, InteractiveElement, IntoElement, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, anchored, canvas, deferred, div, prelude::FluentBuilder, px,
+    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, WindowId, anchored, canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -205,12 +206,16 @@ pub enum PopKind {
     /// The track a device listens to on its sidechain; `param` is its
     /// Internal/External switch, set along with the source.
     Sidechain { device: DeviceId, param: u32 },
+    /// The synth window's menus (wavetables, matrix sources and destinations…).
+    Synth(crate::views::device_window::synth::SynthPop),
 }
 
 #[derive(Clone, Debug)]
 pub struct Pop {
     pub kind: PopKind,
     pub at: Point<Pixels>,
+    /// The window it was opened in (`None` = the main window).
+    pub window: Option<WindowId>,
     seq: u64,
 }
 
@@ -237,10 +242,21 @@ pub struct UiState {
     pub opts: HashMap<(DeviceId, u8), f32>,
     sets: HashMap<String, Rc<ParamSet>>,
     live: HashMap<DeviceId, Live>,
-    regions: HashMap<(DeviceId, u8), Region>,
-    focus: HashMap<DeviceId, FocusHandle>,
+    regions: HashMap<(DeviceId, u8, u64), Region>,
+    focus: HashMap<(DeviceId, u64), FocusHandle>,
     pub waves: kit::WaveCache,
-    pub tables: Option<Rc<Vec<aitrack_dsp::wavetable::Wavetable>>>,
+    /// Wavetable frames for the synth displays, built off the UI thread.
+    pub wave_previews: wavetable::Previews,
+    /// The window whose input is being handled (set by each window's root
+    /// on mouse-down, before the controls see the event; `None` = main).
+    pub surface: Option<WindowId>,
+    /// The window being rendered (`None` = main): plots keep their bounds
+    /// and focus per window, so one device can be open in two at once.
+    pub painting: Option<WindowId>,
+    /// View state of the synth windows (tabs, editor tools, gestures).
+    pub synth: HashMap<DeviceId, crate::views::device_window::synth::SynthView>,
+    /// The Vault browsers (factory list, favourites, filters per device).
+    pub vault: crate::views::device_window::vault::VaultState,
     last_change: Instant,
     pub sample_rate: f64,
 }
@@ -261,7 +277,11 @@ impl Default for UiState {
             regions: HashMap::new(),
             focus: HashMap::new(),
             waves: kit::WaveCache::default(),
-            tables: None,
+            wave_previews: wavetable::Previews::default(),
+            surface: None,
+            painting: None,
+            synth: HashMap::new(),
+            vault: Default::default(),
             last_change: Instant::now() - Duration::from_secs(10),
             sample_rate: 48_000.,
         }
@@ -349,11 +369,13 @@ impl UiState {
 
     /// The canvas bounds of a device's plot `slot`, written during prepaint.
     pub fn region(&mut self, device: DeviceId, slot: u8) -> Region {
-        self.regions.entry((device, slot)).or_default().clone()
+        let w = self.painting.map_or(0, |w| w.as_u64());
+        self.regions.entry((device, slot, w)).or_default().clone()
     }
 
     pub fn focus(&mut self, device: DeviceId, cx: &mut App) -> FocusHandle {
-        self.focus.entry(device).or_insert_with(|| cx.focus_handle()).clone()
+        let w = self.painting.map_or(0, |w| w.as_u64());
+        self.focus.entry((device, w)).or_insert_with(|| cx.focus_handle()).clone()
     }
 
     pub fn opt(&self, device: DeviceId, slot: u8, default: f32) -> f32 {
@@ -365,16 +387,19 @@ impl UiState {
             self.pop = None;
         } else {
             self.pop_seq += 1;
-            self.pop = Some(Pop { kind, at, seq: self.pop_seq });
+            self.pop = Some(Pop { kind, at, window: self.surface, seq: self.pop_seq });
         }
     }
 
     /// Forget devices that left the project.
     pub fn prune(&mut self, alive: impl Fn(DeviceId) -> bool) {
         self.live.retain(|id, _| alive(*id));
-        self.regions.retain(|(id, _), _| alive(*id));
-        self.focus.retain(|id, _| alive(*id));
+        self.regions.retain(|(id, _, _), _| alive(*id));
+        self.focus.retain(|(id, _), _| alive(*id));
         self.selected.retain(|id, _| alive(*id));
+        self.wave_previews.prune(&alive);
+        self.synth.retain(|id, _| alive(*id));
+        self.vault.prune(&alive);
     }
 }
 
@@ -458,13 +483,15 @@ pub fn capture(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement
 
 // ───────────────────────────── Popovers ─────────────────────────────
 
-/// The open popover (choice list or EQ band menu), anchored where it was opened.
-pub fn overlay(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
-    let pop = ws.fx.pop.clone()?;
+/// The open popover (choice list or EQ band menu), anchored where it was
+/// opened; each window draws only the popovers opened in it.
+pub fn overlay(ws: &mut Workspace, window: Option<WindowId>, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let pop = ws.fx.pop.clone().filter(|p| p.window == window)?;
     let body = match &pop.kind {
         PopKind::Choice { device, param } => choice_menu(ws, *device, *param, cx)?,
         PopKind::EqBand { device, band } => eq::band_menu(ws, *device, *band, cx)?,
         PopKind::Sidechain { device, param } => sidechain_menu(ws, *device, *param, cx)?,
+        PopKind::Synth(pop) => crate::views::device_window::synth::pop_menu(ws, pop, cx)?,
     };
     let id = gpui::ElementId::Name(format!("fx-pop-{}", pop.seq).into());
     Some(
@@ -494,7 +521,8 @@ fn choice_menu(ws: &mut Workspace, device: DeviceId, param: u32, cx: &mut Contex
     let info = set.get(param)?.clone();
     let now = (info.to_plain(current(ws, device, &info)) - info.min).round() as usize;
     let mut list = div().id("fx-choices").max_h(px(420.)).overflow_y_scroll().flex().flex_col();
-    for (i, name) in info.choices.iter().enumerate() {
+    // Lists padded for future entries show only the named ones.
+    for (i, name) in info.choices.iter().enumerate().filter(|(_, n)| **n != "—") {
         let norm = info.to_normalized(info.min + i as f32);
         list = list.child(menu_item(("fx-choice", i), None, *name, None, i == now).on_click(cx.listener(move |this, _, _, cx| {
             set_now(this, device, param, norm);
@@ -600,6 +628,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "instrument.wavetable"
             | "instrument.sampler"
             | "instrument.drum"
+            | "instrument.vault"
     )
 }
 
@@ -623,6 +652,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "instrument.wavetable" => wavetable::render(ws, dev, cx),
         "instrument.sampler" => sampler::render(ws, dev, d, cx),
         "instrument.drum" => drum::render(ws, dev, d, cx),
+        "instrument.vault" => vault::render(ws, dev, cx),
         _ => generic::render(ws, dev, cx),
     }
 }

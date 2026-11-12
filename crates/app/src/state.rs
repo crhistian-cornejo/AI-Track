@@ -97,6 +97,21 @@ pub struct PianoView {
     pub scroll_y: f32,
 }
 
+/// A time range in one automation lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoRange {
+    pub track: TrackId,
+    pub target: AutomationTarget,
+    pub start: Tick,
+    pub end: Tick,
+}
+
+impl AutoRange {
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
 pub struct AppState {
     pub project: Project,
     pub history: History,
@@ -113,6 +128,12 @@ pub struct AppState {
     pub piano: PianoView,
     /// Selection, insert marker, clipboard and grid of the editing commands.
     pub ed: crate::editing::EditState,
+    /// The time range dragged out in an automation lane (Live's automation
+    /// selection). Cut, Copy, Paste, Duplicate and Delete act on it while it
+    /// is set; `start == end` is a caret, where Paste lands.
+    pub auto_sel: Option<AutoRange>,
+    /// What Copy took from an automation range: breakpoints from tick 0 and the span.
+    pub auto_clip: Option<(Vec<AutomationPoint>, Tick)>,
     /// Length new notes get (the last drawn or resized length, FL-style).
     pub note_length: Tick,
     pub last_error: Option<String>,
@@ -136,6 +157,8 @@ impl AppState {
             arrange: ArrangeView { px_per_beat: 7., scroll_x: 0., scroll_y: 0. },
             piano: PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 0. },
             ed: Default::default(),
+            auto_sel: None,
+            auto_clip: None,
             note_length: PPQ / 2,
             last_error: None,
         };
@@ -218,6 +241,9 @@ impl AppState {
 
     pub(crate) fn prune_selection(&mut self) {
         self.prune_edit_selection();
+        if self.auto_sel.is_some_and(|r| self.project.track(r.track).is_none()) {
+            self.auto_sel = None;
+        }
         if let Some(c) = self.selected_clip
             && !self.project.clips.contains_key(&c) {
                 self.selected_clip = None;
@@ -523,6 +549,9 @@ impl AppState {
     /// Ctrl+D: duplicate the selected notes right after themselves, or the
     /// selected arrangement clip right after itself (as an independent copy).
     pub fn duplicate_selection(&mut self) -> bool {
+        if let Some(done) = self.duplicate_auto_range() {
+            return done;
+        }
         if let Some(done) = self.duplicate_arrangement() {
             return done;
         }
@@ -713,8 +742,50 @@ impl AppState {
     /// Edits under the same `key` (one drag) are one undo step.
     pub fn set_clip_warp(&mut self, key: &str, clip: ClipId, f: impl Fn(&mut Warp)) -> bool {
         let targets = self.warp_targets(clip);
+        self.set_warp_of(key, &targets, f)
+    }
+
+    /// Every audio clip that plays the same file as `clip` (whether it shares
+    /// `clip`'s source or got a copy of its own when it was transposed
+    /// alone), `clip` first. Empty when `clip` is not an audio clip.
+    pub fn sample_targets(&self, clip: ClipId) -> Vec<ClipId> {
+        let path_of = |c: &Clip| match self.project.sources.get(&c.source) {
+            Some(Source::Audio(a)) => Some(a.path.clone()),
+            _ => None,
+        };
+        let Some(path) = self.project.clips.get(&clip).and_then(path_of) else { return Vec::new() };
+        let mut out = vec![clip];
+        out.extend(self.project.clips.iter().filter(|(id, c)| **id != clip && path_of(c).as_ref() == Some(&path)).map(|(id, _)| *id));
+        out
+    }
+
+    /// As [`Self::set_clip_warp`], on every clip of the sample `clip` plays
+    /// ([`Self::sample_targets`]), selected or not: Cmd/Ctrl + a Transpose or
+    /// Detune drag, and "Apply to all clips of this sample".
+    pub fn set_sample_warp(&mut self, key: &str, clip: ClipId, f: impl Fn(&mut Warp)) -> bool {
+        let targets = self.sample_targets(clip);
+        self.set_warp_of(key, &targets, f)
+    }
+
+    /// Give every clip of the sample `clip` plays the transpose, detune and
+    /// reverse `clip` has; each keeps its own warp and stretch. One undo step.
+    pub fn match_sample_pitch(&mut self, clip: ClipId) -> bool {
+        let Some(Source::Audio(a)) = self.project.clips.get(&clip).and_then(|c| self.project.sources.get(&c.source)) else { return false };
+        let (transpose, detune, reverse) = (a.warp.transpose, a.warp.detune, a.warp.reverse);
+        self.seal();
+        let ok = self.set_sample_warp("sample-pitch", clip, |w| {
+            w.transpose = transpose;
+            w.detune = detune;
+            w.reverse = reverse;
+        });
+        self.seal();
+        ok
+    }
+
+    /// The sample edit of [`Self::set_clip_warp`] on exactly `targets`.
+    fn set_warp_of(&mut self, key: &str, targets: &[ClipId], f: impl Fn(&mut Warp)) -> bool {
         let mut sources: Vec<SourceId> = Vec::new();
-        for c in &targets {
+        for c in targets {
             if let Some(s) = self.project.clips.get(c).map(|c| c.source).filter(|s| !sources.contains(s)) {
                 sources.push(s);
             }
@@ -736,7 +807,7 @@ impl AppState {
             }
             let id = self.project.alloc_source_id();
             cmds.push(Command::AddSource { id, source: Box::new(Source::Audio(AudioSource { warp, ..a })) });
-            for c in &targets {
+            for c in targets {
                 if let Some(clip) = self.project.clips.get(c).filter(|cl| cl.source == src) {
                     cmds.push(Command::UpdateClip { id: *c, clip: Box::new(Clip { source: id, ..clip.clone() }) });
                 }
@@ -880,7 +951,7 @@ impl AppState {
     }
 
     pub fn resize_clip(&mut self, clip: ClipId, length: Tick) -> bool {
-        // Past the end of its file an audio clip starts looping.
+        // A one-shot audio clip stops at the end of its file; a looping one repeats.
         let Some(cmd) = aitrack_model::ops::resize_end(&self.project, clip, length) else { return false };
         self.edit_coalesced("clip-resize", "Resize clip", vec![cmd])
     }
@@ -959,8 +1030,166 @@ impl AppState {
         self.edit_coalesced("automation-curve", "Curve automation", vec![Command::SetAutomation { track, target, lane: Some(lane) }])
     }
 
+    // ── Hosted plugins ──
+
+    /// Parameter edits made in plugin windows (oldest first) become
+    /// `SetParam` commands: each `Begin`…`End` gesture on one parameter is
+    /// one undo step. A value the project already holds is skipped, so the
+    /// engine never sends a plugin back what it just reported; values the
+    /// host sets are not reported by plugins as edits, so nothing loops.
+    /// Returns whether the project changed.
+    pub fn apply_plugin_edits(&mut self, edits: &[crate::bridge::PluginEdit]) -> bool {
+        use crate::bridge::PluginEditKind;
+        let mut changed = false;
+        for e in edits {
+            match e.kind {
+                PluginEditKind::Begin => {}
+                PluginEditKind::Value => {
+                    let Some(d) = self.project.device(e.device) else { continue };
+                    let value = e.value.clamp(0., 1.);
+                    if d.params.get(&e.param).is_some_and(|v| (v - value).abs() < 1e-6) {
+                        continue;
+                    }
+                    let key = format!("plugin:{}:{}", e.device, e.param);
+                    changed |= self.edit_coalesced(&key, "Plugin parameter", vec![Command::SetParam { device: e.device, param: e.param, value: Some(value) }]);
+                }
+                PluginEditKind::End => self.seal(),
+            }
+        }
+        changed
+    }
+
+    /// Store the states the plugins report (before saving): one sealed undo
+    /// step "Plugin state" for the devices whose stored state differs.
+    /// Devices no longer in the project are left out. Returns whether any changed.
+    pub fn store_plugin_states(&mut self, states: Vec<(DeviceId, Vec<u8>)>) -> bool {
+        let cmds: Vec<Command> = states
+            .into_iter()
+            .filter(|(device, state)| self.project.device(*device).is_some_and(|d| d.state.as_deref() != Some(state.as_slice())))
+            .map(|(device, state)| Command::SetDeviceState { device, state: Some(state), preset: None })
+            .collect();
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit("Plugin state", cmds);
+        self.seal();
+        ok
+    }
+
+    // ── Automation ranges (Live: drag in an automation lane, then edit that range) ──
+
+    fn lane_points(&self, track: TrackId, target: AutomationTarget) -> Vec<AutomationPoint> {
+        self.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default()
+    }
+
+    /// The command that gives the lane `points` (keeping its other settings).
+    fn lane_command(&self, track: TrackId, target: AutomationTarget, points: Vec<AutomationPoint>) -> Command {
+        let lane = self.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned()).unwrap_or_else(|| AutomationLane::new(target));
+        Command::SetAutomation { track, target, lane: Some(AutomationLane { points, ..lane }) }
+    }
+
+    /// One sealed undo step that sets the lane's points; `false` when nothing changes.
+    fn set_lane_points(&mut self, track: TrackId, target: AutomationTarget, label: &str, points: Vec<AutomationPoint>) -> bool {
+        if points == self.lane_points(track, target) {
+            return false;
+        }
+        let cmd = self.lane_command(track, target, points);
+        self.seal();
+        let ok = self.edit(label, vec![cmd]);
+        self.seal();
+        ok
+    }
+
+    /// Select `a..b` (either order) in an automation lane; the insert marker
+    /// goes to its start.
+    pub fn set_auto_range(&mut self, track: TrackId, target: AutomationTarget, a: Tick, b: Tick) {
+        let (start, end) = (a.min(b).max(0), a.max(b).max(0));
+        self.ed.area = crate::editing::Area::Arrange;
+        self.ed.marker = start;
+        self.selected_track = Some(track);
+        self.auto_sel = Some(AutoRange { track, target, start, end });
+    }
+
+    /// The selected automation range, when the arrangement has the keys.
+    fn active_auto_range(&self) -> Option<AutoRange> {
+        self.auto_sel.filter(|_| self.ed.area == crate::editing::Area::Arrange)
+    }
+
+    /// Ctrl+C on an automation range. `None` when no automation range is selected.
+    pub(crate) fn copy_auto_range(&mut self) -> Option<bool> {
+        let r = self.active_auto_range()?;
+        let points = aitrack_model::automation::slice(&self.lane_points(r.track, r.target), r.start, r.end);
+        if r.is_empty() || points.is_empty() {
+            return Some(false);
+        }
+        self.auto_clip = Some((points, r.end - r.start));
+        Some(true)
+    }
+
+    /// Delete on an automation range: the breakpoints inside go and the
+    /// envelope runs straight across it; the outside is unchanged.
+    pub(crate) fn delete_auto_range(&mut self) -> Option<bool> {
+        let r = self.active_auto_range()?;
+        if r.is_empty() {
+            return Some(false);
+        }
+        let points = aitrack_model::automation::clear(&self.lane_points(r.track, r.target), r.start, r.end);
+        Some(self.set_lane_points(r.track, r.target, "Delete automation", points))
+    }
+
+    /// Ctrl+X on an automation range: Copy, then Delete.
+    pub(crate) fn cut_auto_range(&mut self) -> Option<bool> {
+        let r = self.active_auto_range()?;
+        if self.copy_auto_range() != Some(true) {
+            return Some(false);
+        }
+        let points = aitrack_model::automation::clear(&self.lane_points(r.track, r.target), r.start, r.end);
+        // Cutting a range that was already flat still copied it.
+        self.set_lane_points(r.track, r.target, "Cut automation", points);
+        Some(true)
+    }
+
+    /// Ctrl+V into the selected automation lane, at the start of its range
+    /// (or the caret), over as long as what was copied. The pasted range
+    /// becomes the selection. `None` without an automation range or copy.
+    pub(crate) fn paste_auto_range(&mut self) -> Option<bool> {
+        let r = self.active_auto_range()?;
+        let (clip, span) = self.auto_clip.clone()?;
+        let points = aitrack_model::automation::paste(&self.lane_points(r.track, r.target), r.start, &clip, span);
+        // Pasting what is already there changes nothing, which is still a paste.
+        self.set_lane_points(r.track, r.target, "Paste automation", points);
+        self.set_auto_range(r.track, r.target, r.start, r.start + span);
+        Some(true)
+    }
+
+    /// Ctrl+D on an automation range: it again right after itself, and the
+    /// copy becomes the selection, so repeating it tiles the range.
+    pub(crate) fn duplicate_auto_range(&mut self) -> Option<bool> {
+        let r = self.active_auto_range()?;
+        if r.is_empty() {
+            return Some(false);
+        }
+        let (points, (a, b)) = aitrack_model::automation::duplicate(&self.lane_points(r.track, r.target), r.start, r.end);
+        self.set_lane_points(r.track, r.target, "Duplicate automation", points);
+        self.set_auto_range(r.track, r.target, a, b);
+        Some(true)
+    }
+
+    /// Drag of a selected automation range up or down: `original` moved by
+    /// `delta` (normalised), clamped to the parameter's range. One coalesced
+    /// undo step per drag (sealed on mouse-up).
+    pub fn shift_auto_range(&mut self, range: AutoRange, original: &[AutomationPoint], delta: f32) -> bool {
+        let points = aitrack_model::automation::shift(original, range.start, range.end, delta);
+        let cmd = self.lane_command(range.track, range.target, points);
+        self.edit_coalesced("automation-range", "Move automation", vec![cmd])
+    }
+
     /// Delete whatever is selected: notes in the piano roll, else the selected arrangement clip.
     pub fn delete_selection(&mut self) -> bool {
+        if let Some(done) = self.delete_auto_range() {
+            return done;
+        }
         if let Some(done) = self.delete_arrangement() {
             return done;
         }
@@ -1206,6 +1435,58 @@ mod tests {
         // One undo step brings the shared sample back.
         s.undo();
         assert_eq!(source_of(&s, ids[0].0), src);
+    }
+
+    #[test]
+    fn all_clips_of_a_sample_follow_a_cmd_drag_and_the_menu_item() {
+        let mut s = state();
+        let (&src, _) = s.project.sources.iter().find(|(_, x)| matches!(x, Source::Audio(_))).unwrap();
+        let track = s.add_track(TrackKind::Audio).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let clip = s.project.alloc_clip_id();
+            let pl = s.project.alloc_placement_id();
+            s.edit("add", vec![
+                Command::AddClip { id: clip, clip: Box::new(Clip::new("c", Color(0), src, PPQ)) },
+                Command::PlaceClip { track, placement: Placement { id: pl, clip, start: i * 4 * PPQ, lane: 0 } },
+            ]);
+            ids.push((clip, pl));
+        }
+        let warp_of = |s: &AppState, c: ClipId| match &s.project.sources[&s.project.clips[&c].source] {
+            Source::Audio(a) => a.warp.clone(),
+            _ => unreachable!(),
+        };
+        // The first clip alone transposed: it gets a copy of the file, the others keep theirs.
+        s.click_clip(ids[0].1, false);
+        s.seal();
+        assert!(s.set_clip_warp("t", ids[0].0, |w| w.transpose = 5.));
+        s.seal();
+        assert_eq!((warp_of(&s, ids[0].0).transpose, warp_of(&s, ids[1].0).transpose), (5., 0.));
+        // Copies or not, they are all clips of the same sample.
+        let all = s.sample_targets(ids[1].0);
+        assert_eq!(all[0], ids[1].0);
+        for (c, _) in &ids {
+            assert!(all.contains(c));
+        }
+        // Cmd + drag on the Transpose knob: every clip of the sample, selected or not.
+        s.seal();
+        assert!(s.set_sample_warp("transpose-x", ids[0].0, |w| w.transpose = -3.));
+        assert!(s.set_sample_warp("transpose-x", ids[0].0, |w| w.transpose = -7.));
+        s.seal();
+        assert!(ids.iter().all(|(c, _)| warp_of(&s, *c).transpose == -7.));
+        assert!(s.undo(), "one drag, one step");
+        assert_eq!((warp_of(&s, ids[0].0).transpose, warp_of(&s, ids[2].0).transpose), (5., 0.));
+        // "Apply to all clips of this sample": the first clip's pitch on every one, stretch kept.
+        let stretched = s.project.clips[&ids[2].0].source;
+        let warp = Warp { enabled: true, original_bpm: Some(60.), ..warp_of(&s, ids[2].0) };
+        s.edit("stretch", vec![Command::SetWarp { source: stretched, warp: Box::new(warp) }]);
+        assert!(s.set_clip_warp("d", ids[0].0, |w| w.detune = 20.));
+        assert!(s.match_sample_pitch(ids[0].0));
+        assert!(ids.iter().all(|(c, _)| { let w = warp_of(&s, *c); (w.transpose, w.detune) == (5., 20.) }));
+        assert_eq!(warp_of(&s, ids[2].0).original_bpm, Some(60.), "each clip keeps its own stretch");
+        assert!(!s.match_sample_pitch(ids[0].0), "already the same");
+        // A notes clip has no sample.
+        assert!(s.sample_targets(lead_clip(&s)).is_empty());
     }
 
     fn lead_clip(s: &AppState) -> ClipId {

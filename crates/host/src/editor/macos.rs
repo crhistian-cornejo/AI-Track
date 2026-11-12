@@ -81,10 +81,20 @@ pub(super) fn set_client_size(raw: usize, width: u32, height: u32) {
     window.setContentSize(NSSize::new(width as f64, height as f64));
 }
 
+/// Most events handled per call, and the longest a call may take: an editor
+/// that keeps posting redraws (DPF's OpenGL views do) would otherwise keep
+/// the queue from ever running dry and the call from returning.
+const PUMP_MAX_EVENTS: usize = 64;
+const PUMP_MAX_TIME: std::time::Duration = std::time::Duration::from_millis(8);
+
 pub(super) fn pump_messages() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let app = NSApplication::sharedApplication(mtm);
-    loop {
+    let start = std::time::Instant::now();
+    for _ in 0..PUMP_MAX_EVENTS {
+        if start.elapsed() >= PUMP_MAX_TIME {
+            break;
+        }
         let event =
             unsafe { app.nextEventMatchingMask_untilDate_inMode_dequeue(NSEventMask::Any, Some(&NSDate::distantPast()), NSDefaultRunLoopMode, true) };
         match event {
@@ -92,4 +102,28 @@ pub(super) fn pump_messages() {
             None => break,
         }
     }
+}
+
+/// The login session's screen is locked. While it is, windows are off
+/// screen and OpenGL editors (JUCE, DPF) can spend the main thread redrawing
+/// surfaces that never present, so editors cannot be checked.
+pub(super) fn screen_locked() -> bool {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    // SAFETY: a Copy-rule function: we own the returned dictionary (or null
+    // without a window server session).
+    let raw = unsafe { CGSessionCopyCurrentDictionary() };
+    if raw.is_null() {
+        return false;
+    }
+    let dict: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(raw) };
+    dict.find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+        .and_then(|v| v.downcast::<CFBoolean>())
+        .is_some_and(bool::from)
 }

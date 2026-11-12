@@ -7,7 +7,8 @@
 //! 100 % = 24 st of pitch, 6 octaves of cutoff, the full table position or
 //! +100 % amplitude; LFOs are bipolar.
 
-use aitrack_stock::instrument::wavetable::{self as wt, dst, p, src};
+use aitrack_stock::instrument::wavetable::modulation::src as msrc;
+use aitrack_stock::instrument::wavetable::{self as wt, legacy_dst as dst, legacy_src as src, p, vdst};
 use aitrack_stock::instrument::{drum, sampler};
 use aitrack_stock::presets::{PresetBuilder, factory_dir};
 
@@ -323,6 +324,238 @@ fn chords() -> Vec<B> {
     ]
 }
 
+// ── Sound-design showcase (the newer engine: bank tables, warps, osc 3,
+// filter 2, drawn / one-shot LFOs, the 32-slot matrix, macros, FX). ──
+
+// Bank tables (`WAVE` values; see `wt::waves()`).
+const W_BASIC: f32 = 1.0;
+const W_HARMONIC: f32 = 2.0;
+const W_FORMANT: f32 = 3.0;
+const W_SYNC: f32 = 4.0;
+const W_FM: f32 = 5.0;
+const W_ORGAN: f32 = 6.0;
+const W_DIGITAL: f32 = 7.0;
+const W_FOLD: f32 = 8.0;
+const W_PD: f32 = 9.0;
+const W_COMB: f32 = 10.0;
+const W_GROWL: f32 = 11.0;
+const W_NOISE: f32 = 12.0;
+const W_PWM: f32 = 13.0;
+const W_GLASS: f32 = 14.0;
+
+// Warps (`wt::WARPS`).
+const WP_SYNC: f32 = 1.0;
+const WP_BEND: f32 = 2.0;
+const WP_ASYM: f32 = 4.0;
+const WP_MIRROR: f32 = 5.0;
+const WP_QUANT: f32 = 6.0;
+const WP_FM_NEXT: f32 = 8.0;
+
+// Filter models (`filter::MODELS`).
+const M_LADDER: f32 = 1.0;
+const M_NOTCH: f32 = 2.0;
+const M_COMB: f32 = 3.0;
+const M_FORMANT: f32 = 5.0;
+
+/// Oscillator `n` on bank table `wave` at `pos` %, octave, level %.
+fn wave(b: B, n: u32, wave: f32, pos: f32, oct: f32, level: f32) -> B {
+    b.set(p::osc(n, p::WAVE), wave).set(p::osc(n, p::POS), pos).set(p::osc(n, p::OCTAVE), oct).set(p::osc(n, p::LEVEL), level)
+}
+
+fn warp(b: B, n: u32, mode: f32, amount: f32) -> B {
+    b.set(p::osc(n, p::WARP), mode).set(p::osc(n, p::WARP_AMT), amount)
+}
+
+/// Unison up to 16 voices with blend %.
+fn uni16(b: B, n: u32, voices: f32, detune: f32, spread: f32, blend: f32) -> B {
+    b.set(p::osc(n, p::VOICES), voices).set(p::osc(n, p::DETUNE), detune).set(p::osc(n, p::SPREAD), spread).set(p::osc(n, p::BLEND), blend)
+}
+
+/// Filter `n`: model, cutoff, resonance, drive, env-2 depth (enables it).
+fn filt_x(b: B, n: u32, model: f32, cutoff: f32, reso: f32, drive: f32, env: f32) -> B {
+    b.set(p::filt(n, p::F_ENABLE), 1.0)
+        .set(p::filt(n, p::F_MODEL), model)
+        .set(p::filt(n, p::F_CUTOFF), cutoff)
+        .set(p::filt(n, p::F_RESO), reso)
+        .set(p::filt(n, p::F_DRIVE), drive)
+        .set(p::filt(n, p::F_ENV), env)
+        .set(p::filt(n, p::F_KEY), 40.0)
+}
+
+/// Matrix slot `s`: source → destination id, amount %.
+fn mx(b: B, s: u32, source: u8, dest: u32, amount: f32) -> B {
+    b.set(p::slot_x(s, p::M_SRC), source as f32).set(p::slot_x(s, p::M_DST), dest as f32).set(p::slot_x(s, p::M_AMT), amount)
+}
+
+fn mx_via(b: B, s: u32, source: u8, dest: u32, amount: f32, via: u8) -> B {
+    mx(b, s, source, dest, amount).set(p::slot_x(s, p::M_VIA), via as f32)
+}
+
+/// Tempo-synced LFO `n` (free running), classic shape.
+fn lfo_x(b: B, n: u32, shape: f32, div: f32) -> B {
+    b.set(p::lfo(n, p::LFO_SHAPE), shape).set(p::lfo(n, p::LFO_SYNC), 1.0).set(p::lfo(n, p::LFO_DIVISION), div)
+}
+
+fn env3(b: B, a: f32, d: f32, s: f32, r: f32) -> B {
+    b.set(p::env(2, p::E_ATTACK), a).set(p::env(2, p::E_DECAY), d).set(p::env(2, p::E_SUSTAIN), s).set(p::env(2, p::E_RELEASE), r)
+}
+
+fn dist(b: B, mode: f32, drive: f32, mix: f32) -> B {
+    b.set(p::DIST_MODE, mode).set(p::DIST_DRIVE, drive).set(p::DIST_MIX, mix)
+}
+
+fn eq(b: B, low: f32, mid: f32, freq: f32, high: f32) -> B {
+    b.set(p::EQ_LOW, low).set(p::EQ_MID, mid).set(p::EQ_MID_FREQ, freq).set(p::EQ_HIGH, high)
+}
+
+fn macros(b: B, m: [f32; 4]) -> B {
+    (0..4u32).fold(b, |b, i| b.set(p::macro_knob(i), m[i as usize]))
+}
+
+fn sound_design() -> Vec<B> {
+    let c = "Sound Design";
+    vec![
+        // Formant table swept by an LFO + formant filter: talking bass.
+        vol(
+            mx(
+                mx(
+                    macros(lfo_x(filt_x(mono(wave(syn(c, "Talking Growl", &["dubstep", "riddim", "growl", "bass", "wavetable"]), 0, W_GROWL, 30.0, -1.0, 85.0), MONO, 20.0), 0, M_FORMANT, 800.0, 40.0, 30.0, 0.0), 0, L_TRI, D_EIGHTH), [50.0, 0.0, 0.0, 0.0]),
+                    0,
+                    msrc::LFO1,
+                    p::osc(0, p::POS),
+                    35.0,
+                ),
+                1,
+                msrc::MACRO1,
+                p::CUTOFF,
+                30.0,
+            )
+            .set(p::DIST_MODE, 1.0)
+            .set(p::DIST_DRIVE, 45.0),
+            -6.0,
+        ),
+        // Sync sweep driven by env 2: classic sync lead.
+        fx(
+            mx(menv(warp(uni16(wave(syn(c, "Sync Sweep Lead", &["sync", "lead", "edm", "wavetable"]), 0, W_BASIC, 66.0, 0.0, 80.0), 0, 3.0, 20.0, 60.0, 80.0), 0, WP_SYNC, 10.0), 1.0, 500.0, 20.0, 300.0), 0, msrc::ENV2, p::osc(0, p::WARP_AMT), 70.0),
+            15.0,
+            20.0,
+            T_8D,
+            30.0,
+            20.0,
+            2.0,
+        ),
+        // FM bell table with osc 2 phase-modulating it.
+        fx(
+            amp(warp(wave(wave(syn(c, "FM Glass Bell", &["bell", "fm", "glass", "ambient", "wavetable"]), 0, W_FM, 40.0, 0.0, 70.0), 1, W_GLASS, 20.0, 1.0, 20.0), 0, WP_FM_NEXT, 35.0), 1.0, 1800.0, 0.0, 1200.0),
+            0.0,
+            20.0,
+            T_8D,
+            30.0,
+            35.0,
+            3.5,
+        ),
+        // 16-voice harmonic sweep pad, slow LFO on position, macro = brightness.
+        fx(
+            mx(
+                mx(
+                    amp(lfo(uni16(wave(syn(c, "Harmonic Bloom Pad", &["pad", "ambient", "cinematic", "supersaw", "wavetable"]), 0, W_HARMONIC, 20.0, 0.0, 70.0), 0, 16.0, 30.0, 100.0, 70.0), 0, L_SMOOTH, 0.15), 1200.0, 1500.0, 80.0, 2500.0),
+                    0,
+                    msrc::LFO1,
+                    p::osc(0, p::POS),
+                    25.0,
+                ),
+                1,
+                msrc::MACRO1,
+                vdst::POS,
+                60.0,
+            ),
+            35.0,
+            15.0,
+            T_4,
+            40.0,
+            45.0,
+            6.0,
+        ),
+        // Digital steps + quantize warp, bitcrush: chip / glitch.
+        dist(amp(warp(wave(syn(c, "Bit Glitch Lead", &["glitch", "chiptune", "digital", "lead"]), 0, W_DIGITAL, 50.0, 0.0, 75.0), 0, WP_QUANT, 40.0), 1.0, 400.0, 60.0, 120.0), 5.0, 40.0, 60.0),
+        // Comb filter tuned by key on noise + organ table: plucked metal.
+        amp(menv(filt_x(wave(syn(c, "Comb Metal Pluck", &["pluck", "metallic", "comb", "percussive"]), 0, W_ORGAN, 50.0, 0.0, 60.0).set(p::NOISE, 30.0), 0, M_COMB, 440.0, 85.0, 0.0, 20.0).set(p::filt(0, p::F_KEY), 100.0), 1.0, 200.0, 0.0, 200.0), 1.0, 900.0, 0.0, 600.0),
+        // Ladder bass with osc 3 sub layer and mirror warp; macro 1 = filter, macro 2 = drive.
+        vol(
+            mx(
+                mx(
+                    macros(
+                        mono(menv(filt_x(warp(wave(wave(syn(c, "Ladder Reese", &["reese", "dnb", "neuro", "bass"]), 0, W_PWM, 40.0, -1.0, 70.0), 2, W_BASIC, 0.0, -2.0, 50.0), 0, WP_MIRROR, 40.0), 0, M_LADDER, 400.0, 45.0, 40.0, 30.0), 1.0, 300.0, 30.0, 200.0), MONO, 15.0),
+                        [40.0, 20.0, 0.0, 0.0],
+                    ),
+                    0,
+                    msrc::MACRO1,
+                    p::CUTOFF,
+                    40.0,
+                ),
+                1,
+                msrc::MACRO2,
+                p::DRIVE,
+                60.0,
+            )
+            .set(p::osc(0, p::VOICES), 2.0)
+            .set(p::osc(0, p::DETUNE), 35.0),
+            -5.0,
+        ),
+        // Phase-distortion keys with a drawn one-shot LFO "pluck" on position.
+        fx(
+            mx(
+                amp(wave(syn(c, "PD Keys", &["keys", "casio", "phase distortion", "retro"]), 0, W_PD, 0.0, 0.0, 75.0), 2.0, 900.0, 40.0, 400.0)
+                    .set(p::lfo(2, p::LFO_DRAWN), 0.0)
+                    .set(p::lfo(2, p::LFO_SHAPE), L_SAW_DOWN)
+                    .set(p::lfo(2, p::LFO_ONESHOT), 1.0)
+                    .set(p::lfo(2, p::LFO_SYNC), 1.0)
+                    .set(p::lfo(2, p::LFO_DIVISION), D_QUARTER),
+                0,
+                msrc::LFO3,
+                p::osc(0, p::POS),
+                70.0,
+            )
+            .set(p::slot_x(0, p::M_MODE), 1.0),
+            20.0,
+            0.0,
+            T_8,
+            30.0,
+            20.0,
+            2.0,
+        ),
+        // Noise-spectra pad through a notch + filter 2 band-pass, parallel.
+        fx(
+            amp(filt_x(filt_x(wave(syn(c, "Spectral Mist", &["texture", "ambient", "noise", "cinematic"]), 0, W_NOISE, 50.0, 0.0, 60.0), 0, M_NOTCH, 1200.0, 30.0, 0.0, 0.0), 1, 0.0, 3000.0, 30.0, 0.0, 0.0).set(p::filt(1, p::F_TYPE), BP).set(p::FILTER_ROUTING, 1.0).set(p::osc(0, p::ROUTE), 2.0), 1500.0, 2000.0, 80.0, 3000.0),
+            30.0,
+            0.0,
+            T_8,
+            30.0,
+            60.0,
+            8.0,
+        ),
+        // Folded sine bass: env 3 drives the fold position; velocity via mod wheel.
+        vol(
+            mx_via(mx(env3(mono(wave(syn(c, "Fold Bass", &["bass", "fold", "west coast", "techno"]), 0, W_FOLD, 10.0, -1.0, 85.0), MONO, 0.0), 1.0, 350.0, 20.0, 150.0), 0, msrc::ENV3, p::osc(0, p::POS), 60.0), 1, msrc::VELOCITY, p::osc(0, p::POS), 30.0, msrc::MOD_WHEEL),
+            -5.0,
+        ),
+        // The sync-sweep table scanned by env 2: hard-sync stab.
+        fx(mx(menv(amp(wave(syn(c, "Sync Table Stab", &["stab", "sync", "house", "wavetable"]), 0, W_SYNC, 0.0, 0.0, 75.0), 1.0, 350.0, 0.0, 200.0), 0.5, 250.0, 0.0, 200.0), 0, msrc::ENV2, p::osc(0, p::POS), 80.0), 0.0, 20.0, T_8, 30.0, 20.0, 2.0),
+        // Asym PWM warp on the comb table, chorus + EQ: wide keys.
+        eq(fx(warp(uni16(wave(syn(c, "Asym Comb Keys", &["keys", "wide", "pop", "wavetable"]), 0, W_COMB, 30.0, 0.0, 70.0), 0, 4.0, 15.0, 70.0, 60.0), 0, WP_ASYM, 50.0), 40.0, 0.0, T_8, 30.0, 20.0, 2.0), 2.0, -3.0, 600.0, 3.0),
+        // Formant table, bend warp, vibrato from the mod wheel (via).
+        fx(
+            mx_via(lfo(warp(wave(syn(c, "Vox Lead", &["vocal", "formant", "lead", "expressive"]), 0, W_FORMANT, 50.0, 0.0, 80.0), 0, WP_BEND, 20.0), 1, L_SINE, 5.5), 0, msrc::LFO2, vdst::PITCH, 2.0, msrc::MOD_WHEEL),
+            10.0,
+            25.0,
+            T_8D,
+            30.0,
+            25.0,
+            2.5,
+        ),
+    ]
+}
+
 fn sampler_presets() -> Vec<B> {
     use sampler::p;
     let b = |cat: &str, name: &str, tags: &[&str]| B::new(sampler::ID, cat, name).tags(tags);
@@ -359,7 +592,7 @@ fn drum_presets() -> Vec<B> {
 
 fn main() -> std::io::Result<()> {
     let root = factory_dir();
-    let groups = [bass(), lead(), pad(), pluck(), keys(), arp(), fx_presets(), chords(), sampler_presets(), drum_presets()];
+    let groups = [bass(), lead(), pad(), pluck(), keys(), arp(), fx_presets(), chords(), sound_design(), sampler_presets(), drum_presets()];
     let mut n = 0;
     for group in groups {
         for pr in group {

@@ -41,6 +41,25 @@ pub enum SlotState {
     Queued { scene: SceneId },
 }
 
+/// A parameter edit made in a hosted plugin's own window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PluginEdit {
+    pub device: DeviceId,
+    pub param: u32,
+    /// Normalised 0..=1; meaningful for [`PluginEditKind::Value`].
+    pub value: f32,
+    pub kind: PluginEditKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginEditKind {
+    /// The user grabbed a control.
+    Begin,
+    Value,
+    /// The user let go: close the undo step.
+    End,
+}
+
 pub trait EngineBridge {
     fn play(&mut self);
     fn stop(&mut self);
@@ -72,6 +91,10 @@ pub trait EngineBridge {
     fn set_audio_config(&mut self, config: AudioConfig) -> Result<AudioConfig, String>;
     /// A short 440 Hz tone on the selected output channels.
     fn test_tone(&mut self);
+    /// Measured latency of the running audio device, for Preferences → Audio.
+    fn audio_latency(&self) -> Option<AudioLatency> {
+        None
+    }
 
     // ── Offline export ──
     /// Render in the background; `progress` runs on the render thread and
@@ -104,6 +127,18 @@ pub trait EngineBridge {
     /// Open a VST3/CLAP device's editor window (main thread).
     fn open_editor(&mut self, _device: aitrack_model::DeviceId) -> Result<(), String> {
         Err("Plugin windows need the real engine".into())
+    }
+    /// Main thread: the current state of every loaded VST3/CLAP device, so
+    /// the UI can store it in the project (`SetDeviceState`) before saving.
+    /// Changes made in a plugin's own window live only in the plugin until then.
+    fn plugin_states(&mut self) -> Vec<(DeviceId, Vec<u8>)> {
+        Vec::new()
+    }
+    /// Parameter edits made in plugin windows since the last call, oldest
+    /// first, for the UI to turn into `SetParam` commands (one undo step per
+    /// `Begin`…`End` gesture).
+    fn take_plugin_edits(&mut self) -> Vec<PluginEdit> {
+        Vec::new()
     }
     /// Run third-party plugins out of process (applies to newly loaded instances).
     fn sandbox_plugins(&self) -> bool {
@@ -610,6 +645,23 @@ pub struct AudioDevice {
     pub sample_rates: Vec<u32>,
     pub buffer_range: (u32, u32),
     pub default_rate: u32,
+}
+
+/// Measured audio latency for Preferences → Audio.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AudioLatency {
+    pub sample_rate: u32,
+    pub buffer_frames: u32,
+    pub output_ms: f32,
+    pub input_ms: f32,
+    pub device_output_ms: f32,
+    pub plugin_ms: f32,
+}
+
+impl AudioLatency {
+    pub fn round_trip_ms(&self) -> f32 {
+        self.output_ms + self.input_ms
+    }
 }
 
 /// What the user picks in Preferences → Audio. `None` devices mean "default".

@@ -535,26 +535,51 @@ struct TreeFile {
     size: u64,
 }
 
-fn github_listing(agent: &ureq::Agent, g: &GithubSource, p: &BundledPack) -> Result<Vec<TreeFile>> {
-    let url = format!("https://api.github.com/repos/{}/git/trees/{}?recursive=1", g.repo, g.rev);
+fn tree_json(agent: &ureq::Agent, repo: &str, sha: &str, recursive: bool) -> Result<serde_json::Value> {
+    let url = format!("https://api.github.com/repos/{repo}/git/trees/{sha}{}", if recursive { "?recursive=1" } else { "" });
     let mut body = String::new();
     get(agent, &url)?.into_body().into_reader().read_to_string(&mut body)?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    if v["truncated"].as_bool() == Some(true) {
-        bail!("{}: GitHub tree listing truncated", p.id);
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// True when a selector could match something under directory `dir/`.
+fn dir_selected(g: &GithubSource, dir: &str) -> bool {
+    g.paths.iter().any(|sel| sel.starts_with(dir) || dir.starts_with(sel.as_str()))
+}
+
+/// Blobs of a tree, with paths prefixed by `prefix`. GitHub truncates the
+/// recursive listing of large repositories; then only the directories the
+/// selection reaches are walked, one level at a time.
+fn walk_tree(agent: &ureq::Agent, g: &GithubSource, sha: &str, prefix: &str, out: &mut Vec<TreeFile>) -> Result<()> {
+    let v = tree_json(agent, &g.repo, sha, true)?;
+    if v["truncated"].as_bool() != Some(true) {
+        for e in v["tree"].as_array().ok_or_else(|| anyhow!("bad tree listing"))? {
+            if e["type"] == "blob"
+                && let (Some(path), Some(sha)) = (e["path"].as_str(), e["sha"].as_str())
+            {
+                out.push(TreeFile { path: format!("{prefix}{path}"), sha: sha.to_string(), size: e["size"].as_u64().unwrap_or(0) });
+            }
+        }
+        return Ok(());
     }
-    let mut files: Vec<TreeFile> = v["tree"]
-        .as_array()
-        .ok_or_else(|| anyhow!("{}: bad tree listing", p.id))?
-        .iter()
-        .filter(|e| e["type"] == "blob")
-        .filter_map(|e| {
-            Some(TreeFile {
-                path: e["path"].as_str()?.to_string(),
-                sha: e["sha"].as_str()?.to_string(),
-                size: e["size"].as_u64().unwrap_or(0),
-            })
-        })
+    let v = tree_json(agent, &g.repo, sha, false)?;
+    for e in v["tree"].as_array().ok_or_else(|| anyhow!("bad tree listing"))? {
+        let (Some(name), Some(sha)) = (e["path"].as_str(), e["sha"].as_str()) else { continue };
+        let path = format!("{prefix}{name}");
+        if e["type"] == "blob" {
+            out.push(TreeFile { path, sha: sha.to_string(), size: e["size"].as_u64().unwrap_or(0) });
+        } else if e["type"] == "tree" && dir_selected(g, &format!("{path}/")) {
+            walk_tree(agent, g, sha, &format!("{path}/"), out)?;
+        }
+    }
+    Ok(())
+}
+
+fn github_listing(agent: &ureq::Agent, g: &GithubSource, p: &BundledPack) -> Result<Vec<TreeFile>> {
+    let mut all = Vec::new();
+    walk_tree(agent, g, &g.rev, "", &mut all).with_context(|| format!("{}: listing {}@{}", p.id, g.repo, g.rev))?;
+    let mut files: Vec<TreeFile> = all
+        .into_iter()
         .filter(|f| {
             g.paths.iter().any(|sel| if sel.ends_with('/') { f.path.starts_with(sel.as_str()) } else { f.path == *sel })
         })
@@ -977,6 +1002,16 @@ mod tests {
         assert_eq!(second.analysed, 0, "{second:?}");
         assert_eq!(second.cached, second.candidates);
         assert_eq!(lib.find_by_path(&packs.join("Click Loop.wav")).unwrap().unwrap().bpm, Some(bpm));
+    }
+
+    #[test]
+    fn truncated_trees_walk_only_selected_dirs() {
+        let g = GithubSource { repo: "o/r".into(), rev: "x".into(), paths: vec!["AKWF/AKWF_bw_saw/".into(), "LICENSE.md".into()] };
+        assert!(dir_selected(&g, "AKWF/"));
+        assert!(dir_selected(&g, "AKWF/AKWF_bw_saw/"));
+        assert!(dir_selected(&g, "AKWF/AKWF_bw_saw/deep/"));
+        assert!(!dir_selected(&g, "AKWF/AKWF_piano/"));
+        assert!(!dir_selected(&g, "AKWF--Surge/"));
     }
 
     #[test]

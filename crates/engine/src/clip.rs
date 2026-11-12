@@ -226,6 +226,20 @@ pub(crate) struct AudioClipData {
 }
 
 impl AudioClipData {
+    /// How a file with `warp` plays: repitched to its original tempo when
+    /// warped (a clip stretched with Cmd/Ctrl + an edge is warped at a tempo
+    /// scaled by the stretch, `ops::stretch`), sped up or slowed down by its
+    /// transpose and detune, maybe backwards.
+    pub fn of(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>) -> Self {
+        Self {
+            audio,
+            warped: warp.enabled && warp.original_bpm.is_some_and(|b| b > 0.0),
+            original_bpm: warp.original_bpm.unwrap_or(120.0),
+            ratio: warp.pitch_ratio(),
+            reverse: warp.reverse,
+        }
+    }
+
     /// Whether the clip plays whole frames at the file's own speed.
     #[inline]
     fn exact(&self) -> bool {
@@ -821,6 +835,32 @@ mod tests {
         // +50 ct: 2^(0.5/12) faster.
         let fine = play(&pitched_clip(&c, ramp, 2f64.powf(0.5 / 12.), false), 120., 0, Some(8 * PPQ), 1200);
         assert!((fine[1000] - 1000. * 2f32.powf(0.5 / 12.) / 48_000.).abs() < 1e-3, "{}", fine[1000]);
+    }
+
+    #[test]
+    fn a_stretched_clip_plays_the_same_audio_over_its_new_length() {
+        use aitrack_model::{ops, Warp};
+        // A ramp of four seconds: the value read tells where in the file playback is.
+        let ramp: Vec<f32> = (0..192_000).map(|i| i as f32 / 192_000.).collect();
+        let audio = Arc::new(DecodedAudio::from_planar(vec![ramp], 48_000));
+        // Beats 1..3 of the file at 120 BPM (frames 24 000..72 000), stretched to four beats.
+        let one_shot = clip(PPQ, 2 * PPQ, None);
+        let (long, warp) = ops::stretched(&one_shot, &Warp::default(), 120.0, 4 * PPQ).unwrap();
+        let c = CompiledClip::audio(ClipId(1), &long, AudioClipData::of(&warp, Some(audio.clone())));
+        let out = play(&c, 120., 0, Some(long.length), 100_000);
+        // Half speed: sample n reads frame 24 000 + n / 2, up to the old end at the new one.
+        for n in [1_000usize, 48_000, 95_000] {
+            let want = (24_000. + n as f32 / 2.) / 192_000.;
+            assert!((out[n] - want).abs() < 1e-4, "sample {n}: {} vs {want}", out[n]);
+        }
+        assert!(out[96_100..].iter().all(|s| *s == 0.), "silent after the four beats");
+        // Squeezed to one beat: twice as fast, with a transpose on top (+12 st: four times).
+        let (short, mut warp) = ops::stretched(&one_shot, &Warp::default(), 120.0, PPQ).unwrap();
+        warp.transpose = 12.;
+        let c = CompiledClip::audio(ClipId(1), &short, AudioClipData::of(&warp, Some(audio)));
+        let out = play(&c, 120., 0, Some(short.length), 20_000);
+        let want = (24_000. + 4. * 2_000.) / 192_000.;
+        assert!((out[2_000] - want).abs() < 1e-4, "{} vs {want}", out[2_000]);
     }
 
     #[test]

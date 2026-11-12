@@ -2,7 +2,9 @@
 //! waveform as it will sound, a fade handle in each top corner (drag it
 //! inwards for the fade's length, drag the dot on its slope to bend it,
 //! double-click to reset), both edges (the left one trims or reveals the
-//! start, the right one resizes and loops), and Ctrl+drag to drag copies.
+//! start, the right one resizes: a one-shot up to the end of its file, a
+//! looping clip as far as it repeats), Cmd/Ctrl + an edge to stretch an
+//! audio clip in time (Re-Pitch), and Ctrl+drag on the body to drag copies.
 //!
 //! - [`geom`]: where everything is and what is under the pointer; which
 //!   source frames a pixel column shows. Plain data.
@@ -26,8 +28,29 @@ use crate::views::sample_editor::geom::curve_through;
 use crate::workspace::{Drag, Workspace};
 use aitrack_model::ops::MIN_CLIP_LEN;
 use aitrack_model::*;
-use edit::{Copies, Edit, Origin};
+use edit::{Copies, Edit, Origin, Stretch};
 use gpui::{Context, CursorStyle, MouseDownEvent, MouseMoveEvent, Pixels, Point};
+use std::cell::Cell;
+
+thread_local! {
+    /// Whether the stretch modifier (Cmd on macOS, Ctrl on Windows) is down,
+    /// and whether a stretch drag is running: the edges then show the
+    /// stretch pointer and their stretch mark. Painting reads it, so it
+    /// lives outside the workspace (the lane canvas paints on its own).
+    static STRETCH_KEY: Cell<bool> = const { Cell::new(false) };
+    static STRETCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The stretch modifier went down or up. Returns whether that changed
+/// anything, so the caller repaints.
+pub fn set_stretch_key(down: bool) -> bool {
+    STRETCH_KEY.replace(down) != down
+}
+
+/// Whether an edge under the pointer, or held, stretches.
+pub fn stretch_shown() -> bool {
+    STRETCH_KEY.get() || STRETCHING.get()
+}
 
 /// The pointer moves this far before a press becomes a drag.
 const SLOP: f32 = 3.;
@@ -47,6 +70,8 @@ pub struct ShapeDrag {
     moved: bool,
     /// Whether the project changed (Escape then undoes it).
     applied: bool,
+    /// Cmd/Ctrl on an edge: the clip is stretched instead of trimmed.
+    stretch: Option<Stretch>,
 }
 
 /// Ctrl+drag on a clip: copies of it (or of the selection it is part of)
@@ -102,8 +127,58 @@ pub fn press(ws: &mut Workspace, row: &LaneRow, placement: PlacementId, tick: Ti
         Zone::FadeIn | Zone::FadeOut | Zone::FadeInCurve | Zone::FadeOutCurve | Zone::Start => {
             let Some(origin) = Origin::take(&ws.s, placement) else { return };
             let handle_y = bx.slope(matches!(zone, Zone::FadeInCurve)).map_or(y, |p| p.1);
-            ws.begin_drag(Drag::ClipShape(Box::new(ShapeDrag { zone, origin, from: e.position, grab_tick: tick, grab_y: y - handle_y, bx, moved: false, applied: false })), cx);
+            ws.begin_drag(Drag::ClipShape(Box::new(ShapeDrag { zone, origin, from: e.position, grab_tick: tick, grab_y: y - handle_y, bx, moved: false, applied: false, stretch: None })), cx);
         }
+    }
+}
+
+/// The edge of the clip at `placement` that a press at `tick` grabs, when it
+/// is an audio clip and the press is on one (as [`ClipBox::edge`] measures
+/// it); for Cmd/Ctrl + edge, which stretches.
+pub fn stretch_edge(ws: &Workspace, placement: PlacementId, tick: Tick) -> Option<Zone> {
+    let (_, pl, length) = ws.s.placement(placement)?;
+    let clip = ws.s.project.clips.get(&pl.clip)?;
+    if !matches!(ws.s.project.sources.get(&clip.source), Some(Source::Audio(_))) {
+        return None;
+    }
+    let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
+    let (x, w) = ((tick - pl.start) as f32 * ppt, length as f32 * ppt);
+    let edge = (w / 3.).min(geom::EDGE);
+    if x < edge {
+        Some(Zone::Start)
+    } else if w - x < edge {
+        Some(Zone::End)
+    } else {
+        None
+    }
+}
+
+/// Cmd/Ctrl + left button down on an edge of an audio clip (from
+/// `editing::gestures::lane_down`): the clip is selected and stretched.
+pub fn begin_stretch(ws: &mut Workspace, placement: PlacementId, zone: Zone, tick: Tick, e: &MouseDownEvent, cx: &mut Context<Workspace>) -> bool {
+    let Some((track, pl, _)) = ws.s.placement(placement) else { return false };
+    let Some(st) = Stretch::take(&ws.s, placement, zone == Zone::Start) else { return false };
+    ws.s.click_clip(placement, false);
+    ws.s.selected_placement = Some((track, placement));
+    ws.s.select_clip(Some(pl.clip));
+    let bx = ClipBox::of(&st.origin.clip, true, pl.start, 0., 0., ws.s.arrange.px_per_beat / PPQ as f32, ws.s.arrange.scroll_x);
+    let origin = st.origin.clone();
+    STRETCHING.set(true);
+    ws.begin_drag(Drag::ClipShape(Box::new(ShapeDrag { zone, origin, from: e.position, grab_tick: tick, grab_y: 0., bx, moved: false, applied: false, stretch: Some(st) })), cx);
+    true
+}
+
+/// The clip length a stretch drag of `zone` asks for with the pointer at
+/// `tick`: the moved edge lands on the grid.
+fn stretch_length(ws: &Workspace, o: &Origin, zone: Zone, tick: Tick, grab_tick: Tick, free: bool) -> Tick {
+    let snap = |at: Tick| ws.s.snap_tick(GridView::Arrange, at + tick - grab_tick, free);
+    let step = ws.s.snap_step(GridView::Arrange).filter(|_| !free).unwrap_or(MIN_CLIP_LEN).min(o.clip.length);
+    if zone == Zone::Start {
+        o.end() - snap(o.start).clamp(0, o.end() - step)
+    } else {
+        // The end stops where the next clip of the track starts.
+        let room = ws.s.room_after(o.placement, o.clip.length).unwrap_or(Tick::MAX);
+        (snap(o.end()) - o.start).max(step).min(room)
     }
 }
 
@@ -127,6 +202,11 @@ pub fn drag_move(ws: &mut Workspace, drag: &mut Drag, e: &MouseMoveEvent) {
                 return;
             }
             d.moved = true;
+            if let Some(st) = &d.stretch {
+                let length = stretch_length(ws, &st.origin, d.zone, tick, d.grab_tick, free);
+                d.applied |= edit::stretch(&mut ws.s, st, length);
+                return;
+            }
             let o = &d.origin;
             // The handle lands on the grid (not the amount it moved).
             let snap = |at: Tick| ws.s.snap_tick(GridView::Arrange, at + tick - d.grab_tick, free);
@@ -179,8 +259,16 @@ pub fn copy_end(ws: &mut Workspace, d: CopyDrag) {
     }
 }
 
-/// Mouse-up of a fade or trim drag: a trimmed notes clip settles its notes.
-pub fn shape_end(ws: &mut Workspace, d: &ShapeDrag) {
+/// Mouse-up of a fade, trim or stretch drag: a trimmed notes clip settles
+/// its notes; a stretch says how far it went.
+pub fn shape_end(ws: &mut Workspace, d: &ShapeDrag, cx: &mut Context<Workspace>) {
+    STRETCHING.set(false);
+    if let Some(st) = d.stretch.as_ref().filter(|_| d.applied) {
+        let length = ws.s.project.clips.get(&st.origin.id).map_or(st.origin.clip.length, |c| c.length);
+        let factor = st.factor(&ws.s, length);
+        ws.toast(format!("Stretched to ×{factor:.2} ({:+.1} st)", -12. * factor.log2()), cx);
+        return;
+    }
     if d.zone == Zone::Start && d.applied {
         edit::finish_trim(&mut ws.s, &d.origin);
     }
@@ -191,6 +279,7 @@ pub fn shape_end(ws: &mut Workspace, d: &ShapeDrag) {
 pub fn cancel_drag(ws: &mut Workspace) -> bool {
     match ws.drag.take() {
         Some(Drag::ClipShape(d)) => {
+            STRETCHING.set(false);
             ws.s.seal();
             if d.applied {
                 ws.s.undo();
@@ -233,6 +322,7 @@ pub fn copying(ws: &Workspace) -> bool {
 pub fn cursor_for(zone: Option<Zone>, copying: bool) -> CursorStyle {
     match zone {
         _ if copying => CursorStyle::DragCopy,
+        Some(Zone::Start | Zone::End) if stretch_shown() => CursorStyle::ResizeColumn,
         Some(Zone::Start | Zone::End) => CursorStyle::ResizeLeftRight,
         Some(Zone::FadeIn | Zone::FadeOut) => CursorStyle::PointingHand,
         Some(Zone::FadeInCurve | Zone::FadeOutCurve) => CursorStyle::ResizeUpDown,
@@ -258,5 +348,12 @@ mod tests {
         assert_eq!(cursor_for(Some(Zone::Body), false), CursorStyle::Arrow);
         assert_eq!(cursor_for(None, false), CursorStyle::Arrow);
         assert_eq!(cursor_for(Some(Zone::Body), true), CursorStyle::DragCopy);
+        // With the stretch modifier down the edges stretch; the body still moves.
+        assert!(set_stretch_key(true));
+        assert!(!set_stretch_key(true), "no change, no repaint");
+        assert_eq!(cursor_for(Some(Zone::End), false), CursorStyle::ResizeColumn);
+        assert_eq!(cursor_for(Some(Zone::Body), false), CursorStyle::Arrow);
+        assert!(set_stretch_key(false));
+        assert_eq!(cursor_for(Some(Zone::End), false), CursorStyle::ResizeLeftRight);
     }
 }

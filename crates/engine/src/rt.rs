@@ -13,7 +13,7 @@
 
 use crate::clip::TimeCtx;
 use crate::graph::{CompiledGraph, SegmentIo};
-use crate::status::SharedStatus;
+use crate::status::{PlayheadAnchor, SharedStatus};
 use aitrack_dsp::{AudioBuffer, EventKind};
 use aitrack_model::{Quantize, SceneId, TempoMap, Tick, TrackId, TrackKind, PPQ};
 use rtrb::{Consumer, Producer};
@@ -199,6 +199,47 @@ pub struct AudioProcessor {
     out: AudioBuffer,
     input: AudioBuffer,
     thread_promoted: bool,
+    /// Start of the device callback being processed ([`SharedStatus::epoch`]
+    /// clock) and how many of its frames came before the current block.
+    cb_nanos: u64,
+    cb_offset: usize,
+    run: RunTracker,
+}
+
+/// Continuous-run bookkeeping for the heard playhead, in engine samples:
+/// where the run started, where the previous run ended (loop wrap), and
+/// where the engine expects to be next if nothing jumps.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RunTracker {
+    pub start: i64,
+    pub prev_end: Option<i64>,
+    pub expected: Option<i64>,
+}
+
+impl RunTracker {
+    /// A playing segment starts at `pos`: a jump (play start, seek, tempo
+    /// remap, loop wrap) begins a new run. Real-time safe.
+    #[inline]
+    pub fn note(&mut self, pos: i64, loop_samples: Option<(i64, i64)>) {
+        if self.expected == Some(pos) {
+            return;
+        }
+        let wrapped = matches!((self.expected, loop_samples), (Some(e), Some((ls, le))) if e == le && pos == ls);
+        self.prev_end = if wrapped { self.expected } else { None };
+        self.start = pos;
+    }
+
+    /// The segment advanced the engine to `pos`.
+    #[inline]
+    pub fn advanced(&mut self, pos: i64) {
+        self.expected = Some(pos);
+    }
+
+    /// Not playing: the next playing segment starts a fresh run.
+    #[inline]
+    pub fn stopped(&mut self) {
+        self.expected = None;
+    }
 }
 
 impl AudioProcessor {
@@ -226,7 +267,18 @@ impl AudioProcessor {
             out: AudioBuffer::new(2, max_frames),
             input: AudioBuffer::new(2, max_frames),
             thread_promoted: false,
+            cb_nanos: 0,
+            cb_offset: 0,
+            run: RunTracker::default(),
         }
+    }
+
+    /// Mark the start of a device callback (for the heard-playhead anchor).
+    /// The cpal callbacks call this; offline drivers need not.
+    #[inline]
+    pub fn begin_callback(&mut self) {
+        self.cb_nanos = self.status.now_nanos();
+        self.cb_offset = 0;
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -536,6 +588,11 @@ impl AudioProcessor {
                 remaining
             };
             let playing_seg = self.playing && !counting;
+            if playing_seg {
+                self.run.note(self.pos, loop_samples);
+            } else {
+                self.run.stopped();
+            }
             let input = if has_input { Some((&self.input, cur)) } else { None };
             let mut io = SegmentIo {
                 seg_start: self.pos,
@@ -597,6 +654,7 @@ impl AudioProcessor {
                 }
             } else if playing_seg {
                 self.pos += seg as i64;
+                self.run.advanced(self.pos);
                 if let Some((ls, le)) = loop_samples
                     && self.pos == le && le > ls {
                         self.pos = ls;
@@ -613,7 +671,22 @@ impl AudioProcessor {
         let engine_ticks = g.tempo.samples_to_tick(self.pos as f64, sr);
         let audible = if self.playing { g.tempo.samples_to_tick((self.pos - lat) as f64, sr) } else { engine_ticks };
         g.publish(engine_ticks);
+        let playing_now = self.playing && self.count_in_left == 0;
+        if !playing_now {
+            self.run.stopped();
+        }
+        let at_ticks = |s: i64| g.tempo.samples_to_tick((s - lat) as f64, sr);
+        let anchor = PlayheadAnchor {
+            playing: playing_now,
+            ticks: audible,
+            ticks_per_second: g.tempo.bpm_at(audible.max(0.).floor() as Tick) * PPQ as f64 / 60.,
+            at_nanos: self.cb_nanos + ((self.cb_offset + frames) as f64 / sr * 1e9) as u64,
+            run_start: if playing_now { at_ticks(self.run.start) } else { audible },
+            prev_run_end: if playing_now { self.run.prev_end.map(at_ticks) } else { None },
+        };
+        self.cb_offset += frames;
         let st = &self.status;
+        st.anchor.publish(&anchor);
         st.playing.store(self.playing || self.count_in_left > 0, Ordering::Relaxed);
         st.recording.store(self.recording, Ordering::Relaxed);
         st.metronome.store(self.metronome, Ordering::Relaxed);
@@ -625,5 +698,71 @@ impl AudioProcessor {
         if budget > 0.0 {
             st.set_cpu((started.elapsed().as_secs_f64() / budget) as f32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fallback::FallbackFactory;
+    use crate::{Engine, EngineConfig};
+    use aitrack_model::Project;
+
+    #[test]
+    fn run_tracker_tells_wraps_from_jumps() {
+        let mut r = RunTracker::default();
+        r.note(100, None);
+        assert_eq!((r.start, r.prev_end), (100, None), "play start");
+        r.advanced(200);
+        r.note(200, Some((0, 400)));
+        assert_eq!(r.start, 100, "continuous");
+        r.advanced(400);
+        r.note(0, Some((0, 400)));
+        assert_eq!((r.start, r.prev_end), (0, Some(400)), "loop wrap");
+        r.advanced(50);
+        r.note(300, Some((0, 400)));
+        assert_eq!((r.start, r.prev_end), (300, None), "seek");
+        r.stopped();
+        r.note(300, None);
+        assert_eq!((r.start, r.prev_end), (300, None), "restart at the same place");
+    }
+
+    #[test]
+    fn playhead_anchor_follows_blocks_and_loop_wraps() {
+        let sr = 48_000.;
+        let (h, proc_) = Engine::new(EngineConfig::headless(sr), Arc::new(FallbackFactory)).unwrap();
+        let mut proc_ = proc_.unwrap();
+        h.update_project(&Project::new("t"));
+        h.flush();
+        // 120 bpm: one beat = 24 000 samples = PPQ ticks.
+        h.set_loop(Some((0, PPQ)));
+        h.play();
+        let mut buf = AudioBuffer::new(2, 1_000);
+        let ticks_of = |samples: f64| samples / 24_000. * PPQ as f64;
+        proc_.begin_callback();
+        proc_.process_planar(&mut buf);
+        let a = h.playhead_anchor();
+        assert!(a.playing);
+        assert!((a.ticks - ticks_of(1_000.)).abs() < 1e-6, "{a:?}");
+        assert!((a.ticks_per_second - 2. * PPQ as f64).abs() < 1e-9);
+        assert_eq!((a.run_start, a.prev_run_end), (0., None));
+        // The block's end is due 1 000 frames after the callback started.
+        let due = a.at_nanos - proc_.cb_nanos;
+        assert!((due as f64 - 1_000. / sr * 1e9).abs() < 1e3, "{due}");
+        for _ in 0..27 {
+            proc_.process_planar(&mut buf);
+        }
+        // 28 000 samples into a 24 000-sample loop: wrapped once.
+        let a = h.playhead_anchor();
+        assert!((a.ticks - ticks_of(4_000.)).abs() < 1e-6, "{a:?}");
+        assert_eq!(a.prev_run_end, Some(PPQ as f64));
+        assert_eq!(a.run_start, 0.);
+        // 100 ms of output latency puts the speakers before the wrap, at the loop end.
+        let heard = a.heard_at(a.at_nanos, 0.1);
+        let back = 0.1 * a.ticks_per_second;
+        assert!((heard - (PPQ as f64 - (back - a.ticks))).abs() < 1e-6, "{heard}");
+        h.stop();
+        proc_.process_planar(&mut buf);
+        assert!(!h.playhead_anchor().playing);
     }
 }

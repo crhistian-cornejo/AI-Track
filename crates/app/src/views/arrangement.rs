@@ -23,6 +23,11 @@ use gpui::{DispatchPhase, HitboxBehavior, MouseMoveEvent};
 use std::rc::Rc;
 
 const AUTO_H: f32 = 56.;
+
+/// Pixels between the bottom (0) and top (1) of an automation lane's values.
+pub fn auto_value_px() -> f32 {
+    AUTO_H - 12.
+}
 const CLIP_HEAD: f32 = 14.;
 
 #[derive(Clone, Debug)]
@@ -164,6 +169,8 @@ struct AutoPaint {
     /// The lane as drawn: breakpoints plus samples along curved segments.
     line: Vec<(f32, f32)>,
     color: Hsla,
+    /// The selected range of this lane, left and right in pixels (equal for a caret).
+    sel: Option<(f32, f32)>,
 }
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
@@ -274,6 +281,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     points: lane.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect(),
                     line: automation_line(lane, px_per_tick, view.scroll_x),
                     color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
+                    sel: ws.s.auto_sel.filter(|r| r.track == t.id && r.target == target).map(|r| (r.start as f32 * px_per_tick - view.scroll_x, r.end as f32 * px_per_tick - view.scroll_x)),
                 });
             }
     }
@@ -350,6 +358,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             for a in &autos {
                 let lane_top = a.y + 6.;
                 let lane_h = AUTO_H - 12.;
+                // The selected range: a tinted band with edges, under the line.
+                if let Some((l, r)) = a.sel {
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y, (r - l).max(0.), AUTO_H - 1.), accent_alpha(0.18)));
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y, 1., AUTO_H - 1.), accent_alpha(0.8)));
+                    if r > l {
+                        window.paint_quad(paint::fill_rect(at(o, r - 1., a.y, 1., AUTO_H - 1.), accent_alpha(0.8)));
+                    }
+                }
                 let mut pts: Vec<Point<Pixels>> = Vec::with_capacity(a.points.len() + 2);
                 if let Some(first) = a.points.first() {
                     pts.push(point(o.x, o.y + px(lane_top + lane_h * (1. - first.1))));
@@ -860,6 +876,14 @@ fn lane_hit(ws: &Workspace, pos: Point<Pixels>) -> Option<(LaneRow, Tick, f32, f
 
 fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
     if e.first_mouse {
+        // The click that brings the window forward only places the insert
+        // marker, so a single click is enough and nothing is edited by it.
+        if let Some((row, tick, ..)) = lane_hit(ws, e.position) {
+            let at = ws.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+            crate::editing::gestures::place_marker(&mut ws.s, ws.b.engine.as_mut(), at, Some(row.track));
+            ws.s.auto_sel = None;
+            cx.notify();
+        }
         return;
     }
     let Some((row, tick, x, ly)) = lane_hit(ws, e.position) else {
@@ -867,43 +891,12 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
         cx.notify();
         return;
     };
-    let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
     let track = row.track;
     ws.s.selected_track = Some(track);
     // Automation lane.
     if ly >= row.h {
         if let Some(target) = row.auto {
-            let lane = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned());
-            let points = lane.map(|l| l.points).unwrap_or_default();
-            let value = (1. - (ly - row.h - 6.) / (AUTO_H - 12.)).clamp(0., 1.);
-            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 6. && ((1. - p.value) * (AUTO_H - 12.) + 6. - (ly - row.h)).abs() < 8.);
-            // Double-click a breakpoint to delete it (as in Live).
-            if let Some(i) = hit.filter(|_| e.click_count >= 2) {
-                ws.s.delete_automation_point(track, target, i);
-                cx.notify();
-                return;
-            }
-            // Alt + drag between two breakpoints bends that segment.
-            if hit.is_none() && e.modifiers.alt {
-                if let Some(i) = points.windows(2).position(|w| tick >= w[0].tick && tick < w[1].tick) {
-                    let (a, b) = (points[i], points[i + 1]);
-                    ws.s.seal();
-                    ws.begin_drag(Drag::AutoCurve { track, target, index: i, start_y: f32::from(e.position.y), start_curve: a.curve, rising: b.value >= a.value }, cx);
-                }
-                return;
-            }
-            let index = match hit {
-                Some(i) => i,
-                None => {
-                    // On the grid the lanes snap to (adaptive by default), like the drag that follows.
-                    let t = ws.s.snap_tick(crate::editing::GridView::Arrange, tick, false);
-                    ws.s.set_automation_point(track, target, t, value, false);
-                    let pts = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
-                    pts.iter().position(|p| p.tick == t).unwrap_or(0)
-                }
-            };
-            let original = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
-            ws.begin_drag(Drag::AutoPoint { track, target, original, index }, cx);
+            auto_lane_down(ws, track, target, tick, x, ly - row.h, e, cx);
         }
         return;
     }
@@ -918,6 +911,75 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
     ws.s.selected_placement = Some((track, pid));
     ws.s.select_clip(Some(pl.clip));
     arrange_clips::press(ws, &row, pid, tick, e, cx);
+}
+
+/// Left button down in an automation lane, `y` px below its top. As in
+/// Live: a breakpoint is dragged (double-click deletes it), Alt + drag bends
+/// a segment, the line inside the selected range drags that part up or
+/// down, a click on the line (or in an empty lane) adds a breakpoint, and a
+/// click off the line places the insert marker and drags out a range.
+#[allow(clippy::too_many_arguments)]
+fn auto_lane_down(ws: &mut Workspace, track: TrackId, target: AutomationTarget, tick: Tick, x: f32, y: f32, e: &MouseDownEvent, cx: &mut Context<Workspace>) {
+    let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
+    let lane = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned());
+    let line_y = lane.as_ref().and_then(|l| l.value_at(tick.max(0))).map(|v| (1. - v) * auto_value_px() + 6.);
+    let points = lane.map(|l| l.points).unwrap_or_default();
+    let value = (1. - (y - 6.) / auto_value_px()).clamp(0., 1.);
+    let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 6. && ((1. - p.value) * auto_value_px() + 6. - y).abs() < 8.);
+    let near = |tol: f32| line_y.is_some_and(|ly| (ly - y).abs() < tol);
+    let at = ws.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+    let selected = ws.s.auto_sel.filter(|r| r.track == track && r.target == target);
+    // Double-click a breakpoint to delete it (as in Live).
+    if let Some(i) = hit.filter(|_| e.click_count >= 2) {
+        ws.s.delete_automation_point(track, target, i);
+        cx.notify();
+        return;
+    }
+    // Alt + drag between two breakpoints bends that segment.
+    if hit.is_none() && e.modifiers.alt {
+        if let Some(i) = points.windows(2).position(|w| tick >= w[0].tick && tick < w[1].tick) {
+            let (a, b) = (points[i], points[i + 1]);
+            ws.s.seal();
+            ws.begin_drag(Drag::AutoCurve { track, target, index: i, start_y: f32::from(e.position.y), start_curve: a.curve, rising: b.value >= a.value }, cx);
+        }
+        return;
+    }
+    // Shift+click stretches the selected range to here.
+    if e.modifiers.shift && let Some(r) = selected {
+        let anchor = if at >= r.start { r.start } else { r.end };
+        ws.s.set_auto_range(track, target, anchor, at);
+        ws.begin_drag(Drag::AutoRange { track, target, anchor }, cx);
+        return;
+    }
+    // The line inside the selected range: drag that part up or down.
+    if hit.is_none()
+        && let Some(r) = selected.filter(|r| !r.is_empty() && tick >= r.start && tick < r.end)
+        && near(10.)
+    {
+        ws.s.seal();
+        ws.begin_drag(Drag::AutoShift { range: r, original: points, start_y: f32::from(e.position.y) }, cx);
+        return;
+    }
+    // Off the line: the insert marker goes here and dragging selects a range.
+    if hit.is_none() && !points.is_empty() && !near(6.) {
+        crate::editing::gestures::place_marker(&mut ws.s, ws.b.engine.as_mut(), at, Some(track));
+        ws.s.set_auto_range(track, target, at, at);
+        ws.begin_drag(Drag::AutoRange { track, target, anchor: at }, cx);
+        return;
+    }
+    ws.s.auto_sel = None;
+    let index = match hit {
+        Some(i) => i,
+        None => {
+            // On the grid the lanes snap to (adaptive by default), like the drag that follows.
+            let t = ws.s.snap_tick(crate::editing::GridView::Arrange, tick, false);
+            ws.s.set_automation_point(track, target, t, value, false);
+            let pts = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
+            pts.iter().position(|p| p.tick == t).unwrap_or(0)
+        }
+    };
+    let original = ws.s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
+    ws.begin_drag(Drag::AutoPoint { track, target, original, index }, cx);
 }
 
 fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {

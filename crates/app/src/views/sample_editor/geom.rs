@@ -5,8 +5,12 @@
 //! The horizontal axis is in **unrolled source ticks** (`u`): the file's own
 //! time for a clip that does not loop, and for a looping clip the same time
 //! continued past the loop's end, so the repeats lie one after another to
-//! the right. The clip plays `offset .. offset + length` on that axis, which
-//! makes clip time simply `u - offset`.
+//! the right. A transposed clip reads its file faster or slower (Re-Pitch),
+//! so a tick of clip time covers `rate` ticks of the axis: the editor draws
+//! and hit-tests the clip [`on_axis`], where every clip-time length (length,
+//! fades, volume envelope) is scaled by that rate. On that copy the clip
+//! plays `offset .. offset + length` and clip time is `u - offset`; the
+//! gestures divide by the rate again to edit the real clip.
 
 use crate::grid::GridSpec;
 use aitrack_model::{AudioSource, AutomationPoint, Clip, LoopRegion, PPQ, Tick, TimeSignature, curve_shape};
@@ -77,6 +81,32 @@ pub fn unroll(looping: Option<LoopRegion>, u: f64) -> f64 {
         Some(l) if l.end > l.start && u >= l.end as f64 => l.start as f64 + (u - l.start as f64).rem_euclid((l.end - l.start) as f64),
         _ => u,
     }
+}
+
+/// `c` with its clip-time lengths (length, fades, envelope ticks) scaled to
+/// axis ticks at `rate` source ticks per clip tick (a transposed clip's
+/// speed, `ops::clip_rate`); `c` itself at rate 1. Draw and hit-test this.
+pub fn on_axis(c: &Clip, rate: f64) -> Clip {
+    if rate == 1. {
+        return c.clone();
+    }
+    let scale = |t: Tick| (t as f64 * rate).round() as Tick;
+    let mut a = c.clone();
+    a.length = scale(c.length);
+    a.fade_in.length = scale(c.fade_in.length);
+    a.fade_out.length = scale(c.fade_out.length);
+    for lane in &mut a.envelopes {
+        for pt in &mut lane.points {
+            pt.tick = scale(pt.tick);
+        }
+    }
+    a
+}
+
+/// Clip time of axis position `u` on a clip that starts at `offset` and
+/// plays `rate` source ticks per clip tick: the inverse of [`on_axis`].
+pub fn clip_time(u: Tick, offset: Tick, rate: f64) -> Tick {
+    ((u - offset) as f64 / rate).round() as Tick
 }
 
 /// Where the played region ends on the axis.
@@ -447,6 +477,23 @@ mod tests {
         assert_eq!(fit.scrolled(-5_000.).clamped(800., 8 * BEAT), fit);
         let end = fit.scrolled(50_000.).clamped(800., 8 * BEAT);
         assert!((end.x(8. * BEAT as f64) - 400.).abs() < 1e-2, "half a view of room past the end");
+    }
+
+    #[test]
+    fn a_transposed_clip_lies_on_the_axis_at_its_speed() {
+        let mut c = with_points(Clip { fade_in: aitrack_model::Fade { length: BEAT / 2, curve: 0. }, fade_out: aitrack_model::Fade { length: BEAT, curve: 0. }, ..clip() }, &[(0, 1.), (BEAT, 0.5)]);
+        assert_eq!(on_axis(&c, 1.), c);
+        // An octave up: two beats of clip time read four beats of the file.
+        let a = on_axis(&c, 2.);
+        assert_eq!((a.offset, end_u(&a), a.fade_in.length, a.fade_out.length), (BEAT, 5 * BEAT, BEAT, 2 * BEAT));
+        assert_eq!(envelope(&a).iter().map(|pt| pt.tick).collect::<Vec<_>>(), vec![0, 2 * BEAT]);
+        // The end marker's position comes back as the clip's length.
+        assert_eq!(clip_time(end_u(&a), a.offset, 2.), c.length);
+        // The handles follow: the end marker hit sits where the scaled end is drawn.
+        let l = Layout { w: 800., ..layout() };
+        assert_eq!(hit_test(&l, &a, l.x(end_u(&a)), 120.), Hit::End);
+        c.length = 3 * BEAT;
+        assert_eq!(end_u(&on_axis(&c, 0.5)), BEAT + 3 * BEAT / 2, "an octave down reads half as much");
     }
 
     #[test]

@@ -11,6 +11,10 @@
 //! it stops the start marker at the loop's ends, where a lane edge wraps
 //! around the loop as the model does.)
 //!
+//! A stretch (Cmd/Ctrl + an edge) keeps a [`Stretch`]: the origin and its
+//! file's warp, so every move resamples the clip as it was to the new length
+//! (`ops::stretch`, Re-Pitch: the pitch follows).
+//!
 //! A copy-drag makes its [`Copies`] once, on top of their originals, and
 //! then moves them like any group of clips. All of it coalesces into one
 //! undo step.
@@ -156,6 +160,54 @@ pub fn apply(s: &mut AppState, origin: &Origin, edit: Edit) -> bool {
 pub fn finish_trim(s: &mut AppState, origin: &Origin) -> bool {
     let Some(cmds) = ops::rebase_notes(&mut s.project, origin.id) else { return false };
     s.edit_coalesced(&format!("clip-shape-{}", origin.placement.0), Edit::Start(0).label(), cmds)
+}
+
+/// A clip being stretched in time: the clip as it was and its file's warp.
+#[derive(Clone, Debug)]
+pub struct Stretch {
+    pub origin: Origin,
+    pub warp: Warp,
+    /// Dragging the left edge: the clip keeps its end and its start moves.
+    pub from_start: bool,
+}
+
+impl Stretch {
+    /// `None` unless the placement holds an audio clip.
+    pub fn take(s: &AppState, placement: PlacementId, from_start: bool) -> Option<Self> {
+        let origin = Origin::take(s, placement)?;
+        let Some(Source::Audio(file)) = s.project.sources.get(&origin.clip.source) else { return None };
+        Some(Self { warp: file.warp.clone(), origin, from_start })
+    }
+
+    /// The longest and shortest a stretch may make the clip: a sixteenth to
+    /// sixteen times its length, never shorter than the minimum.
+    pub fn bounds(&self) -> (Tick, Tick) {
+        let len = self.origin.clip.length;
+        ((len / 16).max(ops::MIN_CLIP_LEN), len.saturating_mul(16))
+    }
+
+    /// How much longer the clip is at `length` than its file plays at the project tempo.
+    pub fn factor(&self, s: &AppState, length: Tick) -> f64 {
+        let bpm = s.project.tempo.initial_bpm();
+        ops::stretch_factor(&self.warp, bpm) * length as f64 / self.origin.clip.length.max(1) as f64
+    }
+}
+
+/// One move of a stretch drag: the clip resampled to `length` ticks (from
+/// the end, or keeping its end when stretched from the start). Coalesced with
+/// the drag's other moves into one undo step; returns whether the project
+/// changed.
+pub fn stretch(s: &mut AppState, st: &Stretch, length: Tick) -> bool {
+    let (lo, hi) = st.bounds();
+    let length = length.clamp(lo, hi);
+    let o = &st.origin;
+    let keep: Vec<(TrackId, PlacementId, Tick)> = if st.from_start {
+        std::iter::once((o.track, o.placement, o.start)).chain(o.others.iter().map(|(t, id, start, _)| (*t, *id, *start))).collect()
+    } else {
+        Vec::new()
+    };
+    let Some(cmds) = ops::stretch(&mut s.project, o.id, &o.clip, &st.warp, length, st.from_start.then_some(keep.as_slice())) else { return false };
+    s.edit_coalesced(&format!("clip-shape-{}", o.placement.0), "Stretch clip", cmds)
 }
 
 /// Double-click on a fade handle: that fade is gone (`curve_only` keeps its
@@ -563,5 +615,75 @@ mod tests {
         assert_eq!(alone.origin.len(), 1);
         alone.cancel(&mut f.s);
         assert_eq!(f.s.selected_clip_ids().into_iter().collect::<Vec<_>>(), [midi.id]);
+    }
+
+    fn warp_of(s: &AppState, clip: ClipId) -> Warp {
+        match &s.project.sources[&s.project.clips[&clip].source] {
+            Source::Audio(a) => a.warp.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_stretch_drag_resamples_the_clip_and_is_one_undo_step() {
+        let mut f = fixture();
+        let before = f.s.project.clone();
+        let (bpm, steps) = (f.s.project.tempo.initial_bpm(), f.steps());
+        f.s.seal();
+        let st = Stretch::take(&f.s, f.placement, false).unwrap();
+        for len in [5 * BEAT, 6 * BEAT, 8 * BEAT] {
+            assert!(stretch(&mut f.s, &st, len));
+        }
+        f.s.seal();
+        assert_eq!(f.steps(), steps + 1);
+        assert_eq!(f.s.history.undo_label(), Some("Stretch clip"));
+        // Twice as long, at half speed: an octave down (Re-Pitch).
+        assert_eq!((f.clip().length, f.start()), (8 * BEAT, 16 * BEAT));
+        let w = warp_of(&f.s, f.clip);
+        assert!(w.enabled && w.mode == WarpMode::Repitch);
+        assert!((ops::stretch_factor(&w, bpm) - 2.).abs() < 1e-9);
+        assert!((st.factor(&f.s, 8 * BEAT) - 2.).abs() < 1e-9);
+        // The end of the file moved with it, so the clip still plays to the same place.
+        assert_eq!(ops::source_len(&f.s.project, f.clip), Some(16 * BEAT));
+        assert!(f.s.undo());
+        assert_eq!(f.s.project.clips, before.clips);
+        assert_eq!(f.s.project.sources, before.sources);
+    }
+
+    #[test]
+    fn a_stretch_from_the_left_edge_keeps_the_end_and_leaves_other_clips_of_the_file_alone() {
+        let mut f = fixture();
+        // Another clip on the same file, elsewhere.
+        let (twin, twin_pl) = (f.s.project.alloc_clip_id(), f.s.project.alloc_placement_id());
+        let src = f.clip().source;
+        assert!(f.s.edit("Twin", vec![
+            Command::AddClip { id: twin, clip: Box::new(Clip::new("Twin", Color(0), src, 2 * BEAT)) },
+            Command::PlaceClip { track: f.track, placement: Placement { id: twin_pl, clip: twin, start: 40 * BEAT, lane: 0 } },
+        ]));
+        f.s.seal();
+        let st = Stretch::take(&f.s, f.placement, true).unwrap();
+        assert!(stretch(&mut f.s, &st, 2 * BEAT));
+        f.s.seal();
+        // Half as long and twice as fast; it still ends at beat 20.
+        assert_eq!((f.clip().length, f.start()), (2 * BEAT, 18 * BEAT));
+        assert_ne!(f.clip().source, src, "the stretched clip has its own copy of the file");
+        assert_eq!(warp_of(&f.s, twin), Warp::default(), "the other clip of the file is untouched");
+        assert_eq!(f.s.project.clips[&twin].source, src);
+        // Bounded: never beyond sixteen times either way.
+        assert!(stretch(&mut f.s, &st, 1000 * BEAT));
+        assert_eq!(f.clip().length, 64 * BEAT);
+        // Escape-like: back to the length it had leaves only the copy behind, sounding as before.
+        assert!(stretch(&mut f.s, &st, 4 * BEAT));
+        assert_eq!((f.clip().length, f.start()), (4 * BEAT, 16 * BEAT));
+        assert_eq!(warp_of(&f.s, f.clip), Warp::default());
+    }
+
+    #[test]
+    fn notes_clips_do_not_stretch() {
+        let f = fixture();
+        let midi = f.s.project.tracks.iter().find_map(|t| t.arrangement.iter().find(|pl| matches!(f.s.project.sources.get(&f.s.project.clips[&pl.clip].source), Some(Source::Notes(_)))).map(|pl| pl.id));
+        if let Some(midi) = midi {
+            assert!(Stretch::take(&f.s, midi, false).is_none());
+        }
     }
 }

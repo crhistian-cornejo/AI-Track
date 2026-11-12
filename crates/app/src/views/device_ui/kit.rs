@@ -710,17 +710,6 @@ pub fn paint_wave(window: &mut Window, r: Rect, wave: &[(f32, f32)], color: Hsla
 }
 
 
-/// A narrow numeric control for table rows (same gestures as `num`).
-pub fn slim(
-    ws: &mut Workspace,
-    dev: &Dev,
-    id: u32,
-    width: f32,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    num_w(ws, dev, id, width, cx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

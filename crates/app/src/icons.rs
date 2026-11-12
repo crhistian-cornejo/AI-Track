@@ -41,6 +41,7 @@ icons! {
     ChevronRight => "chevron-right",
     ChevronUp => "chevron-up",
     Clock => "clock",
+    Cloud => "cloud",
     Copy => "copy",
     Cursor => "cursor-magic",
     Dashboard => "dashboard",
@@ -72,6 +73,7 @@ icons! {
     Mic => "mic-01",
     Minus => "minus-sign",
     Mixer => "mixer",
+    OpenWindow => "open-window",
     Moon => "moon",
     More => "more-horizontal",
     MusicNote => "music-note",
@@ -134,7 +136,7 @@ mod tests {
 
     #[test]
     fn every_icon_is_embedded() {
-        for i in [Icon::Play, Icon::Record, Icon::Sparkles, Icon::Piano, Icon::Mixer, Icon::ZoomOut, Icon::StarFilled] {
+        for i in [Icon::Play, Icon::Record, Icon::Sparkles, Icon::Piano, Icon::Mixer, Icon::ZoomOut, Icon::StarFilled, Icon::OpenWindow] {
             let bytes = bytes(i.path()).expect("embedded");
             assert!(std::str::from_utf8(bytes).unwrap().contains("<svg"));
         }

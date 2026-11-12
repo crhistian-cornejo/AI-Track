@@ -142,6 +142,10 @@ impl Workspace {
             self.s.edit("Rename project", vec![aitrack_model::Command::RenameProject { name: stem.to_owned() }]);
             self.s.seal();
         }
+        // What was changed inside the plugins' own windows lives only in the
+        // plugins until now: store it in the project first.
+        let states = self.b.engine.plugin_states();
+        self.s.store_plugin_states(states);
         match save(path, &self.s.project) {
             Ok(()) => {
                 self.s.history.mark_saved();

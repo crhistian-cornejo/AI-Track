@@ -455,6 +455,18 @@ fn card(
                     })),
             )
         })
+        .when(crate::views::device_window::can_open(&d.kind), |h| {
+            let open = crate::views::device_window::is_open(ws, id);
+            h.child(
+                widgets::sized_icon_button(("window-dev", id.0 as usize), Icon::OpenWindow, open, 20., 12.)
+                    .tooltip(widgets::tip(if open { "Bring its window to the front" } else { "Open in a window: the full editor" }, None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        crate::views::device_window::open(this, id, cx);
+                        cx.notify();
+                    })),
+            )
+        })
         .child(
             widgets::sized_icon_button(("remove-dev", id.0 as usize), Icon::X, false, 20., 12.)
                 .tooltip(widgets::tip("Remove device", None))

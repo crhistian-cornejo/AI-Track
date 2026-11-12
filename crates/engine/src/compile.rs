@@ -475,18 +475,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                         && let Some(e) = cx.samples.error(&a.path, sr as u32) {
                             warnings.push(format!("audio '{}': {e}", a.path.display()));
                         }
-                    let warped = a.warp.enabled && a.warp.original_bpm.is_some_and(|b| b > 0.0);
-                    CompiledClip::audio(
-                        id,
-                        clip,
-                        AudioClipData {
-                            audio,
-                            warped,
-                            original_bpm: a.warp.original_bpm.unwrap_or(120.0),
-                            ratio: a.warp.pitch_ratio(),
-                            reverse: a.warp.reverse,
-                        },
-                    )
+                    // Each clip reads the warp of its own source: a clip transposed
+                    // or stretched alone has a copy of the file's source.
+                    CompiledClip::audio(id, clip, AudioClipData::of(&a.warp, audio))
                 }
                 _ => return None,
             };

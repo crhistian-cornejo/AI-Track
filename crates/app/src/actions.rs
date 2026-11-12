@@ -55,6 +55,7 @@ actions!(
         ToggleDetailView,
         ShowMixer,
         TogglePalette,
+        AddLibraryFolder,
         ToggleGroupFold,
         Quit,
     ]

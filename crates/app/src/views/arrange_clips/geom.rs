@@ -42,7 +42,9 @@ pub enum Zone {
     FadeOutCurve,
     /// The left edge: trims or reveals the clip's start.
     Start,
-    /// The right edge: resizes, and loops an audio clip past its file.
+    /// The right edge: resizes (a one-shot audio clip up to the end of its
+    /// file, a looping clip as far as it repeats). With Cmd/Ctrl either edge
+    /// of an audio clip stretches it instead.
     End,
     /// Anywhere else: moves the clip.
     Body,
@@ -148,13 +150,22 @@ impl ClipBox {
         }
         // Square handles: the larger of the two distances.
         let reach = |p: (f32, f32)| (x - p.0).abs().max((y - p.1).abs());
+        let edge = self.edge();
+        // With the stretch modifier down an audio clip's edges come first.
+        if self.audio && super::stretch_shown() {
+            if x - self.x < edge {
+                return Some(Zone::Start);
+            }
+            if self.x + self.w - x < edge {
+                return Some(Zone::End);
+            }
+        }
         if self.has_handles() {
             let (fi, fo) = (reach(self.handle(true)), reach(self.handle(false)));
             if fi.min(fo) <= GRAB {
                 return Some(if fi <= fo { Zone::FadeIn } else { Zone::FadeOut });
             }
         }
-        let edge = self.edge();
         if x - self.x < edge {
             return Some(Zone::Start);
         }

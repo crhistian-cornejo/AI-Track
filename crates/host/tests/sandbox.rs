@@ -104,3 +104,41 @@ fn sandbox_reports_missing_plugin() {
     let r = SandboxedPlugin::spawn_with(env!("CARGO_BIN_EXE_aitrack-plugin-host").as_ref(), &bad);
     assert!(r.is_err());
 }
+
+/// A host whose main thread stops (an editor stuck in its own redraw loop)
+/// is killed by the watchdog: silence, fast-failing calls, no hang on drop.
+#[test]
+fn sandbox_watchdog_kills_a_frozen_host() {
+    let mut p = spawn(PluginFormat::Clap);
+    p.set_hang_timeout(Duration::from_millis(1500));
+    let editor = p.editor_handle();
+    let out = run(&mut p, 0.5, &[]);
+    assert!(out.channel(0).iter().any(|s| *s != 0.0), "no output before the freeze");
+    // Idle for longer than the timeout: heartbeats keep a healthy host alive.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(!p.is_hung(), "a healthy host was taken for hung");
+    assert!(p.is_alive());
+
+    p.freeze_host().expect("freeze");
+    let start = Instant::now();
+    while !p.is_hung() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(p.is_hung(), "watchdog did not fire");
+    eprintln!("frozen host detected after {:?}", start.elapsed());
+    assert!(editor.take_hung());
+    assert!(!editor.take_hung(), "reported twice");
+    let t = Instant::now();
+    assert!(editor.open().is_err());
+    assert!(t.elapsed() < Duration::from_millis(500), "a call waited on a dead host");
+    let out = run(&mut p, 0.5, &[]);
+    assert!(out.channel(0).iter().all(|s| *s == 0.0), "a hung device must be silent");
+    let start = Instant::now();
+    while p.is_alive() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!p.is_alive(), "host process still running");
+    let t = Instant::now();
+    drop(p);
+    assert!(t.elapsed() < Duration::from_secs(1), "drop waited on a dead host");
+}

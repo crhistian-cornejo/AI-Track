@@ -132,6 +132,7 @@ pub fn fades(window: &mut Window, o: Point<Pixels>, bx: &ClipBox, canvas_w: f32,
 /// The fade handles of a clip that is hovered, selected or being dragged:
 /// a square in each top corner, and a dot on each slope long enough to bend.
 pub fn handles(window: &mut Window, o: Point<Pixels>, bx: &ClipBox, hot: Option<Zone>) {
+    stretch_mark(window, o, bx, hot);
     if !bx.has_handles() {
         return;
     }
@@ -147,6 +148,25 @@ pub fn handles(window: &mut Window, o: Point<Pixels>, bx: &ClipBox, hot: Option<
         let side = if held { HANDLE + 2. } else { HANDLE };
         window.paint_quad(paint::rrect_border(at(o, x - side / 2., y - side / 2., side, side), 2., if held { pal.accent } else { pal.text }, pal.well, 1.));
     }
+}
+
+/// With the stretch modifier down (or a stretch running), the edge under
+/// the pointer is lit in the accent colour with a bar on its border: that
+/// edge stretches the clip instead of trimming it.
+fn stretch_mark(window: &mut Window, o: Point<Pixels>, bx: &ClipBox, hot: Option<Zone>) {
+    let start = match hot {
+        Some(Zone::Start) => true,
+        Some(Zone::End) => false,
+        _ => return,
+    };
+    if !bx.audio || !super::stretch_shown() {
+        return;
+    }
+    let edge = bx.edge().max(4.);
+    let x = if start { bx.x } else { bx.x + bx.w - edge };
+    window.paint_quad(paint::fill_rect(at(o, x, bx.y, edge, bx.h), accent_alpha(0.22)));
+    let bar = if start { bx.x + 1. } else { bx.x + bx.w - 3. };
+    window.paint_quad(paint::fill_rect(at(o, bar, bx.y, 2., bx.h), accent()));
 }
 
 /// The loop glyph at the right end of a looping clip's title. Returns the

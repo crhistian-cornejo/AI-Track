@@ -9,6 +9,7 @@
 //! compile a snapshot of it off the audio thread and tests can drive it
 //! headlessly.
 
+pub mod automation;
 pub mod command;
 pub mod groups;
 pub mod history;

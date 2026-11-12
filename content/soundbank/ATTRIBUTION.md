@@ -19,6 +19,8 @@ AI-Track bundles the following free sound packs. Each one keeps its own license;
 | Salamander Grand Piano V3 (optional download) | Alexander Holm | [CC-BY-3.0](https://creativecommons.org/licenses/by/3.0/) | https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html |
 | Upright Piano KW | FreePats (Roberto Gordo Saez) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) | https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html |
 | VS Chamber Orchestra 2: Community Edition (selection) | Versilian Studios (Sam Gossner, Simon Dalzell) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) | https://vis.versilstudios.net/vsco-community.html |
+| AKWF Single-Cycle Waveforms (synthesized selection) | Kristoffer Ekstrand (Adventure Kid) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) | https://github.com/KristofferKarlAxelEkstrand/AKWF-FREE |
+| WaveEdit Online Wavetable Banks | WaveEdit users (Synthesis Technology WaveEdit Online), mirrored by smpldsnds | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) | https://github.com/smpldsnds/wavedit-online |
 
 ## Credits
 
@@ -35,3 +37,5 @@ AI-Track bundles the following free sound packs. Each one keeps its own license;
 - **Salamander Grand Piano V3**: Salamander Grand Piano V3 by Alexander Holm, licensed under CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/). Packaged by FreePats.
 - **Upright Piano KW**: Upright Piano KW by FreePats (CC0 1.0)
 - **VS Chamber Orchestra 2: Community Edition (selection)**: VS Chamber Orchestra: Community Edition by Versilian Studios (CC0 1.0)
+- **AKWF Single-Cycle Waveforms (synthesized selection)**: AKWF single-cycle waveforms by Kristoffer Ekstrand / Adventure Kid (CC0 1.0)
+- **WaveEdit Online Wavetable Banks**: WaveEdit Online wavetable banks by the WaveEdit community (CC0 1.0)

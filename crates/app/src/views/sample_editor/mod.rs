@@ -4,8 +4,9 @@
 //! sample view do it: start and end markers trim it, corner handles set the
 //! fades and their curve, a volume envelope shapes the level over time, a
 //! brace on the ruler sets the loop, and a cursor or a time selection is
-//! where it is split or cropped. Pulling the end marker past the end of the
-//! file loops the clip; its repeats are drawn one after another.
+//! where it is split or cropped. As in Live, a one-shot clip ends with its
+//! file at the latest; with Loop on, pulling the end marker out repeats the
+//! loop brace, and the repeats are drawn one after another.
 //!
 //! * `geom` is the coordinate maths (axis, handle positions, hit-testing,
 //!   snapping), on plain data.
@@ -29,7 +30,7 @@ use crate::theme::*;
 use crate::waveform::Status;
 use crate::widgets::{self, label, mono};
 use crate::workspace::Workspace;
-use aitrack_model::ops::MIN_CLIP_LEN;
+use aitrack_model::ops::{self, MIN_CLIP_LEN};
 use aitrack_model::{AudioSource, Clip, ClipId, PPQ, Source, Tick, TimeSignature, curve_shape};
 use edit::{Gesture, Placed, Snapshot};
 use geom::{Axis, Hit, Layout, RULER, TimeBase};
@@ -117,7 +118,10 @@ struct Drag {
 /// The clip and its file as the handlers and the painter see them this frame.
 struct Frame {
     id: ClipId,
+    /// The clip on the axis ([`geom::on_axis`]): what is drawn and hit-tested.
     clip: Clip,
+    /// Axis (source) ticks per tick of clip time: the clip's transpose as a speed.
+    rate: f64,
     source: AudioSource,
     base: TimeBase,
     /// Length of the file in source ticks; 0 when unknown.
@@ -136,7 +140,9 @@ struct Frame {
 impl Frame {
     fn of(ws: &Workspace) -> Option<Self> {
         let id = ws.s.selected_clip?;
-        let clip = ws.s.project.clips.get(&id)?.clone();
+        // On the axis: a transposed clip's lengths in ticks of its file.
+        let rate = ops::clip_rate(&ws.s.project, id);
+        let clip = geom::on_axis(ws.s.project.clips.get(&id)?, rate);
         let Source::Audio(source) = ws.s.project.sources.get(&clip.source)? else { return None };
         let source = source.clone();
         let bpm = ws.s.project.tempo.initial_bpm();
@@ -153,7 +159,7 @@ impl Frame {
         let axis = ws.sample.axis.filter(|_| ws.sample.clip == Some(id)).unwrap_or_else(|| Axis::fit(if w > 0. { w } else { 800. }, end));
         let sig = ws.s.project.tempo.signature_at(0);
         let grid = grid::adaptive(axis.px_per_beat as f32, sig, 0, false);
-        Some(Self { id, clip, source, base, source_len, end, place, origin, sig, bpm, grid, layout: Layout { axis, w, h } })
+        Some(Self { id, clip, rate, source, base, source_len, end, place, origin, sig, bpm, grid, layout: Layout { axis, w, h } })
     }
 
     /// Snap an axis position (`free` = Alt or Shift: no grid). The ends of
@@ -183,12 +189,16 @@ impl Frame {
 }
 
 /// Where the transport is on this clip's axis, and whether it is running.
-fn playhead(ws: &Workspace, id: ClipId, clip: &Clip) -> Option<(Tick, bool)> {
+fn playhead(ws: &Workspace, id: ClipId) -> Option<(Tick, bool)> {
+    let clip = ws.s.project.clips.get(&id)?;
+    // Clip time → axis: a transposed clip reads its file at its own speed.
+    let rate = ops::clip_rate(&ws.s.project, id);
+    let at = |t: Tick| clip.offset + (t as f64 * rate).round() as Tick;
     let t = ws.b.engine.transport();
     for track in &ws.s.project.tracks {
         for pl in track.arrangement.iter().filter(|pl| pl.clip == id) {
             if t.position >= pl.start && t.position < pl.start + clip.length {
-                return Some((clip.offset + t.position - pl.start, t.playing));
+                return Some((at(t.position - pl.start), t.playing));
             }
         }
     }
@@ -197,7 +207,7 @@ fn playhead(ws: &Workspace, id: ClipId, clip: &Clip) -> Option<(Tick, bool)> {
         && let Some(SlotState::Playing { scene: playing, since }) = ws.b.engine.slot_state(track)
         && playing == scene
     {
-        return Some((clip.offset + (t.position - since).rem_euclid(clip.length.max(1)), true));
+        return Some((at((t.position - since).rem_euclid(clip.length.max(1))), true));
     }
     None
 }
@@ -217,7 +227,7 @@ pub fn wants_frames(ws: &Workspace) -> bool {
     if !ws.bottom_open || ws.s.bottom_tab != BottomTab::PianoRoll || !ws.b.engine.transport().playing {
         return false;
     }
-    audio_clip(ws).is_some_and(|(id, clip)| playhead(ws, id, clip).is_some())
+    audio_clip(ws).is_some_and(|(id, _)| playhead(ws, id).is_some())
 }
 
 // ───────────────────────────── Public edits ─────────────────────────────
@@ -533,7 +543,7 @@ fn drag_end(ws: &mut Workspace, cx: &mut Context<Workspace>) {
             && drag.anchor >= f.clip.offset
             && drag.anchor < geom::end_u(&f.clip)
         {
-            ws.b.engine.locate(pl.start + drag.anchor - f.clip.offset);
+            ws.b.engine.locate(pl.start + geom::clip_time(drag.anchor, f.clip.offset, f.rate));
         }
     }
     ws.s.seal();
@@ -735,7 +745,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         note,
         cursor: ws.sample.cursor,
         selection: ws.sample.selection,
-        playhead: playhead(ws, id, c),
+        playhead: playhead(ws, id),
         hot,
         picked: ws.sample.picked,
         readout: ws.sample.drag.as_ref().and_then(|d| d.readout.clone()),
@@ -751,7 +761,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let can_split = f.place.is_some() && ws.sample.cursor.is_some_and(|u| u > c.offset && u < geom::end_u(c));
     let can_crop = ws.sample.selection.is_some();
     let gain_db = c.gain_db;
-    let length = c.length;
+    // The toolbar's Length and its /2 ×2 are the clip's own, in clip time.
+    let length = ws.s.project.clips.get(&id).map_or(c.length, |real| real.length);
     let mut info = div().flex().items_center().gap(px(SP2));
     if f.place.is_none() {
         info = info.child(label("Not in the arrangement", TEXT_SM, pal.faint));
@@ -809,7 +820,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         )
         .child(
             widgets::icon_button("se-loop", Icon::Loop, looping)
-                .tooltip(widgets::tip("Loop the clip: drag the brace on the ruler, pull the end marker out to repeat", None))
+                .tooltip(widgets::tip("Loop the clip: drag the brace on the ruler, then pull the end marker out to repeat it", None))
                 .on_click(cx.listener(|this, _, _, cx| toggle_loop(this, cx))),
         )
         .child(widgets::divider_v(16.))
@@ -866,7 +877,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 cx.notify();
             }
         })))
-        .child(tool_button("se-double", "×2", true).tooltip(widgets::tip("Twice as long: past the end of the file the clip loops", None)).on_click(cx.listener(
+        .child(tool_button("se-double", "×2", true).tooltip(widgets::tip("Twice as long (a one-shot stops at the end of its file; switch Loop on to repeat it)", None)).on_click(cx.listener(
             move |this, _, _, cx| {
                 if edit::apply_now(&mut this.s, id, Gesture::Length(length * 2)) {
                     // Show what was added.

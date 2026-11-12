@@ -169,10 +169,17 @@ pub(super) fn set_client_size(raw: usize, width: u32, height: u32) {
     }
 }
 
+/// Most messages handled per call: an editor that keeps posting messages
+/// must not keep the call from returning (see the macOS side).
+const PUMP_MAX_EVENTS: usize = 64;
+
 pub(super) fn pump_messages() {
     unsafe {
         let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+        for _ in 0..PUMP_MAX_EVENTS {
+            if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

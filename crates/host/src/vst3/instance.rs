@@ -180,7 +180,6 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
                 c.setComponentState(sp);
             }
         }
-        read_params(c, &mut params, &mut values);
         if let Some(mm) = c.cast::<IMidiMapping>() {
             for ch in 0..16i16 {
                 for cc in 0..MIDI_MAP_STRIDE as i16 {
@@ -191,6 +190,9 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
                 }
             }
         }
+        let mut midi_ids: Vec<u32> = midi_map.iter().copied().filter(|&id| id != NO_PARAM).collect();
+        midi_ids.sort_unstable();
+        read_params(c, &midi_ids, &mut params, &mut values);
     }
 
     unsafe {
@@ -255,11 +257,23 @@ unsafe fn main_bus_channels(component: &ComPtr<IComponent>, dir: BusDirection) -
     }
 }
 
-fn read_params(c: &ComPtr<IEditController>, params: &mut Vec<ParamInfo>, values: &mut Vec<(u32, f32)>) {
+/// Whether a parameter belongs in the device's parameter list. Hidden ones
+/// are not, and neither are the MIDI proxies some wrappers (JUCE: 16 × 130
+/// "MIDI CC n|m") expose for `IMidiMapping`: they are not automatable and
+/// stay reachable by id for CC, pressure and pitch bend.
+fn listed(flags: i32, id: u32, midi_ids: &[u32]) -> bool {
+    use ParameterInfo_::ParameterFlags_::*;
+    if flags & kIsHidden as i32 != 0 {
+        return false;
+    }
+    flags & kCanAutomate as i32 != 0 || midi_ids.binary_search(&id).is_err()
+}
+
+fn read_params(c: &ComPtr<IEditController>, midi_ids: &[u32], params: &mut Vec<ParamInfo>, values: &mut Vec<(u32, f32)>) {
     let n = unsafe { c.getParameterCount() };
     for i in 0..n {
         let mut pi: ParameterInfo = unsafe { std::mem::zeroed() };
-        if unsafe { c.getParameterInfo(i, &mut pi) } != OK {
+        if unsafe { c.getParameterInfo(i, &mut pi) } != OK || !listed(pi.flags, pi.id, midi_ids) {
             continue;
         }
         let steps = pi.stepCount.max(0);
@@ -825,5 +839,16 @@ mod tests {
         assert_eq!(split_state(&data), Some((&[1u8, 2, 3][..], &[9u8, 9][..])));
         assert_eq!(split_state(&[5, 6]), Some((&[5u8, 6][..], &[][..])));
         assert_eq!(split_state(&data[..10]), None);
+    }
+
+    #[test]
+    fn midi_proxies_and_hidden_params_are_not_listed() {
+        use ParameterInfo_::ParameterFlags_::*;
+        let midi = [7u32, 9];
+        assert!(listed(kCanAutomate as i32, 1, &midi));
+        assert!(listed(0, 1, &midi), "plain read-only/meter params stay listed");
+        assert!(!listed(0, 7, &midi), "JUCE-style MIDI CC proxy");
+        assert!(listed(kCanAutomate as i32, 9, &midi), "an automatable param mapped to a CC stays");
+        assert!(!listed(kIsHidden as i32 | kCanAutomate as i32, 1, &midi));
     }
 }

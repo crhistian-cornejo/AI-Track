@@ -127,6 +127,11 @@ pub enum Drag {
     AutoPoint { track: TrackId, target: AutomationTarget, original: Vec<AutomationPoint>, index: usize },
     /// Alt + drag on an automation segment bends it.
     AutoCurve { track: TrackId, target: AutomationTarget, index: usize, start_y: f32, start_curve: f32, rising: bool },
+    /// Dragging off the line in an automation lane selects a time range of it, from `anchor`.
+    AutoRange { track: TrackId, target: AutomationTarget, anchor: Tick },
+    /// Dragging the line inside the selected automation range raises or
+    /// lowers just that part (`original` is the lane when the drag began).
+    AutoShift { range: crate::state::AutoRange, original: Vec<AutomationPoint>, start_y: f32 },
     LoopBrace { anchor: Tick },
     Scrub,
     /// Colour picker: the hue strip or the saturation/value square.
@@ -256,6 +261,10 @@ pub struct Workspace {
     /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
     midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
     pub organize: OrganizeUi,
+    /// Devices open in windows of their own (`views::device_window`).
+    pub device_windows: std::collections::HashMap<DeviceId, gpui::WindowHandle<views::device_window::DeviceWindow>>,
+    /// A device window the dev view asked for (opened on the first frame).
+    window_pending: Option<DeviceId>,
     _housekeeping: Task<()>,
 }
 
@@ -373,6 +382,8 @@ impl Workspace {
             analysis_jobs: Default::default(),
             midi_jobs: Default::default(),
             organize: OrganizeUi::default(),
+            device_windows: Default::default(),
+            window_pending: None,
             _housekeeping: housekeeping,
         };
         // Seed the assistant with a greeting and one reviewable proposal.
@@ -406,6 +417,13 @@ impl Workspace {
     /// Development aid for visual checks without touching the keyboard:
     /// `AITRACK_DEV_VIEW=devices,meters,play,big,track=Bass,group,slash` opens the app in
     /// that state. Unknown words are ignored; unset, nothing happens.
+    /// The Vault of the selected track, else the first one (dev view words).
+    fn dev_vault(&self) -> Option<DeviceId> {
+        let p = &self.s.project;
+        let is_vault = |d: &&Device| matches!(&d.kind, aitrack_model::DeviceKind::Stock { plugin_id } if plugin_id == aitrack_stock::instrument::vault::ID);
+        self.s.selected_track.and_then(|t| p.track(t)).and_then(|t| t.devices.iter().find(is_vault).map(|d| d.id)).or_else(|| p.tracks.iter().flat_map(|t| &t.devices).find(is_vault).map(|d| d.id))
+    }
+
     fn apply_dev_view(&mut self) {
         let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
         for word in spec.split(',').map(str::trim) {
@@ -436,6 +454,22 @@ impl Workspace {
                     ))
                 }
                 "play" => self.b.engine.play(),
+                // Select bars 3..5 of the first automation lane shown, with the marker there.
+                "autorange" => {
+                    let lane = self.s.project.tracks.iter().find(|t| self.s.automation_shown.contains(&t.id)).and_then(|t| Some((t.id, t.automation.first()?.target)));
+                    if let Some((track, target)) = lane {
+                        self.s.set_auto_range(track, target, 8 * PPQ, 16 * PPQ);
+                        self.s.arrange.px_per_beat = 24.;
+                    }
+                }
+                // Raise that range by a quarter (after `autorange`).
+                "autoraise" => {
+                    if let Some(r) = self.s.auto_sel {
+                        let original = self.s.project.track(r.track).and_then(|t| t.automation.iter().find(|l| l.target == r.target)).map(|l| l.points.clone()).unwrap_or_default();
+                        self.s.shift_auto_range(r, &original, 0.25);
+                        self.s.seal();
+                    }
+                }
                 // Put the selected track (`track=Name` first) in a new group.
                 "group" => {
                     self.s.group_tracks();
@@ -472,6 +506,39 @@ impl Workspace {
                         });
                     }
                 }
+                // Stretch the selected clip (`audio` first) to `stretch=2` times its length.
+                _ if word == "stretch" || word.starts_with("stretch=") => {
+                    let k: f64 = word.split('=').nth(1).and_then(|v| v.parse().ok()).unwrap_or(2.);
+                    if let Some((_, placement)) = self.s.selected_placement
+                        && let Some(st) = views::arrange_clips::edit::Stretch::take(&self.s, placement, false)
+                    {
+                        let length = (st.origin.clip.length as f64 * k).round() as Tick;
+                        views::arrange_clips::edit::stretch(&mut self.s, &st, length);
+                        self.s.seal();
+                    }
+                }
+                // An audio track with the file `wav=/path/to.wav` at bar 2, second from the top (before `audio`).
+                _ if word.starts_with("wav=") => {
+                    let path = std::path::PathBuf::from(&word["wav=".len()..]);
+                    let info = hound::WavReader::open(&path).map(|r| (r.spec().sample_rate, r.spec().channels, r.duration() as u64)).unwrap_or((48_000, 2, 0));
+                    let cmds = audio_track_commands(&mut self.s, "Sample", Color::palette(5), &path, info, 4 * PPQ, 1);
+                    self.s.edit("Add sample", cmds);
+                    self.s.seal();
+                }
+                // A copy of the selected clip right after it, on the same sample.
+                "twin" => {
+                    if let Some((track, placement)) = self.s.selected_placement
+                        && let Some((_, pl, length)) = self.s.placement(placement)
+                        && let Some((cmds, _)) = aitrack_model::ops::duplicate_placement(&mut self.s.project, track, placement, pl.start + length)
+                    {
+                        self.s.edit("Duplicate", cmds);
+                        self.s.seal();
+                    }
+                }
+                // The right-click menu of the selected clip.
+                "menu=clip" => {
+                    self.menu = Some(Menu { kind: MenuKind::ClipContext, at: gpui::point(gpui::px(420.), gpui::px(200.)), opened: 0 });
+                }
                 // Group the selected track's whole chain into a rack.
                 "rack" => {
                     let ids: Vec<_> = self
@@ -506,6 +573,95 @@ impl Workspace {
                             at: gpui::point(gpui::px(320.), gpui::px(420.)),
                             opened: 0,
                         });
+                    }
+                }
+                // Open the wavetable synth of the selected track (else the first
+                // one) in its window: `synthwin`, with `synthtab=matrix|fx|table`
+                // and `synthmod=lfo1` picking what it shows.
+                "synthwin" => {
+                    let id = {
+                        let p = &self.s.project;
+                        let is_synth = |d: &&Device| matches!(&d.kind, aitrack_model::DeviceKind::Stock { plugin_id } if plugin_id == aitrack_stock::instrument::wavetable::ID);
+                        self.s.selected_track.and_then(|t| p.track(t)).and_then(|t| t.devices.iter().find(is_synth).map(|d| d.id)).or_else(|| p.tracks.iter().flat_map(|t| &t.devices).find(is_synth).map(|d| d.id))
+                    };
+                    if let Some(id) = id {
+                        if let Some(t) = self.s.project.device_track(id) {
+                            self.s.selected_track = Some(t);
+                        }
+                        self.window_pending = Some(id);
+                    }
+                }
+                // Route LFO 1 → Osc A position and Env 2 → cutoff, and draw
+                // LFO 1 (shows rings and a drawn curve in the synth window).
+                "synthroute" => {
+                    if let Some(id) = self.window_pending {
+                        use aitrack_stock::instrument::wavetable::{modulation::LfoCurve, p, src};
+                        use views::device_window::synth::{commit_curve, knob};
+                        for (s, d) in [(src::LFO1, p::osc(0, p::POS)), (src::ENV2, p::CUTOFF), (src::MACRO1, p::osc(0, p::WARP_AMT))] {
+                            let slots = knob::read_slots(self, id);
+                            if let Some(info) = self.fx.param_info(self.b.plugins.as_ref(), &self.s.project, id, d)
+                                && let Some((_, edits)) = views::device_window::synth::geom::route_drop(&slots, s, &info)
+                            {
+                                knob::set_plain(self, "dev", id, &edits);
+                            }
+                        }
+                        commit_curve(self, id, 0, LfoCurve::pluck(), false);
+                        // Osc A on a multi-frame factory table, osc B on another.
+                        knob::set_plain(self, "dev", id, &[(p::osc(0, p::WAVE), 2.), (p::osc(0, p::POS), 35.), (p::osc(1, p::WAVE), 4.), (p::osc(1, p::POS), 60.)]);
+                    }
+                }
+                // Open the selected track's last stock device in its window.
+                "devwin" => {
+                    let id = self.s.selected_track.and_then(|t| self.s.project.track(t)).and_then(|t| t.devices.iter().rev().find(|d| views::device_window::can_open(&d.kind)).map(|d| d.id));
+                    self.window_pending = id;
+                }
+                _ if word.starts_with("synthtab=") || word.starts_with("synthmod=") => {
+                    if let Some(id) = self.window_pending {
+                        use views::device_window::synth::{ModTab, Tab};
+                        let v = self.fx.synth.entry(id).or_default();
+                        match word {
+                            "synthtab=matrix" => v.tab = Tab::Matrix,
+                            "synthtab=fx" => v.tab = Tab::Fx,
+                            "synthtab=table" => v.tab = Tab::Table,
+                            "synthtab=harmonics" => {
+                                v.tab = Tab::Table;
+                                v.tool = views::device_window::synth::Tool::Harmonics;
+                            }
+                            "synthtab=formula" => {
+                                v.tab = Tab::Table;
+                                v.tool = views::device_window::synth::Tool::Formula;
+                            }
+                            _ => {
+                                let n: u32 = word.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(1);
+                                v.mods = if word.contains("lfo") { ModTab::Lfo(n.clamp(1, 4) - 1) } else { ModTab::Env(n.clamp(1, 3) - 1) };
+                            }
+                        }
+                    }
+                }
+                // The Vault of the selected track (else the first one) in its
+                // window; `vaultpreset=Name` loads a factory preset onto it
+                // first and `vaultfilter=keys` / `vaultfilter=warm` filters
+                // its browser by a type or a character tag.
+                "vaultwin" => self.window_pending = self.dev_vault(),
+                _ if word.starts_with("vaultpreset=") || word.starts_with("vaultfilter=") => {
+                    let Some(id) = self.dev_vault() else { continue };
+                    let value = word.split_once('=').map_or("", |(_, v)| v);
+                    if word.starts_with("vaultpreset=") {
+                        let list = self.fx.vault.presets();
+                        if let Some(pr) = list.iter().find(|p| p.name.eq_ignore_ascii_case(value))
+                            && let Ok(preset) = aitrack_stock::presets::load(&pr.path)
+                        {
+                            let params = preset.params.iter().filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v.clamp(0., 1.)))).collect();
+                            self.s.load_preset(id, &preset.name, &params);
+                        }
+                    } else {
+                        let f = &mut self.fx.vault.view(id).filter;
+                        match aitrack_stock::instrument::vault::TYPES.iter().position(|t| t.eq_ignore_ascii_case(value)) {
+                            Some(k) => f.kind = Some(k),
+                            None => {
+                                f.tags.insert(value.to_lowercase());
+                            }
+                        }
                     }
                 }
                 "big" => {
@@ -561,6 +717,9 @@ impl Workspace {
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         self.audition.retry(|t, k, v| self.b.engine.audition_note(t, k, v));
         let mut changed = self.b.engine.idle();
+        // Knobs turned in a plugin's own window become undoable SetParam edits.
+        let edits = self.b.engine.take_plugin_edits();
+        changed |= self.s.apply_plugin_edits(&edits);
         // The usage read-out moves about once a second even when nothing else does.
         let (cpu, mem) = (self.usage.cpu, self.usage.memory);
         self.usage.tick();
@@ -633,14 +792,11 @@ impl Workspace {
 
     // ── Actions ──
 
+    /// Space. How it, Shift+Space and clicks in the lanes and the ruler
+    /// work together (Live's insert marker) is set out at the top of
+    /// `editing::gestures`.
     pub fn play_stop(&mut self, _: &PlayStop, _: &mut Window, cx: &mut Context<Self>) {
-        if self.b.engine.transport().playing {
-            self.b.engine.stop();
-        } else {
-            // Playback starts from the insert marker (Shift+Space continues instead).
-            self.b.engine.locate(self.s.ed.marker);
-            self.b.engine.play();
-        }
+        crate::editing::gestures::play_stop(&self.s, self.b.engine.as_mut());
         cx.notify();
     }
 
@@ -688,14 +844,14 @@ impl Workspace {
         cx.notify();
     }
 
-    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         let label = self.s.history.undo_label().map(str::to_owned);
         if self.s.undo() {
             self.toast(format!("Undo {}", label.unwrap_or_default()), cx);
         }
     }
 
-    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         let label = self.s.history.redo_label().map(str::to_owned);
         if self.s.redo() {
             self.toast(format!("Redo {}", label.unwrap_or_default()), cx);
@@ -885,7 +1041,7 @@ impl Workspace {
     }
 
     /// The root's key hook for value-box typing; runs before the piano keys.
-    fn num_edit_key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn num_edit_key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.num_edit.is_none() {
             return;
         }
@@ -934,7 +1090,7 @@ impl Workspace {
 
     /// While a value box is open, a click anywhere drops the text (the
     /// box's own click reopens it right after, in the bubble phase).
-    fn num_edit_capture(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn num_edit_capture(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.num_edit.as_ref()?;
         let weak = cx.entity().downgrade();
         Some(
@@ -981,6 +1137,13 @@ impl Workspace {
                     }
                     KnobTarget::Send { track, index } => {
                         self.s.set_send(track, index, fader_to_db(v).max(-70.));
+                    }
+                    // Cmd/Ctrl: every clip of the sample, selected or not.
+                    KnobTarget::Transpose { clip } if e.modifiers.secondary() => {
+                        self.s.set_sample_warp(&format!("transpose-{}", clip.0), clip, |w| w.transpose = v * 96. - 48.);
+                    }
+                    KnobTarget::Detune { clip } if e.modifiers.secondary() => {
+                        self.s.set_sample_warp(&format!("detune-{}", clip.0), clip, |w| w.detune = v * 100. - 50.);
                     }
                     KnobTarget::Transpose { clip } => {
                         self.s.set_clip_warp(&format!("transpose-{}", clip.0), clip, |w| w.transpose = v * 96. - 48.);
@@ -1086,6 +1249,15 @@ impl Workspace {
                 let curve = *start_curve + if *rising { -dy } else { dy };
                 self.s.set_automation_curve(*track, *target, *index, curve);
             }
+            Drag::AutoRange { track, target, anchor } => {
+                let (tick, _) = self.arrange_pos(e.position);
+                let at = self.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+                self.s.set_auto_range(*track, *target, *anchor, at);
+            }
+            Drag::AutoShift { range, original, start_y } => {
+                let delta = (*start_y - f32::from(e.position.y)) / views::arrangement::auto_value_px() * fine;
+                self.s.shift_auto_range(*range, original, delta);
+            }
             Drag::LoopBrace { anchor } => {
                 let (tick, _) = self.arrange_pos(e.position);
                 let t = self.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt).max(0);
@@ -1122,7 +1294,7 @@ impl Workspace {
                     self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
                 }
                 Drag::ClipCopy(d) => views::arrange_clips::copy_end(self, d),
-                Drag::ClipShape(d) => views::arrange_clips::shape_end(self, &d),
+                Drag::ClipShape(d) => views::arrange_clips::shape_end(self, &d, cx),
                 // A click on a clip that never moved it puts the insert
                 // marker (and, when stopped, the playhead) where it was clicked.
                 Drag::Clip { track, start, applied, .. } => {
@@ -1506,7 +1678,7 @@ impl Workspace {
 
     // ── Layout ──
 
-    fn drag_capture(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn drag_capture(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.drag.as_ref()?;
         let weak = cx.entity().downgrade();
         Some(
@@ -1933,6 +2105,10 @@ impl Render for Workspace {
             let project = &self.s.project;
             self.fx.prune(|id| project.device(id).is_some());
         }
+        views::device_window::close_orphans(self, cx);
+        if let Some(id) = self.window_pending.take() {
+            views::device_window::open(self, id, cx);
+        }
         let pal = p();
         let center = match self.s.view {
             MainView::Session => views::session::render(self, window, cx),
@@ -1968,7 +2144,7 @@ impl Render for Workspace {
         let num_capture = self.num_edit_capture(cx);
         let fx_capture = views::device_ui::capture(self, cx);
         let sample_capture = views::sample_editor::capture(self, cx);
-        let fx_overlay = views::device_ui::overlay(self, cx);
+        let fx_overlay = views::device_ui::overlay(self, None, cx);
         let meter_strip = views::meters::render(self, cx);
         let meter_layers = views::meters::overlay(self, cx);
         let toast = self.render_toast();
@@ -1980,6 +2156,14 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            // Clicks here are main-window clicks (popovers open in this window).
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.fx.surface = None))
+            // The stretch modifier lights the clip edges it would stretch.
+            .on_modifiers_changed(cx.listener(|_, e: &gpui::ModifiersChangedEvent, _, cx| {
+                if views::arrange_clips::set_stretch_key(e.modifiers.secondary()) {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(Self::num_edit_key_down))
             .on_key_down(cx.listener(Self::piano_key_down))
             .on_key_up(cx.listener(Self::piano_key_up))
@@ -2003,6 +2187,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UngroupTracks, _, cx| crate::editing::ungroup_selection(this, cx)))
             .on_action(cx.listener(|this, _: &ToggleGroupFold, _, cx| crate::editing::toggle_group_fold(this, cx)))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| views::palette::toggle(this, window, cx)))
+            .on_action(cx.listener(|this, _: &AddLibraryFolder, window, cx| views::palette::open_add_library(this, window, cx)))
             .on_action(cx.listener(|this, _: &AddAudioTrack, _, cx| {
                 this.s.add_track(TrackKind::Audio);
                 cx.notify();
@@ -2088,6 +2273,7 @@ impl Render for Workspace {
                 this.modal = if this.export.running.is_some() { this.modal } else { None };
                 this.s.selected_notes.clear();
                 this.s.clear_arrange_selection();
+                this.s.auto_sel = None;
                 this.focus.focus(window, cx);
                 cx.notify();
             }))

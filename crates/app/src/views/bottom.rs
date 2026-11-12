@@ -27,6 +27,9 @@ use gpui::{
 use std::rc::Rc;
 
 /// Width of the Clip View's properties column.
+/// What Cmd/Ctrl does on the Transpose and Detune knobs.
+const ALL_CLIPS_HINT: &str = if cfg!(target_os = "macos") { "⌘-drag: every clip of this sample" } else { "Ctrl-drag: every clip of this sample" };
+
 const PROPS_W: f32 = 224.;
 /// Height of a property row.
 const ROW_H: f32 = 24.;
@@ -474,7 +477,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
         ))
         .child(row(
             "Loop",
-            widgets::switch(("clip-loop", n), looping).tooltip(widgets::tip("Loop the clip", None)).on_click(cx.listener(move |this, _, _, cx| {
+            widgets::switch(("clip-loop", n), looping).tooltip(widgets::tip("Loop the clip: then dragging its right edge out repeats the loop. Off, it stops at the end of the sample", None)).on_click(cx.listener(move |this, _, _, cx| {
                 if audio {
                     crate::views::sample_editor::edit::toggle_loop(&mut this.s, id);
                 } else {
@@ -521,6 +524,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
             let warp = &src.warp;
             let (warp_on, reversed) = (warp.enabled, warp.reverse);
             let mode = format!("{:?}", warp.mode);
+            let stretch = (aitrack_model::ops::stretch_factor(warp, ws.s.project.tempo.initial_bpm()) * 100.).round() / 100.;
             let sample_box = section("SAMPLE", Icon::Sample)
                 .child(div().px(px(SP2)).h(px(ROW_H)).flex().items_center().child(label(crate::paint::fit(&file, PROPS_W - 16., TEXT_SM), TEXT_SM, pal.text)))
                 .child(row("Format", mono(format!("{:.1} kHz {channels}", f64::from(src.sample_rate) / 1000.), TEXT_SM, pal.muted)))
@@ -551,13 +555,17 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                         .child(widgets::badge(mode, pal.muted).id(("warp-mode", n)).tooltip(widgets::tip("Warp mode. Only Re-Pitch plays for now: pitch-preserving stretch is on its way", None))),
                 ))
                 .when_some(warp.original_bpm, |d, b| d.child(row("Seg. BPM", value_box(format!("{b:.2}")))))
+                // A clip stretched with Cmd/Ctrl + an edge (Re-Pitch).
+                .when(stretch != 1., |d| {
+                    d.child(row("Stretch", value_box(format!("×{stretch:.2}")).id(("stretch", n)).tooltip(widgets::tip("Stretched in time: Cmd/Ctrl + drag a clip edge in the arrangement. Pitch follows (Re-Pitch)", None))))
+                })
                 .child(row(
                     "Transpose",
                     div()
                         .flex()
                         .items_center()
                         .gap(px(SP1))
-                        .child(crate::views::devices::knob_control(("transpose", n), (warp.transpose + 48.) / 96., true, true, KnobTarget::Transpose { clip: id }, cx).tooltip(widgets::tip("Transpose in semitones: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", None)))
+                        .child(crate::views::devices::knob_control(("transpose", n), (warp.transpose + 48.) / 96., true, true, KnobTarget::Transpose { clip: id }, cx).tooltip(widgets::tip("Transpose in semitones: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", Some(ALL_CLIPS_HINT))))
                         .child(num_box(ws, ("transpose-value", n), NumTarget::Transpose { clip: id }, format!("{:+.0} st", warp.transpose), plain_text(f64::from(warp.transpose)), cx))
                 ))
                 .child(row(
@@ -566,7 +574,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                         .flex()
                         .items_center()
                         .gap(px(SP1))
-                        .child(crate::views::devices::knob_control(("detune", n), (warp.detune + 50.) / 100., true, true, KnobTarget::Detune { clip: id }, cx).tooltip(widgets::tip("Detune in cents: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", None)))
+                        .child(crate::views::devices::knob_control(("detune", n), (warp.detune + 50.) / 100., true, true, KnobTarget::Detune { clip: id }, cx).tooltip(widgets::tip("Detune in cents: drag, Shift for fine, double-click for 0. Acts on every selected audio clip", Some(ALL_CLIPS_HINT))))
                         .child(num_box(ws, ("detune-value", n), NumTarget::Detune { clip: id }, format!("{:+.0} ct", warp.detune), plain_text(f64::from(warp.detune)), cx)),
                 ))
                 .child(row(

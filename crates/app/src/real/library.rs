@@ -5,6 +5,11 @@
 //! app data folder, whose folders are scanned by a background
 //! [`ScanJob`] with [`AiAnalyzer`] (`aitrack-ai` key/BPM/category on top of
 //! the filename hints). The palette searches both.
+//!
+//! A folder may be a cloud folder (Dropbox, OneDrive, Google Drive, iCloud
+//! Drive): the scan indexes its online-only files by name without reading
+//! them (see [`aitrack_library::cloud`]); the palette downloads one when it
+//! is played and analyses it then.
 
 use crate::bridge::*;
 use aitrack_library::{
@@ -272,9 +277,11 @@ impl LibraryBridge for RealLibrary {
             return e.clone();
         }
         let user = self.count(USER);
+        let online = self.libs[USER].as_ref().and_then(|l| l.count_cloud().ok()).unwrap_or(0);
+        let online = if online > 0 { format!(" ({online} online only)") } else { String::new() };
         match &self.libs[FACTORY] {
-            Some(_) => format!("Factory bank: {} samples · yours: {user}", self.count(FACTORY)),
-            None => format!("Factory sound bank not found (set AITRACK_CONTENT_DIR) · yours: {user}"),
+            Some(_) => format!("Factory bank: {} samples · yours: {user}{online}", self.count(FACTORY)),
+            None => format!("Factory sound bank not found (set AITRACK_CONTENT_DIR) · yours: {user}{online}"),
         }
     }
 
@@ -347,7 +354,8 @@ impl LibraryBridge for RealLibrary {
                         }
                         ScanEvent::Finished(s) => {
                             let what = if s.cancelled { "Scan cancelled" } else { "Scan finished" };
-                            self.status = ScanStatus { running: false, fraction: 1., message: format!("{what}: {} added, {} updated, {} errors", s.added, s.updated, s.errors) };
+                            let online = if s.cloud > 0 { format!(", {} online only (they download when played)", s.cloud) } else { String::new() };
+                            self.status = ScanStatus { running: false, fraction: 1., message: format!("{what}: {} added, {} updated, {} errors{online}", s.added, s.updated, s.errors) };
                             finished = true;
                         }
                         ScanEvent::Failed(e) => {

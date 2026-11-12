@@ -98,3 +98,67 @@ fn counter_detects_allocations() {
     });
     assert!(n >= 1);
 }
+
+#[test]
+fn wavetable_swaps_tables_without_rt_heap_traffic() {
+    use aitrack_dsp::Processor;
+    use aitrack_stock::instrument::wavetable::{self as wt, WavetableSynth, modulation::LfoCurve, tablegen};
+    let mut s = WavetableSynth::new();
+    s.prepare(SR, BLOCK);
+    let wave = s.info().params.iter().find(|i| i.id == wt::p::osc(0, wt::p::WAVE)).unwrap().to_normalized(wt::USER_WAVE as f32);
+    s.set_param(wt::p::osc(0, wt::p::WAVE), wave);
+    let remote = s.remote();
+    let mut d = Driver::new();
+    for i in 0..3 {
+        // Control side: build and post (allocates, FFTs) …
+        remote.post_user_table(0, Some(tablegen::factory_table(i)));
+        remote.post_lfo_curve(1, LfoCurve::duck());
+        // … audio side: take it over, play it, retire the old one: no heap.
+        let n = counted(|| {
+            for _ in 0..8 {
+                d.block(&mut s, 2);
+            }
+        });
+        assert_eq!(n, 0, "swap {i}: {n} heap operations on the audio side");
+        assert!(!remote.pending());
+        // Control side frees what was retired.
+        remote.collect();
+    }
+}
+
+#[test]
+fn vault_switches_engines_and_presets_without_rt_heap_traffic() {
+    use aitrack_dsp::Processor;
+    use aitrack_stock::instrument::vault::{self, Vault, params as vp};
+    use aitrack_stock::presets;
+    let mut s = Vault::new();
+    s.prepare(SR, BLOCK);
+    let engine = s.info().params.iter().find(|i| i.id == vp::ENGINE).unwrap().clone();
+    // Factory presets, applied the way the engine applies parameter
+    // commands: plain set_param calls between blocks.
+    let loaded: Vec<presets::Preset> = presets::list(vault::ID).iter().map(|r| presets::load(&r.path).unwrap()).collect();
+    let pairs: Vec<Vec<(u32, f32)>> = loaded.iter().map(|p| p.params.iter().map(|(k, v)| (k.parse().unwrap(), *v)).collect()).collect();
+    let mut d = Driver::new();
+    for round in 0..2 {
+        for e in 0..vault::ENGINE_COUNT {
+            let n = counted(|| {
+                s.set_param(vp::ENGINE, engine.to_normalized(e as f32));
+                for _ in 0..12 {
+                    d.block(&mut s, 0);
+                }
+            });
+            assert_eq!(n, 0, "round {round} engine {e}: {n} heap operations");
+        }
+        for (i, p) in pairs.iter().enumerate().step_by(5) {
+            let n = counted(|| {
+                for &(id, v) in p {
+                    s.set_param(id, v);
+                }
+                for _ in 0..6 {
+                    d.block(&mut s, 0);
+                }
+            });
+            assert_eq!(n, 0, "preset {}: {n} heap operations", loaded[i].name);
+        }
+    }
+}

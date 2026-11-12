@@ -15,7 +15,9 @@ use crate::taxonomy::{Category, SampleKind};
 /// 2: absolute roots are stored with symlinks resolved (see [`stored_root_path`]).
 /// 3: `samples.onsets` (attacks counted while decoding), and labels are
 /// re-derived whenever [`crate::reanalyse::TAGGER_VERSION`] grows.
-pub const SCHEMA_VERSION: i32 = 3;
+/// 4: `samples.cloud`: the file is online-only in a cloud folder (see
+/// [`crate::cloud`]), indexed by name until it is downloaded.
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// The form a root is stored in. An absolute path that exists is stored with
 /// its symlinks resolved, because the OS reports canonical paths to the
@@ -142,6 +144,7 @@ CREATE TABLE IF NOT EXISTS samples(
   added_at INTEGER NOT NULL,
   last_used INTEGER,
   use_count INTEGER NOT NULL DEFAULT 0,
+  cloud INTEGER NOT NULL DEFAULT 0,
   UNIQUE(root_id, rel_path));
 CREATE INDEX IF NOT EXISTS samples_cat ON samples(category, subcategory);
 CREATE INDEX IF NOT EXISTS samples_key ON samples(key_root, scale_kind);
@@ -200,6 +203,22 @@ pub struct Root {
     pub last_scan: Option<i64>,
 }
 
+impl Root {
+    /// The cloud service this folder syncs with, judged from its path.
+    pub fn provider(&self) -> Option<crate::cloud::Provider> {
+        crate::cloud::provider_of(&self.path)
+    }
+}
+
+/// A root and what is indexed in it ([`Library::root_stats`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RootStats {
+    pub root: Root,
+    pub samples: u64,
+    /// Of those, online-only (see [`crate::cloud`]).
+    pub cloud: u64,
+}
+
 /// Pack metadata (from the sound bank manifest or derived from a folder name).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PackInfo {
@@ -251,6 +270,9 @@ pub struct Sample {
     pub user_tags: Vec<String>,
     pub analysis_version: u32,
     pub last_used: Option<i64>,
+    /// Online-only in a cloud folder: indexed by name, not analysed, and
+    /// downloaded when it is auditioned or dragged.
+    pub cloud: bool,
 }
 
 impl Sample {
@@ -321,7 +343,7 @@ pub(crate) fn decode_list(s: &str) -> Vec<String> {
 pub(crate) const SAMPLE_COLS: &str = "s.id, s.root_id, s.rel_path, s.name, s.size, s.mtime, s.hash, \
     s.duration, s.sample_rate, s.channels, s.peak_db, s.loudness, s.bpm, s.key_root, s.scale_kind, \
     s.camelot, s.root_note, s.kind, s.loop_family, s.category, s.subcategory, s.genres, s.pack, \
-    s.license, s.favorite, s.rating, s.user_tags, s.analysis_version, s.last_used, r.path";
+    s.license, s.favorite, s.rating, s.user_tags, s.analysis_version, s.last_used, r.path, s.cloud";
 
 /// Normalizes a relative path to `/` separators.
 pub(crate) fn rel_string(rel: &Path) -> String {
@@ -386,6 +408,9 @@ impl Library {
         }
         if v < 3 && !self.has_column("samples", "onsets")? {
             self.conn.execute_batch("ALTER TABLE samples ADD COLUMN onsets INTEGER")?;
+        }
+        if v < 4 && !self.has_column("samples", "cloud")? {
+            self.conn.execute_batch("ALTER TABLE samples ADD COLUMN cloud INTEGER NOT NULL DEFAULT 0")?;
         }
         if v < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -538,6 +563,20 @@ impl Library {
         Ok(out)
     }
 
+    /// Every root with how many samples it holds and how many of those are
+    /// online-only.
+    pub fn root_stats(&self) -> Result<Vec<RootStats>> {
+        let mut out = Vec::new();
+        let mut st = self.conn.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(cloud), 0) FROM samples WHERE root_id = ?1 AND status = 'ok'",
+        )?;
+        for root in self.roots()? {
+            let (samples, cloud) = st.query_row([root.id.0], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)))?;
+            out.push(RootStats { root, samples, cloud });
+        }
+        Ok(out)
+    }
+
     pub fn root(&self, id: RootId) -> Result<Root> {
         self.roots()?
             .into_iter()
@@ -651,6 +690,7 @@ impl Library {
             user_tags: decode_list(&tags),
             analysis_version: r.get::<_, i64>(27)? as u32,
             last_used: r.get(28)?,
+            cloud: r.get(30)?,
         })
     }
 
@@ -739,7 +779,7 @@ impl Library {
                    bpm=?13, bpm_source=?14, root_note=?15, kind=?16, is_loop=?17, loop_family=?18,
                    genres=?19, pack=?20, license=?21, analyzer=?22, analysis_version=?23,
                    embedding=COALESCE(?24, embedding), embedding_model=COALESCE(?25, embedding_model),
-                   onsets=?26
+                   onsets=?26, cloud=0
                  WHERE id=?1",
                 params![
                     id,
@@ -839,6 +879,21 @@ impl Library {
         };
         self.refresh_fts(SampleId(id))?;
         Ok(SampleId(id))
+    }
+
+    /// Flags a row as online-only (`true`) or local again.
+    pub(crate) fn set_cloud(&self, root_id: RootId, rel: &str, cloud: bool) -> Result<()> {
+        self.conn
+            .execute("UPDATE samples SET cloud=?3 WHERE root_id=?1 AND rel_path=?2", params![root_id.0, rel, cloud])?;
+        Ok(())
+    }
+
+    /// How many indexed samples are online-only.
+    pub fn count_cloud(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM samples WHERE status = 'ok' AND cloud = 1", [], |r| r.get::<_, i64>(0))?
+            as u64)
     }
 
     /// Records a file that could not be decoded, so it is not retried until it changes.

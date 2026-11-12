@@ -101,6 +101,22 @@ when the pack lists exactly one. When those rules change,
 `aitrack_library::reanalyse::TAGGER_VERSION` goes up and every library,
 `factory.db` included, re-derives its labels the next time it is opened.
 
+### Wavetables
+
+The packs with `kinds = ["wavetables", …]` hold oscillator material for
+`instrument.wavetable`, not one-shots:
+
+- `akwf-single-cycles`: 600-sample single cycles. Import them with
+  `wavetable::wav::import`; files with no chunk that are shorter than two
+  frames are read as one cycle.
+- `waveedit-online-banks`: banks of 64 frames × 256 samples with no chunk.
+  Import them with `wavetable::wav::import_with(.., Some(256))`.
+
+See `docs/research/10-wavetable-synth.md`. Some GitHub repositories are too
+large for a single recursive tree listing (AKWF is one). For those,
+`fetch` walks only the selected sub-folders, and the file-list hash stays the
+same.
+
 ## Adding a pack
 
 1. Read the license on the official page **and** in the archive or repository.

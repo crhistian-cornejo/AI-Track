@@ -353,22 +353,30 @@ fn splitting_keeps_the_fades_on_the_outer_edges() {
 }
 
 #[test]
-fn dragging_an_audio_clip_longer_than_its_file_loops_it() {
+fn dragging_a_one_shot_past_its_file_stops_there_and_a_looping_clip_repeats() {
     let Song { mut s, audio, .. } = song();
     let kick = audio_clip(&mut s, audio, 0, 2 * BEAT);
     let id = s.placement(kick).unwrap().1.clip;
     assert_eq!(ops::source_len(&s.project, id), Some(2 * BEAT), "one second at 120 BPM");
+    // Loop off: shorter, then out past the file, where it stops; it never starts looping.
+    s.seal();
+    assert!(s.resize_clip(id, BEAT));
+    assert!(s.resize_clip(id, 7 * BEAT));
+    s.seal();
+    let clip = s.project.clips[&id].clone();
+    assert_eq!((clip.length, clip.looping), (2 * BEAT, None));
+    assert!(!s.resize_clip(id, 9 * BEAT), "already at the end of the file");
+    // Loop on: the edge repeats the loop.
+    s.click_clip(kick, false);
+    assert_eq!(s.toggle_clips_loop(), Some(true));
     s.seal();
     assert!(s.resize_clip(id, 3 * BEAT) && s.resize_clip(id, 7 * BEAT));
     s.seal();
     let clip = s.project.clips[&id].clone();
     assert_eq!((clip.length, clip.looping), (7 * BEAT, Some(LoopRegion { start: 0, end: 2 * BEAT })));
     assert_eq!(overlay::loop_repeats(&clip, 1.), [(2 * BEAT) as f32, (4 * BEAT) as f32, (6 * BEAT) as f32]);
-    // Back inside the file the loop it got goes away; the whole drag is one step.
-    s.seal();
-    assert!(s.resize_clip(id, BEAT));
-    assert_eq!(s.project.clips[&id].looping, None);
-    assert!(s.undo() && s.undo());
+    // The whole drag is one step.
+    assert!(s.undo());
     assert_eq!(s.project.clips[&id].length, 2 * BEAT);
 }
 
@@ -649,12 +657,14 @@ fn ramp_clip(s: &mut AppState, track: TrackId) -> (PlacementId, ClipId, Vec<f32>
     (id, clip, data)
 }
 
-/// The left edge pulled half a beat in and the right edge out to five beats, in the lanes.
+/// The left edge pulled half a beat in, Loop switched on, and the right edge
+/// out to five beats (repeating the loop), in the lanes.
 fn trim_and_stretch_in_the_lane(s: &mut AppState, placement: PlacementId, clip: ClipId) {
     s.seal();
     let origin = Origin::take(s, placement).unwrap();
     assert!(lane_edit::apply(s, &origin, Edit::Start(4 * BEAT + BEAT / 2)));
     s.seal();
+    assert!(sample_edit::toggle_loop(s, clip));
     assert!(s.resize_clip(clip, 5 * BEAT));
     s.seal();
 }
@@ -671,12 +681,13 @@ fn the_lane_edges_and_the_sample_editor_markers_make_the_same_looping_clip() {
     let Song { mut s, audio, .. } = song();
     let (placement, clip, _) = ramp_clip(&mut s, audio);
     assert!(sample_edit::apply_now(&mut s, clip, Gesture::Start(BEAT / 2)));
+    assert!(sample_edit::toggle_loop(&mut s, clip));
     assert!(sample_edit::apply_now(&mut s, clip, Gesture::End(BEAT / 2 + 5 * BEAT)));
     let editor = (s.project.clips[&clip].clone(), s.placement(placement).unwrap().1.start);
 
     assert_eq!(lane, editor);
     assert_eq!((lane.0.offset, lane.0.length, lane.1), (BEAT / 2, 5 * BEAT, 4 * BEAT + BEAT / 2));
-    assert_eq!(lane.0.looping, Some(LoopRegion { start: BEAT / 2, end: 2 * BEAT }), "past the file it loops what it was showing");
+    assert_eq!(lane.0.looping, Some(LoopRegion { start: BEAT / 2, end: 2 * BEAT }), "it loops what it was showing when Loop went on");
 }
 
 #[test]
@@ -940,4 +951,166 @@ fn a_stretched_shaped_clip_pastes_whole_and_the_engine_plays_the_copies_like_the
             assert!((got - want).abs() < 2e-3, "engine {n} samples after the repeat at {r}: {got} vs {want}");
         }
     }
+}
+
+#[test]
+fn space_plays_from_the_insert_marker_and_shift_space_continues() {
+    use crate::bridge::{EngineBridge, StubEngine};
+    let Song { mut s, midi, .. } = song();
+    let mut e = StubEngine::default();
+    let pos = |e: &StubEngine| e.transport().position;
+    // Stopped: a click in a lane moves the marker and the playhead.
+    gestures::place_marker(&mut s, &mut e, 8 * BEAT, Some(midi));
+    assert_eq!((s.ed.marker, pos(&e), s.selected_track), (8 * BEAT, 8 * BEAT, Some(midi)));
+    // Space plays from the marker.
+    gestures::play_stop(&s, &mut e);
+    assert!(e.transport().playing);
+    assert!((8 * BEAT..9 * BEAT).contains(&pos(&e)));
+    // Playback runs on to bar 5; a click in a lane while playing only moves the marker.
+    e.locate(16 * BEAT);
+    gestures::place_marker(&mut s, &mut e, 2 * BEAT, Some(midi));
+    assert_eq!(s.ed.marker, 2 * BEAT);
+    assert!(pos(&e) >= 16 * BEAT, "playback carries on");
+    // Space stops where it is; the marker stays.
+    gestures::play_stop(&s, &mut e);
+    assert!(!e.transport().playing);
+    let stopped = pos(&e);
+    assert!((16 * BEAT..17 * BEAT).contains(&stopped));
+    assert_eq!(s.ed.marker, 2 * BEAT);
+    // Shift+Space (`Cmd::Continue`: play on, as `commands.rs` does) carries on from the stop.
+    e.play();
+    assert!(pos(&e) >= stopped);
+    gestures::play_stop(&s, &mut e);
+    // Space again starts over from the marker.
+    gestures::play_stop(&s, &mut e);
+    assert!((2 * BEAT..3 * BEAT).contains(&pos(&e)));
+    // The ruler's scrub area moves playback while playing.
+    gestures::scrub_to(&mut s, &mut e, 12 * BEAT);
+    assert_eq!(s.ed.marker, 12 * BEAT);
+    assert!(e.transport().playing && (12 * BEAT..13 * BEAT).contains(&pos(&e)));
+    gestures::play_stop(&s, &mut e);
+}
+
+#[test]
+fn a_ruler_click_keeps_the_automation_range_and_a_lane_marker_clears_the_time_selection() {
+    use crate::bridge::StubEngine;
+    let Song { mut s, midi, midi2, .. } = song();
+    let mut e = StubEngine::default();
+    s.set_time_selection((0, midi), (4 * BEAT, midi2));
+    gestures::place_marker(&mut s, &mut e, 6 * BEAT, Some(midi2));
+    assert!(s.time_selection().is_none(), "a plain click drops the time selection");
+    s.set_auto_range(midi, AutomationTarget::Pan, BEAT, 3 * BEAT);
+    gestures::scrub_to(&mut s, &mut e, 0);
+    assert_eq!(s.ed.marker, 0);
+    assert!(s.auto_sel.is_some());
+}
+
+/// A track whose Pan lane ramps 0 → 1 over bars 1..2 then back to 0.5 at bar 3.
+fn pan_ramp(s: &mut AppState, track: TrackId) {
+    let lane = AutomationLane {
+        points: vec![AutomationPoint { tick: 0, value: 0., curve: 0. }, AutomationPoint { tick: 4 * BEAT, value: 1., curve: 0. }, AutomationPoint { tick: 8 * BEAT, value: 0.5, curve: 0. }],
+        ..AutomationLane::new(AutomationTarget::Pan)
+    };
+    assert!(s.edit("Automate", vec![Command::SetAutomation { track, target: AutomationTarget::Pan, lane: Some(lane) }]));
+    s.seal();
+}
+
+fn pan_at(s: &AppState, track: TrackId, tick: Tick) -> f32 {
+    s.project.track(track).unwrap().automation.iter().find(|l| l.target == AutomationTarget::Pan).unwrap().value_at(tick).unwrap()
+}
+
+#[test]
+fn automation_ranges_cut_copy_paste_and_duplicate_in_one_undo_step_each() {
+    let Song { mut s, midi, .. } = song();
+    pan_ramp(&mut s, midi);
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    // Nothing selected in the lane: Copy does not touch automation.
+    assert_eq!(s.copy_auto_range(), None);
+    s.set_auto_range(midi, AutomationTarget::Pan, 2 * BEAT, 6 * BEAT);
+    assert_eq!(s.ed.marker, 2 * BEAT);
+    let base = steps(&s);
+    // Copy, then Delete: straight across the range, the outside unchanged.
+    assert!(s.copy());
+    assert_eq!(s.auto_clip.as_ref().map(|c| c.1), Some(4 * BEAT));
+    assert!(s.delete_selection());
+    assert_eq!(steps(&s), base + 1);
+    assert!(close(pan_at(&s, midi, BEAT), 0.25) && close(pan_at(&s, midi, 7 * BEAT), 0.625));
+    assert!(close(pan_at(&s, midi, 4 * BEAT), 0.625), "straight from 0.5 to 0.75");
+    s.undo();
+    assert!(close(pan_at(&s, midi, 4 * BEAT), 1.));
+    // Paste over a caret at bar 3: the copied ramp lands there; the outside stays.
+    s.set_auto_range(midi, AutomationTarget::Pan, 8 * BEAT, 8 * BEAT);
+    assert!(s.paste());
+    assert_eq!(steps(&s), base + 1);
+    assert!(close(pan_at(&s, midi, 10 * BEAT), 1.), "the copy's peak, two beats in");
+    assert!(close(pan_at(&s, midi, 7 * BEAT), 0.625), "before the paste unchanged");
+    assert_eq!(s.auto_sel.map(|r| (r.start, r.end)), Some((8 * BEAT, 12 * BEAT)), "the pasted range is selected");
+    // Duplicate: the selection again right after itself, which becomes the selection.
+    assert!(s.duplicate_selection());
+    assert_eq!(steps(&s), base + 2);
+    assert!(close(pan_at(&s, midi, 14 * BEAT), 1.));
+    assert_eq!(s.auto_sel.map(|r| (r.start, r.end)), Some((12 * BEAT, 16 * BEAT)));
+    // Cut: copy and flatten.
+    s.set_auto_range(midi, AutomationTarget::Pan, 0, 8 * BEAT);
+    assert!(s.cut());
+    assert_eq!(steps(&s), base + 3);
+    assert!(close(pan_at(&s, midi, 4 * BEAT), 0.25), "straight from 0 to 0.5");
+    assert_eq!(s.auto_clip.as_ref().map(|c| c.1), Some(8 * BEAT));
+    // A clip time selection is untouched by it all.
+    assert!(s.time_selection().is_none());
+}
+
+#[test]
+fn dragging_an_automation_range_moves_only_it_in_one_undo_step() {
+    let Song { mut s, midi, .. } = song();
+    pan_ramp(&mut s, midi);
+    s.set_auto_range(midi, AutomationTarget::Pan, 2 * BEAT, 6 * BEAT);
+    let range = s.auto_sel.unwrap();
+    let original = s.project.track(midi).unwrap().automation[0].points.clone();
+    let base = steps(&s);
+    for d in [0.05, -0.1, -0.2] {
+        assert!(s.shift_auto_range(range, &original, d));
+    }
+    s.seal();
+    assert_eq!(steps(&s), base + 1, "one drag, one undo step");
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    assert!(close(pan_at(&s, midi, 2 * BEAT), 0.3) && close(pan_at(&s, midi, 4 * BEAT), 0.8));
+    assert!(close(pan_at(&s, midi, BEAT), 0.25) && close(pan_at(&s, midi, 7 * BEAT), 0.625), "outside unchanged");
+    // Clamped to the parameter's range.
+    s.shift_auto_range(range, &original, -5.);
+    s.seal();
+    assert!(close(pan_at(&s, midi, 3 * BEAT), 0.));
+    s.undo();
+    s.undo();
+    assert_eq!(s.project.track(midi).unwrap().automation[0].points, original);
+}
+
+#[test]
+fn plugin_window_edits_become_one_undo_step_per_gesture_and_states_are_stored() {
+    use crate::bridge::{PluginEdit, PluginEditKind as K};
+    let Song { mut s, midi, .. } = song();
+    let device = s.add_stock_device(midi, "eq8", "EQ").unwrap();
+    s.seal();
+    let base = steps(&s);
+    let edit = |kind, value| PluginEdit { device, param: 3, value, kind };
+    let gesture = [edit(K::Begin, 0.), edit(K::Value, 0.2), edit(K::Value, 0.4), edit(K::Value, 0.6)];
+    assert!(s.apply_plugin_edits(&gesture));
+    assert!(s.apply_plugin_edits(&[edit(K::Value, 0.7), edit(K::End, 0.)]), "a gesture spread over frames");
+    assert_eq!(steps(&s), base + 1);
+    assert_eq!(s.project.device(device).unwrap().params.get(&3), Some(&0.7));
+    assert_eq!(s.history.undo_label(), Some("Plugin parameter"));
+    // The value the project already holds (the plugin echoing it) is no edit.
+    assert!(!s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.7), edit(K::End, 0.)]));
+    assert_eq!(steps(&s), base + 1);
+    // An edit for a device that is gone is ignored.
+    assert!(!s.apply_plugin_edits(&[PluginEdit { device: DeviceId(9999), param: 1, value: 0.5, kind: K::Value }]));
+    s.undo();
+    assert_eq!(s.project.device(device).unwrap().params.get(&3), None);
+    // States: only what differs, in one step, unknown devices left out.
+    assert!(s.store_plugin_states(vec![(device, vec![1, 2, 3]), (DeviceId(9999), vec![4])]));
+    assert_eq!(s.project.device(device).unwrap().state.as_deref(), Some(&[1u8, 2, 3][..]));
+    assert_eq!(s.history.undo_label(), Some("Plugin state"));
+    let n = steps(&s);
+    assert!(!s.store_plugin_states(vec![(device, vec![1, 2, 3])]), "unchanged: no undo step");
+    assert_eq!(steps(&s), n);
 }

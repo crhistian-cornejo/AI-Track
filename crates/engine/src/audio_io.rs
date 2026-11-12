@@ -8,7 +8,15 @@
 //!
 //! The output callback promotes its thread once (MMCSS "Pro Audio"), flushes
 //! denormals and runs the [`AudioProcessor`]. Stream errors that mean the
-//! device is gone set a flag the control thread polls to reopen a device.
+//! device is gone set a flag the control thread polls to reopen a device;
+//! a reroute of the system default output (headphones plugged in, Bluetooth
+//! connected) sets another so the stream is rebuilt at the new device's own
+//! rate and channel count instead of running through the OS's converter.
+//!
+//! Latency: every callback measures `playback − callback` (output) and
+//! `callback − capture` (input) from cpal's stream timestamps, which on
+//! CoreAudio already include the device latency and safety offset and on
+//! Bluetooth the link delay, and publishes them in [`SharedStatus::io`].
 
 use crate::rt::AudioProcessor;
 use crate::status::SharedStatus;
@@ -17,7 +25,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use rtrb::Producer;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 /// A device as listed for the settings UI.
@@ -107,10 +115,20 @@ pub struct ActiveAudio {
     pub input_channels: u16,
     /// Human-readable notes about fallbacks ("device X missing, using default").
     pub notes: Vec<String>,
+    /// The output is the system default device (no device was asked for):
+    /// the stream is rebuilt when the system default changes.
+    pub follows_default: bool,
+    /// A specific output device was asked for but is missing; the engine
+    /// switches back to it when it reappears.
+    pub wanted_missing: bool,
 }
 
 pub const MIN_BUFFER: u32 = 32;
 pub const MAX_BUFFER: u32 = 4096;
+
+/// Buffer size used when the settings do not name one: 256 frames (5.3 ms
+/// at 48 kHz) is safe on every built-in device and low enough to play.
+pub const DEFAULT_BUFFER: u32 = 256;
 
 pub const COMMON_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 
@@ -214,18 +232,34 @@ fn find_device(host: &cpal::Host, id: Option<&str>, name: Option<&str>, output: 
     devs.into_iter().find(|d| device_name(d) == name)
 }
 
+/// Whether the output device `cfg` asks for is present (for switching back
+/// after a fallback). Control thread only.
+pub(crate) fn output_present(cfg: &AudioConfig) -> bool {
+    if cfg.output_device.is_none() && cfg.output_device_name.is_none() {
+        return false;
+    }
+    let Ok(host) = host_by_name(cfg.host.as_deref()) else { return false };
+    find_device(&host, cfg.output_device.as_deref(), cfg.output_device_name.as_deref(), true).is_some()
+}
+
 fn supports_rate(configs: &[cpal::SupportedStreamConfigRange], rate: u32) -> bool {
     configs.iter().any(|c| rate >= c.min_sample_rate() && rate <= c.max_sample_rate())
 }
 
+/// The frames-per-callback to ask for: the requested size (or
+/// [`DEFAULT_BUFFER`]) clamped to the device's range and the engine's
+/// 32–4096. A range that does not intersect ours leaves the driver default.
 fn pick_buffer(requested: Option<u32>, range: &cpal::SupportedBufferSize, notes: &mut Vec<String>) -> cpal::BufferSize {
-    let Some(n) = requested else { return cpal::BufferSize::Default };
+    let n = requested.unwrap_or(DEFAULT_BUFFER);
     let (lo, hi) = match range {
         cpal::SupportedBufferSize::Range { min, max } => ((*min).max(MIN_BUFFER), (*max).min(MAX_BUFFER)),
         cpal::SupportedBufferSize::Unknown => (MIN_BUFFER, MAX_BUFFER),
     };
-    let clamped = if lo <= hi { n.clamp(lo, hi) } else { n.clamp(MIN_BUFFER, MAX_BUFFER) };
-    if clamped != n {
+    if lo > hi {
+        return cpal::BufferSize::Default;
+    }
+    let clamped = n.clamp(lo, hi);
+    if clamped != n && requested.is_some() {
         notes.push(format!("buffer size {n} not supported, using {clamped}"));
     }
     cpal::BufferSize::Fixed(clamped)
@@ -253,10 +287,12 @@ pub(crate) fn prepare(cfg: &AudioConfig) -> Result<Prepared, EngineError> {
         notes.push("WASAPI exclusive mode is not available yet; using shared mode".into());
     }
     let wanted_out = cfg.output_device.is_some() || cfg.output_device_name.is_some();
+    let mut wanted_missing = false;
     let output = match find_device(&host, cfg.output_device.as_deref(), cfg.output_device_name.as_deref(), true) {
         Some(d) => d,
         None => {
             if wanted_out {
+                wanted_missing = true;
                 notes.push(format!(
                     "output device '{}' not found; using the default device",
                     cfg.output_device_name.as_deref().or(cfg.output_device.as_deref()).unwrap_or("?")
@@ -298,7 +334,14 @@ pub(crate) fn prepare(cfg: &AudioConfig) -> Result<Prepared, EngineError> {
                         let max_in = in_configs.iter().map(|c| c.channels()).max().unwrap_or(c.channels()).max(1);
                         in_sel = clamp_selection(in_sel, max_in, "input", &mut notes);
                         let ch = c.channels().max(in_sel.first + in_sel.count).min(max_in);
-                        let conf = cpal::StreamConfig { channels: ch, sample_rate, buffer_size: cpal::BufferSize::Default };
+                        // Same frames per callback as the output, so input
+                        // latency does not sit on a bigger driver default.
+                        let wanted = match buffer_size {
+                            cpal::BufferSize::Fixed(n) => Some(n),
+                            cpal::BufferSize::Default => None,
+                        };
+                        let buffer_size = pick_buffer(wanted, c.buffer_size(), &mut Vec::new());
+                        let conf = cpal::StreamConfig { channels: ch, sample_rate, buffer_size };
                         input = Some((d, conf, c.sample_format()));
                     } else {
                         notes.push(format!("input device does not run at {sample_rate} Hz; input disabled"));
@@ -322,6 +365,8 @@ pub(crate) fn prepare(cfg: &AudioConfig) -> Result<Prepared, EngineError> {
         output_channels: out_config.channels,
         input_channels: input.as_ref().map_or(0, |i| i.1.channels),
         notes,
+        follows_default: !wanted_out || wanted_missing,
+        wanted_missing,
     };
     Ok(Prepared {
         out_format: def.sample_format(),
@@ -340,8 +385,66 @@ pub(crate) fn prepare(cfg: &AudioConfig) -> Result<Prepared, EngineError> {
 pub(crate) struct OpenStream {
     _out: cpal::Stream,
     _input: Option<cpal::Stream>,
+    /// The device is gone or the stream is invalid (rate changed under it).
     pub lost: Arc<AtomicBool>,
+    /// The system default output changed and the stream was rerouted.
+    pub rerouted: Arc<AtomicBool>,
     pub active: ActiveAudio,
+}
+
+/// Flags the stream error callbacks raise for the control thread.
+#[derive(Clone)]
+struct Flags {
+    status: Arc<SharedStatus>,
+    lost: Arc<AtomicBool>,
+    rerouted: Arc<AtomicBool>,
+}
+
+impl Flags {
+    fn on_error(&self, kind: cpal::ErrorKind) {
+        if kind == cpal::ErrorKind::Xrun {
+            self.status.xruns.fetch_add(1, Ordering::Relaxed);
+        } else if kind == cpal::ErrorKind::DeviceChanged {
+            self.rerouted.store(true, Ordering::Release);
+        } else if is_fatal(kind) {
+            self.lost.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Moves a value into a stream callback only if the stream gets built: the
+/// callback takes it with one atomic swap on its first call (wait-free, no
+/// lock, no allocation); after a failed build the caller takes it back.
+struct Handoff<T>(AtomicPtr<T>);
+
+// SAFETY: the pointer is owned by exactly one side at a time (whoever
+// swapped it out), so sharing the cell is sound when `T` can move threads.
+unsafe impl<T: Send> Send for Handoff<T> {}
+unsafe impl<T: Send> Sync for Handoff<T> {}
+
+impl<T> Handoff<T> {
+    fn new(value: Option<T>) -> Self {
+        Self(AtomicPtr::new(value.map_or(std::ptr::null_mut(), |v| Box::into_raw(Box::new(v)))))
+    }
+
+    fn take(&self) -> Option<Box<T>> {
+        let p = self.0.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: a non-null pointer came from `Box::into_raw` and the swap
+        // made this call its only owner.
+        (!p.is_null()).then(|| unsafe { Box::from_raw(p) })
+    }
+}
+
+impl<T> Drop for Handoff<T> {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+/// Frames between two stream instants, at `rate` (0 when out of order).
+fn frames_between(later: cpal::StreamInstant, earlier: cpal::StreamInstant, rate: u32) -> u32 {
+    let d = later.duration_since(earlier);
+    (d.as_secs_f64() * rate as f64).round().min(u32::MAX as f64) as u32
 }
 
 fn is_fatal(kind: cpal::ErrorKind) -> bool {
@@ -353,24 +456,47 @@ fn is_fatal(kind: cpal::ErrorKind) -> bool {
 
 fn build_output<T>(
     p: &Prepared,
-    mut runner: AudioProcessor,
-    status: Arc<SharedStatus>,
-    lost: Arc<AtomicBool>,
+    config: cpal::StreamConfig,
+    runner: &mut Option<AudioProcessor>,
+    flags: &Flags,
 ) -> Result<cpal::Stream, EngineError>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
 {
-    let channels = p.out_config.channels as usize;
+    let channels = config.channels as usize;
     let first = p.out_first.min(channels.saturating_sub(1));
     let mut scratch = vec![0f32; 8192 * channels];
-    let status_err = status.clone();
-    p.output
+    let status = flags.status.clone();
+    let rate = config.sample_rate;
+    // The processor moves into the callback only if the stream is built;
+    // on failure it comes back so a fallback config can try again.
+    let slot = Arc::new(Handoff::new(runner.take()));
+    let cb_slot = slot.clone();
+    let mut proc: Option<Box<AudioProcessor>> = None;
+    let flags_err = flags.clone();
+    let built = p
+        .output
         .build_output_stream::<T, _, _>(
-            p.out_config,
-            move |data: &mut [T], _info| {
+            config,
+            move |data: &mut [T], info| {
+                let runner = match &mut proc {
+                    Some(r) => r,
+                    None => {
+                        // First callback: take the processor (one swap).
+                        let Some(r) = cb_slot.take() else {
+                            data.fill(T::EQUILIBRIUM);
+                            return;
+                        };
+                        proc.insert(r)
+                    }
+                };
                 if !runner.mark_thread_promoted() {
                     crate::thread_priority::promote_audio_thread();
                 }
+                let ts = info.timestamp();
+                let frames = (data.len() / channels.max(1)) as u32;
+                status.io.publish_output(frames, frames_between(ts.playback, ts.callback, rate));
+                runner.begin_callback();
                 for chunk in data.chunks_mut(scratch.len()) {
                     let s = &mut scratch[..chunk.len()];
                     runner.process_interleaved_at(s, channels, first);
@@ -379,37 +505,92 @@ where
                     }
                 }
             },
-            move |err| {
-                if err.kind() == cpal::ErrorKind::Xrun {
-                    status_err.xruns.fetch_add(1, Ordering::Relaxed);
-                } else if is_fatal(err.kind()) {
-                    lost.store(true, Ordering::Release);
-                }
-            },
+            move |err| flags_err.on_error(err.kind()),
             None,
         )
-        .map_err(|e| EngineError::Audio(e.to_string()))
+        .map_err(|e| EngineError::Audio(e.to_string()));
+    if built.is_err() {
+        *runner = slot.take().map(|b| *b);
+    }
+    built
 }
 
-fn build_input<T>(device: &cpal::Device, config: cpal::StreamConfig, mut tx: Producer<f32>) -> Result<cpal::Stream, EngineError>
+fn build_input<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    tx: &mut Option<Producer<f32>>,
+    flags: &Flags,
+) -> Result<cpal::Stream, EngineError>
 where
     T: SizedSample + Send + 'static,
     f32: FromSample<T>,
 {
-    device
+    let slot = Arc::new(Handoff::new(tx.take()));
+    let cb_slot = slot.clone();
+    let mut producer: Option<Box<Producer<f32>>> = None;
+    let status = flags.status.clone();
+    let flags_err = flags.clone();
+    let channels = config.channels.max(1) as usize;
+    let rate = config.sample_rate;
+    let built = device
         .build_input_stream::<T, _, _>(
             config,
-            move |data: &[T], _info| {
+            move |data: &[T], info| {
+                let tx = match &mut producer {
+                    Some(t) => t,
+                    None => {
+                        let Some(t) = cb_slot.take() else { return };
+                        producer.insert(t)
+                    }
+                };
+                let ts = info.timestamp();
+                status.io.publish_input((data.len() / channels) as u32, frames_between(ts.callback, ts.capture, rate));
                 for s in data {
                     if tx.push(f32::from_sample(*s)).is_err() {
                         break;
                     }
                 }
             },
-            |err| log::warn!("audio input error: {err}"),
+            move |err| {
+                // A vanished input (Bluetooth mic, USB interface) rebuilds
+                // the streams so the output keeps running without it.
+                if is_fatal(err.kind()) {
+                    flags_err.lost.store(true, Ordering::Release);
+                }
+            },
             None,
         )
-        .map_err(|e| EngineError::Audio(e.to_string()))
+        .map_err(|e| EngineError::Audio(e.to_string()));
+    if built.is_err() {
+        *tx = slot.take().map(|b| *b);
+    }
+    built
+}
+
+fn build_output_any(p: &Prepared, config: cpal::StreamConfig, runner: &mut Option<AudioProcessor>, flags: &Flags) -> Result<cpal::Stream, EngineError> {
+    match p.out_format {
+        SampleFormat::F32 => build_output::<f32>(p, config, runner, flags),
+        SampleFormat::I16 => build_output::<i16>(p, config, runner, flags),
+        SampleFormat::I32 => build_output::<i32>(p, config, runner, flags),
+        SampleFormat::F64 => build_output::<f64>(p, config, runner, flags),
+        SampleFormat::U16 => build_output::<u16>(p, config, runner, flags),
+        other => Err(EngineError::Audio(format!("unsupported output sample format {other:?}"))),
+    }
+}
+
+fn build_input_any(
+    dev: &cpal::Device,
+    conf: cpal::StreamConfig,
+    fmt: SampleFormat,
+    tx: &mut Option<Producer<f32>>,
+    flags: &Flags,
+) -> Result<cpal::Stream, EngineError> {
+    match fmt {
+        SampleFormat::F32 => build_input::<f32>(dev, conf, tx, flags),
+        SampleFormat::I16 => build_input::<i16>(dev, conf, tx, flags),
+        SampleFormat::I32 => build_input::<i32>(dev, conf, tx, flags),
+        other => Err(EngineError::Audio(format!("unsupported input sample format {other:?}"))),
+    }
 }
 
 /// Build and start the streams; `runner` moves into the output callback.
@@ -419,23 +600,31 @@ pub(crate) fn start(
     input_tx: Option<Producer<f32>>,
     status: Arc<SharedStatus>,
 ) -> Result<OpenStream, EngineError> {
-    let lost = Arc::new(AtomicBool::new(false));
-    let out = match p.out_format {
-        SampleFormat::F32 => build_output::<f32>(&p, runner, status, lost.clone()),
-        SampleFormat::I16 => build_output::<i16>(&p, runner, status, lost.clone()),
-        SampleFormat::I32 => build_output::<i32>(&p, runner, status, lost.clone()),
-        SampleFormat::F64 => build_output::<f64>(&p, runner, status, lost.clone()),
-        SampleFormat::U16 => build_output::<u16>(&p, runner, status, lost.clone()),
-        other => Err(EngineError::Audio(format!("unsupported output sample format {other:?}"))),
-    }?;
-    let input = match (&p.input, input_tx) {
-        (Some((dev, conf, fmt)), Some(tx)) => {
-            let built = match fmt {
-                SampleFormat::F32 => build_input::<f32>(dev, *conf, tx),
-                SampleFormat::I16 => build_input::<i16>(dev, *conf, tx),
-                SampleFormat::I32 => build_input::<i32>(dev, *conf, tx),
-                other => Err(EngineError::Audio(format!("unsupported input sample format {other:?}"))),
-            };
+    let flags = Flags { status: status.clone(), lost: Arc::new(AtomicBool::new(false)), rerouted: Arc::new(AtomicBool::new(false)) };
+    status.io.reset();
+    let mut active = p.active.clone();
+    let mut runner = Some(runner);
+    // A fixed buffer size some drivers refuse (WASAPI shared mode, a few
+    // USB/Bluetooth drivers): retry with the driver's own size.
+    let out = match build_output_any(&p, p.out_config, &mut runner, &flags) {
+        Ok(s) => s,
+        Err(e) if matches!(p.out_config.buffer_size, cpal::BufferSize::Fixed(_)) && runner.is_some() => {
+            log::info!("audio: fixed buffer refused ({e}); using the driver default");
+            active.notes.push("the device refused the buffer size; using its default".into());
+            build_output_any(&p, cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..p.out_config }, &mut runner, &flags)?
+        }
+        Err(e) => return Err(e),
+    };
+    let mut input_tx = input_tx;
+    let input = match &p.input {
+        Some((dev, conf, fmt)) if input_tx.is_some() => {
+            let built = build_input_any(dev, *conf, *fmt, &mut input_tx, &flags).or_else(|e| {
+                if matches!(conf.buffer_size, cpal::BufferSize::Fixed(_)) && input_tx.is_some() {
+                    build_input_any(dev, cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..*conf }, *fmt, &mut input_tx, &flags)
+                } else {
+                    Err(e)
+                }
+            });
             match built {
                 Ok(s) => {
                     if let Err(e) = s.play() {
@@ -452,9 +641,69 @@ pub(crate) fn start(
         _ => None,
     };
     out.play().map_err(|e| EngineError::Audio(e.to_string()))?;
-    let mut active = p.active;
     if let Ok(n) = out.buffer_size() {
         active.buffer_size = Some(n);
     }
-    Ok(OpenStream { _out: out, _input: input, lost, active })
+    Ok(OpenStream { _out: out, _input: input, lost: flags.lost, rerouted: flags.rerouted, active })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_defaults_to_256_and_clamps_to_the_device() {
+        let mut notes = Vec::new();
+        let range = cpal::SupportedBufferSize::Range { min: 64, max: 2048 };
+        assert_eq!(pick_buffer(None, &range, &mut notes), cpal::BufferSize::Fixed(DEFAULT_BUFFER));
+        assert_eq!(pick_buffer(Some(128), &range, &mut notes), cpal::BufferSize::Fixed(128));
+        assert!(notes.is_empty());
+        assert_eq!(pick_buffer(Some(32), &range, &mut notes), cpal::BufferSize::Fixed(64));
+        assert_eq!(pick_buffer(Some(8192), &range, &mut notes), cpal::BufferSize::Fixed(2048));
+        assert_eq!(notes.len(), 2);
+        // A default outside the device range is clamped silently.
+        let big = cpal::SupportedBufferSize::Range { min: 512, max: 4096 };
+        let mut quiet = Vec::new();
+        assert_eq!(pick_buffer(None, &big, &mut quiet), cpal::BufferSize::Fixed(512));
+        assert!(quiet.is_empty());
+        // Unknown ranges take the request as is; a disjoint range keeps the driver default.
+        assert_eq!(pick_buffer(Some(96), &cpal::SupportedBufferSize::Unknown, &mut quiet), cpal::BufferSize::Fixed(96));
+        let odd = cpal::SupportedBufferSize::Range { min: 8192, max: 16384 };
+        assert_eq!(pick_buffer(Some(256), &odd, &mut quiet), cpal::BufferSize::Default);
+    }
+
+    #[test]
+    fn frames_between_stream_instants() {
+        let cb = cpal::StreamInstant::new(1, 0);
+        let play = cpal::StreamInstant::new(1, 10_000_000);
+        assert_eq!(frames_between(play, cb, 48_000), 480);
+        // Out of order (a driver glitch) saturates to zero.
+        assert_eq!(frames_between(cb, play, 48_000), 0);
+    }
+
+    #[test]
+    fn handoff_moves_once_and_frees_leftovers() {
+        let h = Handoff::new(Some(Arc::new(5)));
+        let probe = h.take().expect("first take");
+        assert_eq!(**probe, 5);
+        assert!(h.take().is_none());
+        let kept = Arc::new(());
+        let h = Handoff::new(Some(kept.clone()));
+        assert_eq!(Arc::strong_count(&kept), 2);
+        drop(h);
+        assert_eq!(Arc::strong_count(&kept), 1, "dropped with the cell");
+        assert!(Handoff::<u8>::new(None).take().is_none());
+    }
+
+    #[test]
+    fn device_errors_raise_the_right_flag() {
+        let f = Flags { status: Arc::new(SharedStatus::new()), lost: Arc::default(), rerouted: Arc::default() };
+        f.on_error(cpal::ErrorKind::Xrun);
+        assert_eq!(f.status.xruns.load(Ordering::Relaxed), 1);
+        assert!(!f.lost.load(Ordering::Relaxed) && !f.rerouted.load(Ordering::Relaxed));
+        f.on_error(cpal::ErrorKind::DeviceChanged);
+        assert!(f.rerouted.load(Ordering::Relaxed) && !f.lost.load(Ordering::Relaxed));
+        f.on_error(cpal::ErrorKind::StreamInvalidated);
+        assert!(f.lost.load(Ordering::Relaxed));
+    }
 }

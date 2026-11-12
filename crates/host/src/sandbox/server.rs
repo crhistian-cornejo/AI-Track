@@ -50,6 +50,14 @@ fn loaded_reply(p: &HostedPlugin) -> Response {
 /// `Shutdown` or closes stdin (parent died).
 pub fn host_main() -> i32 {
     super::disable_crash_dialogs();
+    // Plugin editors on Windows (JUCE, VSTGUI) expect an OLE apartment on
+    // their thread for drag and drop and the clipboard; GPUI does this for
+    // the app, the sandbox has to do it itself. Never uninitialised: the
+    // process exits right after the loop.
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows::Win32::System::Ole::OleInitialize(None);
+    }
     let (tx, rx) = mpsc::channel::<Option<Request>>();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -74,14 +82,28 @@ pub fn host_main() -> i32 {
     let mut edits: Option<rtrb::Consumer<ParamEdit>> = None;
     let mut rt: Option<Rt> = None;
 
+    // The parent's watchdog kills this process when the heartbeat stops
+    // (an editor stuck inside one AppKit/Win32 call never returns here).
+    let mut alive = std::time::Instant::now();
+    respond(&Response::Alive);
     loop {
+        if alive.elapsed() >= HEARTBEAT {
+            respond(&Response::Alive);
+            alive = std::time::Instant::now();
+        }
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(Some(req)) => {
                 let shutdown = matches!(req, Request::Shutdown);
+                let freeze = matches!(req, Request::Freeze);
                 let reply = handle(req, &plugin, &mut controller, &mut edits, &mut rt);
                 respond(&reply);
                 if shutdown {
                     break;
+                }
+                if freeze {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
                 }
             }
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -191,7 +213,7 @@ fn handle(
             }
             Response::Ok
         }
-        Request::Shutdown => Response::Ok,
+        Request::Shutdown | Request::Freeze => Response::Ok,
     }
 }
 

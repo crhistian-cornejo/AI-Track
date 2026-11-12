@@ -11,13 +11,14 @@ use aitrack_dsp::{EventKind, ParamInfo, ParamScale, ProcessContext};
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiSize, PluginGui, Window as ClapWindow};
 use clack_extensions::latency::PluginLatency;
-use clack_extensions::note_ports::PluginNotePorts;
+use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_extensions::tail::PluginTail;
 use clack_extensions::timer::{PluginTimer, TimerId};
 use clack_host::events::event_types::*;
 use clack_host::events::spaces::CoreEventSpace;
+use clack_host::utils::Cookie;
 use clack_host::events::{EventFlags, EventHeader};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
@@ -65,6 +66,15 @@ pub(crate) struct ClapAudio {
     flags: Arc<ClapFlags>,
     tail_ext: Option<PluginTail>,
     steady: u64,
+    /// The note input only speaks MIDI 1.0: send notes as MIDI bytes.
+    midi_notes: bool,
+    /// Each parameter's cookie from `clap_param_info`, in parameter-list
+    /// order, sent back with every value event as the spec asks. JUCE-based
+    /// CLAPs (clap-juce-extensions, e.g. Odin 2) read the cookie as their
+    /// parameter object and crash on an empty one.
+    cookies: Vec<Cookie>,
+    /// `(param id, index into cookies)`, sorted by id.
+    cookie_index: Vec<(u32, usize)>,
 }
 
 // SAFETY: the audio processor is `Send` by clack's design; the extension
@@ -94,6 +104,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
 
     let mut params = Vec::new();
     let mut values = Vec::new();
+    let mut cookies = Vec::new();
     if let Some(pe) = &params_ext {
         let mut buf = ParamInfoBuffer::new();
         for i in 0..pe.count(&handle) {
@@ -110,6 +121,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
             let range = (p.max_value - p.min_value).abs();
             let n = if range < f64::EPSILON { 0.0 } else { ((plain - p.min_value) / (p.max_value - p.min_value)).clamp(0.0, 1.0) };
             values.push((id, n as f32));
+            cookies.push(p.cookie);
             params.push(info);
         }
     }
@@ -125,6 +137,10 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
     {
         hosted.is_instrument = true;
     }
+    let midi_notes = note_ext.as_ref().is_some_and(|np| {
+        let mut buf = NotePortInfoBuffer::new();
+        np.count(&handle, true) > 0 && np.get(&handle, 0, true, &mut buf).is_some_and(|p| midi_only(p.supported_dialects))
+    });
 
     let (edits_tx, edits_rx) = rtrb::RingBuffer::new(PARAM_EDIT_QUEUE);
     let main = ClapMain {
@@ -151,6 +167,13 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
         flags,
         tail_ext,
         steady: 0,
+        midi_notes,
+        cookie_index: {
+            let mut ix: Vec<(u32, usize)> = params.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
+            ix.sort_unstable();
+            ix
+        },
+        cookies,
     };
     Ok(Loaded { main: MainSide::Clap(Box::new(main)), audio: AudioSide::Clap(Box::new(audio)), info: hosted, params, values, edits: edits_rx })
 }
@@ -433,14 +456,25 @@ impl ClapAudio {
         let mut n = 0usize;
         let infos = state.params.infos();
         let events = &mut self.in_events;
+        let (cookies, cookie_index) = (&self.cookies, &self.cookie_index);
+        let cookie_of = |id: u32| cookie_index.binary_search_by_key(&id, |e| e.0).ok().and_then(|i| cookies.get(cookie_index[i].1)).copied().unwrap_or_default();
         pending.drain(|index, v| {
             let id = infos[index].id;
-            let ev = ParamValueEvent::new(0, ClapId::new(id), Pckn::match_all(), state.params.to_plain(id, v));
+            // SAFETY: the cookie is the one this parameter reported in its info.
+            let ev = unsafe { ParamValueEvent::new(0, ClapId::new(id), Pckn::match_all(), state.params.to_plain(id, v)).with_cookie(cookie_of(id)) };
             Self::push(events, &mut n, &ev);
         });
         for e in ctx.events {
             let t = e.offset.min(frames as u32 - 1);
             match e.kind {
+                EventKind::NoteOn { channel, key, velocity, .. } if self.midi_notes => {
+                    let ev = MidiEvent::new(t, 0, [0x90 | (channel & 15), key & 127, midi_velocity(velocity).max(1)]);
+                    Self::push(events, &mut n, &ev);
+                }
+                EventKind::NoteOff { channel, key, velocity, .. } if self.midi_notes => {
+                    let ev = MidiEvent::new(t, 0, [0x80 | (channel & 15), key & 127, midi_velocity(velocity)]);
+                    Self::push(events, &mut n, &ev);
+                }
                 EventKind::NoteOn { channel, key, velocity, note_id } => {
                     let ev = NoteOnEvent::new(t, pckn(channel, key, note_id), velocity as f64);
                     Self::push(events, &mut n, &ev);
@@ -462,7 +496,8 @@ impl ClapAudio {
                 }
                 EventKind::Param { id, value } => {
                     state.params.set(id, value);
-                    let ev = ParamValueEvent::new(t, ClapId::new(id), Pckn::match_all(), state.params.to_plain(id, value));
+                    // SAFETY: as above.
+                    let ev = unsafe { ParamValueEvent::new(t, ClapId::new(id), Pckn::match_all(), state.params.to_plain(id, value)).with_cookie(cookie_of(id)) };
                     Self::push(events, &mut n, &ev);
                 }
                 EventKind::ControlChange { channel, cc, value } => {
@@ -546,6 +581,15 @@ impl ClapAudio {
     }
 }
 
+/// A note port that accepts MIDI 1.0 but not CLAP note events.
+fn midi_only(dialects: NoteDialects) -> bool {
+    dialects.contains(NoteDialects::MIDI) && !dialects.contains(NoteDialects::CLAP)
+}
+
+fn midi_velocity(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 127.0).round() as u8
+}
+
 fn pckn(channel: u8, key: u8, note_id: i32) -> Pckn {
     if note_id >= 0 {
         Pckn::new(0u16, channel as u16, key as u16, note_id as u32)
@@ -584,5 +628,21 @@ fn make_transport(ctx: &ProcessContext<'_>) -> TransportEvent {
         bar_number: bar_number(t),
         time_signature_numerator: t.time_sig.0 as u16,
         time_signature_denominator: t.time_sig.1 as u16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midi_only_note_ports_get_midi_notes() {
+        assert!(midi_only(NoteDialects::MIDI));
+        assert!(!midi_only(NoteDialects::CLAP | NoteDialects::MIDI));
+        assert!(!midi_only(NoteDialects::CLAP));
+        assert!(!midi_only(NoteDialects::empty()));
+        assert_eq!(midi_velocity(0.8), 102);
+        assert_eq!(midi_velocity(2.0), 127);
+        assert_eq!(midi_velocity(0.0), 0);
     }
 }

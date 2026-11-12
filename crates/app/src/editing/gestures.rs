@@ -3,15 +3,63 @@
 //! moving and resizing clips on the grid, and opening the context menus.
 //!
 //! `views::arrangement` hit-tests the lane and calls in here (fade handles,
-//! the left edge and Ctrl+drag copies are in `views::arrange_clips`); the drags run
+//! the left edge, Cmd/Ctrl + edge stretches and Ctrl+drag copies are in
+//! `views::arrange_clips`); the drags run
 //! through `Workspace::drag_move`, which hands [`Drag::Clip`],
 //! [`Drag::ClipResize`] and [`Drag::TimeSel`] to [`drag_move`]. Holding Alt
 //! during any of them bypasses snapping.
 
 use super::{Area, GridView};
+use crate::bridge::EngineBridge;
+use crate::state::AppState;
 use crate::workspace::{Drag, MenuKind, Workspace};
 use aitrack_model::*;
 use gpui::{Context, MouseDownEvent, MouseMoveEvent};
+
+// ── Transport and the insert marker, as in Ableton Live ──
+//
+// * A click in the lanes (clip lanes or automation lanes) puts the insert
+//   marker there. Stopped, the playhead goes there too; while playing,
+//   playback carries on and the marker waits for the next start.
+// * A click or drag in the ruler (Live's scrub area) puts the marker there
+//   and moves the playhead with it, also while playing: playback jumps
+//   there and carries on. (Live waits for the global launch quantisation;
+//   here it jumps at once.)
+// * Space: stopped, play from the insert marker; playing, stop. The
+//   playhead stays where it stopped, the marker where it was, so Space
+//   again starts from the marker once more.
+// * Shift+Space (Continue, `Cmd::Continue` in `commands.rs`): stopped, play
+//   on from where playback stopped; playing, stop.
+// * The marker is drawn in the text colour on the lanes and as a flag on
+//   the ruler (`overlay::Overlay::paint_marker*`); the playhead is the accent.
+
+/// Space: play from the insert marker, or stop.
+pub fn play_stop(s: &AppState, engine: &mut dyn EngineBridge) {
+    if engine.transport().playing {
+        engine.stop();
+    } else {
+        engine.locate(s.ed.marker);
+        engine.play();
+    }
+}
+
+/// A click in the lanes at `at`: the insert marker goes there (on `track`),
+/// and the playhead too while stopped.
+pub fn place_marker(s: &mut AppState, engine: &mut dyn EngineBridge, at: Tick, track: Option<TrackId>) {
+    s.set_marker(at, track);
+    if !engine.transport().playing {
+        engine.locate(s.ed.marker);
+    }
+}
+
+/// A click or drag in the ruler at `at`: marker and playhead go there,
+/// playing or not. The time selection is dropped; an automation range stays.
+pub fn scrub_to(s: &mut AppState, engine: &mut dyn EngineBridge, at: Tick) {
+    s.ed.area = Area::Arrange;
+    s.ed.marker = at.max(0);
+    s.ed.time = None;
+    engine.locate(s.ed.marker);
+}
 
 /// The placement on `track` under `tick`, topmost first.
 pub fn clip_at(ws: &Workspace, track: TrackId, tick: Tick) -> Option<PlacementId> {
@@ -26,9 +74,18 @@ pub fn clip_at(ws: &Workspace, track: TrackId, tick: Tick) -> Option<PlacementId
 pub fn lane_down(ws: &mut Workspace, track: TrackId, kind: TrackKind, tick: Tick, e: &MouseDownEvent, cx: &mut Context<Workspace>) -> bool {
     ws.s.ed.area = Area::Arrange;
     ws.s.ed.pressed = None;
+    ws.s.auto_sel = None;
     let toggle = e.modifiers.shift || e.modifiers.control || e.modifiers.secondary();
     if let Some(id) = clip_at(ws, track, tick) {
-        // Ctrl + drag drags copies; without moving it is the Ctrl+click below.
+        // Cmd (Ctrl on Windows) on an edge of an audio clip stretches it in time.
+        if !e.modifiers.shift
+            && e.modifiers.secondary()
+            && let Some(zone) = crate::views::arrange_clips::stretch_edge(ws, id, tick)
+            && crate::views::arrange_clips::begin_stretch(ws, id, zone, tick, e, cx)
+        {
+            return true;
+        }
+        // Ctrl + drag on the body drags copies; without moving it is the Ctrl+click below.
         if !e.modifiers.shift && (e.modifiers.control || e.modifiers.secondary()) {
             crate::views::arrange_clips::begin_copy(ws, id, tick, e, cx);
             return true;
@@ -57,10 +114,7 @@ pub fn lane_down(ws: &mut Workspace, track: TrackId, kind: TrackKind, tick: Tick
         cx.notify();
         return true;
     }
-    ws.s.set_marker(at, Some(track));
-    if !ws.b.engine.transport().playing {
-        ws.b.engine.locate(at);
-    }
+    place_marker(&mut ws.s, ws.b.engine.as_mut(), at, Some(track));
     // Dragging on from here selects time.
     ws.begin_drag(Drag::TimeSel { anchor: (at, track) }, cx);
     true
@@ -71,6 +125,7 @@ pub fn lane_down(ws: &mut Workspace, track: TrackId, kind: TrackKind, tick: Tick
 pub fn context_down(ws: &mut Workspace, track: TrackId, tick: Tick, e: &MouseDownEvent, cx: &mut Context<Workspace>) {
     ws.s.ed.area = Area::Arrange;
     ws.s.selected_track = Some(track);
+    ws.s.auto_sel = None;
     ws.menu = None;
     match clip_at(ws, track, tick) {
         Some(id) => {
@@ -93,10 +148,7 @@ pub fn context_down(ws: &mut Workspace, track: TrackId, tick: Tick, e: &MouseDow
 /// and the playhead go there, and dragging scrubs.
 pub fn ruler_down(ws: &mut Workspace, tick: Tick, e: &MouseDownEvent, cx: &mut Context<Workspace>) {
     let at = ws.s.snap_tick(GridView::Arrange, tick.max(0), e.modifiers.alt);
-    ws.s.ed.area = Area::Arrange;
-    ws.s.ed.marker = at;
-    ws.s.ed.time = None;
-    ws.b.engine.locate(at);
+    scrub_to(&mut ws.s, ws.b.engine.as_mut(), at);
     ws.begin_drag(Drag::Scrub, cx);
 }
 

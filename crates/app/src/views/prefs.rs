@@ -3,7 +3,7 @@
 //! audio edits go to `EngineBridge::set_audio_config`.
 
 use crate::appearance::{self, Appearance, Background, BgFit, Pane, ThemeLibrary};
-use crate::bridge::{AudioConfig, AudioHost, BUFFER_SIZES, SAMPLE_RATES};
+use crate::bridge::{AudioConfig, AudioHost, AudioLatency, BUFFER_SIZES, SAMPLE_RATES};
 use crate::icons::{Icon, icon};
 use crate::motion;
 use crate::theme::{self, *};
@@ -494,6 +494,71 @@ fn device_list(id: &'static str, devices: Vec<(String, String)>, selected: Optio
     list
 }
 
+/// Device output latency above this is a wireless link (Bluetooth adds
+/// 100–300 ms); the page warns that it is no good for playing in.
+const WIRELESS_MS: f32 = 40.;
+
+fn ms(v: f32) -> String {
+    if v >= 100. { format!("{v:.0} ms") } else { format!("{v:.1} ms") }
+}
+
+/// The latency read-out: `(caption, value, detail)` per tile. Measured
+/// figures when the engine has them, the buffer estimate otherwise.
+fn latency_tiles(lat: Option<AudioLatency>, cfg: &AudioConfig) -> Vec<(&'static str, String, String)> {
+    let buffer = cfg.buffer_ms();
+    match lat.filter(|l| l.output_ms > 0.) {
+        Some(l) => {
+            let rate = format!("{:.1} kHz", l.sample_rate as f32 / 1000.).replace(".0 ", " ");
+            let buf_ms = if l.sample_rate > 0 { l.buffer_frames as f32 * 1000. / l.sample_rate as f32 } else { buffer };
+            let input = if l.input_ms > 0. { (ms(l.input_ms), "microphone to engine".to_owned()) } else { ("—".to_owned(), "no input open".to_owned()) };
+            vec![
+                ("OUTPUT", ms(l.output_ms), format!("{:.1} buffer + {} device", buf_ms, ms(l.device_output_ms))),
+                ("INPUT", input.0, input.1),
+                ("ROUND TRIP", ms(l.round_trip_ms() + l.plugin_ms), if l.plugin_ms > 0. { format!("incl. {} plugin delay", ms(l.plugin_ms)) } else { "in → out, monitored".to_owned() }),
+                ("FORMAT", rate, format!("{} samples per buffer", l.buffer_frames)),
+            ]
+        }
+        None => vec![
+            ("OUTPUT", format!("≈ {}", ms(buffer)), "estimate, waiting for the device".to_owned()),
+            ("INPUT", format!("≈ {}", ms(buffer)), "estimate".to_owned()),
+            ("ROUND TRIP", format!("≈ {}", ms(buffer * 2.)), "two buffers".to_owned()),
+            ("FORMAT", format!("{:.1} kHz", cfg.sample_rate as f32 / 1000.).replace(".0 ", " "), format!("{} samples per buffer", cfg.buffer_size)),
+        ],
+    }
+}
+
+fn latency_readout(lat: Option<AudioLatency>, cfg: &AudioConfig) -> Div {
+    let pal = p();
+    let mut row = div().flex().gap(px(SP2)).py(px(SP2));
+    for (caption, value, detail) in latency_tiles(lat, cfg) {
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .p(px(SP3))
+                .rounded(px(r_md()))
+                .bg(pal.well)
+                .border_1()
+                .border_color(border())
+                .flex()
+                .flex_col()
+                .gap(px(SP1))
+                .child(label(caption, TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
+                .child(mono(value, TEXT_LG, pal.text))
+                .child(label(detail, TEXT_XS, pal.muted).whitespace_normal()),
+        );
+    }
+    let mut col = div().flex().flex_col().child(row);
+    if let Some(l) = lat.filter(|l| l.device_output_ms > WIRELESS_MS) {
+        col = col.child(label(
+            format!("This output adds {} on its own (Bluetooth or AirPlay?). Fine for listening; plug in wired headphones to play or record in time.", ms(l.device_output_ms)),
+            TEXT_SM,
+            pal.meter_mid,
+        ).whitespace_normal());
+    }
+    col.child(label("Measured from the device's timestamps. The playhead is drawn where you hear it.", TEXT_SM, pal.faint).whitespace_normal())
+}
+
 fn apply_audio(ws: &mut Workspace, c: AudioConfig, cx: &mut Context<Workspace>) {
     match ws.b.engine.set_audio_config(c) {
         Ok(_) => {}
@@ -521,6 +586,7 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let buf_items: Vec<(String, bool, bool)> =
         BUFFER_SIZES.iter().map(|b| (b.to_string(), *b == cfg.buffer_size, *b >= range.0 && *b <= range.1)).collect();
     let one_way = cfg.buffer_ms();
+    let latency = ws.b.engine.audio_latency();
     let scan = ws.b.plugins.scan_status();
     let channel_chips = |id: &'static str, count: u16, enabled: &[u16], output: bool, cx: &mut Context<Workspace>| {
         let items: Vec<(String, bool, bool)> = (0..count.max(1)).map(|c| (format!("{}", c + 1), enabled.contains(&c), count > 0)).collect();
@@ -554,10 +620,12 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             let c = AudioConfig { sample_rate: SAMPLE_RATES[i], ..this.b.engine.audio_config() };
             apply_audio(this, c, cx);
         })))
-        .child(setting_row("Buffer size", Some(format!("{one_way:.1} ms buffer · ≈ {:.1} ms round trip", one_way * 2.).into()), chip_row("buffer", buf_items, cx, |this, i, cx| {
+        .child(setting_row("Buffer size", Some(format!("{one_way:.1} ms per buffer").into()), chip_row("buffer", buf_items, cx, |this, i, cx| {
             let c = AudioConfig { buffer_size: BUFFER_SIZES[i], ..this.b.engine.audio_config() };
             apply_audio(this, c, cx);
         })))
+        .child(section_title("LATENCY"))
+        .child(latency_readout(latency, &cfg))
         .child(section_title("CHANNELS"))
         .child(setting_row("Output channels", out_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("out-ch", out_dev.as_ref().map_or(2, |d| d.output_channels), &cfg.output_channels, true, cx)))
         .child(setting_row("Input channels", in_dev.as_ref().map(|d| d.name.clone().into()), channel_chips("in-ch", in_dev.as_ref().map_or(0, |d| d.input_channels), &cfg.input_channels, false, cx)))
@@ -1138,4 +1206,36 @@ pub fn backdrop(ws: &Workspace) -> Option<AnyElement> {
             .child(div().absolute().top_0().left_0().size_full().bg(with_alpha(pal.base, b.dim.clamp(0., 0.9))))
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_tiles_show_measured_figures() {
+        let cfg = AudioConfig { sample_rate: 48_000, buffer_size: 256, ..AudioConfig::default() };
+        let l = AudioLatency { sample_rate: 48_000, buffer_frames: 256, output_ms: 10., input_ms: 6., device_output_ms: 4.67, plugin_ms: 0. };
+        let t = latency_tiles(Some(l), &cfg);
+        assert_eq!(t[0], ("OUTPUT", "10.0 ms".to_owned(), "5.3 buffer + 4.7 ms device".to_owned()));
+        assert_eq!(t[1].1, "6.0 ms");
+        assert_eq!(t[2].1, "16.0 ms");
+        assert_eq!((t[3].1.as_str(), t[3].2.as_str()), ("48 kHz", "256 samples per buffer"));
+        // Plugin delay counts in the round trip; no input shows a dash.
+        let t = latency_tiles(Some(AudioLatency { input_ms: 0., plugin_ms: 2., ..l }), &cfg);
+        assert_eq!((t[1].1.as_str(), t[2].1.as_str()), ("—", "12.0 ms"));
+        // Bluetooth-sized numbers drop the decimal.
+        assert_eq!(latency_tiles(Some(AudioLatency { output_ms: 215.4, ..l }), &cfg)[0].1, "215 ms");
+    }
+
+    #[test]
+    fn latency_tiles_estimate_before_the_first_callback() {
+        let cfg = AudioConfig { sample_rate: 44_100, buffer_size: 441, ..AudioConfig::default() };
+        let t = latency_tiles(None, &cfg);
+        assert_eq!(t[0].1, "≈ 10.0 ms");
+        assert_eq!(t[2].1, "≈ 20.0 ms");
+        assert_eq!(t[3].1, "44.1 kHz");
+        // A device that has not called back yet reports zeros: still an estimate.
+        assert_eq!(latency_tiles(Some(AudioLatency::default()), &cfg)[0].1, "≈ 10.0 ms");
+    }
 }

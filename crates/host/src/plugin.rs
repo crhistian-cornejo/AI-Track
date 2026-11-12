@@ -24,6 +24,19 @@
 //! on it outputs silence and ignores calls. Non-finite output samples are
 //! replaced with zeros. Hard faults (access violations) cannot be caught in
 //! process: that is what the out-of-process [`sandbox`](crate::sandbox) is for.
+//! Neither can a hang: an editor stuck inside one AppKit / Win32 call
+//! (Dragonfly Early Reflections redraws itself forever inside one Core
+//! Animation commit on macOS) freezes the thread that pumps the DAW's UI.
+//! Only the sandbox's watchdog recovers from that; prefer it for plugins
+//! whose editors are not known to behave.
+//!
+//! # Unloading
+//!
+//! JUCE plugins tear their GUI singletons down when the module's last
+//! instance is destroyed, and some crash doing it (Odin2 2.4.1: its asset
+//! rescaler thread outlives the workers it reads). So once an instance's
+//! editor has been opened, dropping it keeps one instance of that module
+//! alive, deactivated, until the process exits (see [`keep_alive`]).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -51,6 +64,8 @@ pub(crate) struct SharedState {
     pub needs_restart: AtomicBool,
     pub latency_changed: AtomicBool,
     pub state_dirty: AtomicBool,
+    /// The editor was opened at least once (see the module docs on unloading).
+    pub editor_opened: AtomicBool,
 }
 
 pub(crate) struct PluginShared {
@@ -234,6 +249,7 @@ impl HostedPlugin {
                 needs_restart: AtomicBool::new(false),
                 latency_changed: AtomicBool::new(false),
                 state_dirty: AtomicBool::new(false),
+                editor_opened: AtomicBool::new(false),
             },
             main: MainThreadCell::new(main),
         });
@@ -398,6 +414,11 @@ impl Drop for HostedPlugin {
                 });
             }));
             drop(audio);
+            if shared.state.editor_opened.load(Ordering::Relaxed) {
+                // Controllers may still hold the instance; the parked clone
+                // keeps it (and the module's GUI singletons) for good.
+                keep_alive::park_once(&shared.state.hosted.path, shared.clone());
+            }
         } else {
             log::error!("HostedPlugin '{}' dropped off the main thread; leaking it", self.info.name);
             std::mem::forget(audio);
@@ -461,7 +482,9 @@ impl PluginController {
 
     pub fn open_editor(&self) -> Result<()> {
         let title = format!("{} — {}", self.shared.state.hosted.name, self.shared.state.hosted.vendor);
-        self.call(|m| if m.is_editor_open() { Ok(()) } else { m.open_editor(&title) })?
+        self.call(|m| if m.is_editor_open() { Ok(()) } else { m.open_editor(&title) })??;
+        self.shared.state.editor_opened.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn close_editor(&self) {
@@ -499,6 +522,55 @@ impl PluginController {
                 shared.state.crashed.store(true, Ordering::Relaxed);
                 Err(HostError::Crashed)
             }
+        }
+    }
+}
+
+/// Instances kept alive until the process exits, one per plugin module, so
+/// a module's last instance is never destroyed (see the module docs).
+pub(crate) mod keep_alive {
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::mem::ManuallyDrop;
+    use std::path::{Path, PathBuf};
+
+    type Parked = Vec<(PathBuf, Box<dyn Any>)>;
+
+    thread_local! {
+        // Never dropped, not even when the thread exits: tearing the
+        // instance down at exit would crash just the same.
+        static PARKED: ManuallyDrop<RefCell<Parked>> = const { ManuallyDrop::new(RefCell::new(Vec::new())) };
+    }
+
+    /// Keep `value` for good unless this thread already keeps one for
+    /// `module`; then it is dropped here. Returns whether it was kept.
+    pub fn park_once<T: 'static>(module: &Path, value: T) -> bool {
+        let kept = PARKED.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.iter().any(|(m, _)| m == module) {
+                return Some(value);
+            }
+            p.push((module.to_path_buf(), Box::new(value)));
+            None
+        });
+        kept.is_none()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::rc::Rc;
+
+        #[test]
+        fn keeps_one_value_per_module() {
+            let first = Rc::new(());
+            let second = Rc::new(());
+            assert!(park_once(Path::new("/a.clap"), first.clone()));
+            assert!(!park_once(Path::new("/a.clap"), second.clone()));
+            assert!(park_once(Path::new("/b.vst3"), 7u8));
+            // The second one was dropped, the first one kept.
+            assert_eq!(Rc::strong_count(&second), 1);
+            assert_eq!(Rc::strong_count(&first), 2);
         }
     }
 }

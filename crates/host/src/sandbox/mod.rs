@@ -10,6 +10,17 @@
 //! ways), latency, state and editor open/close work. Not yet: grouping
 //! several plugins per process, sidechain, MMCSS / audio-workgroup joining
 //! of the sandbox RT thread, crash restart with state recovery.
+//!
+//! # Watchdog
+//!
+//! The host's main loop sends a heartbeat ([`protocol::HEARTBEAT`]). A
+//! plugin editor that never returns from one AppKit / Win32 call (Dragonfly
+//! Early Reflections redraws itself forever inside one Core Animation
+//! commit) stops it. When the heartbeat has been missing for
+//! [`HANG_TIMEOUT`] while no request is in flight, or a request is not
+//! answered in time, the host process is killed: the device outputs silence
+//! from then on ([`SandboxedPlugin::is_hung`]) and the DAW never waits on it
+//! again. It is not restarted.
 
 pub mod protocol;
 pub mod server;
@@ -18,7 +29,7 @@ pub mod shm;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -60,22 +71,136 @@ fn unique_names() -> (String, String, String) {
     }
 }
 
+/// A host whose heartbeat has been missing this long (with no request in
+/// flight) is considered hung and killed.
+pub const HANG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Liveness of one host process, shared by the stdout reader, the watchdog
+/// thread, the control channel, the processor and editor handles.
+struct Watch {
+    epoch: Instant,
+    /// Milliseconds since `epoch` of the last message from the host.
+    last_alive: AtomicU64,
+    /// Requests waiting for an answer: the host's main loop is busy with
+    /// them (loading can take many seconds) and sends no heartbeat.
+    busy: AtomicU32,
+    timeout_ms: AtomicU64,
+    hung: AtomicBool,
+    /// The hang was reported to the UI ([`SandboxEditor::take_hung`]).
+    reported: AtomicBool,
+    pid: u32,
+}
+
+impl Watch {
+    fn new(pid: u32) -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_alive: AtomicU64::new(0),
+            busy: AtomicU32::new(0),
+            timeout_ms: AtomicU64::new(HANG_TIMEOUT.as_millis() as u64),
+            hung: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
+            pid,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn touch(&self) {
+        self.last_alive.store(self.now_ms(), Ordering::Release);
+    }
+
+    /// Silent for longer than the timeout while not serving a request.
+    fn silent(&self) -> bool {
+        self.busy.load(Ordering::Acquire) == 0
+            && self.now_ms().saturating_sub(self.last_alive.load(Ordering::Acquire)) > self.timeout_ms.load(Ordering::Relaxed)
+    }
+
+    /// Mark the host hung and kill it (once).
+    fn kill(&self, why: &str) {
+        if self.hung.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        log::error!("plugin sandbox (pid {}) {why}; killing it", self.pid);
+        kill_pid(self.pid);
+    }
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    // SAFETY: plain syscall. The pid stays ours: the child is only reaped in
+    // `SandboxedPlugin::drop`, after the watchdog thread was joined.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: the handle is checked and closed; the `Child` still holds its
+    // own handle, so the pid cannot have been reused.
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(h, 1);
+            let _ = CloseHandle(h);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_pid(_pid: u32) {}
+
+/// Kill the host when its heartbeat stops. Ends when `stop` is dropped.
+fn spawn_watchdog(watch: Arc<Watch>, stop: mpsc::Receiver<()>) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("aitrack-sandbox-watchdog".into()).spawn(move || {
+        while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(HEARTBEAT) {
+            if watch.hung.load(Ordering::Acquire) {
+                return;
+            }
+            if watch.silent() {
+                watch.kill("stopped responding (no heartbeat)");
+                return;
+            }
+        }
+    })
+}
+
 struct Control {
     child: Child,
     stdin: ChildStdin,
     rx: mpsc::Receiver<Response>,
+    watch: Arc<Watch>,
 }
 
 impl Control {
     fn call(&mut self, req: &Request, timeout: Duration) -> Result<Response> {
-        let line = serde_json::to_string(req)?;
-        writeln!(self.stdin, "{line}").and_then(|_| self.stdin.flush()).map_err(|e| HostError::Sandbox(format!("sandbox pipe closed: {e}")))?;
-        match self.rx.recv_timeout(timeout) {
-            Ok(Response::Error { message }) => Err(HostError::Sandbox(message)),
-            Ok(r) => Ok(r),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(HostError::Sandbox("sandbox did not answer in time".into())),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(HostError::Sandbox("sandbox process exited".into())),
+        if self.watch.hung.load(Ordering::Acquire) {
+            return Err(HostError::Sandbox("the plugin host stopped responding and was closed".into()));
         }
+        let line = serde_json::to_string(req)?;
+        self.watch.busy.fetch_add(1, Ordering::AcqRel);
+        let sent = writeln!(self.stdin, "{line}").and_then(|_| self.stdin.flush());
+        let reply = match sent {
+            Err(e) => Err(HostError::Sandbox(format!("sandbox pipe closed: {e}"))),
+            Ok(()) => match self.rx.recv_timeout(timeout) {
+                Ok(Response::Error { message }) => Err(HostError::Sandbox(message)),
+                Ok(r) => Ok(r),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Its answer would otherwise be taken for the next request's.
+                    self.watch.kill("did not answer in time");
+                    Err(HostError::Sandbox("sandbox did not answer in time".into()))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(HostError::Sandbox("sandbox process exited".into())),
+            },
+        };
+        // A long request (loading) had no heartbeats: restart the clock.
+        self.watch.touch();
+        self.watch.busy.fetch_sub(1, Ordering::AcqRel);
+        reply
     }
 }
 
@@ -83,9 +208,26 @@ impl Control {
 #[derive(Clone)]
 pub struct SandboxEditor {
     control: Arc<Mutex<Control>>,
+    watch: Arc<Watch>,
+    name: &'static str,
 }
 
 impl SandboxEditor {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The host process hung and was killed (see the module docs).
+    pub fn is_hung(&self) -> bool {
+        self.watch.hung.load(Ordering::Acquire)
+    }
+
+    /// `true` once, the first time this is called after the host hung: for
+    /// telling the user.
+    pub fn take_hung(&self) -> bool {
+        self.is_hung() && !self.watch.reported.swap(true, Ordering::AcqRel)
+    }
+
     pub fn open(&self) -> Result<()> {
         self.control.lock().call(&Request::OpenEditor, Duration::from_secs(10)).map(|_| ())
     }
@@ -100,6 +242,8 @@ pub struct SandboxedPlugin {
     info: PluginInfo,
     hosted: HostedPluginInfo,
     control: Arc<Mutex<Control>>,
+    watch: Arc<Watch>,
+    watchdog: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     params: ParamTable,
     pending: PendingParams,
     region: Option<Region>,
@@ -128,13 +272,17 @@ impl SandboxedPlugin {
         let mut child = Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| HostError::Sandbox("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| HostError::Sandbox("no stdout".into()))?;
+        let watch = Arc::new(Watch::new(child.id()));
         let (tx, rx) = mpsc::channel();
+        let reader_watch = watch.clone();
         std::thread::Builder::new().name("aitrack-sandbox-reader".into()).spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 // Anything without our prefix is plugin chatter.
                 if let Some(json) = line.strip_prefix(CONTROL_PREFIX) {
+                    reader_watch.touch();
                     match serde_json::from_str::<Response>(json) {
+                        Ok(Response::Alive) => {}
                         Ok(r) => {
                             if tx.send(r).is_err() {
                                 break;
@@ -145,13 +293,22 @@ impl SandboxedPlugin {
                 }
             }
         })?;
-        let mut control = Control { child, stdin, rx };
+        let mut control = Control { child, stdin, rx, watch: watch.clone() };
         let (hosted, wire, values) = match control.call(&Request::Load { info: info.clone() }, Duration::from_secs(30)) {
             Ok(Response::Loaded { info, params, values }) => (info, params, values),
             Ok(other) => return Err(HostError::Sandbox(format!("unexpected reply {other:?}"))),
             Err(e) => {
                 let _ = control.child.kill();
+                let _ = control.child.wait();
                 return Err(e);
+            }
+        };
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watchdog = match spawn_watchdog(watch.clone(), stop_rx) {
+            Ok(handle) => Some((stop_tx, handle)),
+            Err(e) => {
+                log::warn!("no watchdog for the plugin sandbox: {e}");
+                None
             }
         };
         let params: Vec<_> = wire.iter().map(WireParam::to_info).collect();
@@ -176,6 +333,8 @@ impl SandboxedPlugin {
             info,
             hosted,
             control: Arc::new(Mutex::new(control)),
+            watch,
+            watchdog,
             params: table,
             pending,
             region: None,
@@ -224,7 +383,23 @@ impl SandboxedPlugin {
     /// A cloneable handle for the UI thread: opens and closes this plugin's
     /// editor while the plugin itself is owned by the audio engine.
     pub fn editor_handle(&self) -> SandboxEditor {
-        SandboxEditor { control: self.control.clone() }
+        SandboxEditor { control: self.control.clone(), watch: self.watch.clone(), name: self.info.name }
+    }
+
+    /// The host process hung and was killed: this device outputs silence.
+    pub fn is_hung(&self) -> bool {
+        self.watch.hung.load(Ordering::Acquire)
+    }
+
+    /// How long a missing heartbeat is tolerated (default [`HANG_TIMEOUT`]).
+    pub fn set_hang_timeout(&self, timeout: Duration) {
+        self.watch.timeout_ms.store(timeout.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Test hook: make the host's main thread stop, as a stuck editor does.
+    #[doc(hidden)]
+    pub fn freeze_host(&self) -> Result<()> {
+        self.control.lock().call(&Request::Freeze, Duration::from_secs(10)).map(|_| ())
     }
 
     pub fn close_editor(&self) -> Result<()> {
@@ -292,7 +467,8 @@ impl Processor for SandboxedPlugin {
             ctx.buffer.clear();
             return;
         };
-        if self.crashed {
+        if self.crashed || self.watch.hung.load(Ordering::Relaxed) {
+            self.crashed = true;
             ctx.buffer.clear();
             return;
         }
@@ -436,8 +612,15 @@ impl Processor for SandboxedPlugin {
 
 impl Drop for SandboxedPlugin {
     fn drop(&mut self) {
+        // Stop the watchdog before the child is reaped (its pid freed).
+        if let Some((stop, handle)) = self.watchdog.take() {
+            drop(stop);
+            let _ = handle.join();
+        }
         let mut c = self.control.lock();
-        let _ = c.call(&Request::Shutdown, Duration::from_secs(2));
+        if !self.watch.hung.load(Ordering::Acquire) {
+            let _ = c.call(&Request::Shutdown, Duration::from_secs(2));
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if let Ok(Some(_)) = c.child.try_wait() {

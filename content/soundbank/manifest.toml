@@ -25,7 +25,7 @@
 
 [meta]
 version = 1
-updated = "2026-11-11"
+updated = "2026-11-12"
 notes = "Target size: <= 1.5 GB on disk. Licenses verified 2026-11-11."
 
 # ---------------------------------------------------------------------------
@@ -312,6 +312,61 @@ paths = [
   "Harp.sfz", "FHornSus.sfz", "FHornStac.sfz", "ClarinetSus.sfz", "ClarinetStac.sfz",
   "Timpani.sfz", "Glockenspiel.sfz", "Marimba.sfz", "Xylophone.sfz", "LICENSE", "README.md",
 ]
+
+# Wavetables. Both load in instrument.wavetable (`wavetable::wav::import`):
+# AKWF cycles are 600-sample single cycles; WaveEdit banks are 64 frames of
+# 256 samples with no chunk, so import them with a 256 frame length
+# (`wav::import_with(.., Some(256))`).
+
+[[pack]]
+id = "akwf-single-cycles"
+name = "AKWF Single-Cycle Waveforms (synthesized selection)"
+author = "Kristoffer Ekstrand (Adventure Kid)"
+homepage = "https://github.com/KristofferKarlAxelEkstrand/AKWF-FREE"
+format = "github_tree"
+sha256 = "8b7ba98e29d8b7ebcef865b43425bfa796ba497b8b6e2085ce11c545358de075"
+sample_count = 989
+size_mb = 1.3
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "LICENSE.md in repo (checked 2026-11-12 at the pinned commit): 'CC0 1.0 Universal'; GitHub detects CC0-1.0. Only the author's own synthesized folders of the original AKWF set are bundled (bw_* basic shapes, fmsynth, hdrawn, linear, overtone, sinharm, symetric, oscchip, bitreduced, pluckalgo). The folders named after other products (AKWF--Akai-MPC, --U-he-Zebra, --Surge, --Alchemy, ...) and the sampled-instrument folders are left out because their provenance may involve third-party sounds."
+attribution = "AKWF single-cycle waveforms by Kristoffer Ekstrand / Adventure Kid (CC0 1.0)"
+genres = []
+kinds = ["wavetables", "single-cycle"]
+license_file = "LICENSE.md"
+default_category = "Synths"
+strip_prefix = "AKWF/"
+
+[pack.github]
+repo = "KristofferKarlAxelEkstrand/AKWF-FREE"
+rev = "8de90bf94376670947369e69de0af6b9fbd19286"
+paths = ["AKWF/AKWF_bw_blended/", "AKWF/AKWF_bw_perfectwaves/", "AKWF/AKWF_bw_saw/", "AKWF/AKWF_bw_sawbright/", "AKWF/AKWF_bw_sawgap/", "AKWF/AKWF_bw_sawrounded/", "AKWF/AKWF_bw_sin/", "AKWF/AKWF_bw_squ/", "AKWF/AKWF_bw_squrounded/", "AKWF/AKWF_bw_tri/", "AKWF/AKWF_fmsynth/", "AKWF/AKWF_hdrawn/", "AKWF/AKWF_linear/", "AKWF/AKWF_overtone/", "AKWF/AKWF_sinharm/", "AKWF/AKWF_symetric/", "AKWF/AKWF_oscchip/", "AKWF/AKWF_bitreduced/", "AKWF/AKWF_pluckalgo/", "LICENSE.md", "README.md"]
+
+[[pack]]
+id = "waveedit-online-banks"
+name = "WaveEdit Online Wavetable Banks"
+author = "WaveEdit users (Synthesis Technology WaveEdit Online), mirrored by smpldsnds"
+homepage = "https://github.com/smpldsnds/wavedit-online"
+format = "github_tree"
+sha256 = "8941530b0bd9f8cdb759c5c5fd4b0ce6c1ab1a32964b517fb9028411d0b46605"
+sample_count = 705
+size_mb = 23.1
+license = "CC0-1.0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+redistributable = true
+license_evidence = "README.md in repo (checked 2026-11-12 at the pinned commit): 'A growing library of free wavetable banks shared by WaveEdit users via the WaveEdit Online tab within the software. All wavetables here are under CC0 1.0 Universal (CC0 1.0) Public Domain Dedication.' The original waveeditonline.com site (offline today) published every shared bank as CC0; the open-vital-resources repo (atsushieno) also cites WAVEEDIT ONLINE as CC0. Each file is one bank of 64 frames x 256 samples (E352 format)."
+attribution = "WaveEdit Online wavetable banks by the WaveEdit community (CC0 1.0)"
+genres = []
+kinds = ["wavetables"]
+license_file = "README.md"
+default_category = "Synths"
+strip_prefix = "samples/"
+
+[pack.github]
+repo = "smpldsnds/wavedit-online"
+rev = "1a8d80f7a062f36eca212f92f24f2ca6329b88ff"
+paths = ["samples/", "README.md"]
 
 # ---------------------------------------------------------------------------
 # Content Hub: link-only sample packs (not redistributable, or too large)

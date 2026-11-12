@@ -140,6 +140,20 @@ pub fn pump_messages() {
     imp::pump_messages();
 }
 
+/// The screen is locked (macOS): editor windows are off screen and OpenGL
+/// editors may stall the main thread until it is unlocked. Always `false`
+/// elsewhere.
+pub fn screen_locked() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        imp::screen_locked()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 #[allow(dead_code)]
 fn unsupported() -> HostError {
     HostError::Editor("unsupported platform".into())

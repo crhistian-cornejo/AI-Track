@@ -7,6 +7,7 @@ pub mod arrangement;
 pub mod bottom;
 pub mod browser;
 pub mod device_ui;
+pub mod device_window;
 pub mod devices;
 pub mod export;
 pub mod hub;

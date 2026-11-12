@@ -10,5 +10,6 @@ pub mod gate;
 pub mod limiter;
 pub mod reverb;
 pub mod saturator;
+pub mod shaper;
 pub mod transient;
 pub mod utility;

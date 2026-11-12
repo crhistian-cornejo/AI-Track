@@ -269,6 +269,7 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
         "fx.transient" => put(&[if playing { 6.0 * env - 2.0 * (1.0 - env) * hat } else { 0.0 }]),
         "fx.limiter" => put(&[-4.0 * env, if playing { -1.0 } else { -120.0 }, if playing { -5.0 + 6.0 * env } else { -120.0 }]),
         "fx.saturator" => put(&[0.7 * env, 0.6 * env, 0.6 * env, 0.3 * hat * env.max(0.2), 0.25 * hat]),
+        "fx.shaper" => put(&[beat.fract(), if playing { 0.15 + 0.85 * beat.fract().min(0.6) / 0.6 } else { 1.0 }]),
         "fx.reverb" => put(&[0.3 * env + 0.1 * hat, 0.28 * env + 0.12 * hat, 2.4]),
         "fx.delay" => put(&[0.3 * hat, 0.26 * (1.0 - hat) * env, 1.0 - 0.3 * env]),
         "fx.chorus" => put(&[(secs * 0.8).fract()]),

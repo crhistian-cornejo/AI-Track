@@ -29,6 +29,7 @@ pub mod limiter;
 pub mod reverb;
 pub mod sampler;
 pub mod saturator;
+pub mod shaper;
 pub mod utility;
 pub mod wavetable;
 
@@ -575,6 +576,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.transient"
             | "fx.limiter"
             | "fx.saturator"
+            | "fx.shaper"
             | "fx.reverb"
             | "fx.delay"
             | "fx.chorus"
@@ -594,6 +596,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.compressor" | "fx.gate" | "fx.transient" => dynamics::render(ws, plugin, dev, cx),
         "fx.limiter" => limiter::render(ws, dev, cx),
         "fx.saturator" => saturator::render(ws, dev, cx),
+        "fx.shaper" => shaper::render(ws, dev, cx),
         "fx.reverb" => reverb::render(ws, dev, cx),
         "fx.delay" => delay::render(ws, dev, cx),
         "fx.chorus" => chorus::render(ws, dev, cx),

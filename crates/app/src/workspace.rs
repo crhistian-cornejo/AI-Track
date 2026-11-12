@@ -360,6 +360,17 @@ impl Workspace {
                     self.fx.big.extend(ids);
                 }
                 _ => {
+                    // `device=fx.shaper` appends a stock device to the selected track.
+                    if let Some(plugin) = word.strip_prefix("device=")
+                        && let Some(track) = self.s.selected_track
+                    {
+                        let id = self.s.project.alloc_device_id();
+                        let index = self.s.project.track(track).map_or(0, |t| t.devices.len());
+                        let name = self.b.plugins.device(plugin).map_or(plugin.to_owned(), |d| d.name.to_owned());
+                        let device = Device::stock(id, plugin, name);
+                        self.s.edit("Add device", vec![Command::AddDevice { slot: aitrack_model::command::DeviceSlot::Track { track, index }, device: Box::new(device) }]);
+                        self.fx.big.insert(id);
+                    }
                     if let Some(name) = word.strip_prefix("track=")
                         && let Some(t) = self.s.project.tracks.iter().find(|t| t.name.eq_ignore_ascii_case(name))
                     {

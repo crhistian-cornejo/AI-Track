@@ -586,6 +586,154 @@ impl AppState {
         ok
     }
 
+    // ── Clips and tracks (the Live key commands) ──
+
+    /// Ctrl+E: split at `tick`. The selected arrangement clip when the cut
+    /// falls inside it, otherwise every clip of the selected track under it.
+    /// Returns how many clips were split.
+    pub fn split_at(&mut self, tick: Tick) -> usize {
+        let tick = self.snap.round(tick);
+        let spans = |p: &Project, pl: &Placement| p.clips.get(&pl.clip).is_some_and(|c| tick > pl.start && tick < pl.start + c.length);
+        let mut targets: Vec<(TrackId, Placement)> = Vec::new();
+        if let Some((track, id)) = self.selected_placement
+            && let Some(pl) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id))
+            && spans(&self.project, pl)
+        {
+            targets.push((track, pl.clone()));
+        }
+        if targets.is_empty()
+            && let Some(track) = self.selected_track
+            && let Some(t) = self.project.track(track)
+        {
+            targets.extend(t.arrangement.iter().filter(|pl| spans(&self.project, pl)).map(|pl| (track, pl.clone())));
+        }
+        let mut cmds = Vec::new();
+        let mut last = None;
+        for (track, pl) in &targets {
+            let Some(clip) = self.project.clips.get(&pl.clip).cloned() else { continue };
+            let head = tick - pl.start;
+            let right = Clip { offset: clip.offset + head, length: clip.length - head, ..clip.clone() };
+            let (right_id, place_id) = (self.project.alloc_clip_id(), self.project.alloc_placement_id());
+            cmds.push(Command::UpdateClip { id: pl.clip, clip: Box::new(Clip { length: head, ..clip }) });
+            cmds.push(Command::AddClip { id: right_id, clip: Box::new(right) });
+            cmds.push(Command::PlaceClip { track: *track, placement: Placement { id: place_id, clip: right_id, start: tick, lane: pl.lane } });
+            last = Some((*track, place_id));
+        }
+        if cmds.is_empty() {
+            return 0;
+        }
+        self.seal();
+        let ok = self.edit("Split clip", cmds);
+        self.seal();
+        if ok {
+            self.selected_placement = last;
+            targets.len()
+        } else {
+            0
+        }
+    }
+
+    /// Where a new track goes: right after the selected one, else before the buses.
+    fn new_track_index(&self) -> usize {
+        let buses = self.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(self.project.tracks.len());
+        self.selected_track
+            .and_then(|id| self.project.track_index(id))
+            .filter(|i| *i < buses)
+            .map_or(buses, |i| {
+                // After a group, skip the tracks inside it.
+                let id = self.project.tracks[i].id;
+                let inside = self.project.tracks[i + 1..buses].iter().take_while(|t| t.parent == Some(id)).count();
+                i + 1 + inside
+            })
+    }
+
+    /// Ctrl+T / Ctrl+Shift+T / Ctrl+Alt+T: a new audio, MIDI or return track.
+    pub fn add_track(&mut self, kind: TrackKind) -> Option<TrackId> {
+        let id = self.project.alloc_track_id();
+        let count = self.project.tracks.iter().filter(|t| t.kind == kind).count();
+        let mut cmds = Vec::new();
+        let (name, index) = match kind {
+            TrackKind::Return => {
+                let letter = (b'A' + (count as u8).min(25)) as char;
+                // Every track gets a send to the new return, turned down.
+                for t in self.project.tracks.iter().filter(|t| t.kind.has_clips() || t.kind == TrackKind::Group) {
+                    let mut sends = t.sends.clone();
+                    sends.push(Send { target: id, level_db: -70., pre_fader: false });
+                    cmds.push(Command::SetTrack { id: t.id, change: TrackProp::Sends(sends) });
+                }
+                let main = self.project.track_index(self.project.main_track().id).unwrap_or(self.project.tracks.len());
+                let after_returns = self.project.tracks.iter().rposition(|t| t.kind == TrackKind::Return).map_or(main, |i| i + 1);
+                (format!("{letter} Return"), after_returns.min(main))
+            }
+            TrackKind::Audio => (format!("Audio {}", count + 1), self.new_track_index()),
+            _ => (format!("MIDI {}", count + 1), self.new_track_index()),
+        };
+        let mut track = Track::new(id, kind, name, Color::palette(self.project.tracks.len()));
+        // A track created inside a group joins it.
+        if kind != TrackKind::Return
+            && let Some(parent) = self.selected_track.and_then(|s| self.project.track(s)).and_then(|s| if s.kind == TrackKind::Group { Some(s.id) } else { s.parent })
+            && let Some(g) = self.project.track(parent)
+        {
+            track.parent = Some(parent);
+            track.output = Output::Track(parent);
+            track.color = g.color;
+        }
+        cmds.insert(0, Command::AddTrack { track: Box::new(track), index });
+        self.seal();
+        let ok = self.edit("Add track", cmds);
+        self.seal();
+        ok.then(|| {
+            self.selected_track = Some(id);
+            id
+        })
+    }
+
+    /// Ctrl+G: put the selected track in a new group (which takes its colour
+    /// and its place in the list). A track that is already in a group is
+    /// grouped inside it.
+    pub fn group_selected(&mut self) -> Option<TrackId> {
+        let track = self.selected_track.and_then(|id| self.project.track(id)).filter(|t| t.kind.has_clips() || t.kind == TrackKind::Group)?.clone();
+        let index = self.project.track_index(track.id)?;
+        let id = self.project.alloc_track_id();
+        let mut group = Track::new(id, TrackKind::Group, "Group", track.color);
+        group.parent = track.parent;
+        group.output = track.output;
+        group.sends = track.sends.clone();
+        let cmds = vec![
+            Command::AddTrack { track: Box::new(group), index },
+            Command::SetTrack { id: track.id, change: TrackProp::Parent(Some(id)) },
+            Command::SetTrack { id: track.id, change: TrackProp::Output(Output::Track(id)) },
+        ];
+        self.seal();
+        let ok = self.edit("Group track", cmds);
+        self.seal();
+        ok.then_some(id)
+    }
+
+    /// Ctrl+Shift+G: dissolve the selected group (or the group the selected
+    /// track is in); its tracks go back to where the group was routed.
+    pub fn ungroup_selected(&mut self) -> bool {
+        let Some(sel) = self.selected_track.and_then(|id| self.project.track(id)) else { return false };
+        let Some(group) = (if sel.kind == TrackKind::Group { Some(sel.clone()) } else { sel.parent.and_then(|p| self.project.track(p)).cloned() }) else {
+            return false;
+        };
+        let mut cmds = Vec::new();
+        let mut first = None;
+        for t in self.project.tracks.iter().filter(|t| t.parent == Some(group.id)) {
+            first.get_or_insert(t.id);
+            cmds.push(Command::SetTrack { id: t.id, change: TrackProp::Parent(group.parent) });
+            cmds.push(Command::SetTrack { id: t.id, change: TrackProp::Output(group.output) });
+        }
+        cmds.push(Command::RemoveTrack { id: group.id });
+        self.seal();
+        let ok = self.edit("Ungroup tracks", cmds);
+        self.seal();
+        if ok {
+            self.selected_track = first.or(self.project.content_tracks().next().map(|t| t.id));
+        }
+        ok
+    }
+
     /// Step sequencer: toggle a note of `key` in the step starting at `start`.
     pub fn toggle_step(&mut self, clip: ClipId, key: u8, start: Tick, len: Tick) -> bool {
         let Some((source, n)) = self.clip_notes(clip) else { return false };
@@ -1089,6 +1237,66 @@ mod tests {
         assert!(s.undo());
         assert_eq!(lane(&s).points.len(), 3);
         assert!(!s.delete_automation_point(track, target, 9));
+    }
+
+    #[test]
+    fn split_cuts_the_clip_under_the_playhead() {
+        let mut s = state();
+        let (track, place) = s
+            .project
+            .tracks
+            .iter()
+            .find_map(|t| t.arrangement.first().filter(|_| t.kind == TrackKind::Instrument).map(|p| (t.id, p.clone())))
+            .unwrap();
+        let clip = s.project.clips[&place.clip].clone();
+        s.selected_track = Some(track);
+        s.selected_placement = None;
+        let before = s.project.track(track).unwrap().arrangement.len();
+        assert_eq!(s.split_at(place.start), 0, "the clip's own edge is not a cut");
+        let cut = place.start + BAR;
+        assert_eq!(s.split_at(cut + 7), 1, "the cut snaps to the grid");
+        let t = s.project.track(track).unwrap();
+        assert_eq!(t.arrangement.len(), before + 1);
+        let left = &s.project.clips[&place.clip];
+        let right_place = t.arrangement.iter().find(|p| p.start == cut).expect("a clip starts at the cut");
+        let right = &s.project.clips[&right_place.clip];
+        assert_eq!(left.length, BAR);
+        assert_eq!((right.offset, right.length), (clip.offset + BAR, clip.length - BAR));
+        assert_eq!(s.selected_placement, Some((track, right_place.id)), "the right half is selected");
+        assert!(s.undo());
+        assert_eq!(s.project.clips[&place.clip].length, clip.length);
+        assert_eq!(s.project.track(track).unwrap().arrangement.len(), before);
+    }
+
+    #[test]
+    fn tracks_are_added_grouped_and_ungrouped() {
+        let mut s = state();
+        let bass = s.project.tracks.iter().find(|t| t.name == "Bass").unwrap().id;
+        s.selected_track = Some(bass);
+        let audio = s.add_track(TrackKind::Audio).unwrap();
+        assert_eq!(s.project.track_index(audio), s.project.track_index(bass).map(|i| i + 1), "after the selected track");
+        // A new track made while inside a group joins it and takes its colour.
+        let lead = s.project.tracks.iter().find(|t| t.name == "Lead").unwrap().clone();
+        s.selected_track = Some(lead.id);
+        let midi = s.add_track(TrackKind::Instrument).unwrap();
+        let t = s.project.track(midi).unwrap();
+        assert_eq!((t.parent, t.color), (lead.parent, lead.color));
+        // A return goes after the other returns and every track gets a send to it.
+        let ret = s.add_track(TrackKind::Return).unwrap();
+        let ri = s.project.track_index(ret).unwrap();
+        assert_eq!(s.project.tracks[ri - 1].kind, TrackKind::Return);
+        assert_eq!(s.project.tracks[ri].name, "C Return");
+        assert!(s.project.track(bass).unwrap().sends.iter().any(|x| x.target == ret));
+        // Group, then ungroup, the bass.
+        s.selected_track = Some(bass);
+        let group = s.group_selected().unwrap();
+        let b = s.project.track(bass).unwrap();
+        assert_eq!((b.parent, b.output), (Some(group), Output::Track(group)));
+        assert_eq!(s.project.track_index(group).map(|i| i + 1), s.project.track_index(bass), "the group sits right above");
+        assert!(s.ungroup_selected());
+        let b = s.project.track(bass).unwrap();
+        assert_eq!((b.parent, b.output), (None, Output::Main));
+        assert!(s.project.track(group).is_none());
     }
 
     #[test]

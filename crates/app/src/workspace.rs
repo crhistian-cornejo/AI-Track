@@ -41,6 +41,7 @@ pub enum Drag {
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
     BrowserResize { start_x: f32, start_w: f32 },
+    MixerResize { start_y: f32, start_h: f32 },
     Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
     Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
     Audition { track: TrackId, key: Option<u8> },
@@ -128,6 +129,9 @@ pub struct Workspace {
     pub project_path: Option<std::path::PathBuf>,
     pub bottom_h: f32,
     pub bottom_open: bool,
+    /// The mixer section between the arrangement and the detail panel.
+    pub mixer_open: bool,
+    pub mixer_h: f32,
     /// Width of the browser sidebar (drag its right edge).
     pub browser_w: f32,
     pub browser_open: bool,
@@ -248,6 +252,8 @@ impl Workspace {
             project_path: None,
             bottom_h: 300.,
             bottom_open: true,
+            mixer_open: false,
+            mixer_h: 264.,
             browser_w: BROWSER_W,
             browser_open: true,
             // Closed at start: the arrangement gets the room; the Assistant button opens it.
@@ -312,7 +318,7 @@ impl Workspace {
                 "devices" => self.s.bottom_tab = BottomTab::Devices,
                 "piano" => self.s.bottom_tab = BottomTab::PianoRoll,
                 "steps" => self.s.bottom_tab = BottomTab::Steps,
-                "mixer" => self.s.bottom_tab = BottomTab::Mixer,
+                "mixer" => self.mixer_open = true,
                 "meters" => self.meters.open = true,
                 "tall" => self.bottom_h = 460.,
                 "no-ai" => self.ai_open = false,
@@ -621,6 +627,9 @@ impl Workspace {
                 *last_y = y;
                 *bpm = (*bpm + dy * if e.modifiers.shift { 0.05 } else { 0.5 }).clamp(20., 999.);
                 self.s.set_tempo(*bpm);
+            }
+            Drag::MixerResize { start_y, start_h } => {
+                self.mixer_h = (*start_h + (*start_y - f32::from(e.position.y))).clamp(160., 520.);
             }
             Drag::BrowserResize { start_x, start_w } => {
                 self.browser_w = (*start_w + f32::from(e.position.x) - *start_x).clamp(200., 520.);
@@ -1304,6 +1313,68 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The mixer as its own section: every channel strip, always the same
+    /// height, independent of what the detail panel shows.
+    fn render_mixer_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.mixer_open {
+            return None;
+        }
+        let strips = views::mixer::render(self, window, cx);
+        let grip = div()
+            .id("mixer-grip")
+            .absolute()
+            .top(px(-SP1))
+            .left_0()
+            .right_0()
+            .h(px(SP2))
+            .cursor_row_resize()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if e.click_count >= 2 {
+                        this.mixer_h = 264.;
+                        cx.notify();
+                    } else {
+                        let start_h = this.mixer_h;
+                        this.begin_drag(Drag::MixerResize { start_y: f32::from(e.position.y), start_h }, cx);
+                    }
+                }),
+            );
+        Some(
+            motion::rise_in(
+                "mixer-section",
+                div()
+                    .relative()
+                    .flex_none()
+                    .h(px(self.mixer_h))
+                    .bg(pane_bg(crate::appearance::Pane::Bottom))
+                    .rounded(px(r_lg()))
+                    .border_1()
+                    .border_color(border())
+                    .child(div().size_full().overflow_hidden().rounded(px(r_lg())).child(strips))
+                    .child(grip),
+                8.,
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Zoom the arrangement around the playhead (or the left edge when it is out of view).
+    fn arrange_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let a = &mut self.s.arrange;
+        let old = a.px_per_beat;
+        let new = (old * factor).clamp(1., 160.);
+        let width = f32::from(self.regions.arrange.get().size.width);
+        let playhead = self.b.engine.transport().position as f32 / PPQ as f32;
+        let anchor_px = playhead * old - a.scroll_x;
+        let anchor = if (0. ..=width).contains(&anchor_px) { playhead } else { a.scroll_x / old };
+        let offset = anchor * old - a.scroll_x;
+        a.px_per_beat = new;
+        a.scroll_x = (anchor * new - offset).max(0.);
+        cx.notify();
+    }
+
     /// An arrow-key edit of the selection (notes, or the selected clip).
     fn key_edit(&mut self, e: KeyEdit, cx: &mut Context<Self>) {
         if self.s.key_edit(e) {
@@ -1541,6 +1612,7 @@ impl Render for Workspace {
             .child(views::ai_panel::render(self, window, cx));
 
         let bottom = views::bottom::render(self, window, cx);
+        let mixer = self.render_mixer_section(window, cx);
         let menu = self.render_menu(window, cx);
         let modal = views::prefs::render_modal(self, window, cx);
         let backdrop = views::prefs::backdrop(self);
@@ -1573,6 +1645,45 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenProject, window, cx| this.file_open(window, cx)))
             .on_action(cx.listener(|this, _: &SaveProject, _, cx| this.file_save(cx)))
             .on_action(cx.listener(|this, _: &SaveProjectAs, _, cx| this.file_save_as(None, cx)))
+            .on_action(cx.listener(|this, _: &SplitClip, _, cx| {
+                let at = this.b.engine.transport().position;
+                match this.s.split_at(at) {
+                    0 => this.toast("Nothing to split: put the playhead inside a clip of the selected track", cx),
+                    _ => cx.notify(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GroupTracks, _, cx| {
+                if this.s.group_selected().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &UngroupTracks, _, cx| {
+                if this.s.ungroup_selected() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AddAudioTrack, _, cx| {
+                this.s.add_track(TrackKind::Audio);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &AddMidiTrack, _, cx| {
+                this.s.add_track(TrackKind::Instrument);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &AddReturnTrack, _, cx| {
+                this.s.add_track(TrackKind::Return);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ArrangeZoomIn, _, cx| this.arrange_zoom(1.25, cx)))
+            .on_action(cx.listener(|this, _: &ArrangeZoomOut, _, cx| this.arrange_zoom(0.8, cx)))
+            .on_action(cx.listener(|this, _: &ArrangeFit, _, cx| {
+                // Fit the whole song to the width of the lanes.
+                let width = f32::from(this.regions.arrange.get().size.width).max(200.);
+                let beats = (this.s.project.arrangement_end() as f32 / PPQ as f32).max(4.);
+                this.s.arrange.px_per_beat = (width / beats * 0.96).clamp(1., 160.);
+                this.s.arrange.scroll_x = 0.;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-1, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(0, cx)))
@@ -1610,20 +1721,18 @@ impl Render for Workspace {
                 this.set_tab(next, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowMixer, _, cx| {
-                if this.bottom_open && this.s.bottom_tab == BottomTab::Mixer {
-                    this.bottom_open = false;
-                    cx.notify();
-                } else {
-                    this.bottom_open = true;
-                    this.set_tab(BottomTab::Mixer, cx);
-                }
+                this.mixer_open = !this.mixer_open;
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenPreferences, _, cx| this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Appearance), cx)))
             .on_action(cx.listener(|this, _: &ExportAudio, _, cx| this.open_export(cx)))
             .on_action(cx.listener(|this, _: &TabDevices, _, cx| this.set_tab(BottomTab::Devices, cx)))
             .on_action(cx.listener(|this, _: &TabPianoRoll, _, cx| this.set_tab(BottomTab::PianoRoll, cx)))
             .on_action(cx.listener(|this, _: &TabSteps, _, cx| this.set_tab(BottomTab::Steps, cx)))
-            .on_action(cx.listener(|this, _: &TabMixer, _, cx| this.set_tab(BottomTab::Mixer, cx)))
+            .on_action(cx.listener(|this, _: &TabMixer, _, cx| {
+                this.mixer_open = !this.mixer_open;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.menu = None;
                 this.modal = if this.export.running.is_some() { this.modal } else { None };
@@ -1658,6 +1767,7 @@ impl Render for Workspace {
                     .gap(px(SP1))
                     .p(px(SP1))
                     .child(middle)
+                    .children(mixer)
                     .child(bottom),
             )
             .child(status)

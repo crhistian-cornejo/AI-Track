@@ -131,15 +131,6 @@ impl Workspace {
         window.refresh();
     }
 
-    /// The quick light/dark switch in the top bar.
-    pub fn toggle_theme(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let dark = theme::is_dark();
-        self.set_look(true, cx, |a| {
-            a.follow_system = false;
-            a.theme = if dark { a.light_theme.clone() } else { a.dark_theme.clone() };
-        });
-    }
-
     pub fn open_modal(&mut self, m: Modal, cx: &mut Context<Self>) {
         self.modal = Some(m);
         self.menu = None;

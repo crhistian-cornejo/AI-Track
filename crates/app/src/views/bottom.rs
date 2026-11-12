@@ -15,6 +15,11 @@ use std::rc::Rc;
 
 pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    // The mixer is its own section now (as in Live); the detail panel holds
+    // what belongs to the selected track or clip.
+    if ws.s.bottom_tab == BottomTab::Mixer {
+        ws.s.bottom_tab = BottomTab::Devices;
+    }
     let tab = ws.s.bottom_tab;
     let weak = cx.entity().downgrade();
     let on_tab: widgets::OnSelect = Rc::new(move |i, _, cx| {
@@ -32,7 +37,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let tab_width = if tab == BottomTab::PianoRoll && f32::from(window.viewport_size().width) < 1400. { 84. } else { 112. };
     let tabs = widgets::segmented(
         "bottom-tabs",
-        &[(Some(Icon::Device), "Devices"), (Some(Icon::Piano), "Piano Roll"), (Some(Icon::Steps), "Steps"), (Some(Icon::Mixer), "Mixer")],
+        &[(Some(Icon::Device), "Devices"), (Some(Icon::Piano), "Clip"), (Some(Icon::Steps), "Steps")],
         tab.index(),
         tab_width,
         on_tab,

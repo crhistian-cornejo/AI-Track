@@ -64,7 +64,6 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let scale = project.scale.map_or("No key".to_owned(), |s| s.display());
     let camelot = project.scale.and_then(|s| s.camelot());
     let dirty = ws.s.history.is_dirty();
-    let cpu = ws.b.engine.cpu_load();
 
     // The Session ⇄ Arrangement switch sits with the identity, balancing the bar.
     let switch: widgets::OnSelect = {
@@ -118,6 +117,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.bottom_open = !this.bottom_open;
+                    cx.notify();
+                })),
+        )
+        .child(
+            widgets::icon_button("toggle-mixer", Icon::Mixer, ws.mixer_open)
+                .tooltip(widgets::tip("Mixer", Some("Ctrl+Alt+M")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mixer_open = !this.mixer_open;
                     cx.notify();
                 })),
         )
@@ -250,20 +257,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .items_center()
         .gap(px(SP2))
         .child(drag_area().flex_1())
-        .child(
-            div()
-                .id("cpu")
-                .flex_none()
-                .h(px(32.))
-                .px(px(SP2))
-                .gap(px(SP2))
-                .flex()
-                .items_center()
-                .rounded(px(r_lg()))
-                .tooltip(widgets::tip("DSP load", None))
-                .child(widgets::hbar(cpu, 28., 4., if cpu > 0.8 { pal.record } else { pal.accent }))
-                .child(mono(format!("{:>2.0}%", cpu * 100.), TEXT_SM, pal.muted).w(px(28.))),
-        )
+        // A short, quiet set: what you reach for while producing. Export lives
+        // in File, the theme in Preferences, the load read-outs in the status bar.
         .child(
             widgets::icon_button("meters", Icon::Gauge, ws.meters.open)
                 .tooltip(widgets::tip("Meters: loudness, spectrum, stereo field", None))
@@ -273,42 +268,17 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 })),
         )
         .child(
-            widgets::icon_button("export", Icon::Send, false)
-                .tooltip(widgets::tip("Export audio", Some("Ctrl+Shift+E")))
-                .on_click(cx.listener(|this, _, _, cx| this.open_export(cx))),
-        )
-        .child(
             widgets::icon_button("preferences", Icon::Sliders, false)
                 .tooltip(widgets::tip("Preferences", Some("Ctrl+,")))
                 .on_click(cx.listener(|this, _, _, cx| this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx))),
         )
         .child(
-            widgets::icon_button("theme", if is_dark() { Icon::Sun } else { Icon::Moon }, false)
-                .tooltip(widgets::tip("Light / dark theme", None))
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_theme(window, cx))),
-        )
-        .child(
-            div()
-                .id("assistant")
-                .flex_none()
-                .h(px(32.))
-                .px(px(SP3))
-                .gap(px(SP2))
-                .flex()
-                .items_center()
-                .rounded(px(r_lg()))
-                .cursor_pointer()
-                .bg(if ws.ai_open { accent_alpha(0.16) } else { pal.panel })
-                .border_1()
-                .border_color(if ws.ai_open { accent_alpha(0.5) } else { border() })
-                .hover(|s| s.border_color(accent_alpha(0.6)))
+            widgets::icon_button("assistant", Icon::Sparkles, ws.ai_open)
                 .tooltip(widgets::tip("AI assistant", Some("Ctrl+I")))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.ai_open = !this.ai_open;
                     cx.notify();
-                }))
-                .child(icon(Icon::Sparkles, 16., pal.accent))
-                .child(label("Assistant", TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM)),
+                })),
         )
         .child(div().flex_none().w(px(SP1)));
 

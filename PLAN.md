@@ -273,6 +273,113 @@ Cada fase termina con un criterio de salida verificable. Las duraciones dependen
 
 **Distribución:** ⬜ CI con builds firmados para macOS (universal) y Windows, `cargo-deny` en CI, fuzzing del host de plugins. Los tests golden de audio ya existen (✔).
 
+### 7.1 Prioridad inmediata: poder hacer canciones (añadido 2026-11-11)
+
+Hoy se puede abrir el programa, pero no se puede terminar una canción cómodamente: el sample no se edita bien, el arrangement se queda corto, el navegador es incómodo y las automatizaciones cuestan. Esta lista pasa por delante del resto de F2/F3/F4 hasta que se cierre.
+
+**Qué hay ya en curso en otras sesiones** (revisado el 2026-11-11; no repetir su trabajo, integrarlo):
+
+| Dónde | Qué cubre | Estado |
+|---|---|---|
+| `main`, sin commit: `model/src/ops.rs`, `Clip::new`, `Fade`, `Clip::gain_at`, `engine/src/clip.rs` | Fundamentos del editor de samples: fades, envolvente de volumen, bucle con crossfade anti-clic, recorte, división, crop, duplicar como comandos puros | Escrito y probado, falta commit |
+| `main`, sin commit: `app/src/grid.rs` | Rejilla **adaptativa** (más fina al hacer zoom, 8 compases → 1/128, tresillos, densidad como Narrowest…Widest de Live) | Escrita; **ninguna vista la usa todavía** |
+| Worktree `…-t4` (`views/sample_editor/`, `waveform.rs`, ~3 300 líneas) | Editor de samples en la pestaña Clip: marcadores de inicio/fin, fades con curva, envolvente, llave de bucle, cursor y selección, picos de forma de onda | En curso |
+| Worktree `…-t5` (`keys.rs`, `commands.rs`, `editing/`, `nav.rs`, `views/shortcuts.rs`) | Tabla única de atajos + hoja de atajos con buscador, selección/portapapeles/marcador de inserción de tipo Live, zoom del arrangement (1–640 px por negra), zoom a la selección, seguir el playhead | En curso |
+| Worktree `sidechain` y `agent-a8b3de1…` | Sidechain y Shaper; atajos/layout/abrir-guardar (WIP que no compila) | Fuera de este alcance |
+
+**Qué no cubre nadie** (lo que sigue es lo que hay que construir):
+
+```mermaid
+flowchart TD
+  subgraph FLUJO["Flujo de producir una canción"]
+    direction TB
+    A["Buscar sonido<br/>Cmd+K · views/palette.rs"]:::cambio --> B["Escuchar en contexto<br/>audition.rs + engine preview"]:::cambio
+    B --> C["Arrastrar al track<br/>views/arrangement.rs"]
+    C --> D["Mover fuera de rejilla<br/>grid.rs adaptativa + Alt"]:::cambio
+    D --> E["Editar el sample<br/>views/sample_editor/"]:::cambio
+    E --> F["Pitch, tonalidad, stretch<br/>engine/src/clip.rs + stretch"]:::cambio
+    F --> G["Automatizar lo que sea<br/>views/arrangement.rs · lane picker"]:::cambio
+    G --> H["Mezcla y export<br/>mixer.rs · export.rs"]
+  end
+
+  GRID["grid.rs<br/>(escrita, sin adoptar)"]:::wip -.-> D
+  OPS["model/ops.rs + Command API<br/>(fundamentos listos)"]:::wip -.-> E
+  T4["worktree t4: sample_editor"]:::wip -.-> E
+  T5["worktree t5: keys, editing, nav"]:::wip -.-> D
+  LIB["crates/library<br/>(índice, key, favoritos)"] --> A
+  HUB["Content Hub + soundbank<br/>views/hub.rs"]:::cambio --> A
+  CMD["Command API<br/>(toda edición)"] --> E
+  CMD --> G
+
+  classDef cambio fill:#f59e0b,stroke:#b45309,color:#000
+  classDef wip fill:#38bdf8,stroke:#0369a1,color:#000
+```
+
+Leyenda: 🟧 naranja = lo que hay que construir o cambiar · 🟦 azul = ya en curso en otra sesión (hay que integrarlo, no rehacerlo) · sin color = existe y se queda igual.
+
+#### P0 · Editar y colocar samples (cierra lo que ya está a medias)
+
+1. **Integrar el trabajo de t4 y t5 en `main`**: commit de los fundamentos (`ops.rs`, `clip.rs`, `grid.rs`), merge de los dos worktrees y resolver choques en `state.rs`, `workspace.rs`, `arrangement.rs` y `views/mod.rs`. Hasta que esto esté hecho, cualquier trabajo nuevo choca.
+2. **Adoptar `grid.rs` en el arrangement, el piano roll y el editor de samples.** Sustituye el menú de snap fijo (`state::Snap`: Off/Bar/Beat/1/8/1/16/1/32/1/16T) por un modo **Adaptativo** (por defecto, como Live) más una rejilla fija opcional hasta **1/64 y 1/128**, con tresillos y densidad. Las líneas de la rejilla se pintan según el zoom.
+3. **Zoom estilo Ableton/FL**: zoom horizontal anclado al puntero (rueda con Ctrl/Cmd), zoom vertical de alto de pista, arrastrar en la regla para escalar, zoom a la selección y "ajustar todo". Mantener los límites de `nav.rs` (1–640 px por negra).
+4. **Mover fuera de tiempo (off-beat)**: mantener `Alt` mientras se arrastra desactiva el snap (como Live), y con el zoom alto el snap adaptativo ya permite posiciones finas. `Cmd+Alt+←/→` empuja el clip en pasos de muestra/tick; flechas ← → mueven por la rejilla actual. Todo son `Command` (un solo paso de undo por arrastre).
+5. **Pitch, tonalidad y stretch del sample (la pieza grande que falta)**:
+   - Modelo: `Warp` ya existe; añadir `pitch_semitones`, `pitch_cents`, modo de warp (Beats / Tones / Texture / Re-Pitch / Complex) y **`Command::SetClipWarp`**.
+   - Motor: hoy solo hay repitch. Implementar un time-stretch con preservación de tono (WSOLA o phase vocoder para empezar; **sin Rubber Band**, es GPL) y pitch-shift independiente, en `crates/dsp`, sin asignaciones en `process` (render del stretch fuera del hilo RT y cacheado, o procesado por bloques con búfer previo).
+   - Interfaz: en la pestaña Clip, controles `Warp`, `Pitch`, `Key`, `BPM original`, `×2 / ÷2`, marcadores de warp arrastrables sobre la forma de onda, detección automática del BPM y la tonalidad (ya existe en `crates/ai`).
+   - **Todo lo que dijo el usuario**: ataque/decay/sustain/release del sample (envolvente de amplitud del clip, no solo la de volumen), reversa, ganancia, fade in/out, normalizar, inicio/fin, loop, y "Consolidar" a un nuevo archivo.
+6. **Atajos de manipulación**: `Cmd+E` dividir, `Cmd+D` duplicar (ya están), `Cmd+J` consolidar, `R` reversa, `Cmd+Shift+↑/↓` transponer, doble clic abre el editor, `Cmd+B` duplicar en el mismo sitio.
+
+#### P1 · Arrangement más completo
+
+7. Pistas redimensionables y colapsables con grupos; vista de **lanes** (take lanes) para comping.
+8. **Marcadores de bucle/loop brace y regiones** (arrangement locators) y un **Scrub/Preview** que respete la rejilla adaptativa.
+9. Selección con rubber-band, multi-clip, mover entre pistas con un solo undo, copiar con `Alt+arrastrar`.
+10. Pintar una forma de onda **más fiel** (picos por zoom, estéreo/mono) desde `waveform.rs` (t4).
+
+#### P1 · Automatización (todo se puede automatizar, como en Live)
+
+11. **Selector de parámetro por pista**: dos menús como Live ("Device" → "Parameter") en la cabecera de la lane; hoy solo se muestra `automation.first()` y no se elige. Campo de búsqueda en el selector.
+12. **Crear automatización desde cualquier parámetro**: clic derecho sobre un knob, fader, macro o botón → "Automatizar" (crea la lane con `Command::SetAutomation` y la muestra). Esto cubre el pedido de "todo debe poder automatizarse".
+13. **Clips de automatización**: la lane no es solo puntos sueltos; se pueden dibujar segmentos, curvas (ya hay `curve` por punto), rampas y formas (seno, triángulo, escalón) con un lápiz, y **agruparlos en un clip** que se puede mover, duplicar y alargar con el resto del arrangement.
+14. **Colapsar y ver**: botón para plegar todas las lanes a una banda de 12 px con una miniatura; "Mostrar solo automatizado"; conmutador "Armar automatización" (write/touch/latch).
+15. **Envolventes de clip** (volumen/pan/pitch dentro del clip) editables en el editor de samples; t4 ya cubre el volumen.
+
+#### P0 · Navegador y búsqueda: Cmd+K contextual (sustituye la barra lateral de búsqueda)
+
+16. **Paleta global `Cmd+K`** (`views/palette.rs`, nuevo): un solo campo tipo Spotlight que filtra *todo*: samples, plugins/dispositivos, presets, comandos, pistas, clips, ajustes. Filtros rápidos con prefijos y chips: `s:` samples, `p:` plugins, `>` comandos, `@` pistas, y un conmutador **"Solo en la tonalidad del proyecto"** (reutiliza `Matches project` y `keys_match`).
+    - La barra lateral de búsqueda se quita; el navegador queda como **explorador de carpetas** (el árbol), no como lista de resultados.
+    - **Contextual**: si hay un clip o una pista seleccionados, sugiere samples de la misma tonalidad/BPM/tipo (por ejemplo, pistas de batería → ofrece kicks). Los resultados se ordenan por coincidencia de key + BPM + categoría + favoritos + uso reciente.
+    - Se alimenta de `crates/library` (SQLite). Búsqueda por texto primero; similitud con CLAP después (F4).
+    - **Las acciones del proyecto se ejecutan como `Command` de la tabla de `commands.rs` de t5**; así el Cmd+K y los atajos comparten una sola lista de comandos.
+17. **Audición estilo Splice**: al moverse por la lista con ↑/↓ el sample **suena solo** (sin Enter), con retardo de ~80 ms para no tartamudear; `Espacio` pausa; `Enter` lo añade; `Tab` lo arrastra a la pista seleccionada. El sample de audición **se sincroniza al BPM y a la tonalidad del proyecto** (el stretch/pitch del punto 5 se reutiliza en el motor de preview) con un conmutador "Sync" y un control de volumen de preview. Forma de onda con cabezal y clic para saltar a un punto.
+18. **Buscar sin salir del Cmd+K**: el comando `Buscar samples gratis…` abre el Content Hub (`views/hub.rs`) filtrado y deja descargar un pack sin cambiar de pantalla, con barra de progreso y aviso de licencia. Hay que localizar con más rapidez los packs gratuitos ya descubiertos: un índice local `content/hub.json` con nombre, licencia, tamaño, géneros y enlace, y búsqueda por texto sobre ese índice.
+19. **Futuro, no ahora**: proveedor de Splice como un adaptador en `crates/library` (misma interfaz que la librería local) para que sus resultados aparezcan en el Cmd+K; solo con las vías oficiales y el login del usuario, sin tocar credenciales.
+
+#### P0 · Navegador: arreglos de UX concretos
+
+20. **Todas las filas con el mismo ancho**. Hoy `browser.rs` pinta nombre + badges + duración en una fila flex y el ancho lo manda el texto. Pasar a **columnas de ancho fijo**: icono (16 px) · nombre (flex, con elipsis y tooltip) · key (40) · BPM (36) · duración (40) · favorito (20). Cabeceras de columna ordenables (nombre, key, BPM, duración).
+21. **Estrellas de favorito alineadas a la derecha**, en una columna propia de ancho fijo y siempre en la misma posición; el área de clic es la celda entera (24×24 px), no el icono. Estrella apagada visible solo al pasar el cursor, para no ensuciar la lista.
+22. **Carpetas debajo, samples debajo de la carpeta**: el árbol de carpetas queda arriba con altura recordada y los samples ocupan el resto en una lista a ancho completo (hoy el árbol tiene `max_h(220)` y se reparte mal).
+23. **Arrancar limpio**: `main.rs:66` abre `demo::project()` (con contenido). Cambiarlo a `demo::empty()` (ya existe en `project_io.rs`), y dejar la demo y el starter electrónico solo en `File → New from template` (ya existe).
+
+#### Orden sugerido
+
+```mermaid
+flowchart LR
+  I["1. Integrar t4 + t5<br/>commit de ops/clip/grid"]:::cambio --> G["2. Grid adaptativo<br/>en las tres vistas"]:::cambio
+  G --> Z["3. Zoom y off-beat"]:::cambio
+  I --> B["4. Browser:<br/>columnas, estrellas, carpetas"]:::cambio
+  B --> K["5. Cmd+K + audición"]:::cambio
+  Z --> S["6. Pitch / stretch / ADSR"]:::cambio
+  K --> S
+  S --> A["7. Automatización:<br/>picker + clips"]:::cambio
+  A --> H["8. Hub rápido,<br/>Splice más adelante"]:::cambio
+  classDef cambio fill:#f59e0b,stroke:#b45309,color:#000
+```
+
+**Criterio de salida:** se puede hacer una canción de 3 minutos desde un proyecto vacío usando solo samples de la librería: buscarlos con `Cmd+K`, oírlos a tempo y tonalidad, colocarlos fuera de tiempo, estirarlos y cambiarles el tono, automatizar filtro y volumen, y exportar, sin salir del teclado más que para arrastrar.
+
 ---
 
 ## 8. Qué reutilizamos de las referencias

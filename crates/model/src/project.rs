@@ -350,11 +350,75 @@ pub struct Clip {
     /// Clip gain (Pro Tools style), applied before the device chain.
     pub gain_db: f32,
     /// Clip envelopes (Ableton): absolute or relative modulation.
+    ///
+    /// The `AutomationTarget::Volume` lane is the clip's volume envelope: its
+    /// point ticks are **clip time** (ticks from the clip's start on the
+    /// timeline, so the envelope does not repeat with the loop) and its value
+    /// is a **linear gain multiplier 0..=1 where 1.0 is unity**.
     pub envelopes: Vec<AutomationLane>,
     pub launch: LaunchSettings,
     pub muted: bool,
     /// Per-clip scale override.
     pub scale: Option<Scale>,
+    /// Fade at the clip's start, drawn on the waveform.
+    #[serde(default)]
+    pub fade_in: Fade,
+    /// Fade at the clip's end.
+    #[serde(default)]
+    pub fade_out: Fade,
+}
+
+/// A fade at one end of a clip.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct Fade {
+    /// Length in ticks; 0 = no fade.
+    pub length: Tick,
+    /// Curvature -1..=1 (0 = linear), as [`AutomationPoint::curve`].
+    pub curve: f32,
+}
+
+impl Clip {
+    /// A clip over `source` with everything else at its default: offset 0, no
+    /// loop, 0 dB, no envelopes, default launch, not muted, no scale, no fades.
+    pub fn new(name: impl Into<String>, color: Color, source: SourceId, length: Tick) -> Self {
+        Self {
+            name: name.into(),
+            color,
+            source,
+            offset: 0,
+            length,
+            looping: None,
+            gain_db: 0.0,
+            envelopes: Vec::new(),
+            launch: LaunchSettings::default(),
+            muted: false,
+            scale: None,
+            fade_in: Fade::default(),
+            fade_out: Fade::default(),
+        }
+    }
+
+    /// The enabled volume envelope (see [`Clip::envelopes`] for its units).
+    pub fn volume_envelope(&self) -> Option<&AutomationLane> {
+        self.envelopes.iter().find(|l| l.enabled && l.target == AutomationTarget::Volume)
+    }
+
+    /// Linear gain at clip time `t` (0..length): fade in × fade out × volume
+    /// envelope. `gain_db` is not included. No allocation, so the engine can
+    /// call it per block and the views per pixel.
+    pub fn gain_at(&self, t: Tick) -> f32 {
+        let mut gain = 1.0;
+        if self.fade_in.length > 0 && t < self.fade_in.length {
+            gain *= curve_shape(t.max(0) as f32 / self.fade_in.length as f32, self.fade_in.curve);
+        }
+        if self.fade_out.length > 0 && t > self.length - self.fade_out.length {
+            gain *= curve_shape((self.length - t).max(0) as f32 / self.fade_out.length as f32, self.fade_out.curve);
+        }
+        if let Some(v) = self.volume_envelope().and_then(|l| l.value_at(t)) {
+            gain *= v.clamp(0.0, 1.0);
+        }
+        gain
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -489,6 +553,22 @@ pub struct AudioSource {
     pub warp: Warp,
     /// Detected or tagged musical key of the material.
     pub key: Option<Scale>,
+}
+
+impl AudioSource {
+    /// Natural length of the file on the source-tick timeline the engine
+    /// plays it on: at `warp.original_bpm` when warped, else at `bpm`.
+    /// 0 when the file's length is unknown.
+    pub fn length_ticks(&self, bpm: f64) -> Tick {
+        if self.frames == 0 || self.sample_rate == 0 {
+            return 0;
+        }
+        let bpm = match self.warp.original_bpm {
+            Some(original) if self.warp.enabled => original,
+            _ => bpm,
+        };
+        (self.frames as f64 / self.sample_rate as f64 * bpm / 60.0 * PPQ as f64).round() as Tick
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -703,7 +783,7 @@ impl AutomationLane {
         let a = &pts[i - 1];
         let Some(b) = pts.get(i) else { return Some(a.value) };
         let t = (tick - a.tick) as f32 / (b.tick - a.tick).max(1) as f32;
-        Some(a.value + (b.value - a.value) * shape(t, a.curve))
+        Some(a.value + (b.value - a.value) * curve_shape(t, a.curve))
     }
 
     pub fn insert(&mut self, point: AutomationPoint) {
@@ -716,8 +796,9 @@ impl AutomationLane {
     }
 }
 
-/// Curvature -1..1 (0 = linear) between this point and the next.
-fn shape(t: f32, curve: f32) -> f32 {
+/// Progress 0..=1 bent by a curvature -1..1 (0 = linear): the shape between
+/// an automation point and the next, and of clip fades.
+pub fn curve_shape(t: f32, curve: f32) -> f32 {
     if curve.abs() < 1e-4 {
         t
     } else {
@@ -882,5 +963,58 @@ mod tests {
         lane.insert(AutomationPoint { tick: 100, value: 1.0, curve: 0.0 });
         assert_eq!(lane.value_at(50), Some(0.5));
         assert_eq!(lane.value_at(200), Some(1.0));
+    }
+
+    #[test]
+    fn clip_without_fades_still_loads() {
+        // A clip as saved before fades existed.
+        let old = r#"{"name":"c","color":0,"source":7,"offset":0,"length":960,"looping":null,"gain_db":0.0,
+            "envelopes":[],"launch":{"quantize":"bar","mode":"trigger","follow":null},"muted":false,"scale":null}"#;
+        let clip: Clip = serde_json::from_str(old).unwrap();
+        assert_eq!(clip, Clip::new("c", Color(0), SourceId(7), 960));
+        let mut faded = clip.clone();
+        faded.fade_out = Fade { length: 120, curve: -0.5 };
+        let back: Clip = serde_json::from_str(&serde_json::to_string(&faded).unwrap()).unwrap();
+        assert_eq!(back, faded);
+    }
+
+    #[test]
+    fn gain_follows_fades_and_volume_envelope() {
+        let mut c = Clip::new("c", Color(0), SourceId(1), 1000);
+        assert_eq!(c.gain_at(0), 1.0);
+        c.fade_in = Fade { length: 200, curve: 0.0 };
+        c.fade_out = Fade { length: 400, curve: 0.0 };
+        assert_eq!(c.gain_at(0), 0.0);
+        assert_eq!(c.gain_at(100), 0.5);
+        assert_eq!(c.gain_at(200), 1.0);
+        assert_eq!(c.gain_at(600), 1.0);
+        assert_eq!(c.gain_at(800), 0.5);
+        assert_eq!(c.gain_at(1000), 0.0);
+        // A curved fade still starts at 0 and ends at 1, but bends in between.
+        c.fade_in.curve = 1.0;
+        assert_eq!(c.gain_at(0), 0.0);
+        assert!(c.gain_at(100) < 0.2);
+        // The envelope multiplies; a disabled one is ignored.
+        let mut lane = AutomationLane::new(AutomationTarget::Volume);
+        lane.insert(AutomationPoint { tick: 0, value: 0.5, curve: 0.0 });
+        c.envelopes.push(lane);
+        assert_eq!(c.gain_at(500), 0.5);
+        assert_eq!(c.gain_at(800), 0.25);
+        c.envelopes[0].enabled = false;
+        assert!(c.volume_envelope().is_none());
+        assert_eq!(c.gain_at(500), 1.0);
+    }
+
+    #[test]
+    fn audio_length_in_ticks() {
+        let mut a = AudioSource { path: "a.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 96_000, warp: Warp::default(), key: None };
+        // Two seconds at 120 BPM are four beats.
+        assert_eq!(a.length_ticks(120.0), 4 * PPQ);
+        a.warp.original_bpm = Some(60.0);
+        assert_eq!(a.length_ticks(120.0), 4 * PPQ);
+        a.warp.enabled = true;
+        assert_eq!(a.length_ticks(120.0), 2 * PPQ);
+        a.frames = 0;
+        assert_eq!(a.length_ticks(120.0), 0);
     }
 }

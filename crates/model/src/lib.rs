@@ -12,6 +12,7 @@
 pub mod command;
 pub mod history;
 pub mod ids;
+pub mod ops;
 pub mod project;
 pub mod scale;
 pub mod time;

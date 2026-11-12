@@ -11,14 +11,23 @@
 //! and clip launches, so notes never hang when the project is edited.
 //!
 //! Audio clips play decoded, resampled data from the sample cache. Without
-//! warp they play at their native speed. With `warp.enabled` and an
-//! `original_bpm` they are *repitched* (speed follows the tempo). Pitch-
-//! preserving stretch plugs in at [`AudioClipData::source_frame`].
+//! warp they play at their native speed, reading whole frames (looping or
+//! not). With `warp.enabled` and an `original_bpm` they are *repitched*
+//! (speed follows the tempo). Pitch-preserving stretch plugs in at
+//! [`AudioClipData::source_frame`].
+//!
+//! The gain of an audio clip is its `gain_db` times its fades and volume
+//! envelope ([`ClipShape`], the same curve as `Clip::gain_at`), evaluated per
+//! sample on the clip's timeline. A looping clip crossfades for a few
+//! milliseconds into the material that leads up to the loop start every time
+//! it wraps (into the loop's first frame when the loop starts at the
+//! beginning of the file), so a sample that does not loop perfectly does not
+//! click.
 
 use crate::sample_cache::DecodedAudio;
 use aitrack_dsp::event::Expression;
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
-use aitrack_model::{Clip, ClipId, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, PPQ};
+use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, PPQ};
 use std::sync::Arc;
 
 /// Musical-time context of one processing segment.
@@ -233,6 +242,160 @@ pub(crate) enum ClipContent {
     Audio(AudioClipData),
 }
 
+/// Fades and volume envelope of an audio clip, copied out of the model when
+/// the graph is compiled so the audio thread only reads them.
+///
+/// [`gain`](Self::gain) is `Clip::gain_at` on a fractional clip time: equal
+/// to it on whole ticks, continuous in between.
+#[derive(Debug, Default)]
+pub(crate) struct ClipShape {
+    pub fade_in: Fade,
+    pub fade_out: Fade,
+    /// Points of the enabled volume envelope, sorted by tick (clip time).
+    pub envelope: Box<[AutomationPoint]>,
+}
+
+impl ClipShape {
+    fn of(clip: &Clip) -> Self {
+        // A curvature outside -1..=1 (or NaN) would put NaN in the audio.
+        let curve = |c: f32| if c.is_finite() { c.clamp(-1.0, 1.0) } else { 0.0 };
+        let fade = |f: Fade| Fade { length: f.length.max(0), curve: curve(f.curve) };
+        let mut envelope: Vec<AutomationPoint> = clip
+            .volume_envelope()
+            .map(|lane| {
+                lane.points
+                    .iter()
+                    .map(|p| AutomationPoint { tick: p.tick, value: if p.value.is_finite() { p.value } else { 1.0 }, curve: curve(p.curve) })
+                    .collect()
+            })
+            .unwrap_or_default();
+        envelope.sort_by_key(|p| p.tick);
+        Self { fade_in: fade(clip.fade_in), fade_out: fade(clip.fade_out), envelope: envelope.into_boxed_slice() }
+    }
+
+    /// Whether the clip has any fade or envelope at all.
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.fade_in.length > 0 || self.fade_out.length > 0 || !self.envelope.is_empty()
+    }
+
+    /// Fades × envelope at clip time `t` (ticks since the clip started).
+    /// `end` is the clip time the fade-out ends at; `None` for a clip that
+    /// never ends (a looping clip in the Session View), which has no
+    /// fade-out. `seg` is the caller's envelope cursor: start it at 0 and
+    /// pass it back, so consecutive samples do not search the points again.
+    #[inline]
+    pub fn gain(&self, t: f64, end: Option<Tick>, seg: &mut usize) -> f32 {
+        let mut gain = 1.0f32;
+        let fade_in = self.fade_in.length as f64;
+        if fade_in > 0.0 && t < fade_in {
+            gain *= curve_shape((t.max(0.0) / fade_in) as f32, self.fade_in.curve);
+        }
+        let fade_out = self.fade_out.length as f64;
+        if fade_out > 0.0
+            && let Some(end) = end
+        {
+            let left = end as f64 - t;
+            if left < fade_out {
+                gain *= curve_shape((left.max(0.0) / fade_out) as f32, self.fade_out.curve);
+            }
+        }
+        if let Some(v) = self.envelope_at(t, seg) {
+            gain *= v.clamp(0.0, 1.0);
+        }
+        gain
+    }
+
+    #[inline]
+    fn envelope_at(&self, t: f64, seg: &mut usize) -> Option<f32> {
+        let pts = &self.envelope;
+        let first = pts.first()?;
+        if t <= first.tick as f64 {
+            return Some(first.value);
+        }
+        let mut i = (*seg).min(pts.len() - 1);
+        while i + 1 < pts.len() && pts[i + 1].tick as f64 <= t {
+            i += 1;
+        }
+        while i > 0 && pts[i].tick as f64 > t {
+            i -= 1;
+        }
+        *seg = i;
+        let a = pts[i];
+        let Some(b) = pts.get(i + 1) else { return Some(a.value) };
+        let x = (t - a.tick as f64) / b.tick.saturating_sub(a.tick).max(1) as f64;
+        Some(a.value + (b.value - a.value) * curve_shape(x as f32, a.curve))
+    }
+}
+
+/// Length of the anti-click ramp at a clip edge that has no fade, in samples.
+const EDGE_RAMP: f64 = 64.0;
+/// Length of the crossfade at a loop seam; at most half the loop.
+const SEAM_SECONDS: f64 = 0.005;
+
+/// One pass of an unwarped clip over its source: the intro (offset to loop
+/// end) or one repeat of the loop.
+struct Pass {
+    /// Source frame played at the sample the pass was asked for.
+    frame: i64,
+    /// Samples since the clip started at which the pass ends.
+    end: i64,
+    /// Samples before `end` that crossfade into the lead-up of the loop start.
+    seam: i64,
+}
+
+/// The loop of an unwarped clip in whole source frames. Every repeat starts
+/// on the sample nearest to its exact position (`intro + c × span`), so a
+/// loop whose length is not a whole number of samples does not drift.
+struct FrameLoop {
+    offset: i64,
+    start: i64,
+    intro: i64,
+    span: f64,
+    seam: i64,
+}
+
+impl FrameLoop {
+    /// `offset`, `start` and `end` in source ticks, `spt` samples per tick.
+    fn new(offset: Tick, start: Tick, end: Tick, spt: f64, sr: f64) -> Self {
+        let frame = |tick: Tick| (tick as f64 * spt).round() as i64;
+        let span = ((end - start) as f64 * spt).max(1.0);
+        Self {
+            offset: frame(offset),
+            start: frame(start),
+            intro: frame(end).saturating_sub(frame(offset)).max(0),
+            span,
+            seam: ((SEAM_SECONDS * sr).round() as i64).min((span / 2.0) as i64).max(0),
+        }
+    }
+
+    #[inline]
+    fn repeat_start(&self, c: i64) -> i64 {
+        (c as f64 * self.span).round() as i64
+    }
+
+    /// The pass that plays `since` samples after the clip started.
+    #[inline]
+    fn pass(&self, since: i64) -> Pass {
+        if since < self.intro {
+            return Pass { frame: self.offset.saturating_add(since), end: self.intro, seam: self.seam.min(self.intro) };
+        }
+        let u = since - self.intro;
+        let mut c = (u as f64 / self.span).floor() as i64;
+        while c > 0 && self.repeat_start(c) > u {
+            c -= 1;
+        }
+        while self.repeat_start(c + 1) <= u {
+            c += 1;
+        }
+        Pass {
+            frame: self.start.saturating_add(u - self.repeat_start(c)),
+            end: (self.intro + self.repeat_start(c + 1)).max(since + 1),
+            seam: self.seam,
+        }
+    }
+}
+
 pub(crate) struct CompiledClip {
     pub length: Tick,
     pub offset: Tick,
@@ -243,6 +406,8 @@ pub(crate) struct CompiledClip {
     pub mode: LaunchMode,
     pub follow: Option<FollowAction>,
     pub content: ClipContent,
+    /// Fades and volume envelope (audio clips; empty for MIDI).
+    pub shape: ClipShape,
 }
 
 impl CompiledClip {
@@ -260,7 +425,7 @@ impl CompiledClip {
 
     pub fn audio(id: ClipId, clip: &Clip, data: AudioClipData) -> Self {
         let looping = clip.looping.filter(|l| l.end > l.start).map(|l| (l.start, l.end));
-        Self::base(id, clip, looping, ClipContent::Audio(data))
+        Self { shape: ClipShape::of(clip), ..Self::base(id, clip, looping, ClipContent::Audio(data)) }
     }
 
     fn base(id: ClipId, clip: &Clip, looping: Option<(Tick, Tick)>, content: ClipContent) -> Self {
@@ -275,6 +440,7 @@ impl CompiledClip {
             mode: clip.launch.mode,
             follow: clip.launch.follow,
             content,
+            shape: ClipShape::default(),
         }
     }
 
@@ -365,88 +531,168 @@ impl CompiledClip {
     }
 
     /// Mix the audio of this clip instance for samples `[lo, hi)` into `buf`
-    /// (whose sample 0 is `ctx.seg_start`).
+    /// (whose sample 0 is `ctx.seg_start`). The instance starts at `start`
+    /// (timeline tick) and ends at clip time `limit`; `None` plays on forever
+    /// (a looping clip in the Session View).
+    ///
+    /// Gain is the clip gain × fades × volume envelope at the clip time of
+    /// each sample (timeline ticks since `start`). An edge without a fade
+    /// keeps its 64-sample anti-click ramp: always at the end, and at the
+    /// start when the clip is trimmed (a clip that starts at the very
+    /// beginning of its file keeps the transient the file starts with).
     #[allow(clippy::too_many_arguments)]
     pub fn render_audio(&self, start: Tick, limit: Option<Tick>, lo: i64, hi: i64, ctx: &TimeCtx<'_>, buf: &mut AudioBuffer) {
         let ClipContent::Audio(data) = &self.content else { return };
         let Some(audio) = &data.audio else { return };
-        if self.muted || hi <= lo || buf.channels() < 2 {
+        if self.muted || hi <= lo || buf.channels() < 2 || audio.frames == 0 {
             return;
         }
-        const FADE: f64 = 64.0;
         let start_exact = ctx.tempo.tick_to_samples(start, ctx.sr);
         let spt = ctx.sr * 60.0 / (ctx.tempo.bpm_at(start) * PPQ as f64);
         let end_sample = limit.map(|l| ctx.tempo.tick_to_samples(start + l, ctx.sr));
         let stereo = audio.channels.len() >= 2;
-        let ratio = 2f64.powf(data.transpose as f64 / 12.0);
-        // Clip time (ticks) at a sample: exact for unwarped, tempo map for warped.
-        let clip_time = |n: i64| -> f64 {
-            if data.warped { ctx.tick_of(n) - start as f64 } else { (n as f64 - start_exact) / spt }
+        let shape = &self.shape;
+        let shaped = shape.active();
+        let ramp_in = self.offset != 0 && shape.fade_in.length == 0;
+        let ramp_out = shape.fade_out.length == 0;
+        // Clip gain with the anti-click ramps, `since` samples into the clip.
+        let edge_gain = |k: i64, since: f64| -> f32 {
+            let mut g = self.gain;
+            if ramp_in && since < EDGE_RAMP {
+                g *= (since / EDGE_RAMP).max(0.0) as f32;
+            }
+            if ramp_out
+                && let Some(e) = end_sample
+            {
+                let until = e - k as f64;
+                if until < EDGE_RAMP {
+                    g *= (until / EDGE_RAMP).max(0.0) as f32;
+                }
+            }
+            g
         };
+        // A clip that starts past its loop end starts inside the loop, at the
+        // position playback would have wrapped to.
+        let looping = self.looping.filter(|(ls, le)| le > ls);
+        let offset = match looping {
+            Some((ls, le)) if self.offset >= le => ls + self.offset.saturating_sub(ls).rem_euclid(le - ls),
+            _ => self.offset,
+        };
+        let mut seg = 0usize;
         let (l, r) = buf.stereo_mut();
-        // A clip at its native speed with no loop reads whole frames: playback
-        // is bit-identical to the file instead of an interpolated copy of it.
-        // A clip that starts at the very beginning of its file needs no fade-in:
-        // fading would soften the transient the file starts with.
-        let fade_in = self.offset != 0;
-        if !data.warped && self.looping.is_none() {
+
+        // A clip at its native speed reads whole frames: playback is
+        // bit-identical to the file instead of an interpolated copy of it.
+        if !data.warped {
             let start_i = start_exact.round() as i64;
-            let first_frame = (self.offset as f64 * spt).round() as i64 - start_i;
-            for k in lo.max(start_i)..hi {
-                if end_sample.is_some_and(|e| k as f64 >= e) {
-                    break;
-                }
-                let since = (k - start_i) as f64;
-                let mut g = self.gain;
-                if fade_in && since < FADE {
-                    g *= (since / FADE) as f32;
-                }
-                if let Some(e) = end_sample {
-                    let until = e - k as f64;
-                    if until < FADE {
-                        g *= (until / FADE).max(0.0) as f32;
+            let stop = end_sample.map_or(hi, |e| hi.min(e.ceil() as i64));
+            let frames = looping.map(|(ls, le)| FrameLoop::new(offset, ls, le, spt, ctx.sr));
+            let loop_start = frames.as_ref().map_or(0, |f| f.start);
+            // A loop that starts at the beginning of the file has nothing
+            // leading up to it: the tail fades into its first frame instead.
+            let lead_floor = loop_start.min(0);
+            let first_frame = (offset as f64 * spt).round() as i64;
+            let mut k = lo.max(start_i);
+            while k < stop {
+                let since = k - start_i;
+                let pass = match &frames {
+                    Some(f) => f.pass(since),
+                    None => Pass { frame: first_frame.saturating_add(since), end: i64::MAX, seam: 0 },
+                };
+                let pass_end = start_i.saturating_add(pass.end);
+                let run_end = stop.min(pass_end);
+                let mut n = k;
+                let mut t0 = if shaped { ctx.tick_of(n) - start as f64 } else { 0.0 };
+                while n < run_end {
+                    let chunk_end = (n + crate::automation::CONTROL_BLOCK as i64).min(run_end);
+                    let t1 = if shaped { ctx.tick_of(chunk_end) - start as f64 } else { 0.0 };
+                    let dt = (t1 - t0) / (chunk_end - n) as f64;
+                    for j in n..chunk_end {
+                        let frame = pass.frame.saturating_add(j - k);
+                        let mut sl = audio.frame(0, frame);
+                        let mut sr = if stereo { audio.frame(1, frame) } else { sl };
+                        if pass.seam > 0 {
+                            let left = pass_end - j;
+                            if left <= pass.seam {
+                                // Fade the tail into what leads up to the loop start.
+                                let w = (pass.seam - left + 1) as f32 / (pass.seam + 1) as f32;
+                                let lead = (loop_start - left).max(lead_floor);
+                                let pl = audio.frame(0, lead);
+                                let pr = if stereo { audio.frame(1, lead) } else { pl };
+                                sl += (pl - sl) * w;
+                                sr += (pr - sr) * w;
+                            }
+                        }
+                        let mut g = edge_gain(j, (j - start_i) as f64);
+                        if shaped {
+                            g *= shape.gain(t0 + dt * (j - n) as f64, limit, &mut seg);
+                        }
+                        let idx = (j - ctx.seg_start) as usize;
+                        l[idx] += sl * g;
+                        r[idx] += sr * g;
                     }
+                    t0 = t1;
+                    n = chunk_end;
                 }
-                let idx = (k - ctx.seg_start) as usize;
-                let sl = audio.frame(0, first_frame + k);
-                let sr = if stereo { audio.frame(1, first_frame + k) } else { sl };
-                l[idx] += sl * g;
-                r[idx] += sr * g;
+                k = run_end;
             }
             return;
         }
+
+        // Repitch warp: the source position follows the tempo map and is read
+        // through the interpolator.
+        let ratio = 2f64.powf(data.transpose as f64 / 12.0);
+        let span = looping.map_or(0.0, |(ls, le)| (le - ls) as f64);
+        // Seam length in source ticks: for a repeat, and for the first pass
+        // (which cannot start crossfading before the clip does).
+        let (seam, seam_intro) = match looping {
+            Some((_, le)) => {
+                let ticks = (SEAM_SECONDS * data.original_bpm * PPQ as f64 / 60.0).min(span / 2.0);
+                (ticks, ticks.min((le - offset) as f64))
+            }
+            None => (0.0, 0.0),
+        };
+        // As above: without a lead-up the tail fades into the first frame.
+        let lead_floor = looping.map_or(0.0, |(ls, _)| data.source_frame(ls as f64, spt).min(0.0));
         let mut n = lo;
         while n < hi {
             let chunk_end = (n + crate::automation::CONTROL_BLOCK as i64).min(hi);
-            let t0 = clip_time(n);
-            let t1 = clip_time(chunk_end);
+            let t0 = ctx.tick_of(n) - start as f64;
+            let t1 = ctx.tick_of(chunk_end) - start as f64;
             let len = (chunk_end - n) as f64;
             for k in n..chunk_end {
                 let tau = t0 + (t1 - t0) * (k - n) as f64 / len;
                 if tau < 0.0 || limit.is_some_and(|lim| tau >= lim as f64) {
                     continue;
                 }
-                let mut src = self.offset as f64 + tau * if data.warped { ratio } else { 1.0 };
-                if let Some((ls, le)) = self.looping
-                    && src >= le as f64 {
-                        let span = (le - ls) as f64;
+                let mut src = offset as f64 + tau * ratio;
+                let mut w = 0.0f32;
+                if let Some((ls, le)) = looping {
+                    let mut fade = seam_intro;
+                    if src >= le as f64 {
                         src = ls as f64 + (src - le as f64).rem_euclid(span);
+                        fade = seam;
                     }
-                let frame = data.source_frame(src, spt);
-                let mut g = self.gain;
-                let since = k as f64 - start_exact;
-                if fade_in && since < FADE {
-                    g *= (since / FADE).max(0.0) as f32;
+                    let left = le as f64 - src;
+                    if left < fade {
+                        w = (1.0 - left / fade) as f32;
+                    }
                 }
-                if let Some(e) = end_sample {
-                    let until = e - k as f64;
-                    if until < FADE {
-                        g *= (until / FADE).max(0.0) as f32;
-                    }
+                let frame = data.source_frame(src, spt);
+                let mut sl = audio.sample(0, frame);
+                let mut sr = if stereo { audio.sample(1, frame) } else { sl };
+                if w > 0.0 {
+                    let lead = data.source_frame(src - span, spt).max(lead_floor);
+                    let pl = audio.sample(0, lead);
+                    let pr = if stereo { audio.sample(1, lead) } else { pl };
+                    sl += (pl - sl) * w;
+                    sr += (pr - sr) * w;
+                }
+                let mut g = edge_gain(k, k as f64 - start_exact);
+                if shaped {
+                    g *= shape.gain(tau, limit, &mut seg);
                 }
                 let idx = (k - ctx.seg_start) as usize;
-                let sl = audio.sample(0, frame);
-                let sr = if stereo { audio.sample(1, frame) } else { sl };
                 l[idx] += sl * g;
                 r[idx] += sr * g;
             }
@@ -458,22 +704,10 @@ impl CompiledClip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aitrack_model::{Color, LaunchSettings, LoopRegion, Note, NoteId, SourceId};
+    use aitrack_model::{Color, LoopRegion, Note, NoteId, SourceId};
 
     fn clip(offset: Tick, length: Tick, looping: Option<(Tick, Tick)>) -> Clip {
-        Clip {
-            name: "c".into(),
-            color: Color(0),
-            source: SourceId(1),
-            offset,
-            length,
-            looping: looping.map(|(start, end)| LoopRegion { start, end }),
-            gain_db: 0.0,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        }
+        Clip { offset, looping: looping.map(|(start, end)| LoopRegion { start, end }), ..Clip::new("c", Color(0), SourceId(1), length) }
     }
 
     fn notes() -> NoteSource {
@@ -517,5 +751,200 @@ mod tests {
         let keys: Vec<u8> = ons.iter().map(|o| o.1).collect();
         assert_eq!(keys, vec![61, 60, 61, 60, 61]);
         assert_eq!(ons[1].0, 480);
+    }
+
+    // ───────────────────────────── Audio ─────────────────────────────
+
+    use aitrack_model::{AutomationLane, AutomationTarget};
+
+    fn audio_clip(clip: &Clip, data: Vec<f32>, original_bpm: Option<f64>) -> CompiledClip {
+        let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
+        let data = AudioClipData { audio: Some(audio), warped: original_bpm.is_some(), original_bpm: original_bpm.unwrap_or(120.0), transpose: 0.0 };
+        CompiledClip::audio(ClipId(1), clip, data)
+    }
+
+    /// The first `total` samples of the clip placed at `start`, at 48 kHz.
+    fn play(c: &CompiledClip, bpm: f64, start: Tick, limit: Option<Tick>, total: usize) -> Vec<f32> {
+        let tempo = TempoMap::constant(bpm);
+        let mut out = Vec::with_capacity(total);
+        let mut buf = AudioBuffer::new(2, 100);
+        let mut s = 0i64;
+        while (s as usize) < total {
+            buf.clear();
+            let ctx = TimeCtx { tempo: &tempo, sr: 48_000.0, seg_start: s };
+            c.render_audio(start, limit, s, s + 100, &ctx, &mut buf);
+            out.extend_from_slice(buf.channel(0));
+            s += 100;
+        }
+        out
+    }
+
+    fn shaped_clip() -> Clip {
+        let mut c = clip(0, 4 * PPQ, None);
+        c.fade_in = Fade { length: 700, curve: 0.8 };
+        c.fade_out = Fade { length: 900, curve: -0.4 };
+        let mut lane = AutomationLane::new(AutomationTarget::Volume);
+        lane.insert(AutomationPoint { tick: 200, value: 0.9, curve: 0.0 });
+        lane.insert(AutomationPoint { tick: 1500, value: 0.2, curve: 0.7 });
+        lane.insert(AutomationPoint { tick: 3000, value: 1.0, curve: -1.0 });
+        c.envelopes.push(lane);
+        c
+    }
+
+    #[test]
+    fn shape_is_gain_at_on_every_tick() {
+        let mut linear = clip(0, 4 * PPQ, None);
+        linear.fade_in = Fade { length: 480, curve: 0.0 };
+        linear.fade_out = Fade { length: 4 * PPQ - 480, curve: 0.0 };
+        for c in [shaped_clip(), linear, clip(0, 4 * PPQ, None)] {
+            let shape = ClipShape::of(&c);
+            let mut seg = 0;
+            for t in 0..=c.length {
+                let got = shape.gain(t as f64, Some(c.length), &mut seg);
+                assert!((got - c.gain_at(t)).abs() < 1e-5, "tick {t}: {got} vs {}", c.gain_at(t));
+            }
+            // The cursor may be anywhere: going back in time finds the segment again.
+            for t in [3500, 100, 1499, 1500, 0, 2999, 3000] {
+                assert!((shape.gain(t as f64, Some(c.length), &mut seg) - c.gain_at(t)).abs() < 1e-5, "tick {t}");
+            }
+        }
+        // A clip that never ends has no fade-out; a disabled envelope is ignored.
+        let mut c = shaped_clip();
+        let shape = ClipShape::of(&c);
+        assert!((shape.gain(3800.0, None, &mut 0) - 1.0).abs() < 1e-6);
+        assert!(shape.gain(3800.0, Some(c.length), &mut 0) < 0.5);
+        c.envelopes[0].enabled = false;
+        assert!(ClipShape::of(&c).envelope.is_empty());
+        assert!(!ClipShape::of(&clip(0, PPQ, None)).active());
+    }
+
+    #[test]
+    fn loop_repeats_whole_frames_without_drift() {
+        // 97 BPM: a tick is 30.93 samples, so neither the offset nor the loop
+        // is a whole number of frames. The source holds its own frame index.
+        let (bpm, offset, ls, le) = (97.0, 100, 40, 500);
+        let data: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        let c = audio_clip(&clip(offset, 4 * PPQ, Some((ls, le))), data, None);
+        let total = 3_000_000;
+        let out = play(&c, bpm, 0, None, total);
+        let spt = 48_000.0 * 60.0 / (bpm * PPQ as f64);
+        let (off_e, ls_e, le_e) = (offset as f64 * spt, ls as f64 * spt, le as f64 * spt);
+        let span = le_e - ls_e;
+        let mut checked = 0;
+        for (n, got) in out.iter().enumerate().skip(64) {
+            let pos = off_e + n as f64;
+            let exact = if pos < le_e { pos } else { ls_e + (pos - le_e).rem_euclid(span) };
+            // Skip the crossfade before each wrap (5 ms) and the wrap itself.
+            if le_e - exact < 245.0 || exact - ls_e < 3.0 {
+                continue;
+            }
+            assert_eq!(got.fract(), 0.0, "sample {n} is not a whole frame: {got}");
+            assert!((*got as f64 - exact).abs() <= 2.0, "sample {n}: frame {got}, exact {exact:.2}");
+            checked += 1;
+        }
+        assert!(checked > total * 9 / 10);
+        // More than 200 repeats were played.
+        assert!(total as f64 / span > 200.0);
+    }
+
+    #[test]
+    fn loop_seam_crossfades_into_the_lead_up() {
+        // One beat of file; the loop is its second half.
+        let ramp: Vec<f32> = (0..24_000).map(|i| i as f32 / 24_000.0).collect();
+        let c = audio_clip(&clip(480, 8 * PPQ, Some((480, 960))), ramp.clone(), None);
+        let out = play(&c, 120.0, 0, Some(8 * PPQ), 60_000);
+        // Passes are 12 000 samples; the last 240 of each crossfade from the
+        // tail (frames up to 23 999) into the lead-up (frames up to 11 999).
+        for pass in 0..4usize {
+            let end = (pass + 1) * 12_000;
+            for left in 1..=240usize {
+                let w = (240 - left + 1) as f32 / 241.0;
+                let want = ramp[24_000 - left] * (1.0 - w) + ramp[12_000 - left] * w;
+                assert!((out[end - left] - want).abs() < 1e-6, "pass {pass}, {left} before the wrap");
+            }
+            assert_eq!(out[end], ramp[12_000]);
+            assert_eq!(out[end - 241], ramp[24_000 - 241]);
+            // The half-file jump is spread over the crossfade.
+            let step = (end - 241..end).map(|i| (out[i + 1] - out[i]).abs()).fold(0.0f32, f32::max);
+            assert!(step < 0.5 / 241.0 * 1.1, "pass {pass}: step {step}");
+        }
+        // A loop from the start of the file has no lead-up: the tail fades
+        // into the first frame, so the wrap is continuous all the same.
+        let c = audio_clip(&clip(0, 8 * PPQ, Some((0, 960))), ramp.iter().map(|v| v + 0.25).collect(), None);
+        let out = play(&c, 120.0, 0, Some(8 * PPQ), 60_000);
+        assert_eq!(out[23_000], ramp[23_000] + 0.25);
+        assert!((out[23_999] - 0.25).abs() < 0.01, "{}", out[23_999]);
+        assert_eq!(out[24_000], 0.25);
+        let step = (23_700..24_100).map(|i| (out[i + 1] - out[i]).abs()).fold(0.0f32, f32::max);
+        assert!(step < 1.0 / 241.0 * 1.1, "step {step}");
+    }
+
+    #[test]
+    fn warped_loop_crossfades_too() {
+        // Material at 60 BPM in a 120 BPM project plays twice as fast: the
+        // half-beat loop is 24 000 frames played in 12 000 samples, and the
+        // 5 ms seam lasts 120 samples.
+        let ramp: Vec<f32> = (0..48_000).map(|i| 0.25 + i as f32 / 96_000.0).collect();
+        let c = audio_clip(&clip(480, 8 * PPQ, Some((480, 960))), ramp.clone(), Some(60.0));
+        let out = play(&c, 120.0, 0, Some(8 * PPQ), 30_000);
+        // Away from the seam: the source at double speed (frame 24 000 + 2n).
+        for n in [100usize, 3000, 9000, 11_800, 12_100, 15_000, 23_800, 24_200] {
+            let frame = 24_000 + 2 * (n % 12_000);
+            assert!((out[n] - ramp[frame]).abs() < 1e-3, "sample {n}: {} vs {}", out[n], ramp[frame]);
+        }
+        for wrap in [12_000usize, 24_000] {
+            let step = (wrap - 200..wrap + 20).map(|i| (out[i + 1] - out[i]).abs()).fold(0.0f32, f32::max);
+            assert!(step < 0.25 / 120.0 * 1.2, "wrap at {wrap}: step {step}");
+        }
+        // Fades follow clip time on the warped path as well.
+        let mut faded = clip(0, 2 * PPQ, None);
+        faded.fade_in = Fade { length: 480, curve: 0.6 };
+        faded.fade_out = Fade { length: 480, curve: 0.0 };
+        let c = audio_clip(&faded, vec![1.0; 96_000], Some(60.0));
+        let out = play(&c, 120.0, 0, Some(2 * PPQ), 50_000);
+        for t in [0, 10, 200, 479, 480, 1000, 1441, 1700, 1919] {
+            assert!((out[25 * t as usize] - faded.gain_at(t)).abs() < 1e-3, "tick {t}: {} vs {}", out[25 * t as usize], faded.gain_at(t));
+        }
+        assert!(out[48_000].abs() < 1e-6);
+    }
+
+    #[test]
+    fn odd_loops_and_files_are_safe() {
+        let ones = || vec![1.0f32; 6000];
+        // (The interpolator may overshoot a little at the edges of the file.)
+        let finite = |out: &[f32]| out.iter().all(|s| s.is_finite() && s.abs() <= 1.2);
+        for warp in [None, Some(120.0)] {
+            // Offset past the loop end: starts inside the loop, where
+            // playback would have wrapped to ((705 − 10) mod 30 = 5 ticks in).
+            let data: Vec<f32> = (0..6000).map(|i| i as f32 / 6000.0).collect();
+            let c = audio_clip(&clip(705, 4 * PPQ, Some((10, 40))), data.clone(), warp);
+            let out = play(&c, 120.0, 0, Some(4 * PPQ), 4000);
+            assert!(finite(&out));
+            assert!((out[100] - data[375 + 100]).abs() < 1e-3, "{warp:?}: {}", out[100]);
+            // A loop region longer than the file: silence past the end.
+            let c = audio_clip(&clip(0, 8 * PPQ, Some((0, 960))), ones(), warp);
+            let out = play(&c, 120.0, 0, Some(8 * PPQ), 60_000);
+            assert!(finite(&out));
+            assert!((out[3000] - 1.0).abs() < 1e-3 && (out[24_000 + 3000] - 1.0).abs() < 1e-3);
+            assert!(out[6100..23_000].iter().all(|s| s.abs() < 1e-3), "{warp:?}: sound past the end of the file");
+            // The offset itself past the end of the file, with and without a loop.
+            for looping in [None, Some((0, 100_000))] {
+                let c = audio_clip(&clip(50_000, 4 * PPQ, looping), ones(), warp);
+                assert!(play(&c, 120.0, 0, Some(4 * PPQ), 4000).iter().all(|s| *s == 0.0));
+            }
+            // An empty file, a one-tick loop, a negative loop start, a loop
+            // that never ends (Session View).
+            let c = audio_clip(&clip(0, 4 * PPQ, Some((0, 480))), Vec::new(), warp);
+            assert!(play(&c, 120.0, 0, None, 4000).iter().all(|s| *s == 0.0));
+            let c = audio_clip(&clip(0, 4 * PPQ, Some((100, 101))), ones(), warp);
+            assert!(finite(&play(&c, 120.0, 0, None, 4000)));
+            let c = audio_clip(&clip(-50, 4 * PPQ, Some((-200, 100))), ones(), warp);
+            assert!(finite(&play(&c, 120.0, 0, None, 20_000)));
+        }
+        // An inverted or empty loop region is no loop at all.
+        let c = audio_clip(&clip(0, 4 * PPQ, Some((480, 480))), ones(), None);
+        assert!(c.looping.is_none());
+        let out = play(&c, 120.0, 0, Some(4 * PPQ), 8000);
+        assert!(out[..6000].iter().all(|s| *s == 1.0) && out[6000..].iter().all(|s| *s == 0.0));
     }
 }

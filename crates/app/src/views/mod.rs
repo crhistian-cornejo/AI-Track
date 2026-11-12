@@ -14,6 +14,7 @@ pub mod meters;
 pub mod mixer;
 pub mod piano_roll;
 pub mod prefs;
+pub mod sample_editor;
 pub mod session;
 pub mod steps;
 pub mod topbar;

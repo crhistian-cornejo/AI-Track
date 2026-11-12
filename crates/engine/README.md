@@ -53,6 +53,24 @@ when device params/macros are automated) → pre-fader sends → volume/pan
 post-fader sends → meter → PDC delay → destination. Automation is evaluated
 at the musical time of the signal (shifted by the accumulated latency).
 
+Audio clips (`clip.rs`, arrangement, Session View and export alike):
+
+* An unwarped clip reads whole frames, looping or not, so it is
+  bit-identical to the file. A warped clip is repitched through the sinc
+  interpolator.
+* Gain = `gain_db` × fade in × fade out × volume envelope, the curve of
+  `Clip::gain_at`, evaluated per sample at the clip time (timeline ticks
+  since the clip started). A looping Session clip has no end, so no fade-out.
+* An edge without a fade keeps a 64-sample anti-click ramp: always at the
+  end, and at the start only when the clip is trimmed (`offset != 0`). A
+  fade of any length at an edge replaces the ramp there.
+* A looping clip plays `offset..loop end` once, then `loop start..loop end`
+  until it ends. Each repeat starts on the sample nearest its exact
+  position, so loops do not drift. The last 5 ms before every wrap (at most
+  half the loop) crossfade linearly into the audio that leads up to the loop
+  start, or into the loop's first frame when the loop starts at the
+  beginning of the file. An offset past the loop end starts inside the loop.
+
 ## Public API
 
 ```rust
@@ -165,7 +183,8 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 
 * Parallel worker pool (tracks are processed on the audio thread in
   topological order; the graph is ready for level-based scheduling).
-* Clip envelopes, MIDI racks, launch modes Gate/Repeat (behave as Trigger),
+* Clip envelopes other than volume, fades on MIDI clips, MIDI racks, launch
+  modes Gate/Repeat (behave as Trigger),
   scene tempo, recording to disk, disk streaming (`creek`), pitch-preserving
   warp (hook: `AudioClipData::source_frame`), WASAPI exclusive, macOS
   workgroups, nested VCAs.
@@ -177,7 +196,8 @@ loop wrap, clip loops, automation ramps, device-param automation, PDC with a
 known-latency node, rack chain alignment), routing (cycles, invalid routes,
 groups, returns, solo/mute/VCA), Session (launch quantize, stop, follow
 actions, states), live MIDI, metronome, count-in, processor reuse, audio
-clips with gain and repitch warp, export (bit depths, dither only at
+clips with gain and repitch warp, clip fades, volume envelopes, loops and
+their seams, splits (`tests/clips.rs`), export (bit depths, dither only at
 16-bit, resampled length, stems alignment, normalize, cancel), and the
-zero-allocation test. `examples/play_demo.rs` plays a short demo on the
+zero-allocation tests. `examples/play_demo.rs` plays a short demo on the
 default device (`-- --quiet` mutes it, `-- --list` lists devices).

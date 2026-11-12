@@ -10,6 +10,7 @@ mod appearance;
 mod assets;
 mod bridge;
 mod demo;
+mod grid;
 mod icons;
 mod motion;
 mod paint;
@@ -19,6 +20,7 @@ mod state;
 mod theme;
 mod usage;
 mod views;
+mod waveform;
 mod widgets;
 mod workspace;
 

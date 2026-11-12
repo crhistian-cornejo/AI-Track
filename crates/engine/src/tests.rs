@@ -76,19 +76,7 @@ impl P {
         let cid = self.p.alloc_clip_id();
         self.p.clips.insert(
             cid,
-            Clip {
-                name: "clip".into(),
-                color: Color(0),
-                source: sid,
-                offset: 0,
-                length,
-                looping: looping.map(|(start, end)| LoopRegion { start, end }),
-                gain_db: 0.0,
-                envelopes: Vec::new(),
-                launch: LaunchSettings::default(),
-                muted: false,
-                scale: None,
-            },
+            Clip { looping: looping.map(|(start, end)| LoopRegion { start, end }), ..Clip::new("clip", Color(0), sid, length) },
         );
         cid
     }
@@ -531,19 +519,7 @@ fn audio_clip_plays_with_gain_and_warp() {
     let cid = b.p.alloc_clip_id();
     b.p.clips.insert(
         cid,
-        Clip {
-            name: "a".into(),
-            color: Color(0),
-            source: sid,
-            offset: 0,
-            length: 2 * PPQ,
-            looping: None,
-            gain_db: -6.0,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        },
+        Clip { gain_db: -6.0, ..Clip::new("a", Color(0), sid, 2 * PPQ) },
     );
     b.place(t, cid, PPQ);
     let out = render_offline_with(&b.p, &FallbackFactory, (0, 4 * PPQ), SR, 256, samples.clone()).unwrap();
@@ -590,19 +566,7 @@ fn unwarped_audio_clip_is_bit_exact() {
     let cid = b.p.alloc_clip_id();
     b.p.clips.insert(
         cid,
-        Clip {
-            name: "n".into(),
-            color: Color(0),
-            source: sid,
-            offset: 0,
-            length: 8 * PPQ,
-            looping: None,
-            gain_db: 0.0,
-            envelopes: Vec::new(),
-            launch: LaunchSettings::default(),
-            muted: false,
-            scale: None,
-        },
+        Clip::new("n", Color(0), sid, 8 * PPQ),
     );
     b.place(t, cid, PPQ);
     let out = render_offline_with(&b.p, &FallbackFactory, (0, 4 * PPQ), SR, 256, samples).unwrap();
@@ -1159,3 +1123,5 @@ fn audio_config_serializes() {
     assert_eq!(old.sample_rate, Some(44_100));
     assert_eq!(old.output_channels, crate::ChannelSelection::default());
 }
+
+mod clips;

@@ -24,23 +24,108 @@ pub struct DecodedAudio {
 impl DecodedAudio {
     pub fn from_planar(channels: Vec<Vec<f32>>, sample_rate: u32) -> Self {
         let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
+        init_interpolator();
         Self { channels, sample_rate, source_rate: sample_rate, frames }
     }
 
-    /// Linear interpolation at a fractional frame; 0 outside the data.
+    /// The exact stored sample at an integer frame; 0 outside the data.
+    /// Used for clips that play at their native speed, so playback is
+    /// bit-identical to the file.
+    #[inline]
+    pub fn frame(&self, ch: usize, index: i64) -> f32 {
+        if index < 0 || index as usize >= self.frames || self.channels.is_empty() {
+            return 0.0;
+        }
+        self.channels[ch.min(self.channels.len() - 1)][index as usize]
+    }
+
+    /// Windowed-sinc interpolation at a fractional frame; 0 outside the data.
+    ///
+    /// Linear interpolation dulls the top octave (−3 dB at a quarter of the
+    /// sample rate at half-sample offsets), so anything read at a fractional
+    /// position goes through a 16-tap Kaiser-windowed sinc instead. The table
+    /// is built once off the audio thread (see [`init_interpolator`]).
     #[inline]
     pub fn sample(&self, ch: usize, pos: f64) -> f32 {
-        if pos < 0.0 || self.channels.is_empty() {
+        if self.channels.is_empty() || pos <= -(SINC_HALF as f64) || pos >= (self.frames + SINC_HALF) as f64 {
             return 0.0;
         }
         let data = &self.channels[ch.min(self.channels.len() - 1)];
-        let i = pos as usize;
-        if i + 1 >= self.frames {
-            return if i < self.frames { data[i] } else { 0.0 };
+        let floor = pos.floor();
+        let base = floor as i64;
+        let phase = (pos - floor) * SINC_PHASES as f64;
+        let p0 = (phase as usize).min(SINC_PHASES - 1);
+        let blend = (phase - p0 as f64) as f32;
+        let table = sinc_table();
+        let row0 = &table[p0 * SINC_TAPS..(p0 + 1) * SINC_TAPS];
+        let row1 = &table[(p0 + 1) * SINC_TAPS..(p0 + 2) * SINC_TAPS];
+        let first = base - SINC_HALF as i64 + 1;
+        let mut acc = 0.0f32;
+        if first >= 0 && (first as usize + SINC_TAPS) <= self.frames {
+            let window = &data[first as usize..first as usize + SINC_TAPS];
+            for j in 0..SINC_TAPS {
+                acc += window[j] * (row0[j] + (row1[j] - row0[j]) * blend);
+            }
+        } else {
+            for j in 0..SINC_TAPS {
+                let idx = first + j as i64;
+                if idx >= 0 && (idx as usize) < self.frames {
+                    acc += data[idx as usize] * (row0[j] + (row1[j] - row0[j]) * blend);
+                }
+            }
         }
-        let f = (pos - i as f64) as f32;
-        data[i] + (data[i + 1] - data[i]) * f
+        acc
     }
+}
+
+const SINC_TAPS: usize = 16;
+const SINC_HALF: usize = SINC_TAPS / 2;
+const SINC_PHASES: usize = 512;
+
+/// Build the interpolation table. Call off the audio thread before any
+/// playback (every [`DecodedAudio`] constructor does), so the audio thread
+/// only ever reads it.
+pub fn init_interpolator() {
+    let _ = sinc_table();
+}
+
+/// `(SINC_PHASES + 1)` rows of `SINC_TAPS` coefficients; row `p` interpolates
+/// at fraction `p / SINC_PHASES`. Each row sums to 1 (unity gain at DC).
+fn sinc_table() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Box<[f32]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        // Slightly below Nyquist so the transition band does not fold back.
+        const CUTOFF: f64 = 0.94;
+        const BETA: f64 = 9.0;
+        let i0 = |x: f64| -> f64 {
+            let (mut sum, mut term, mut k) = (1.0, 1.0, 1.0);
+            while term > 1e-12 * sum {
+                term *= (x / (2.0 * k)) * (x / (2.0 * k));
+                sum += term;
+                k += 1.0;
+            }
+            sum
+        };
+        let norm = i0(BETA);
+        let mut table = vec![0.0f32; (SINC_PHASES + 1) * SINC_TAPS];
+        for p in 0..=SINC_PHASES {
+            let frac = p as f64 / SINC_PHASES as f64;
+            let mut row = [0.0f64; SINC_TAPS];
+            let mut sum = 0.0;
+            for (j, c) in row.iter_mut().enumerate() {
+                let x = j as f64 - (SINC_HALF as f64 - 1.0) - frac;
+                let sinc = if x.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * CUTOFF * x).sin() / (std::f64::consts::PI * CUTOFF * x) };
+                let w = x / SINC_HALF as f64;
+                let window = if w.abs() >= 1.0 { 0.0 } else { i0(BETA * (1.0 - w * w).sqrt()) / norm };
+                *c = CUTOFF * sinc * window;
+                sum += *c;
+            }
+            for (j, c) in row.iter().enumerate() {
+                table[p * SINC_TAPS + j] = (c / sum) as f32;
+            }
+        }
+        table.into_boxed_slice()
+    })
 }
 
 /// Decode an audio file to planar `f32` at its own rate.

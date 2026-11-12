@@ -299,9 +299,15 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
     .child(crate::widgets::mono(format!("{now:+.1}"), TEXT_XS, if now.abs() > 0.05 { pal.text } else { pal.faint }))
     .child(crate::widgets::label(if kind == Kind::Transient { "gain" } else { "GR" }, TEXT_XS, pal.faint));
 
+    // Compressor and gate can listen to another track.
+    let sidechain = match plugin {
+        "fx.compressor" => Some(super::sidechain_chip(ws, dev, aitrack_stock::fx::compressor::p::SIDECHAIN, cx)),
+        "fx.gate" => Some(super::sidechain_chip(ws, dev, aitrack_stock::fx::gate::p::SIDECHAIN, cx)),
+        _ => None,
+    };
     kit::panel(if dev.big { 760. } else { 520. })
         .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(curve)).child(history).child(meter))
-        .child(kit::strip(dev, &primary, &more, cx))
+        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::strip(dev, &primary, &more, cx)).children(sidechain))
         .into_any_element()
 }
 

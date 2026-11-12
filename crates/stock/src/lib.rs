@@ -45,6 +45,7 @@ static REGISTRY: &[StockPlugin] = &[
     StockPlugin { id: fx::gate::ID, name: "Gate", category: Category::Effect, tags: &["dynamics", "gate", "expander"], create: fx::gate::create },
     StockPlugin { id: fx::transient::ID, name: "Transient Shaper", category: Category::Effect, tags: &["dynamics", "transient", "attack"], create: fx::transient::create },
     StockPlugin { id: fx::chorus::ID, name: "Chorus", category: Category::Effect, tags: &["modulation", "chorus", "flanger", "phaser"], create: fx::chorus::create },
+    StockPlugin { id: fx::shaper::ID, name: "Shaper", category: Category::Effect, tags: &["dynamics", "sidechain", "pump", "gate", "tremolo", "volume"], create: fx::shaper::create },
     StockPlugin { id: fx::utility::ID, name: "Utility", category: Category::Utility, tags: &["utility", "gain", "pan", "width", "mono"], create: fx::utility::create },
     StockPlugin { id: fx::analyzer::ID, name: "Analyzer", category: Category::Analyzer, tags: &["analyzer", "spectrum", "loudness", "meter"], create: fx::analyzer::create },
     StockPlugin { id: instrument::wavetable::ID, name: "Wavetable Synth", category: Category::Instrument, tags: &["synth", "wavetable", "polyphonic"], create: instrument::wavetable::create },

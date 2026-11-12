@@ -621,6 +621,10 @@ pub struct Device {
     pub preset: Option<String>,
     #[serde(default)]
     pub collapsed: bool,
+    /// The track this device listens to on its sidechain input (ducking a
+    /// bass from the kick, keying a gate). `None` leaves it unconnected.
+    #[serde(default)]
+    pub sidechain: Option<TrackId>,
 }
 
 impl Device {
@@ -634,6 +638,7 @@ impl Device {
             state: None,
             preset: None,
             collapsed: false,
+            sidechain: None,
         }
     }
 

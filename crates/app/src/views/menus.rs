@@ -20,6 +20,7 @@ pub fn render(ws: &mut Workspace, menu: &Menu, _: &mut Window, cx: &mut Context<
         MenuKind::PianoTools => tools_menu(cx),
         MenuKind::AddDevice(track) => device_menu(ws, *track, cx),
         MenuKind::Presets(device) => preset_menu(ws, *device, cx)?,
+        MenuKind::LibraryContext => library_menu(ws, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
     })
 }
@@ -191,6 +192,51 @@ fn preset_menu(ws: &mut Workspace, device: aitrack_model::DeviceId, cx: &mut Con
         })));
     }
     Some(div().id("preset-menu-scroll").max_h(px(480.)).overflow_y_scroll().child(card).into_any_element())
+}
+
+fn library_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let scanning = ws.b.library.scan_status().running;
+    let can_undo = ws.b.library.can_undo_organize();
+    widgets::menu_card("library-menu", 232.)
+        .child(menu_header("LIBRARY"))
+        .child(menu_item("lib-add", Some(Icon::FolderOpen), "Add folder…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.pick_library_folder(cx);
+        })))
+        .child(if scanning {
+            menu_item("lib-cancel", Some(Icon::X), "Cancel scan", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                this.b.library.cancel_scan();
+                cx.notify();
+            }))
+        } else {
+            menu_item("lib-rescan", Some(Icon::Refresh), "Rescan my folders", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                this.b.library.rescan();
+                cx.notify();
+            }))
+        })
+        .child(widgets::divider_h())
+        .child(menu_item("lib-organize", Some(Icon::FolderTree), "Organize on disk…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.organize = crate::workspace::OrganizeUi { items: this.library_view().iter().map(|i| i.id).collect(), ..Default::default() };
+            this.open_modal(crate::views::prefs::Modal::Organize, cx);
+        })))
+        .when(can_undo, |d| {
+            d.child(menu_item("lib-undo-org", Some(Icon::Undo), "Undo last organize", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                let msg = match this.b.library.undo_organize() {
+                    Ok(m) | Err(m) => m,
+                };
+                this.toast(msg, cx);
+            })))
+        })
+        .child(widgets::divider_h())
+        .child(menu_item("lib-hub", Some(Icon::Globe), "Content Hub…", None, false).on_click(cx.listener(|this, _, _, cx| {
+            this.menu = None;
+            this.open_modal(crate::views::prefs::Modal::ContentHub, cx);
+        })))
+        .into_any_element()
 }
 
 fn sig_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {

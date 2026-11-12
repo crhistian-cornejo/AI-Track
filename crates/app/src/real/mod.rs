@@ -1,15 +1,16 @@
 //! Adapters that implement the [`bridge`](crate::bridge) traits over the real
 //! crates: the audio engine (`aitrack-engine`), stock devices
-//! (`aitrack-stock`), hosted VST3/CLAP plugins (`aitrack-host`) and the ML
-//! features (`aitrack-ai`). The sample library stays on its stub until
-//! `aitrack-library` lands.
+//! (`aitrack-stock`), hosted VST3/CLAP plugins (`aitrack-host`), the ML
+//! features (`aitrack-ai`) and the sample library (`aitrack-library`).
 
 pub mod ai;
 pub mod engine;
+pub mod library;
 pub mod main_thread;
 pub mod plugins;
+pub mod preview;
 
-use crate::bridge::{Bridges, StubLibrary};
+use crate::bridge::Bridges;
 use aitrack_engine::FactoryStack;
 use std::sync::Arc;
 
@@ -24,6 +25,8 @@ pub mod settings {
         pub audio: aitrack_engine::AudioConfig,
         /// Run third-party plugins in `aitrack-plugin-host` processes.
         pub sandbox: bool,
+        /// Folder holding the factory sound bank (`factory.db` + `packs/`).
+        pub content_dir: Option<PathBuf>,
     }
 
     fn path() -> PathBuf {
@@ -61,11 +64,12 @@ pub fn bridges() -> Bridges {
     let live = Arc::new(factory(&rt, true));
     let export = Arc::new(factory(&rt, false));
     let catalog = plugins::RealCatalog::new(rt.clone(), crate::appearance::config_dir().join("plugins.json"));
+    let library = library::RealLibrary::new(settings.content_dir.as_deref());
     let engine = engine::RealEngine::new(live, export, rt, settings);
     Bridges {
         engine: Box::new(engine),
         plugins: Box::new(catalog),
-        library: Box::<StubLibrary>::default(),
+        library: Box::new(library),
         ai: Box::new(ai::RealAi::new()),
     }
 }

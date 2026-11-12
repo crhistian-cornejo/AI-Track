@@ -107,6 +107,8 @@ pub trait EngineBridge {
         false
     }
     fn set_sandbox_plugins(&mut self, _on: bool) {}
+    /// Audition an audio file at a low level (`None` stops).
+    fn preview(&mut self, _path: Option<&Path>) {}
     /// Plugin load failures and similar, drained by the UI as toasts.
     fn take_messages(&mut self) -> Vec<String> {
         Vec::new()
@@ -798,6 +800,8 @@ pub struct LibraryFolder {
     /// Stable path-like id, e.g. `"categories/drums/kicks"`.
     pub id: String,
     pub name: String,
+    /// Samples inside (0 when unknown).
+    pub count: u64,
     pub children: Vec<LibraryFolder>,
 }
 
@@ -813,6 +817,33 @@ pub struct LibraryItem {
     /// Seconds.
     pub duration: f32,
     pub is_loop: bool,
+    pub favorite: bool,
+}
+
+/// A Content Hub entry (or a bundled pack) as the hub page lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HubItem {
+    pub name: String,
+    pub author: String,
+    /// "Sample pack", "Instrument", "Plugin" or "Included".
+    pub kind: String,
+    pub license: String,
+    pub license_summary: String,
+    pub redistributable: bool,
+    pub url: String,
+    pub description: String,
+}
+
+/// What "Organize on disk" would do, shown before anything moves.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrganizePreview {
+    pub dest: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub duplicates: usize,
+    pub moves: bool,
+    /// Target folder → number of files (largest first, a few).
+    pub folders: Vec<(String, usize)>,
 }
 
 pub trait LibraryBridge {
@@ -822,6 +853,51 @@ pub trait LibraryBridge {
     fn items(&self, folder: &str) -> Vec<LibraryItem>;
     /// Free-text search, optionally restricted to a key (compatible keys first).
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem>;
+    /// Samples ranked for the project's key and tempo.
+    fn recommend(&self, scale: Option<Scale>, _bpm: f64) -> Vec<LibraryItem> {
+        self.search("", scale)
+    }
+    /// Where the library comes from and how big it is.
+    fn status(&self) -> String {
+        "Demo library".into()
+    }
+    /// Index a folder into the user library (scanned in the background).
+    fn add_folder(&mut self, _path: &Path) -> Result<(), String> {
+        Err("The demo library cannot index folders".into())
+    }
+    fn rescan(&mut self) {}
+    fn cancel_scan(&mut self) {}
+    fn scan_status(&self) -> ScanStatus {
+        ScanStatus::default()
+    }
+    /// Pick up scan progress and results; true when the UI should repaint.
+    fn poll(&mut self) -> bool {
+        false
+    }
+    fn set_favorite(&mut self, _id: u64, _on: bool) {}
+    fn mark_used(&mut self, _id: u64) {}
+    /// Content Hub entries and the bundled packs.
+    fn hub(&self) -> Vec<HubItem> {
+        Vec::new()
+    }
+    /// Plan copying (or moving) `items` into `dest`, by key or by category.
+    fn plan_organize(&mut self, _items: &[u64], _dest: &Path, _by_key: bool, _move_files: bool) -> Result<OrganizePreview, String> {
+        Err("Organizing needs the real library".into())
+    }
+    /// Run the last plan in the background; the result arrives through `organize_result`.
+    fn execute_organize(&mut self) -> Result<(), String> {
+        Err("Nothing planned".into())
+    }
+    /// A finished organize run (`Ok(summary)`), taken once.
+    fn organize_result(&mut self) -> Option<Result<String, String>> {
+        None
+    }
+    fn can_undo_organize(&self) -> bool {
+        false
+    }
+    fn undo_organize(&mut self) -> Result<String, String> {
+        Err("Nothing to undo".into())
+    }
 }
 
 pub struct StubLibrary {
@@ -830,7 +906,7 @@ pub struct StubLibrary {
 }
 
 fn folder(id: &str, name: &str, children: Vec<LibraryFolder>) -> LibraryFolder {
-    LibraryFolder { id: id.into(), name: name.into(), children }
+    LibraryFolder { id: id.into(), name: name.into(), count: 0, children }
 }
 
 impl Default for StubLibrary {
@@ -931,6 +1007,7 @@ impl Default for StubLibrary {
                         bpm: *bpm,
                         duration: *dur,
                         is_loop: *is_loop,
+                        favorite: false,
                     },
                 )
             })

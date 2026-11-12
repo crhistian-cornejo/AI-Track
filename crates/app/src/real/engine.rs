@@ -54,6 +54,7 @@ pub struct RealEngine {
     active: Option<ActiveAudio>,
     lame: OnceLock<Result<(), String>>,
     messages: Vec<String>,
+    preview: super::preview::Preview,
 }
 
 fn host_name(h: AudioHost) -> &'static str {
@@ -181,6 +182,7 @@ impl RealEngine {
             active,
             lame: OnceLock::new(),
             messages: Vec::new(),
+            preview: super::preview::Preview::new(),
         };
         if let Some(a) = &this.active {
             this.app_config.sample_rate = a.sample_rate;
@@ -343,7 +345,14 @@ impl EngineBridge for RealEngine {
     }
 
     fn idle(&mut self) -> bool {
+        self.preview.collect();
         self.rt.idle()
+    }
+
+    fn preview(&mut self, path: Option<&std::path::Path>) {
+        if let Err(e) = self.preview.play(path) {
+            self.messages.push(e);
+        }
     }
 
     fn meter(&self, track: TrackId) -> MeterLevel {

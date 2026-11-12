@@ -28,6 +28,8 @@ pub enum PrefsPage {
 pub enum Modal {
     Preferences(PrefsPage),
     Export,
+    ContentHub,
+    Organize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +199,8 @@ pub fn render_modal(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
     let (title, body, width): (&str, AnyElement, f32) = match modal {
         Modal::Preferences(page) => ("Preferences", preferences(ws, page, window, cx), 880.),
         Modal::Export => ("Export audio", crate::views::export::render(ws, window, cx), 600.),
+        Modal::ContentHub => ("Content Hub", crate::views::hub::render_hub(ws, cx), 760.),
+        Modal::Organize => ("Organize on disk", crate::views::hub::render_organize(ws, cx), 600.),
     };
     let pal = p();
     let card = div()
@@ -223,7 +227,7 @@ pub fn render_modal(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
                 .gap(px(SP2))
                 .border_b_1()
                 .border_color(border())
-                .child(icon(if modal == Modal::Export { Icon::Send } else { Icon::Sliders }, 16., pal.accent))
+                .child(icon(match modal { Modal::Export => Icon::Send, Modal::ContentHub => Icon::Globe, Modal::Organize => Icon::FolderTree, Modal::Preferences(_) => Icon::Sliders }, 16., pal.accent))
                 .child(label(title, TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
                 .child(div().flex_1())
                 .child(widgets::icon_button("close-modal", Icon::X, false).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),

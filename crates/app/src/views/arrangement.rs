@@ -268,6 +268,15 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(lane_canvas)
         .on_mouse_down(MouseButton::Left, cx.listener(lane_mouse_down))
         .on_mouse_down(MouseButton::Right, cx.listener(lane_right_click))
+        .drag_over::<crate::workspace::DraggedSample>(|s, _, _, _| s.bg(accent_alpha(0.06)))
+        // A library sample dropped on a lane lands on that track (audio
+        // tracks; otherwise a new one) at the beat under the cursor.
+        .on_drop(cx.listener(|this, d: &crate::workspace::DraggedSample, window, cx| {
+            let pos = window.mouse_position();
+            let (tick, row) = this.arrange_pos(pos);
+            let start = crate::state::Snap::Beat.floor(tick.max(0));
+            this.add_sample_clip(&d.0, row, Some(start), cx);
+        }))
         .on_scroll_wheel(cx.listener(on_wheel));
 
     // ── Track headers ──

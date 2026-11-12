@@ -61,6 +61,8 @@ pub enum MenuKind {
     AddDevice(TrackId),
     /// Factory presets of a stock device.
     Presets(DeviceId),
+    /// Library actions (right-click in the browser).
+    LibraryContext,
     TimeSignature,
 }
 
@@ -135,7 +137,45 @@ pub struct Workspace {
     analysis_jobs: std::collections::HashMap<JobId, SourceId>,
     /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
     midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
+    /// Browser filter: samples ranked for the project key and tempo.
+    pub library_matches: bool,
+    pub organize: OrganizeUi,
     _housekeeping: Task<()>,
+}
+
+/// "Organize on disk": options → preview → run → undo.
+#[derive(Clone, Debug, Default)]
+pub struct OrganizeUi {
+    pub items: Vec<u64>,
+    pub dest: Option<std::path::PathBuf>,
+    pub by_key: bool,
+    pub move_files: bool,
+    pub preview: Option<crate::bridge::OrganizePreview>,
+    pub running: bool,
+    pub result: Option<Result<String, String>>,
+}
+
+/// A sample dragged out of the browser.
+#[derive(Clone, Debug)]
+pub struct DraggedSample(pub LibraryItem);
+
+impl Render for DraggedSample {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pal = p();
+        div()
+            .px(px(SP2))
+            .h(px(ROW_H))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .rounded(px(r_md()))
+            .bg(pal.raised)
+            .border_1()
+            .border_color(border_strong())
+            .shadow_lg()
+            .child(crate::icons::icon(Icon::Waveform, 12., pal.accent))
+            .child(crate::widgets::label(self.0.name.clone(), TEXT_SM, pal.text))
+    }
 }
 
 impl Workspace {
@@ -204,8 +244,18 @@ impl Workspace {
             midi_mode: MidiMode::default(),
             analysis_jobs: Default::default(),
             midi_jobs: Default::default(),
+            library_matches: false,
+            organize: OrganizeUi::default(),
             _housekeeping: housekeeping,
         };
+        // Open on a folder that exists in this library.
+        if !folder_exists(this.b.library.folders(), &this.library_folder)
+            && let Some(f) = this.b.library.folders().iter().find(|f| f.count > 0)
+        {
+            let first = f.children.iter().find(|c| c.count > 0).unwrap_or(f);
+            this.expanded.insert(f.id.clone());
+            this.library_folder = first.id.clone();
+        }
         // Seed the assistant with a greeting and one reviewable proposal.
         this.chat_log.push(ChatEntry::Assistant(
             "Hi! I can extract MIDI from audio, split stems and find samples in the project key. Edits I suggest show up here as proposals you accept or discard; each one is a single undo step.".into(),
@@ -235,6 +285,16 @@ impl Workspace {
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.b.engine.idle();
         changed |= self.b.plugins.poll();
+        changed |= self.b.library.poll();
+        if let Some(r) = self.b.library.organize_result() {
+            self.organize.running = false;
+            self.organize.preview = None;
+            match &r {
+                Ok(m) | Err(m) => self.toast(m.clone(), cx),
+            }
+            self.organize.result = Some(r);
+            changed = true;
+        }
         for m in self.b.engine.take_messages() {
             self.toast(m, cx);
             changed = true;
@@ -704,6 +764,86 @@ impl Workspace {
         .detach();
     }
 
+    /// Put a library sample on `track` (default: the selected audio track,
+    /// else a new one) at `start` (default: the playhead's bar), as one edit.
+    pub fn add_sample_clip(&mut self, item: &LibraryItem, track: Option<TrackId>, start: Option<Tick>, cx: &mut Context<Self>) {
+        let start = start.unwrap_or_else(|| Snap::Bar.floor(self.b.engine.transport().position.max(0)));
+        let target = track
+            .or(self.s.selected_track)
+            .filter(|t| self.s.project.track(*t).is_some_and(|t| t.kind == TrackKind::Audio));
+        let (sample_rate, channels, frames) = hound::WavReader::open(&item.path)
+            .map(|r| (r.spec().sample_rate, r.spec().channels, r.duration() as u64))
+            .unwrap_or((48_000, 2, (item.duration.max(0.) as f64 * 48_000.) as u64));
+        let name = item.name.clone();
+        let mut cmds = match target {
+            Some(_) => Vec::new(),
+            None => {
+                let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
+                audio_track_commands(&mut self.s, &name, Color::palette(4), &item.path, (sample_rate, channels, frames), start, index)
+            }
+        };
+        if let Some(track) = target {
+            let mut one = audio_track_commands(&mut self.s, &name, Color::palette(4), &item.path, (sample_rate, channels, frames), start, 0);
+            // Keep the source, clip and placement; place on the existing track.
+            one.retain(|c| !matches!(c, Command::AddTrack { .. }));
+            for c in &mut one {
+                if let Command::PlaceClip { track: t, .. } = c {
+                    *t = track;
+                }
+            }
+            cmds = one;
+        }
+        // The library's key and tempo travel with the clip.
+        for c in &mut cmds {
+            if let Command::AddSource { source, .. } = c
+                && let Source::Audio(a) = source.as_mut()
+            {
+                a.key = item.key;
+                if item.is_loop {
+                    a.warp.original_bpm = item.bpm.map(f64::from);
+                    a.warp.enabled = item.bpm.is_some();
+                }
+            }
+            if let Command::AddClip { clip, .. } = c
+                && let Some(color) = target.and_then(|t| self.s.project.track(t)).map(|t| t.color)
+            {
+                clip.color = color;
+            }
+        }
+        if self.s.edit("Add sample", cmds) {
+            self.b.library.mark_used(item.id);
+            self.toast(format!("Added {name}"), cx);
+        }
+    }
+
+    pub fn pick_library_folder(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Add to library".into()) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.into_iter().next() {
+                    let _ = this.update(cx, |ws, cx| {
+                        match ws.b.library.add_folder(&p) {
+                            Ok(()) => ws.toast(format!("Scanning {}", p.display()), cx),
+                            Err(e) => ws.toast(e, cx),
+                        }
+                    });
+                }
+        })
+        .detach();
+    }
+
+    /// The samples the browser currently lists (folder, search or matches).
+    pub fn library_view(&self) -> Vec<LibraryItem> {
+        let q = self.query.trim();
+        if !q.is_empty() {
+            self.b.library.search(q, None)
+        } else if self.library_matches {
+            self.b.library.recommend(self.s.project.scale, self.s.project.tempo.initial_bpm())
+        } else {
+            self.b.library.items(&self.library_folder)
+        }
+    }
+
     fn apply_analysis(&mut self, source: SourceId, a: &AudioAnalysis) {
         let Some(Source::Audio(old)) = self.s.project.sources.get(&source).cloned() else { return };
         let mut new = old.clone();
@@ -996,6 +1136,10 @@ impl Snap {
     fn max_grid(self, other: Snap) -> Snap {
         if other.ticks() > self.ticks() { other } else { self }
     }
+}
+
+fn folder_exists(folders: &[crate::bridge::LibraryFolder], id: &str) -> bool {
+    folders.iter().any(|f| f.id == id || folder_exists(&f.children, id))
 }
 
 /// The chat card for a pending proposal.

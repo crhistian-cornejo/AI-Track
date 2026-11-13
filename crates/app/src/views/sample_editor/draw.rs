@@ -25,7 +25,9 @@ pub struct Scene {
     /// The file's time at the sample rate of `peaks`.
     pub base: TimeBase,
     /// Axis position of song tick 0.
-    pub origin: Tick,
+    pub origin: f64,
+    /// Axis ticks per song tick (transposition / repitch rate).
+    pub rate: f64,
     pub grid: GridSpec,
     pub peaks: Option<Arc<Peaks>>,
     /// Why there is no waveform (still decoding, or unreadable).
@@ -136,7 +138,8 @@ fn grid(pen: &Pen, window: &mut Window, cx: &mut App) {
     let pal = p();
     let (s, l) = (pen.s, &pen.l);
     let (top, wave_h) = pen.wave();
-    let ppt = l.axis.px_per_tick();
+    let rate = s.rate.max(1e-6);
+    let ppt = l.axis.px_per_tick() * rate;
     // Zoomed all the way out even the coarsest step gets crowded: widen it.
     let mut step = s.grid.step.max(1);
     while (step as f64 * ppt) < 6. {
@@ -159,11 +162,11 @@ fn grid(pen: &Pen, window: &mut Window, cx: &mut App) {
             unit *= 2;
         }
     }
-    let first = ((l.axis.start - s.origin as f64) / step as f64).floor() as i64;
+    let first = ((l.axis.start - s.origin) / (step as f64 * rate)).floor() as i64;
     let count = (f64::from(l.w) / (step as f64 * ppt)).ceil() as i64 + 1;
     for i in 0..=count {
         let song = (first + i) * step;
-        let x = l.x(s.origin + song);
+        let x = l.axis.x(s.origin + song as f64 * rate);
         if x < -1. || x > l.w {
             continue;
         }

@@ -287,8 +287,9 @@ fn num_box(ws: &Workspace, id: impl Into<gpui::ElementId>, target: NumTarget, sh
         .border_color(if ws.num_edit.as_ref().is_some_and(|e| e.target == target) { accent() } else { border() })
         .cursor_text()
         .tooltip(widgets::tip("Click to type a value", None))
-        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
             if !this.num_edit.as_ref().is_some_and(|e| e.target == target) {
+                this.focus.focus(window, cx);
                 this.begin_num_edit(target, prefill.clone(), cx);
             }
         }))
@@ -522,8 +523,8 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
             };
             let gain = clip.gain_db;
             let warp = &src.warp;
-            let (warp_on, reversed) = (warp.enabled, warp.reverse);
-            let mode = format!("{:?}", warp.mode);
+            let (warp_on, warp_mode, reversed) = (warp.enabled, warp.mode, warp.reverse);
+            let mode = warp_mode.label();
             let stretch = (aitrack_model::ops::stretch_factor(warp, ws.s.project.tempo.initial_bpm()) * 100.).round() / 100.;
             let sample_box = section("SAMPLE", Icon::Sample)
                 .child(div().px(px(SP2)).h(px(ROW_H)).flex().items_center().child(label(crate::paint::fit(&file, PROPS_W - 16., TEXT_SM), TEXT_SM, pal.text)))
@@ -536,7 +537,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                         .gap(px(SP1))
                         .child(
                             toggle_button(("warp-on", n), if warp.enabled { "On" } else { "Off" }, warp.enabled)
-                                .tooltip(widgets::tip("Warp: follow the project tempo (Re-Pitch: speed and pitch move together)", None))
+                                .tooltip(widgets::tip("Warp: follow project tempo and unlock pitch-preserving modes (Beats, Tones, Texture, Complex, Complex Pro)", None))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let bpm = this.s.project.tempo.initial_bpm();
                                     this.s.seal();
@@ -552,12 +553,29 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                                     cx.notify();
                                 })),
                         )
-                        .child(widgets::badge(mode, pal.muted).id(("warp-mode", n)).tooltip(widgets::tip("Warp mode. Only Re-Pitch plays for now: pitch-preserving stretch is on its way", None))),
+                        .child(
+                            small_button(("warp-mode", n), mode, true)
+                                .tooltip(widgets::tip("Warp algorithm (click to cycle): Beats · Tones · Texture · Complex · Complex Pro · Re-Pitch", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let bpm = this.s.project.tempo.initial_bpm();
+                                    let next = warp_mode.next();
+                                    this.s.seal();
+                                    this.s.set_clip_warp("warp-mode", id, |w| {
+                                        w.enabled = true;
+                                        if w.original_bpm.is_none() {
+                                            w.original_bpm = Some(bpm);
+                                        }
+                                        w.mode = next;
+                                    });
+                                    this.s.seal();
+                                    cx.notify();
+                                })),
+                        ),
                 ))
                 .when_some(warp.original_bpm, |d, b| d.child(row("Seg. BPM", value_box(format!("{b:.2}")))))
-                // A clip stretched with Cmd/Ctrl + an edge (Re-Pitch).
+                // A clip stretched with Cmd/Ctrl + an edge.
                 .when(stretch != 1., |d| {
-                    d.child(row("Stretch", value_box(format!("×{stretch:.2}")).id(("stretch", n)).tooltip(widgets::tip("Stretched in time: Cmd/Ctrl + drag a clip edge in the arrangement. Pitch follows (Re-Pitch)", None))))
+                    d.child(row("Stretch", value_box(format!("×{stretch:.2}")).id(("stretch", n)).tooltip(widgets::tip("Stretched in time: Cmd/Ctrl + drag a clip edge in the arrangement", None))))
                 })
                 .child(row(
                     "Transpose",
@@ -635,7 +653,18 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
             let notes_box = section("NOTES", Icon::Piano)
                 .child(row("Notes", mono(count, TEXT_SM, pal.text)))
                 .child(row("Range", mono(range, TEXT_SM, pal.muted)))
-                .child(row("Scale", widgets::badge(scale, pal.accent)))
+                .child(row(
+                    "Scale",
+                    div()
+                        .id(("clip-scale-pick", n))
+                        .cursor_pointer()
+                        .tooltip(widgets::tip("Set clip key / scale (overrides track & project)", None))
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                            let at = e.position();
+                            this.open_menu(MenuKind::ClipScale(id), point(at.x - px(12.), at.y - px(280.)), cx);
+                        }))
+                        .child(widgets::badge(scale, pal.accent)),
+                ))
                 .child(row("Transpose", transpose_row))
                 .child(row(
                     "Velocity",
@@ -747,6 +776,8 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         });
     });
     let has_scale = ws.s.clip_scale(ws.s.selected_clip).is_some();
+    let scale_fold_on = ws.s.scale_folded(ws.s.selected_clip).is_some();
+    let scale_name = ws.s.clip_scale(ws.s.selected_clip).map_or_else(|| "Scale".into(), |s| s.display());
     div()
         .flex()
         .items_center()
@@ -764,15 +795,12 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         )
         .child(
             widgets::icon_button("pr-keyboard", Icon::Keyboard, ws.piano_keyboard)
-                .tooltip(widgets::tip("Computer keyboard: A W S E D F T G Y H U J K O L P", None))
+                .tooltip(widgets::tip("Computer MIDI Keyboard: A–P notes, Z/X octave, C/V velocity", Some("M")))
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.piano_keyboard = !this.piano_keyboard;
-                    if !this.piano_keyboard {
-                        this.release_audition(cx);
-                    } else {
+                    this.toggle_computer_keyboard(cx);
+                    if this.piano_keyboard {
                         this.focus.focus(window, cx);
                     }
-                    cx.notify();
                 })),
         )
         .child(
@@ -818,14 +846,63 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         )
         .child(widgets::icon_button("pr-quantize", Icon::Quantize, false).tooltip(widgets::tip("Quantize to grid", None)).on_click(cx.listener(|this, _, _, cx| this.quantize_clip(cx))))
         .child(
+            div()
+                .id("pr-scale-fold")
+                .h(px(CONTROL_H))
+                .px(px(SP2))
+                .gap(px(SP1))
+                .flex()
+                .items_center()
+                .rounded(px(r_md()))
+                .cursor_pointer()
+                .bg(if scale_fold_on { accent_alpha(0.18) } else { content(0.0) })
+                .hover(|s| s.bg(if scale_fold_on { accent_alpha(0.26) } else { hover() }))
+                .when(!has_scale, |d| d.opacity(0.45))
+                .tooltip(widgets::tip("Scale mode (Ableton): show only in-scale keys in piano roll & transpose in key", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.s.clip_scale(this.s.selected_clip).is_none() {
+                        this.s.set_scale(Some(aitrack_model::Scale::new(aitrack_model::Key(0), aitrack_model::ScaleKind::Minor)));
+                        this.s.piano_scale_fold = true;
+                    } else {
+                        this.s.piano_scale_fold = !this.s.piano_scale_fold;
+                    }
+                    this.s.piano.scroll_y = 0.;
+                    cx.notify();
+                }))
+                .child(icon(Icon::ScaleSnap, 13., if scale_fold_on { pal.accent } else { pal.muted }))
+                .child(label(scale_name, TEXT_XS, if scale_fold_on { pal.text } else { pal.muted })),
+        )
+        .child(
             widgets::icon_button("pr-scale", Icon::ScaleSnap, false)
                 .when(!has_scale, |d| d.opacity(0.4))
                 .tooltip(widgets::tip("Snap notes to the key", None))
                 .on_click(cx.listener(|this, _, _, cx| this.scale_snap_clip(cx))),
         )
-        .child(widgets::icon_button("pr-tools", Icon::Wand, false).tooltip(widgets::tip("Note tools", None)).on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+        .child(
+            widgets::icon_button("pr-chords", Icon::Piano, false)
+                .tooltip(widgets::tip("Build triad chord in key", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(c) = this.s.selected_clip {
+                        let n = this.s.build_chord(c, crate::state::ChordKind::Triad);
+                        this.toast(if n == 0 { "Select or add notes first".into() } else { format!("Built chord (+{n} notes)") }, cx);
+                    }
+                    cx.notify();
+                })),
+        )
+        .child(
+            widgets::icon_button("pr-arp", Icon::Arpeggio, false)
+                .tooltip(widgets::tip("Arpeggiate selection / clip in key", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(c) = this.s.selected_clip {
+                        let n = this.s.arpeggiate(c, crate::state::ArpPattern::Up);
+                        this.toast(if n == 0 { "Add notes first".into() } else { format!("Arpeggiated ({n} notes)") }, cx);
+                    }
+                    cx.notify();
+                })),
+        )
+        .child(widgets::icon_button("pr-tools", Icon::Wand, false).tooltip(widgets::tip("Scale tools: Chords, Arpeggiate, Strum, Chop, Randomize", None)).on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
             let at = e.position();
-            this.open_menu(MenuKind::PianoTools, point(at.x - px(200.), at.y - px(236.)), cx);
+            this.open_menu(MenuKind::PianoTools, point(at.x - px(200.), at.y - px(380.)), cx);
         })))
         .child(widgets::divider_v(16.))
         .child(widgets::icon_button("pr-zoom-out", Icon::ZoomOut, false).tooltip(widgets::tip("Zoom out (Cmd + scroll or pinch)", None)).on_click(cx.listener(|this, _, _, cx| {

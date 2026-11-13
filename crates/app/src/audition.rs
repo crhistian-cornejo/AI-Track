@@ -12,16 +12,34 @@ pub fn keyboard_note(key: &str, octave: u8) -> Option<u8> {
     let offset = match key {
         "a" => 0, "w" => 1, "s" => 2, "e" => 3, "d" => 4, "f" => 5,
         "t" => 6, "g" => 7, "y" => 8, "h" => 9, "u" => 10, "j" => 11,
-        "k" => 12, "o" => 13, "l" => 14, "p" => 15,
+        "k" => 12, "o" => 13, "l" => 14, "p" => 15, ";" => 16, "'" => 17,
         _ => return None,
     };
     let note = (octave as u16 + 1) * 12 + offset;
     (note <= 127).then_some(note as u8)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardControl {
+    OctaveDown,
+    OctaveUp,
+    VelocityDown,
+    VelocityUp,
+}
+
+pub fn keyboard_control(key: &str) -> Option<KeyboardControl> {
+    match key {
+        "z" => Some(KeyboardControl::OctaveDown),
+        "x" => Some(KeyboardControl::OctaveUp),
+        "c" => Some(KeyboardControl::VelocityDown),
+        "v" => Some(KeyboardControl::VelocityUp),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct Audition {
-    held: BTreeMap<String, (TrackId, u8)>,
+    held: BTreeMap<String, Vec<(TrackId, u8)>>,
     pending_off: BTreeSet<(TrackId, u8)>,
 }
 
@@ -31,11 +49,15 @@ impl Audition {
     }
 
     pub fn pressed(&self, track: TrackId, key: u8) -> bool {
-        self.held.values().any(|note| *note == (track, key))
+        self.held.values().any(|notes| notes.contains(&(track, key)))
+    }
+
+    pub fn any_pressed(&self, tracks: &[TrackId], key: u8) -> bool {
+        tracks.iter().any(|t| self.pressed(*t, key))
     }
 
     pub fn matches_track(&self, track: Option<TrackId>) -> bool {
-        self.held.values().all(|(t, _)| Some(*t) == track)
+        self.held.values().flatten().all(|(t, _)| Some(*t) == track)
     }
 
     pub fn press(
@@ -43,26 +65,51 @@ impl Audition {
         source: &str,
         track: TrackId,
         key: u8,
+        send: impl FnMut(TrackId, u8, Option<u8>) -> bool,
+    ) -> bool {
+        self.press_many(source, &[track], key, 100, send)
+    }
+
+    pub fn press_many(
+        &mut self,
+        source: &str,
+        tracks: &[TrackId],
+        key: u8,
+        velocity: u8,
         mut send: impl FnMut(TrackId, u8, Option<u8>) -> bool,
     ) -> bool {
-        if self.held.get(source) == Some(&(track, key)) {
+        if tracks.is_empty() {
+            return false;
+        }
+        let target: Vec<(TrackId, u8)> = tracks.iter().map(|t| (*t, key)).collect();
+        if self.held.get(source) == Some(&target) {
             return true;
         }
         self.release(source, &mut send);
-        if self.pending_off.contains(&(track, key)) {
+        let vel = velocity.clamp(1, 127);
+        let mut active = Vec::with_capacity(target.len());
+        for &(track, k) in &target {
+            if self.pending_off.contains(&(track, k)) {
+                continue;
+            }
+            if !self.pressed(track, k) && !send(track, k, Some(vel)) {
+                continue;
+            }
+            active.push((track, k));
+        }
+        if active.is_empty() {
             return false;
         }
-        if !self.pressed(track, key) && !send(track, key, Some(100)) {
-            return false;
-        }
-        self.held.insert(source.to_owned(), (track, key));
+        self.held.insert(source.to_owned(), active);
         true
     }
 
     pub fn release(&mut self, source: &str, mut send: impl FnMut(TrackId, u8, Option<u8>) -> bool) -> bool {
-        let Some((track, key)) = self.held.remove(source) else { return false };
-        if !self.pressed(track, key) && !send(track, key, None) {
-            self.pending_off.insert((track, key));
+        let Some(notes) = self.held.remove(source) else { return false };
+        for (track, key) in notes {
+            if !self.pressed(track, key) && !send(track, key, None) {
+                self.pending_off.insert((track, key));
+            }
         }
         true
     }
@@ -335,5 +382,29 @@ mod tests {
         a.retry(|t, k, v| { events.push((t, k, v)); true });
         assert_eq!(events, vec![(TrackId(1), 60, None)]);
         assert!(a.press("a", TrackId(1), 60, |_, _, _| true));
+    }
+
+    #[test]
+    fn ableton_controls_and_multi_track_keyboard_play() {
+        assert_eq!(keyboard_note(";", 4), Some(76));
+        assert_eq!(keyboard_control("z"), Some(KeyboardControl::OctaveDown));
+        assert_eq!(keyboard_control("x"), Some(KeyboardControl::OctaveUp));
+        assert_eq!(keyboard_control("c"), Some(KeyboardControl::VelocityDown));
+        assert_eq!(keyboard_control("v"), Some(KeyboardControl::VelocityUp));
+
+        let mut a = Audition::default();
+        let mut events = Vec::new();
+        assert!(a.press_many("a", &[TrackId(1), TrackId(2)], 60, 110, |t, k, v| { events.push((t, k, v)); true }));
+        assert!(a.any_pressed(&[TrackId(2)], 60));
+        a.release("a", |t, k, v| { events.push((t, k, v)); true });
+        assert_eq!(
+            events,
+            vec![
+                (TrackId(1), 60, Some(110)),
+                (TrackId(2), 60, Some(110)),
+                (TrackId(1), 60, None),
+                (TrackId(2), 60, None),
+            ]
+        );
     }
 }

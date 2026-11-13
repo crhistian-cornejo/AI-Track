@@ -28,6 +28,11 @@ impl DecodedAudio {
         Self { channels, sample_rate, source_rate: sample_rate, frames }
     }
 
+    /// Heap bytes occupied by the decoded sample buffers.
+    pub fn byte_size(&self) -> usize {
+        self.channels.iter().map(|c| c.capacity() * std::mem::size_of::<f32>()).sum()
+    }
+
     /// The exact stored sample at an integer frame; 0 outside the data.
     /// Used for clips that play at their native speed, so playback is
     /// bit-identical to the file.
@@ -300,19 +305,59 @@ pub fn load_audio(path: &Path, rate: u32) -> Result<DecodedAudio, String> {
     Ok(d)
 }
 
+/// Default decoded sample cache budget (512 MB) before LRU eviction.
+pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
 enum Entry {
     Loading,
-    Ready(Arc<DecodedAudio>),
+    Ready { audio: Arc<DecodedAudio>, used: u64 },
     Failed(String),
 }
 
 type Key = (PathBuf, u32);
 
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<Key, Entry>,
+    clock: u64,
+}
+
+impl CacheState {
+    fn total_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .filter_map(|e| match e {
+                Entry::Ready { audio, .. } => Some(audio.byte_size()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn trim(&mut self, budget: usize) {
+        let mut total = self.total_bytes();
+        while total > budget {
+            // Prefer evicting entries no compiled graph currently holds.
+            let candidate = self
+                .entries
+                .iter()
+                .filter_map(|(k, e)| match e {
+                    Entry::Ready { audio, used } => Some((Arc::strong_count(audio) > 1, *used, audio.byte_size(), k.clone())),
+                    _ => None,
+                })
+                .min_by_key(|(in_use, used, _, _)| (*in_use, *used));
+            let Some((_, _, sz, key)) = candidate else { break };
+            self.entries.remove(&key);
+            total = total.saturating_sub(sz);
+        }
+    }
+}
+
 /// Shared cache of decoded files keyed by `(path, rate)`, with a background
-/// loader thread. Control-thread / UI side only.
+/// loader thread and an LRU memory budget. Control-thread / UI side only.
 #[derive(Clone)]
 pub struct SampleCache {
-    entries: Arc<Mutex<HashMap<Key, Entry>>>,
+    state: Arc<Mutex<CacheState>>,
+    budget: Arc<std::sync::atomic::AtomicUsize>,
     jobs: Option<Sender<Key>>,
 }
 
@@ -321,42 +366,78 @@ impl SampleCache {
     /// runs (on that thread) after each file finishes, so the engine can
     /// recompile.
     pub fn with_loader(on_loaded: impl Fn() + Send + 'static) -> Self {
-        let entries: Arc<Mutex<HashMap<Key, Entry>>> = Arc::default();
+        let state: Arc<Mutex<CacheState>> = Arc::default();
+        let budget = Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_CACHE_BUDGET_BYTES));
         let (tx, rx) = unbounded::<Key>();
-        let map = entries.clone();
+        let map = state.clone();
+        let budget_bg = budget.clone();
         let spawned = std::thread::Builder::new().name("aitrack-sample-loader".into()).spawn(move || {
             while let Ok(key) = rx.recv() {
                 let entry = match load_audio(&key.0, key.1) {
-                    Ok(d) => Entry::Ready(Arc::new(d)),
+                    Ok(d) => Ok(Arc::new(d)),
                     Err(e) => {
                         log::warn!("could not load {}: {e}", key.0.display());
-                        Entry::Failed(e)
+                        Err(e)
                     }
                 };
-                map.lock().unwrap_or_else(|p| p.into_inner()).insert(key, entry);
+                {
+                    let mut st = map.lock().unwrap_or_else(|p| p.into_inner());
+                    st.clock = st.clock.saturating_add(1);
+                    let used = st.clock;
+                    let val = match entry {
+                        Ok(audio) => Entry::Ready { audio, used },
+                        Err(e) => Entry::Failed(e),
+                    };
+                    st.entries.insert(key, val);
+                    let limit = budget_bg.load(std::sync::atomic::Ordering::Relaxed);
+                    st.trim(limit);
+                }
                 on_loaded();
             }
         });
         if let Err(e) = spawned {
             log::error!("sample loader thread failed to start: {e}");
         }
-        Self { entries, jobs: Some(tx) }
+        Self { state, budget, jobs: Some(tx) }
     }
 
     /// A cache without a loader: misses are decoded synchronously (offline
     /// render, tests).
     pub fn blocking() -> Self {
-        Self { entries: Arc::default(), jobs: None }
+        Self {
+            state: Arc::default(),
+            budget: Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_CACHE_BUDGET_BYTES)),
+            jobs: None,
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Entry>> {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn set_budget_bytes(&self, bytes: usize) {
+        let clamped = bytes.max(32 * 1024);
+        self.budget.store(clamped, std::sync::atomic::Ordering::Relaxed);
+        self.lock().trim(clamped);
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.budget.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.lock().total_bytes()
     }
 
     /// Put already-decoded audio in the cache (tests, recorded takes).
     pub fn insert(&self, path: impl Into<PathBuf>, audio: Arc<DecodedAudio>) {
         let rate = audio.sample_rate;
-        self.lock().insert((path.into(), rate), Entry::Ready(audio));
+        let mut st = self.lock();
+        st.clock = st.clock.saturating_add(1);
+        let used = st.clock;
+        st.entries.insert((path.into(), rate), Entry::Ready { audio, used });
+        let limit = self.budget_bytes();
+        st.trim(limit);
     }
 
     /// The decoded file if ready. On a miss, the background cache queues a
@@ -364,50 +445,61 @@ impl SampleCache {
     pub fn get(&self, path: &Path, rate: u32) -> Option<Arc<DecodedAudio>> {
         let key = (path.to_path_buf(), rate);
         {
-            let mut map = self.lock();
-            match map.get(&key) {
-                Some(Entry::Ready(a)) => return Some(a.clone()),
+            let mut st = self.lock();
+            st.clock = st.clock.saturating_add(1);
+            let used = st.clock;
+            match st.entries.get_mut(&key) {
+                Some(Entry::Ready { audio, used: slot_used }) => {
+                    *slot_used = used;
+                    return Some(audio.clone());
+                }
                 Some(Entry::Loading | Entry::Failed(_)) => return None,
                 None => {
                     if let Some(tx) = &self.jobs {
-                        map.insert(key.clone(), Entry::Loading);
+                        st.entries.insert(key.clone(), Entry::Loading);
                         let _ = tx.send(key);
                         return None;
                     }
                 }
             }
         }
-        let entry = match load_audio(path, rate) {
-            Ok(d) => Entry::Ready(Arc::new(d)),
+        let res = match load_audio(path, rate) {
+            Ok(d) => Ok(Arc::new(d)),
             Err(e) => {
                 log::warn!("could not load {}: {e}", path.display());
-                Entry::Failed(e)
+                Err(e)
             }
         };
-        let out = match &entry {
-            Entry::Ready(a) => Some(a.clone()),
-            _ => None,
+        let mut st = self.lock();
+        st.clock = st.clock.saturating_add(1);
+        let used = st.clock;
+        let out = res.as_ref().ok().cloned();
+        let entry = match res {
+            Ok(audio) => Entry::Ready { audio, used },
+            Err(e) => Entry::Failed(e),
         };
-        self.lock().insert(key, entry);
+        st.entries.insert(key, entry);
+        let limit = self.budget_bytes();
+        st.trim(limit);
         out
     }
 
     /// Error message for a file that failed to load.
     pub fn error(&self, path: &Path, rate: u32) -> Option<String> {
-        match self.lock().get(&(path.to_path_buf(), rate)) {
+        match self.lock().entries.get(&(path.to_path_buf(), rate)) {
             Some(Entry::Failed(e)) => Some(e.clone()),
             _ => None,
         }
     }
 
     pub fn is_loading(&self) -> bool {
-        self.lock().values().any(|e| matches!(e, Entry::Loading))
+        self.lock().entries.values().any(|e| matches!(e, Entry::Loading))
     }
 
     /// Forget everything (e.g. after a device rate change the old entries
     /// are useless).
     pub fn clear(&self) {
-        self.lock().retain(|_, e| matches!(e, Entry::Loading));
+        self.lock().entries.retain(|_, e| matches!(e, Entry::Loading));
     }
 }
 
@@ -445,5 +537,25 @@ mod tests {
         assert_eq!(a.frames, 4800);
         assert_eq!(a.channels.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lru_evicts_over_byte_budget() {
+        let cache = SampleCache::blocking();
+        // ~40 KB each (10_000 floats); budget holds two entries cleanly.
+        let one = Arc::new(DecodedAudio::from_planar(vec![vec![0.0; 10_000]], 48_000));
+        let sz = one.byte_size();
+        cache.set_budget_bytes(sz * 2 + 1024);
+        cache.insert("mem://a.wav", one);
+        cache.insert("mem://b.wav", Arc::new(DecodedAudio::from_planar(vec![vec![0.0; 10_000]], 48_000)));
+        assert!(cache.used_bytes() <= sz * 2 + 1024);
+        // Touch `a` so `b` becomes least recently used.
+        assert!(cache.get(Path::new("mem://a.wav"), 48_000).is_some());
+        cache.insert("mem://c.wav", Arc::new(DecodedAudio::from_planar(vec![vec![0.0; 10_000]], 48_000)));
+        assert!(cache.used_bytes() <= sz * 2 + 1024);
+        let st = cache.lock();
+        assert!(st.entries.contains_key(&(PathBuf::from("mem://a.wav"), 48_000)));
+        assert!(!st.entries.contains_key(&(PathBuf::from("mem://b.wav"), 48_000)));
+        assert!(st.entries.contains_key(&(PathBuf::from("mem://c.wav"), 48_000)));
     }
 }

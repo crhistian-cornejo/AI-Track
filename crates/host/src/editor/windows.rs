@@ -118,6 +118,18 @@ impl Window {
         }
     }
 
+    pub fn raise(&self) {
+        unsafe {
+            if IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
+            let _ = BringWindowToTop(self.hwnd);
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+    }
+
     pub fn client_size(&self) -> (u32, u32) {
         let mut rect = RECT::default();
         unsafe {

@@ -164,11 +164,14 @@ pub fn mknob(_ws: &mut Workspace, dev: &Dev, slots: &Rc<Vec<ModSlot>>, id: u32, 
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                let Some(s) = newest else { return };
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
-                clear_routing(this, device, s);
-                cx.notify();
+                if let Some(s) = newest {
+                    clear_routing(this, device, s);
+                    cx.notify();
+                } else {
+                    this.open_knob_menu(KnobTarget::Param { device, param: id, default }, e.position, cx);
+                }
             }),
         )
         .on_drop(cx.listener(move |this, source: &ModSource, _, cx| {

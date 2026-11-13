@@ -263,13 +263,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     }
                 }))
                 // A click that didn't move opens the box for typing.
-                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                     if e.click_count() >= 2 || click_dragged(e) {
                         return;
                     }
                     if matches!(&this.num_edit, Some(edit) if edit.target == NumTarget::Tempo) {
                         return;
                     }
+                    this.focus.focus(window, cx);
                     let bpm = this.s.project.tempo.initial_bpm();
                     this.begin_num_edit(NumTarget::Tempo, plain_text(bpm), cx);
                 }))
@@ -410,6 +411,29 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(div().w(px(24.)).flex().justify_end().child(mono(format!("{:.0}%", load * 100.), TEXT_XS, pal.muted))),
         )
         .child(separator())
+        .child(
+            div()
+                .id("computer-midi-kbd")
+                .flex_none()
+                .h(px(BAR_FIELD_H))
+                .px(px(SP1 + 2.))
+                .gap(px(SP1))
+                .flex()
+                .items_center()
+                .rounded(px(r_md()))
+                .cursor_pointer()
+                .bg(if ws.piano_keyboard { accent_alpha(0.18) } else { content(0.0) })
+                .hover(|s| s.bg(if ws.piano_keyboard { accent_alpha(0.26) } else { hover() }))
+                .tooltip(widgets::tip("Computer MIDI Keyboard (A–P notes, Z/X octave, C/V velocity)", Some("M")))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_computer_keyboard(cx);
+                    if this.piano_keyboard {
+                        this.focus.focus(window, cx);
+                    }
+                }))
+                .child(icon(Icon::Keyboard, 14., if ws.piano_keyboard { pal.accent } else { pal.muted }))
+                .when(ws.piano_keyboard, |d| d.child(mono(format!("C{}", ws.piano_octave), TEXT_XS, pal.text))),
+        )
         .child(
             toggle("toggle-bottom", Icon::PanelBottom, ws.bottom_open, pal.accent)
                 .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))

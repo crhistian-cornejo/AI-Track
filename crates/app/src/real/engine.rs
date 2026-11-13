@@ -258,6 +258,7 @@ impl RealEngine {
         };
         let active = handle.active_audio();
         let tap = handle.analysis_tap();
+        handle.set_sample_cache_bytes(settings.sample_cache_mb.clamp(64, 4096) * 1024 * 1024);
         let mut this = Self {
             tap,
             analysis: false,
@@ -769,6 +770,33 @@ impl EngineBridge for RealEngine {
         self.banner = None;
     }
 
+    fn watchdog_warning(&self) -> Option<String> {
+        self.rt.watchdog_warning()
+    }
+
+    fn dismiss_watchdog_warning(&mut self) {
+        self.rt.dismiss_watchdog_warning();
+    }
+
+    fn device_warning(&self, device: DeviceId) -> Option<String> {
+        self.rt.device_warning(device)
+    }
+
+    fn export_factory(&self) -> Arc<dyn aitrack_engine::ProcessorFactory> {
+        self.export_factory.clone()
+    }
+
+    fn set_sample_cache_mb(&mut self, mb: usize) {
+        let clamped = mb.clamp(64, 4096);
+        self.settings.sample_cache_mb = clamped;
+        self.settings.save();
+        self.handle.set_sample_cache_bytes(clamped * 1024 * 1024);
+    }
+
+    fn sample_cache_stats(&self) -> (usize, usize) {
+        self.handle.sample_cache_stats()
+    }
+
     fn status_label(&self) -> String {
         match &self.active {
             Some(a) => {
@@ -891,5 +919,106 @@ mod tests {
         assert!((l.input_ms - 6.).abs() < 1e-4);
         assert!((l.plugin_ms - 1.).abs() < 1e-4);
         assert!((l.round_trip_ms() - 16.).abs() < 1e-3);
+    }
+
+    #[test]
+    fn benchmark_24_tracks_realtime_headroom() {
+        use aitrack_engine::{render_offline_with, SampleCache};
+        use aitrack_model::{
+            AudioSource, Clip, Color, Device, LoopRegion, Note, NoteSource, Placement, Project, Source, Track, TrackKind, Warp, PPQ,
+        };
+        let dir = std::env::temp_dir().join(format!("aitrack-bench24-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav_path = dir.join("loop.wav");
+        let spec = hound::WavSpec { channels: 2, sample_rate: 48_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let mut w = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for i in 0..(48_000 * 2) {
+            let s = (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48_000.0).sin() * 0.25;
+            w.write_sample(s).unwrap();
+            w.write_sample(s).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut p = Project::new("Benchmark 24 Tracks");
+        p.tempo = aitrack_model::TempoMap::constant(120.0);
+        let sid = p.alloc_source_id();
+        p.sources.insert(
+            sid,
+            Source::Audio(AudioSource {
+                path: wav_path,
+                hash: None,
+                sample_rate: 48_000,
+                channels: 2,
+                frames: 48_000 * 2,
+                warp: Warp::default(),
+                key: None,
+            }),
+        );
+        // 12 audio tracks with EQ + Compressor + Utility.
+        for i in 0..12 {
+            let tid = p.alloc_track_id();
+            let mut tr = Track::new(tid, TrackKind::Audio, format!("Audio {}", i + 1), Color::palette(i));
+            let d1 = p.alloc_device_id();
+            let d2 = p.alloc_device_id();
+            tr.devices.push(Device::stock(d1, aitrack_stock::fx::eq::ID, "EQ"));
+            tr.devices.push(Device::stock(d2, aitrack_stock::fx::compressor::ID, "Compressor"));
+            let cid = p.alloc_clip_id();
+            let mut clip = Clip::new(format!("Loop {i}"), Color::palette(i), sid, 20 * PPQ);
+            clip.looping = Some(LoopRegion { start: 0, end: 4 * PPQ });
+            p.clips.insert(cid, clip);
+            let pid = p.alloc_placement_id();
+            tr.arrangement.push(Placement { id: pid, clip: cid, start: 0, lane: 0 });
+            p.tracks.insert(0, tr);
+        }
+        // 12 instrument tracks with Wavetable + EQ + Delay/Reverb.
+        for i in 0..12 {
+            let tid = p.alloc_track_id();
+            let mut tr = Track::new(tid, TrackKind::Instrument, format!("Synth {}", i + 1), Color::palette(i + 12));
+            let inst = p.alloc_device_id();
+            let eq = p.alloc_device_id();
+            let fx = p.alloc_device_id();
+            tr.devices.push(Device::stock(inst, aitrack_stock::instrument::wavetable::ID, "Wavetable"));
+            tr.devices.push(Device::stock(eq, aitrack_stock::fx::eq::ID, "EQ"));
+            let fx_id = if i % 3 == 0 { aitrack_stock::fx::reverb::ID } else { aitrack_stock::fx::delay::ID };
+            tr.devices.push(Device::stock(fx, fx_id, "FX"));
+            let mut notes = Vec::new();
+            for step in 0..40 {
+                let nid = p.alloc_note_id();
+                notes.push(Note::new(nid, 48 + ((step + i) % 24) as u8, step as i64 * (PPQ / 2), PPQ / 4, 0.8));
+            }
+            let nsid = p.alloc_source_id();
+            p.sources.insert(nsid, Source::Notes(NoteSource { notes }));
+            let cid = p.alloc_clip_id();
+            p.clips.insert(cid, Clip::new(format!("Pattern {i}"), Color::palette(i), nsid, 20 * PPQ));
+            let pid = p.alloc_placement_id();
+            tr.arrangement.push(Placement { id: pid, clip: cid, start: 0, lane: 0 });
+            p.tracks.insert(0, tr);
+        }
+
+        let factory = super::super::plugins::StockFactory;
+        let samples = SampleCache::blocking();
+        // Warm sample cache before timing DSP render.
+        let _ = samples.get(
+            &match &p.sources[&sid] {
+                Source::Audio(a) => a.path.clone(),
+                _ => unreachable!(),
+            },
+            48_000,
+        );
+        let t0 = Instant::now();
+        let buf = render_offline_with(&p, &factory, (0, 20 * PPQ), 48_000.0, 256, samples).unwrap();
+        let elapsed = t0.elapsed();
+        let peak = buf.channel(0).iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let rtf = elapsed.as_secs_f64() / 10.0;
+        eprintln!(
+            "24-track benchmark (10s @ 48kHz, block=256, frames={}): {:.3}s wall-clock (RTF={:.3}, DSP={:.1}%)",
+            buf.frames(),
+            elapsed.as_secs_f64(),
+            rtf,
+            rtf * 100.0
+        );
+        assert!(peak > 0.01, "expected audible mixed output across 24 tracks");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -243,6 +243,7 @@ pub struct WaveformCache {
     tx: Sender<(PathBuf, Result<Peaks, String>)>,
     rx: Receiver<(PathBuf, Result<Peaks, String>)>,
     decoder: Decoder,
+    cache_dir: Option<PathBuf>,
     /// Counts `peaks` calls, to know which files were drawn longest ago.
     clock: u64,
     raw_budget: usize,
@@ -250,14 +251,22 @@ pub struct WaveformCache {
 
 impl Default for WaveformCache {
     fn default() -> Self {
-        Self::with_decoder(Arc::new(aitrack_engine::sample_cache::decode_file))
+        Self::with_cache_dir_and_decoder(
+            Some(crate::appearance::config_dir().join("cache").join("peaks")),
+            Arc::new(aitrack_engine::sample_cache::decode_file),
+        )
     }
 }
 
 impl WaveformCache {
+    #[cfg(test)]
     fn with_decoder(decoder: Decoder) -> Self {
+        Self::with_cache_dir_and_decoder(None, decoder)
+    }
+
+    pub fn with_cache_dir_and_decoder(cache_dir: Option<PathBuf>, decoder: Decoder) -> Self {
         let (tx, rx) = channel();
-        Self { entries: HashMap::new(), queue: VecDeque::new(), running: 0, tx, rx, decoder, clock: 0, raw_budget: RAW_BUDGET }
+        Self { entries: HashMap::new(), queue: VecDeque::new(), running: 0, tx, rx, decoder, cache_dir, clock: 0, raw_budget: RAW_BUDGET }
     }
 
     /// The peaks of `path` when they are ready. A file seen for the first
@@ -325,14 +334,23 @@ impl WaveformCache {
     fn pump(&mut self) {
         while self.running < MAX_JOBS {
             let Some(path) = self.queue.pop_front() else { break };
-            let (tx, decode, job_path) = (self.tx.clone(), self.decoder.clone(), path.clone());
+            let (tx, decode, job_path, cache_dir) = (self.tx.clone(), self.decoder.clone(), path.clone(), self.cache_dir.clone());
             let job = move || {
                 let work = std::panic::AssertUnwindSafe(|| {
+                    if let Some(dir) = &cache_dir
+                        && let Some(cached) = disk_load(dir, &job_path)
+                    {
+                        return Ok(cached);
+                    }
                     let (planar, rate) = decode(&job_path)?;
                     if planar.first().is_none_or(Vec::is_empty) {
                         return Err("the file has no audio".to_owned());
                     }
-                    Ok(Peaks::from_planar(&planar, rate))
+                    let peaks = Peaks::from_planar(&planar, rate);
+                    if let Some(dir) = &cache_dir {
+                        let _ = disk_save(dir, &job_path, &peaks);
+                    }
+                    Ok(peaks)
                 });
                 let result = std::panic::catch_unwind(work).unwrap_or_else(|_| Err("the decoder crashed".to_owned()));
                 let _ = tx.send((job_path, result));
@@ -363,6 +381,110 @@ impl WaveformCache {
             *peaks = Arc::new(peaks.without_samples());
         }
     }
+}
+
+const PEAK_MAGIC: &[u8; 8] = b"AIWK0001";
+
+fn file_stamp(path: &Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some((meta.len(), mtime))
+}
+
+fn cache_key_file(dir: &Path, path: &Path) -> PathBuf {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let bytes = abs.to_string_lossy();
+    let mut h1 = 0xcbf2_9ce4_8422_2325u64;
+    let mut h2 = 0xaf63_bd4c_8601_b7dfu64;
+    for b in bytes.as_bytes() {
+        h1 ^= u64::from(*b);
+        h1 = h1.wrapping_mul(0x1000_0000_01b3);
+        h2 = h2.wrapping_mul(0x1000_0000_01b3) ^ u64::from(*b);
+    }
+    dir.join(format!("{h1:016x}{h2:016x}.aipeaks"))
+}
+
+fn disk_load(dir: &Path, src: &Path) -> Option<Peaks> {
+    let (size, mtime) = file_stamp(src)?;
+    let data = std::fs::read(cache_key_file(dir, src)).ok()?;
+    if data.len() < 8 + 8 + 16 + 4 + 8 + 1 || &data[..8] != PEAK_MAGIC {
+        return None;
+    }
+    let mut off = 8usize;
+    let read_u32 = |d: &[u8], o: &mut usize| -> Option<u32> {
+        let s = d.get(*o..*o + 4)?;
+        *o += 4;
+        Some(u32::from_le_bytes(s.try_into().ok()?))
+    };
+    let read_u64 = |d: &[u8], o: &mut usize| -> Option<u64> {
+        let s = d.get(*o..*o + 8)?;
+        *o += 8;
+        Some(u64::from_le_bytes(s.try_into().ok()?))
+    };
+    let read_i16 = |d: &[u8], o: &mut usize| -> Option<i16> {
+        let s = d.get(*o..*o + 2)?;
+        *o += 2;
+        Some(i16::from_le_bytes(s.try_into().ok()?))
+    };
+    if read_u64(&data, &mut off)? != size {
+        return None;
+    }
+    let mlo = u128::from(read_u64(&data, &mut off)?);
+    let mhi = u128::from(read_u64(&data, &mut off)?);
+    if (mlo | (mhi << 64)) != mtime {
+        return None;
+    }
+    let sample_rate = read_u32(&data, &mut off)?;
+    let frames = read_u64(&data, &mut off)? as usize;
+    let ch_count = *data.get(off)? as usize;
+    off += 1;
+    if ch_count == 0 || ch_count > MAX_CHANNELS {
+        return None;
+    }
+    let mut channels = Vec::with_capacity(ch_count);
+    for _ in 0..ch_count {
+        let level_count = read_u32(&data, &mut off)? as usize;
+        if level_count > 32 {
+            return None;
+        }
+        let mut levels = Vec::with_capacity(level_count);
+        for _ in 0..level_count {
+            let n = read_u32(&data, &mut off)? as usize;
+            let mut lvl = Vec::with_capacity(n.min(data.len().saturating_sub(off) / 4));
+            for _ in 0..n {
+                let lo = read_i16(&data, &mut off)?;
+                let hi = read_i16(&data, &mut off)?;
+                lvl.push((lo, hi));
+            }
+            levels.push(lvl);
+        }
+        channels.push(Channel { levels, raw: None });
+    }
+    Some(Peaks { sample_rate, frames, channels })
+}
+
+fn disk_save(dir: &Path, src: &Path, peaks: &Peaks) -> std::io::Result<()> {
+    let Some((size, mtime)) = file_stamp(src) else { return Ok(()) };
+    std::fs::create_dir_all(dir)?;
+    let mut out = Vec::with_capacity(4096);
+    out.extend_from_slice(PEAK_MAGIC);
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&(mtime as u64).to_le_bytes());
+    out.extend_from_slice(&((mtime >> 64) as u64).to_le_bytes());
+    out.extend_from_slice(&peaks.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(peaks.frames as u64).to_le_bytes());
+    out.push(peaks.channels.len().min(MAX_CHANNELS) as u8);
+    for ch in peaks.channels.iter().take(MAX_CHANNELS) {
+        out.extend_from_slice(&(ch.levels.len() as u32).to_le_bytes());
+        for lvl in &ch.levels {
+            out.extend_from_slice(&(lvl.len() as u32).to_le_bytes());
+            for &(lo, hi) in lvl {
+                out.extend_from_slice(&lo.to_le_bytes());
+                out.extend_from_slice(&hi.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(cache_key_file(dir, src), out)
 }
 
 #[cfg(test)]
@@ -618,5 +740,42 @@ mod tests {
         let old = cache.peaks(b).unwrap();
         assert!(!old.has_samples(), "the file drawn longest ago gave its samples up");
         assert!(old.range(None, 0., 1000.).is_some(), "its pyramid stays");
+    }
+
+    #[test]
+    fn disk_cache_skips_redecode_on_second_load() {
+        let dir = std::env::temp_dir().join(format!("aitrack-wave-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.wav");
+        std::fs::write(&src, b"fake-audio-header").unwrap();
+        let cache_dir = dir.join("peaks");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = calls.clone();
+        let mut first = WaveformCache::with_cache_dir_and_decoder(
+            Some(cache_dir.clone()),
+            Arc::new(move |_: &Path| {
+                c1.fetch_add(1, Ordering::SeqCst);
+                Ok((vec![ramp(2048)], 48_000))
+            }),
+        );
+        assert!(first.peaks(&src).is_none());
+        wait(&mut first, |c| c.status(&src) == Status::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let c2 = calls.clone();
+        let mut second = WaveformCache::with_cache_dir_and_decoder(
+            Some(cache_dir),
+            Arc::new(move |_: &Path| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                Ok((vec![ramp(2048)], 48_000))
+            }),
+        );
+        assert!(second.peaks(&src).is_none());
+        wait(&mut second, |c| c.status(&src) == Status::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "disk cache serves peaks without calling decoder again");
+        assert_eq!(second.peaks(&src).unwrap().frames(), 2048);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

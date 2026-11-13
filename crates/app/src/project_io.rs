@@ -8,6 +8,77 @@ use gpui::{Context, PathPromptOptions, PromptLevel, Window};
 use std::path::{Path, PathBuf};
 
 pub const EXTENSION: &str = "aitrack";
+const MAX_RECENT_PROJECTS: usize = 12;
+
+fn recent_projects_file() -> PathBuf {
+    crate::appearance::config_dir().join("recent_projects.json")
+}
+
+/// Load persisted recent project paths (most recent first).
+pub fn load_recent_projects() -> Vec<PathBuf> {
+    let Ok(bytes) = std::fs::read(recent_projects_file()) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = serde_json::from_slice(&bytes).unwrap_or_default();
+    paths.truncate(MAX_RECENT_PROJECTS);
+    paths
+}
+
+/// Persist `paths` under the app config directory.
+pub fn save_recent_projects(paths: &[PathBuf]) {
+    let p = recent_projects_file();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(paths) {
+        let _ = std::fs::write(p, json);
+    }
+}
+
+/// Insert `path` at the front of `list`, deduplicating earlier occurrences and
+/// bounding the list to `MAX_RECENT_PROJECTS`.
+pub fn push_recent_project(list: &mut Vec<PathBuf>, path: &Path) {
+    let canonical = std::fs::canonicalize(path).ok();
+    list.retain(|existing| {
+        if existing == path {
+            return false;
+        }
+        if let Some(ref c) = canonical
+            && std::fs::canonicalize(existing).ok().as_ref() == Some(c)
+        {
+            return false;
+        }
+        true
+    });
+    list.insert(0, path.to_path_buf());
+    list.truncate(MAX_RECENT_PROJECTS);
+}
+
+/// Format `(project_name, compact_parent_dir)` for a recent project menu row.
+pub fn recent_project_display(path: &Path) -> (String, String) {
+    let name = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("Untitled")
+        .to_owned();
+    let parent = path.parent().map(compact_dir).unwrap_or_default();
+    (name, parent)
+}
+
+fn compact_dir(dir: &Path) -> String {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+    if let Some(home) = home
+        && let Ok(rel) = dir.strip_prefix(&home)
+    {
+        return if rel.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display())
+        };
+    }
+    dir.display().to_string()
+}
 
 /// Write `project` to `path` through a temporary file, so a failed write
 /// never leaves half a project behind.
@@ -85,6 +156,7 @@ impl Template {
 enum Then {
     New(Template),
     Open,
+    OpenPath(PathBuf),
 }
 
 impl Workspace {
@@ -96,6 +168,24 @@ impl Workspace {
     /// File → Open…
     pub fn file_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.guard_unsaved(Then::Open, window, cx);
+    }
+
+    /// File → Open Recent → <project>.
+    pub fn file_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.guard_unsaved(Then::OpenPath(path), window, cx);
+    }
+
+    /// Record `path` at the top of the recent projects list and persist it.
+    pub fn note_recent_project(&mut self, path: &Path) {
+        push_recent_project(&mut self.recent_projects, path);
+        save_recent_projects(&self.recent_projects);
+    }
+
+    /// Remove all entries from the recent projects list.
+    pub fn clear_recent_projects(&mut self, cx: &mut Context<Self>) {
+        self.recent_projects.clear();
+        save_recent_projects(&self.recent_projects);
+        cx.notify();
     }
 
     /// File → Save: to the project's file, or ask for one the first time.
@@ -150,6 +240,7 @@ impl Workspace {
             Ok(()) => {
                 self.s.history.mark_saved();
                 self.project_path = Some(path.to_path_buf());
+                self.note_recent_project(path);
                 self.toast(format!("Saved {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("project")), cx);
                 true
             }
@@ -198,16 +289,24 @@ impl Workspace {
                     if let Ok(Ok(Some(paths))) = rx.await
                         && let Some(path) = paths.into_iter().next()
                     {
-                        let _ = this.update(cx, |ws, cx| match load(&path) {
-                            Ok(project) => {
-                                ws.replace_project(project, Some(path), cx);
-                            }
-                            Err(e) => ws.toast(e, cx),
-                        });
+                        let _ = this.update(cx, |ws, cx| ws.open_loaded_project(path, cx));
                     }
                 })
                 .detach();
             }
+            Then::OpenPath(path) => {
+                self.open_loaded_project(path, cx);
+            }
+        }
+    }
+
+    fn open_loaded_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match load(&path) {
+            Ok(project) => {
+                self.note_recent_project(&path);
+                self.replace_project(project, Some(path), cx);
+            }
+            Err(e) => self.toast(e, cx),
         }
     }
 }
@@ -330,5 +429,27 @@ mod tests {
     fn file_names_are_safe() {
         assert_eq!(safe_name("Drop 2: final?"), "Drop 2- final-");
         assert_eq!(safe_name("  "), "Untitled");
+    }
+
+    #[test]
+    fn recent_projects_dedupe_promote_and_cap() {
+        let mut recent = Vec::new();
+        for i in 0..15 {
+            push_recent_project(&mut recent, Path::new(&format!("/tmp/Project {i}.aitrack")));
+        }
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent[0], PathBuf::from("/tmp/Project 14.aitrack"));
+        // Re-opening an older entry promotes it without duplication.
+        push_recent_project(&mut recent, Path::new("/tmp/Project 10.aitrack"));
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent[0], PathBuf::from("/tmp/Project 10.aitrack"));
+        assert_eq!(recent.iter().filter(|p| p.as_path() == Path::new("/tmp/Project 10.aitrack")).count(), 1);
+    }
+
+    #[test]
+    fn recent_project_display_extracts_name_and_parent() {
+        let (name, parent) = recent_project_display(Path::new("/tmp/Songs/Midnight Drive.aitrack"));
+        assert_eq!(name, "Midnight Drive");
+        assert_eq!(parent, "/tmp/Songs");
     }
 }

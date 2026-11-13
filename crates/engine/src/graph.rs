@@ -50,6 +50,11 @@ pub(crate) struct ProcNode {
     pub auto_events: EventList,
     /// The block's events merged with `auto_events` for one process call.
     pub merged: EventList,
+    /// Consecutive samples of `-140 dB` silence produced while receiving silent input.
+    pub silent_samples: u32,
+    /// True once `silent_samples` passes `max(proc.tail(), guard)` and no
+    /// input/events/automation are present; skips `proc.process` until woken.
+    pub sleeping: bool,
 }
 
 /// The sidechain signals available to the devices of one track.
@@ -114,37 +119,68 @@ impl DeviceNode {
     }
 }
 
+const SILENCE_THRESH: f32 = 1e-7; // −140 dBFS
+
+#[inline]
+fn buffer_silent(buf: &AudioBuffer) -> bool {
+    for ch in 0..buf.channels() {
+        if buf.channel(ch).iter().any(|s| s.abs() >= SILENCE_THRESH) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Run a chain over `buf`, the frames `win.0..win.1` of the block: `events`
 /// are already relative to the window; a device's own timed automation
 /// (block offsets) is cut to the window and merged in, in offset order.
-fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize)) {
+#[allow(clippy::too_many_arguments)]
+fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize), allow_sleep: bool) {
     for d in devs {
         match d {
             DeviceNode::Proc(p) => {
                 if !p.enabled.load(Ordering::Relaxed) {
                     continue;
                 }
+                let frames = buf.frames();
                 // SAFETY: the audio thread owns the installed graph and is the
                 // only user of its processors (see `SharedProcessor`).
                 let proc = unsafe { p.proc.get_mut() };
                 if p.is_instrument {
                     buf.clear();
                 }
-                let frames = buf.frames();
                 let sidechain = p.sidechain.and_then(|slot| side.chunk(slot, frames));
-                let events = if p.auto_events.events.is_empty() {
+                let merged_events = if p.auto_events.events.is_empty() {
                     events
                 } else {
                     merge_window(&mut p.merged, events, &p.auto_events.events, win);
                     &p.merged.events
                 };
-                let mut ctx = ProcessContext { sample_rate: sr, buffer: buf, sidechain, events, transport: tr };
+                let input_silent = p.is_instrument || buffer_silent(buf);
+                let side_silent = sidechain.as_ref().is_none_or(|sc| buffer_silent(sc));
+                let woken = p.proc.take_wake();
+                let idle_in = allow_sleep && !woken && merged_events.is_empty() && input_silent && side_silent;
+                if p.sleeping && idle_in {
+                    continue;
+                }
+                p.sleeping = false;
+                let mut ctx = ProcessContext { sample_rate: sr, buffer: buf, sidechain, events: merged_events, transport: tr };
                 proc.process(&mut ctx);
                 p.proc.publish_latency(proc.latency());
+                if idle_in && buffer_silent(buf) {
+                    let min_guard = if p.is_instrument { (sr * 0.5) as u32 } else { (sr * 0.25) as u32 };
+                    let needed = proc.tail().max(min_guard);
+                    p.silent_samples = p.silent_samples.saturating_add(frames as u32);
+                    if p.silent_samples >= needed {
+                        p.sleeping = true;
+                    }
+                } else {
+                    p.silent_samples = 0;
+                }
             }
             DeviceNode::Rack(r) => {
                 if r.enabled.load(Ordering::Relaxed) {
-                    r.process(buf, events, tr, sr, side, win);
+                    r.process(buf, events, tr, sr, side, win, allow_sleep);
                 }
             }
             DeviceNode::Missing(_) => {}
@@ -207,7 +243,8 @@ impl RackNode {
         }
     }
 
-    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize)) {
+    #[allow(clippy::too_many_arguments)]
+    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize), allow_sleep: bool) {
         let n = buf.frames();
         self.input.set_frames(n);
         self.input.copy_from(buf);
@@ -222,7 +259,7 @@ impl RackNode {
             }
             c.buf.set_frames(n);
             c.buf.copy_from(&self.input);
-            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side, win);
+            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side, win, allow_sleep);
             c.delay.process(&mut c.buf);
             let (gl, gr) = c.gain;
             if buf.channels() >= 2 && c.buf.channels() >= 2 {
@@ -257,11 +294,18 @@ fn adopt_devices(new: &mut [DeviceNode], old: &mut [DeviceNode]) {
         if n.id() != o.id() {
             continue;
         }
-        if let (DeviceNode::Rack(nr), DeviceNode::Rack(or)) = (n, o) {
-            for (nc, oc) in nr.chains.iter_mut().zip(or.chains.iter_mut()) {
-                nc.delay.adopt(&mut oc.delay);
-                adopt_devices(&mut nc.devices, &mut oc.devices);
+        match (n, o) {
+            (DeviceNode::Proc(np), DeviceNode::Proc(op)) => {
+                np.silent_samples = op.silent_samples;
+                np.sleeping = op.sleeping;
             }
+            (DeviceNode::Rack(nr), DeviceNode::Rack(or)) => {
+                for (nc, oc) in nr.chains.iter_mut().zip(or.chains.iter_mut()) {
+                    nc.delay.adopt(&mut oc.delay);
+                    adopt_devices(&mut nc.devices, &mut oc.devices);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -352,11 +396,15 @@ impl ParamAuto {
         self.last = v;
         match &self.target {
             // SAFETY: audio thread, see `SharedProcessor`.
-            ParamTarget::Param(p, id) => unsafe { p.get_mut().set_param(*id, v) },
+            ParamTarget::Param(p, id) => {
+                p.wake();
+                unsafe { p.get_mut().set_param(*id, v) };
+            }
             ParamTarget::Timed(..) => {}
             ParamTarget::Enabled(flag) => flag.store(v >= 0.5, Ordering::Relaxed),
             ParamTarget::Macro(maps) => {
                 for (p, id, min, max) in maps {
+                    p.wake();
                     // SAFETY: as above.
                     unsafe { p.get_mut().set_param(*id, min + (max - min) * v) };
                 }
@@ -923,9 +971,10 @@ fn process_track(
             pa.emit(&mut node.auto_events, ctx, auto_start, n);
         }
     }
+    let allow_sleep = !io.playing || t.param_autos.is_empty();
     if t.param_autos.iter().all(ParamAuto::is_timed) {
         let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: 0 };
-        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si, (0, n));
+        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si, (0, n), allow_sleep);
     } else {
         let mut a = 0;
         while a < n {
@@ -946,7 +995,7 @@ fn process_track(
             tr.position_samples = lo + a as i64;
             tr.position_beats = ctx.tick_of(lo + a as i64) / PPQ as f64;
             let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: a };
-            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr, &mut si, (a, b));
+            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr, &mut si, (a, b), allow_sleep);
             for ch in 0..t.buf.channels().min(t.chunk_buf.channels()) {
                 t.buf.channel_mut(ch)[a..b].copy_from_slice(t.chunk_buf.channel(ch));
             }

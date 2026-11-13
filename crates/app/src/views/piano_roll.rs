@@ -30,16 +30,22 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let notes: Vec<Note> = ws.s.clip_notes(clip_id).map(|(_, n)| n.notes.clone()).unwrap_or_default();
     let ghosts = ws.s.ghost_notes(clip_id);
     let scale = ws.s.clip_scale(Some(clip_id));
+    let folded = ws.s.scale_folded(Some(clip_id));
+    let rows = ws.s.piano_rows(Some(clip_id));
     let mask = scale.map_or(0xFFF, |s| s.mask());
     let root = scale.map(|s| s.root.0);
     let len = ws.s.clip_edit_len(clip_id);
     let view = ws.s.piano;
     let ppt = view.px_per_beat / PPQ as f32;
     let selected: BTreeSet<NoteId> = ws.s.selected_notes.clone();
+    let kbd_tracks = ws.keyboard_tracks();
     let audition_track = ws.audition_track();
-    let active_keys: BTreeSet<u8> = audition_track
-        .map(|track| (0..=127).filter(|key| ws.audition.pressed(track, *key)).collect())
-        .unwrap_or_default();
+    let active_keys: BTreeSet<u8> = (0..=127)
+        .filter(|key| {
+            audition_track.is_some_and(|t| ws.audition.pressed(t, *key))
+                || ws.audition.any_pressed(&kbd_tracks, *key)
+        })
+        .collect();
     let velocity_text = {
         let chosen: Vec<_> = notes.iter().filter(|n| selected.contains(&n.id)).collect();
         if chosen.is_empty() {
@@ -93,6 +99,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     .size_full();
 
     // ── Keyboard ──
+    let key_rows = rows.clone();
     let keyboard = canvas(
         |_, _, _| {},
         move |b, _, window, cx| {
@@ -100,26 +107,63 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let h = f32::from(b.size.height);
             let pal = p();
             window.paint_quad(paint::fill_rect(b, pal.surface));
-            let first = (view.scroll_y / view.row_h).floor() as i32;
+            let first = (view.scroll_y / view.row_h).floor().max(0.) as i32;
             let count = (h / view.row_h).ceil() as i32 + 1;
             for r in first..first + count {
-                let key = 127 - r;
-                if !(0..=127).contains(&key) {
+                let Some(&k) = (r >= 0).then(|| key_rows.get(r as usize)).flatten() else {
                     continue;
-                }
+                };
+                let key = k as i32;
                 let y = r as f32 * view.row_h - view.scroll_y;
                 let pc = key % 12;
-                let black = matches!(pc, 1 | 3 | 6 | 8 | 10);
                 let in_scale = mask & (1 << pc) != 0;
-                let fill = if active_keys.contains(&(key as u8)) { pal.accent } else if black { pal.key_black } else { pal.key_white };
-                let w = if black { KEYS_W * 0.62 } else { KEYS_W - 1. };
-                window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h - 1.), fill));
-                if in_scale && scale.is_some() {
-                    window.paint_quad(paint::fill_rect(at(o, KEYS_W - 4., y + 1., 3., view.row_h - 3.), if Some(pc as u8) == root { pal.accent } else { pal.scale_highlight }));
-                }
-                if pc == 0 && view.row_h >= 9. {
-                    let name = format!("C{}", key / 12 - 1);
-                    paint::text(window, cx, &name, o.x + px(KEYS_W - 8.), o.y + px(y + (view.row_h - 12.) / 2.), TEXT_XS, with_alpha(pal.key_black, 0.75), FontWeight::MEDIUM, TextAlign::Right);
+                let is_root = Some(pc as u8) == root;
+                if folded.is_some() {
+                    let base = if active_keys.contains(&k) {
+                        pal.accent
+                    } else if is_root {
+                        theme_mix(pal.key_white, pal.accent, 0.22)
+                    } else {
+                        theme_mix(pal.key_white, pal.surface, 0.1)
+                    };
+                    window.paint_quad(paint::fill_rect(at(o, 0., y, KEYS_W - 1., view.row_h - 1.), base));
+                    window.paint_quad(paint::fill_rect(
+                        at(o, KEYS_W - 4., y + 1., 3., view.row_h - 3.),
+                        if is_root { pal.accent } else { pal.scale_highlight },
+                    ));
+                    if view.row_h >= 10. || pc == 0 || is_root {
+                        let name = format!("{}{}", Key(pc as u8).name(), key / 12 - 1);
+                        let color = if active_keys.contains(&k) {
+                            pal.on_accent
+                        } else if is_root {
+                            pal.key_black
+                        } else {
+                            with_alpha(pal.key_black, 0.78)
+                        };
+                        paint::text(
+                            window,
+                            cx,
+                            &name,
+                            o.x + px(KEYS_W - 8.),
+                            o.y + px(y + (view.row_h - 12.) / 2.),
+                            TEXT_XS,
+                            color,
+                            if is_root { FontWeight::BOLD } else { FontWeight::MEDIUM },
+                            TextAlign::Right,
+                        );
+                    }
+                } else {
+                    let black = matches!(pc, 1 | 3 | 6 | 8 | 10);
+                    let fill = if active_keys.contains(&k) { pal.accent } else if black { pal.key_black } else { pal.key_white };
+                    let w = if black { KEYS_W * 0.62 } else { KEYS_W - 1. };
+                    window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h - 1.), fill));
+                    if in_scale && scale.is_some() {
+                        window.paint_quad(paint::fill_rect(at(o, KEYS_W - 4., y + 1., 3., view.row_h - 3.), if is_root { pal.accent } else { pal.scale_highlight }));
+                    }
+                    if pc == 0 && view.row_h >= 9. {
+                        let name = format!("C{}", key / 12 - 1);
+                        paint::text(window, cx, &name, o.x + px(KEYS_W - 8.), o.y + px(y + (view.row_h - 12.) / 2.), TEXT_XS, with_alpha(pal.key_black, 0.75), FontWeight::MEDIUM, TextAlign::Right);
+                    }
                 }
             }
             window.paint_quad(paint::fill_rect(at(o, KEYS_W - 1., 0., 1., h), border()));
@@ -131,6 +175,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let regions = ws.regions.clone();
     let grid_notes = notes.clone();
     let grid_sel = selected.clone();
+    let grid_rows = rows;
     let grid = canvas(
         move |b, _, _| regions.piano.set(b),
         move |b, _, window, _| {
@@ -139,22 +184,23 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let h = f32::from(b.size.height);
             let pal = p();
             window.paint_quad(paint::fill_rect(b, pal.row_out));
-            let first = (view.scroll_y / view.row_h).floor() as i32;
+            let first = (view.scroll_y / view.row_h).floor().max(0.) as i32;
             let count = (h / view.row_h).ceil() as i32 + 1;
             for r in first..first + count {
-                let key = 127 - r;
-                if !(0..=127).contains(&key) {
+                let Some(&k) = (r >= 0).then(|| grid_rows.get(r as usize)).flatten() else {
                     continue;
-                }
+                };
+                let key = k as i32;
                 let y = r as f32 * view.row_h - view.scroll_y;
                 let pc = key % 12;
                 let in_scale = mask & (1 << pc) != 0;
+                let is_root = Some(pc as u8) == root;
                 let bg = if in_scale { pal.row_scale } else { pal.row_out };
                 window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h), bg));
-                if Some(pc as u8) == root {
+                if is_root {
                     window.paint_quad(paint::fill_rect(at(o, 0., y, w, view.row_h), pal.root_highlight));
                 }
-                window.paint_quad(paint::fill_rect(at(o, 0., y + view.row_h - 1., w, 1.), if pc == 0 { pal.grid_beat } else { pal.grid_sub }));
+                window.paint_quad(paint::fill_rect(at(o, 0., y + view.row_h - 1., w, 1.), if pc == 0 || is_root { pal.grid_beat } else { pal.grid_sub }));
             }
             // Vertical grid: bars, beats and the snap subdivisions.
             overlay.paint_grid(window, o, w, h, false);
@@ -165,7 +211,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             }
             let note_rect = |n: &Note| {
                 let x = n.start as f32 * ppt - view.scroll_x;
-                let y = (127 - n.key as i32) as f32 * view.row_h - view.scroll_y;
+                let r = if folded.is_some() {
+                    crate::state::piano_nearest_row(&grid_rows, n.key) as i32
+                } else {
+                    127 - n.key as i32
+                };
+                let y = r as f32 * view.row_h - view.scroll_y;
                 (x, y, (n.length as f32 * ppt).max(3.), view.row_h)
             };
             for (c, n) in &ghosts {
@@ -182,10 +233,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     continue;
                 }
                 let sel = grid_sel.contains(&n.id);
+                let out_of_scale = folded.is_some_and(|s| !s.contains(n.key));
                 // Deactivated notes (0) stay visible but drained of colour.
                 let base = if n.muted { theme_mix(fill, pal.well, 0.75) } else { fill };
                 let body = with_alpha(if sel { theme_mix(base, pal.clip_text_light, 0.35) } else { base }, if n.muted { 0.45 } else { 0.55 + 0.45 * n.velocity });
-                window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, if sel { pal.accent } else { shadow(0.35) }, if sel { 1.5 } else { 1. }));
+                let outline = if sel { pal.accent } else if out_of_scale { pal.record } else { shadow(0.35) };
+                window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, outline, if sel { 1.5 } else { 1. }));
                 // Resize grip.
                 if nw > 10. {
                     window.paint_quad(paint::fill_rect(at(o, x + nw - 4., y + 3., 1., nh - 6.), shadow(0.3)));
@@ -327,6 +380,16 @@ fn theme_mix(a: gpui::Hsla, b: gpui::Hsla, t: f32) -> gpui::Hsla {
 
 fn note_at(ws: &Workspace, clip: ClipId, tick: Tick, key: i32) -> Option<Note> {
     let (_, n) = ws.s.clip_notes(clip)?;
+    if ws.s.scale_folded(Some(clip)).is_some() {
+        let rows = ws.s.piano_rows(Some(clip));
+        let hit_row = crate::state::piano_nearest_row(&rows, key.clamp(0, 127) as u8);
+        return n
+            .notes
+            .iter()
+            .rev()
+            .find(|n| tick >= n.start && tick < n.end() && crate::state::piano_nearest_row(&rows, n.key) == hit_row)
+            .cloned();
+    }
     n.notes.iter().rev().find(|n| n.key as i32 == key && tick >= n.start && tick < n.end()).cloned()
 }
 
@@ -431,8 +494,8 @@ const MIN_ROW: f32 = 6.;
 const MAX_ROW: f32 = 32.;
 
 /// The vertical scroll range of the key rows.
-fn max_scroll_y(row_h: f32, view_h: f32) -> f32 {
-    (128. * row_h - view_h).max(0.)
+fn max_scroll_y(rows: usize, row_h: f32, view_h: f32) -> f32 {
+    (rows as f32 * row_h - view_h).max(0.)
 }
 
 /// Two-finger pan on both axes with the trackpad's own pixel deltas (a
@@ -442,6 +505,7 @@ fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut C
     let b = ws.regions.piano.get();
     let view_h = f32::from(b.size.height);
     let anchor = f32::from(e.position.x - b.origin.x).max(0.);
+    let rows = ws.s.piano_rows(ws.s.selected_clip).len();
     let v = &mut ws.s.piano;
     match gesture::wheel(e) {
         Wheel::Zoom { factor } => {
@@ -449,11 +513,11 @@ fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut C
         }
         Wheel::Pan { dy, .. } if e.modifiers.alt => {
             let anchor_y = f32::from(e.position.y - b.origin.y).max(0.);
-            zoom_rows(v, anchor_y, gesture::wheel_zoom_factor(dy), view_h);
+            zoom_rows(v, anchor_y, gesture::wheel_zoom_factor(dy), rows, view_h);
         }
         Wheel::Pan { dx, dy } => {
             v.scroll_x = (v.scroll_x - dx).max(0.);
-            v.scroll_y = (v.scroll_y - dy).clamp(0., max_scroll_y(v.row_h, view_h));
+            v.scroll_y = (v.scroll_y - dy).clamp(0., max_scroll_y(rows, v.row_h, view_h));
         }
     }
     cx.stop_propagation();
@@ -461,20 +525,21 @@ fn on_wheel(ws: &mut Workspace, e: &ScrollWheelEvent, _: &mut Window, cx: &mut C
 }
 
 /// Change the row height around `anchor_y` (px from the top of the grid).
-fn zoom_rows(v: &mut crate::state::PianoView, anchor_y: f32, factor: f32, view_h: f32) {
+fn zoom_rows(v: &mut crate::state::PianoView, anchor_y: f32, factor: f32, rows: usize, view_h: f32) {
     let (y, row) = gesture::zoom_anchored(v.scroll_y, v.row_h, anchor_y, factor, MIN_ROW, MAX_ROW);
     v.row_h = row;
-    v.scroll_y = y.min(max_scroll_y(row, view_h));
+    v.scroll_y = y.min(max_scroll_y(rows, row, view_h));
 }
 
 /// Pinch over the grid zooms time around the pinch; over the keyboard it
 /// zooms the rows.
-fn on_pinch(ws: &mut Workspace, e: &PinchEvent, rows: bool, cx: &mut Context<Workspace>) {
+fn on_pinch(ws: &mut Workspace, e: &PinchEvent, rows_axis: bool, cx: &mut Context<Workspace>) {
     let b = ws.regions.piano.get();
     let factor = gesture::pinch_factor(e);
+    let row_count = ws.s.piano_rows(ws.s.selected_clip).len();
     let v = &mut ws.s.piano;
-    if rows {
-        zoom_rows(v, f32::from(e.position.y - b.origin.y).max(0.), factor, f32::from(b.size.height));
+    if rows_axis {
+        zoom_rows(v, f32::from(e.position.y - b.origin.y).max(0.), factor, row_count, f32::from(b.size.height));
     } else {
         let anchor = f32::from(e.position.x - b.origin.x).max(0.);
         (v.scroll_x, v.px_per_beat) = gesture::zoom_anchored(v.scroll_x, v.px_per_beat, anchor, factor, MIN_PX_PER_BEAT, MAX_PX_PER_BEAT);
@@ -490,11 +555,11 @@ mod tests {
     fn row_zoom_keeps_the_key_under_the_pointer() {
         let mut v = crate::state::PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 600. };
         let key_at = (v.scroll_y + 100.) / v.row_h;
-        zoom_rows(&mut v, 100., 1.5, 300.);
+        zoom_rows(&mut v, 100., 1.5, 128, 300.);
         assert_eq!(v.row_h, 18.);
         assert!(((v.scroll_y + 100.) / v.row_h - key_at).abs() < 1e-3);
-        zoom_rows(&mut v, 100., 100., 300.);
+        zoom_rows(&mut v, 100., 100., 128, 300.);
         assert_eq!(v.row_h, MAX_ROW);
-        assert!(v.scroll_y <= max_scroll_y(MAX_ROW, 300.));
+        assert!(v.scroll_y <= max_scroll_y(128, MAX_ROW, 300.));
     }
 }

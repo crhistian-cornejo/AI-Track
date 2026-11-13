@@ -130,7 +130,7 @@ struct Frame {
     end: Tick,
     place: Option<Placed>,
     /// Axis position of song tick 0 (the grid is the song's).
-    origin: Tick,
+    origin: f64,
     sig: TimeSignature,
     bpm: f64,
     grid: GridSpec,
@@ -153,12 +153,13 @@ impl Frame {
         };
         let end = geom::content_end(&clip, source_len);
         let place = edit::placement_of(&ws.s, id);
-        let origin = place.map_or(0, |pl| clip.offset - pl.start);
+        let origin = place.map_or(0., |pl| clip.offset as f64 - pl.start as f64 * rate);
         let b = ws.sample.region.get();
         let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
         let axis = ws.sample.axis.filter(|_| ws.sample.clip == Some(id)).unwrap_or_else(|| Axis::fit(if w > 0. { w } else { 800. }, end));
         let sig = ws.s.project.tempo.signature_at(0);
-        let grid = grid::adaptive(axis.px_per_beat as f32, sig, 0, false);
+        // The grid's lines are the song's, scaled onto the file axis by `rate`.
+        let grid = grid::adaptive((axis.px_per_beat * rate.max(1e-6)) as f32, sig, 0, false);
         Some(Self { id, clip, rate, source, base, source_len, end, place, origin, sig, bpm, grid, layout: Layout { axis, w, h } })
     }
 
@@ -173,7 +174,7 @@ impl Frame {
             magnets[n + 1] = l.end;
             n += 2;
         }
-        geom::snap(u, &self.grid, self.origin, self.layout.axis.px_per_tick(), &magnets[..n], free)
+        geom::snap_scaled(u, &self.grid, self.origin, self.rate, self.layout.axis.px_per_tick(), &magnets[..n], free)
     }
 
     /// Zoom limits in px per beat: twice the whole file, down to single samples.
@@ -242,6 +243,8 @@ pub fn split_at_cursor(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool 
     };
     match edit::split(&mut ws.s, id, cursor) {
         Ok(()) => {
+            ws.sample.cursor = None;
+            ws.sample.picked = None;
             ws.sample.selection = None;
             cx.notify();
             true
@@ -301,8 +304,8 @@ fn audition(ws: &mut Workspace, cx: &mut Context<Workspace>) {
         cx.notify();
         return;
     }
-    // As the clip sounds: transposed, detuned, reversed.
-    let ratio = f.source.warp.pitch_ratio();
+    // Pitch-preserving warp modes keep duration; Re-Pitch and unwarped scale speed.
+    let ratio = f.source.warp.speed_ratio();
     ws.b.engine.preview_pitched(Some(&f.source.path), ratio, f.source.warp.reverse);
     let seconds = if f.source.frames > 0 { f.source.frames as f64 / f64::from(f.source.sample_rate.max(1)) / ratio } else { 4. };
     let length = Duration::from_secs_f64(seconds.clamp(0.2, 600.));
@@ -740,6 +743,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         axis: f.layout.axis,
         base: decoded,
         origin: f.origin,
+        rate: f.rate,
         grid: f.grid,
         peaks,
         note,
@@ -909,7 +913,19 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             }),
         )
         .on_action(cx.listener(|this, _: &SplitClip, _, cx| {
-            split_at_cursor(this, cx);
+            // Only intercept Cmd/Ctrl+E here when the Sample tab is open with
+            // an interior cursor on the active clip; otherwise let the
+            // arrangement workspace handle splitting clips at the marker/playhead.
+            let active = this.bottom_open
+                && this.s.bottom_tab == crate::state::BottomTab::PianoRoll
+                && audio_clip(this)
+                    .zip(this.sample.cursor)
+                    .is_some_and(|((id, _), u)| this.sample.clip == Some(id) && edit::can_split(&this.s, id, u));
+            if active {
+                split_at_cursor(this, cx);
+            } else {
+                cx.propagate();
+            }
         }))
         .on_action(cx.listener(|this, _: &Escape, _, cx| {
             if cancel_drag(this) || this.sample.selection.take().is_some() {

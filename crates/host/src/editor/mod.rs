@@ -92,6 +92,12 @@ impl EditorWindow {
         self.inner.show();
     }
 
+    /// Bring an already-open window to the front (including from a sandbox).
+    pub fn raise(&self) {
+        #[cfg(any(windows, target_os = "macos"))]
+        self.inner.raise();
+    }
+
     pub fn set_client_size(&self, width: u32, height: u32) {
         self.raw().set_client_size(width, height);
     }

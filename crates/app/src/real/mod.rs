@@ -20,14 +20,27 @@ pub mod settings {
     use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
 
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(default)]
     pub struct Settings {
         pub audio: aitrack_engine::AudioConfig,
         /// Run third-party plugins in `aitrack-plugin-host` processes.
         pub sandbox: bool,
+        /// Memory budget (in MB) for decoded audio samples before LRU eviction.
+        pub sample_cache_mb: usize,
         /// Folder holding the factory sound bank (`factory.db` + `packs/`).
         pub content_dir: Option<PathBuf>,
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self {
+                audio: aitrack_engine::AudioConfig::default(),
+                sandbox: false,
+                sample_cache_mb: 512,
+                content_dir: None,
+            }
+        }
     }
 
     fn path() -> PathBuf {

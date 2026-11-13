@@ -52,6 +52,9 @@ pub struct SharedProcessor {
     /// after each block so the control thread can detect PDC changes without
     /// touching the processor.
     latency: AtomicU32,
+    /// Set by the control thread when a parameter or state edit happens so a
+    /// sleeping processor wakes on the next audio block.
+    wake: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: access is serialised by the contract above; `Box<dyn Processor>`
@@ -62,7 +65,20 @@ unsafe impl Send for SharedProcessor {}
 impl SharedProcessor {
     pub fn new(processor: Box<dyn Processor>) -> Self {
         let latency = processor.latency();
-        Self { inner: UnsafeCell::new(processor), latency: AtomicU32::new(latency) }
+        Self {
+            inner: UnsafeCell::new(processor),
+            latency: AtomicU32::new(latency),
+            wake: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn wake(&self) {
+        self.wake.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn take_wake(&self) -> bool {
+        self.wake.swap(false, Ordering::Acquire)
     }
 
     /// # Safety

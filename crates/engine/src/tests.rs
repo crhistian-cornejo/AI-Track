@@ -625,6 +625,7 @@ fn audio_clip_plays_with_gain_and_warp() {
 
     // Repitch warp: material at 60 BPM in a 120 BPM project plays twice as fast.
     warp.enabled = true;
+    warp.mode = aitrack_model::WarpMode::Repitch;
     warp.original_bpm = Some(60.0);
     if let Some(Source::Audio(a)) = b.p.sources.get_mut(&sid) {
         a.warp = warp;
@@ -1219,6 +1220,90 @@ fn audio_config_serializes() {
     let old: crate::AudioConfig = serde_json::from_str(r#"{"sample_rate":44100}"#).unwrap();
     assert_eq!(old.sample_rate, Some(44_100));
     assert_eq!(old.output_channels, crate::ChannelSelection::default());
+}
+
+#[test]
+fn idle_device_sleeps_after_tail_and_wakes_on_audio() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_cb = calls.clone();
+    struct SpyFx {
+        info: aitrack_dsp::PluginInfo,
+        calls: Arc<AtomicUsize>,
+    }
+    impl aitrack_dsp::Processor for SpyFx {
+        fn info(&self) -> &aitrack_dsp::PluginInfo {
+            &self.info
+        }
+        fn prepare(&mut self, _: f64, _: usize) {}
+        fn reset(&mut self) {}
+        fn process(&mut self, _: &mut aitrack_dsp::ProcessContext<'_>) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+        fn set_param(&mut self, _: u32, _: f32) {}
+        fn get_param(&self, _: u32) -> f32 {
+            0.0
+        }
+        fn tail(&self) -> u32 {
+            256
+        }
+    }
+    struct SpyFactory(Arc<AtomicUsize>);
+    impl crate::ProcessorFactory for SpyFactory {
+        fn create(&self, _: &Device, _: f64, _: usize) -> Option<Box<dyn aitrack_dsp::Processor>> {
+            Some(Box::new(SpyFx {
+                info: aitrack_dsp::PluginInfo {
+                    id: "fx.spy",
+                    name: "Spy",
+                    vendor: "AI-Track",
+                    category: aitrack_dsp::Category::Effect,
+                    tags: &[],
+                    params: Vec::new(),
+                    inputs: 2,
+                    outputs: 2,
+                    has_sidechain: false,
+                },
+                calls: self.0.clone(),
+            }))
+        }
+    }
+
+    let mut b = P::new(120.0);
+    let t = b.track(TrackKind::Audio, "fx");
+    let did = b.p.alloc_device_id();
+    b.p.track_mut(t).unwrap().devices.push(Device::stock(did, "fx.spy", "Spy"));
+    let (h, proc_) = Engine::new(EngineConfig::headless(SR), Arc::new(SpyFactory(calls_cb))).unwrap();
+    let mut proc_ = proc_.unwrap();
+    h.update_project(&b.p);
+    h.flush();
+
+    let mut buf = AudioBuffer::new(2, 512);
+    // Run 1 second of silence: past tail + 0.25s guard, the device must go to sleep.
+    for _ in 0..(48_000 / 512) {
+        proc_.process_planar(&mut buf);
+    }
+    let settled = calls.load(Ordering::Relaxed);
+    for _ in 0..40 {
+        proc_.process_planar(&mut buf);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), settled, "silent idle blocks do not run asleep devices");
+
+    // Waking via live MIDI activates the upstream synth + downstream effect immediately.
+    let mut b2 = P::new(120.0);
+    let (st, _) = b2.synth_track("wake");
+    let did2 = b2.p.alloc_device_id();
+    b2.p.track_mut(st).unwrap().devices.push(Device::stock(did2, "fx.spy", "Spy"));
+    calls.store(0, Ordering::Relaxed);
+    h.update_project(&b2.p);
+    h.flush();
+    for _ in 0..(48_000 / 512) {
+        proc_.process_planar(&mut buf);
+    }
+    let before_note = calls.load(Ordering::Relaxed);
+    h.set_midi_target(Some(st));
+    h.send_midi(crate::MidiMessage::note_on(0, 60, 100));
+    proc_.process_planar(&mut buf);
+    assert!(calls.load(Ordering::Relaxed) > before_note, "MIDI/audio signal wakes the effect immediately");
 }
 
 mod clips;

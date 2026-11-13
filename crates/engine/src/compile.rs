@@ -206,6 +206,8 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                             sidechain: d.sidechain.filter(|s| *s != dc.track).and_then(|s| dc.side_slots.get(&s).copied()),
                             auto_events: EventList::with_capacity(0),
                             merged: EventList::with_capacity(0),
+                            silent_samples: 0,
+                            sleeping: false,
                         }));
                     }
                     None => {
@@ -479,7 +481,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                         }
                     // Each clip reads the warp of its own source: a clip transposed
                     // or stretched alone has a copy of the file's source.
-                    CompiledClip::audio(id, clip, AudioClipData::of(&a.warp, audio))
+                    CompiledClip::audio(id, clip, AudioClipData::of_bpm(&a.warp, audio, project.tempo.initial_bpm()))
                 }
                 _ => return None,
             };

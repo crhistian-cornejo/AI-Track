@@ -32,6 +32,7 @@ pub mod shaper;
 pub mod smooth;
 pub mod spectrum;
 pub mod svf;
+pub mod warp;
 pub mod wavetable;
 
 pub use buffer::AudioBuffer;

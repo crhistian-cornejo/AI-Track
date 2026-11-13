@@ -28,9 +28,10 @@
 
 use crate::sample_cache::DecodedAudio;
 use aitrack_dsp::event::Expression;
+use aitrack_dsp::warp::{detect_transients, sample_warped_beats, sample_warped_grain, warp_audio, WarpAlgorithm};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
-use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, PPQ};
-use std::sync::Arc;
+use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Musical-time context of one processing segment.
 pub(crate) struct TimeCtx<'a> {
@@ -215,27 +216,155 @@ impl Section {
 
 pub(crate) struct AudioClipData {
     pub audio: Option<Arc<DecodedAudio>>,
-    /// Repitch warp: source plays at `original_bpm`.
+    /// Warped: source plays at `original_bpm` (which equals the compiled
+    /// project tempo after offline pitch/time warping for pitch-preserving modes).
     pub warped: bool,
     pub original_bpm: f64,
-    /// Source speed asked for by transpose and detune (1 = as recorded).
-    /// Re-Pitch: the pitch moves with the speed.
+    /// Source speed asked for by transpose and detune (`1.0` when pitch-preserving
+    /// because pitch shift is pre-warped at unchanged clip duration).
     pub ratio: f64,
+    pub mode: WarpMode,
+    pub pitch_preserving: bool,
+    pub transients: Arc<[usize]>,
     /// Read the source backwards.
     pub reverse: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct WarpKey {
+    frames: usize,
+    sample_rate: u32,
+    channels: usize,
+    fingerprint: u64,
+    mode: WarpMode,
+    pitch_cents: i32,
+    time_scale_milli: i32,
+}
+
+struct CachedWarp {
+    key: WarpKey,
+    audio: Arc<DecodedAudio>,
+    transients: Arc<[usize]>,
+}
+
+fn audio_fingerprint(a: &DecodedAudio) -> u64 {
+    let mut h = 0xCBF2_9CE4_8422_2325u64;
+    for ch in &a.channels {
+        let len = ch.len();
+        if len == 0 {
+            continue;
+        }
+        for step in 0..8 {
+            let idx = (step * len) / 8;
+            let bits = ch[idx].to_bits() as u64;
+            h = (h ^ bits).wrapping_mul(0x1000_0000_01B3);
+        }
+        h = (h ^ ch[len - 1].to_bits() as u64).wrapping_mul(0x1000_0000_01B3);
+    }
+    h
+}
+
+fn warp_algo(mode: WarpMode) -> WarpAlgorithm {
+    match mode {
+        WarpMode::Beats => WarpAlgorithm::Beats,
+        WarpMode::Tones => WarpAlgorithm::Tones,
+        WarpMode::Texture => WarpAlgorithm::Texture,
+        WarpMode::Complex => WarpAlgorithm::Complex,
+        WarpMode::ComplexPro => WarpAlgorithm::ComplexPro,
+        WarpMode::Repitch => WarpAlgorithm::Repitch,
+    }
+}
+
+fn cached_warp(src: &Arc<DecodedAudio>, mode: WarpMode, time_scale: f64, pitch_ratio: f64, pitch_cents: i32) -> (Arc<DecodedAudio>, Arc<[usize]>) {
+    static CACHE: OnceLock<Mutex<Vec<CachedWarp>>> = OnceLock::new();
+    let time_scale_milli = (time_scale * 1000.0).round() as i32;
+    if (time_scale - 1.0).abs() < 1e-4 && (pitch_ratio - 1.0).abs() < 1e-4 {
+        return (src.clone(), Arc::from([]));
+    }
+    let key = WarpKey {
+        frames: src.frames,
+        sample_rate: src.sample_rate,
+        channels: src.channels.len(),
+        fingerprint: audio_fingerprint(src),
+        mode,
+        pitch_cents,
+        time_scale_milli,
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = cache.lock()
+        && let Some(pos) = guard.iter().position(|e| e.key == key)
+    {
+        let entry = guard.remove(pos);
+        let pair = (entry.audio.clone(), entry.transients.clone());
+        guard.push(entry);
+        return pair;
+    }
+
+    let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
+    let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
+    let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
+    let mut warped_audio = DecodedAudio::from_planar(warped_channels, src.sample_rate);
+    warped_audio.source_rate = src.source_rate;
+    let warped_arc = Arc::new(warped_audio);
+    let trans_arc: Arc<[usize]> = Arc::from(if mode == WarpMode::Beats {
+        let w_refs: Vec<&[f32]> = warped_arc.channels.iter().map(Vec::as_slice).collect();
+        detect_transients(&w_refs, warped_arc.sample_rate)
+    } else {
+        Vec::new()
+    });
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 32 {
+            guard.remove(0);
+        }
+        guard.push(CachedWarp { key, audio: warped_arc.clone(), transients: trans_arc.clone() });
+    }
+    (warped_arc, trans_arc)
+}
+
 impl AudioClipData {
-    /// How a file with `warp` plays: repitched to its original tempo when
-    /// warped (a clip stretched with Cmd/Ctrl + an edge is warped at a tempo
-    /// scaled by the stretch, `ops::stretch`), sped up or slowed down by its
-    /// transpose and detune, maybe backwards.
+    /// How a file with `warp` plays without a known project tempo (defaults to `original_bpm`).
+    #[cfg(test)]
     pub fn of(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>) -> Self {
+        Self::of_bpm(warp, audio, warp.original_bpm.unwrap_or(120.0))
+    }
+
+    /// How a file with `warp` plays against `project_bpm`. Pitch-preserving
+    /// warp modes pre-render off the audio thread (with caching) at `project_bpm`
+    /// and the requested transpose/detune so timeline duration stays independent
+    /// of pitch and playback needs zero real-time allocations.
+    pub fn of_bpm(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>, project_bpm: f64) -> Self {
+        let warped = warp.enabled && warp.original_bpm.is_some_and(|b| b > 0.0);
+        let original_bpm = warp.original_bpm.unwrap_or(120.0);
+        let pitch_preserving = warped && warp.mode.preserves_pitch();
+        if pitch_preserving
+            && let Some(ref src) = audio
+            && src.frames > 0
+            && project_bpm > 0.0
+        {
+            let time_scale = (original_bpm / project_bpm).clamp(0.125, 8.0);
+            let pitch_ratio = warp.pitch_ratio();
+            let pitch_cents = (warp.pitch() * 100.0).round() as i32;
+            let (warped_audio, transients) = cached_warp(src, warp.mode, time_scale, pitch_ratio, pitch_cents);
+            return Self {
+                audio: Some(warped_audio),
+                warped: true,
+                original_bpm: project_bpm,
+                ratio: 1.0,
+                mode: warp.mode,
+                pitch_preserving: true,
+                transients,
+                reverse: warp.reverse,
+            };
+        }
         Self {
             audio,
-            warped: warp.enabled && warp.original_bpm.is_some_and(|b| b > 0.0),
-            original_bpm: warp.original_bpm.unwrap_or(120.0),
+            warped,
+            original_bpm,
             ratio: warp.pitch_ratio(),
+            mode: warp.mode,
+            pitch_preserving: false,
+            transients: Arc::from([]),
             reverse: warp.reverse,
         }
     }
@@ -243,7 +372,7 @@ impl AudioClipData {
     /// Whether the clip plays whole frames at the file's own speed.
     #[inline]
     fn exact(&self) -> bool {
-        !self.warped && self.ratio == 1.0
+        !self.warped && !self.pitch_preserving && self.ratio == 1.0
     }
 
     /// Frame `index` of the source as this clip reads it (mirrored when reversed).
@@ -691,12 +820,23 @@ impl CompiledClip {
         };
         // As above: without a lead-up the tail fades into the first frame.
         let lead_floor = looping.map_or(0.0, |(ls, _)| data.source_frame(ls as f64, spt).min(0.0));
+        // If a pitch-preserving clip is crossing a dynamic tempo ramp or live BPM
+        // change away from its compiled tempo, use the allocation-free RT stretch reader.
+        let tempo_steady = !data.pitch_preserving
+            || ((ctx.tempo.bpm_at(start) - data.original_bpm).abs() <= data.original_bpm * 0.005
+                && (ctx.tempo.bpm_at(start + limit.unwrap_or(PPQ)) - data.original_bpm).abs() <= data.original_bpm * 0.005);
+        let ch0 = &audio.channels[0];
+        let ch1 = if stereo { &audio.channels[1] } else { ch0 };
+        let sr = audio.sample_rate as f64;
         let mut n = lo;
         while n < hi {
             let chunk_end = (n + crate::automation::CONTROL_BLOCK as i64).min(hi);
             let t0 = ctx.tick_of(n) - start as f64;
             let t1 = ctx.tick_of(chunk_end) - start as f64;
             let len = (chunk_end - n) as f64;
+            let frame_0 = data.source_frame(offset as f64 + t0 * ratio, spt);
+            let frame_1 = data.source_frame(offset as f64 + t1 * ratio, spt);
+            let local_step = (frame_1 - frame_0) / len;
             for k in n..chunk_end {
                 let tau = t0 + (t1 - t0) * (k - n) as f64 / len;
                 if tau < 0.0 || limit.is_some_and(|lim| tau >= lim as f64) {
@@ -716,14 +856,29 @@ impl CompiledClip {
                     }
                 }
                 let frame = data.source_frame(src, spt);
-                let mut sl = data.sample(audio, 0, frame);
-                let mut sr = if stereo { data.sample(audio, 1, frame) } else { sl };
+                let (mut sl, mut sr_s) = if tempo_steady {
+                    (data.sample(audio, 0, frame), if stereo { data.sample(audio, 1, frame) } else { 0.0 })
+                } else if data.mode == WarpMode::Beats {
+                    let s0 = sample_warped_beats(ch0, &data.transients, frame, sr, data.reverse);
+                    let s1 = if stereo { sample_warped_beats(ch1, &data.transients, frame, sr, data.reverse) } else { s0 };
+                    (s0, s1)
+                } else {
+                    let since = k as f64 - start_exact;
+                    let jitter = data.mode == WarpMode::Texture;
+                    let src_at_hop = |center_out: f64| frame + (center_out - since) * local_step;
+                    let s0 = sample_warped_grain(ch0, 0x1234_5678, since, src_at_hop, sr, jitter, data.reverse);
+                    let s1 = if stereo { sample_warped_grain(ch1, 0x8765_4321, since, src_at_hop, sr, jitter, data.reverse) } else { s0 };
+                    (s0, s1)
+                };
+                if !stereo && tempo_steady {
+                    sr_s = sl;
+                }
                 if w > 0.0 {
                     let lead = data.source_frame(src - span, spt).max(lead_floor);
                     let pl = data.sample(audio, 0, lead);
                     let pr = if stereo { data.sample(audio, 1, lead) } else { pl };
                     sl += (pl - sl) * w;
-                    sr += (pr - sr) * w;
+                    sr_s += (pr - sr_s) * w;
                 }
                 let mut g = edge_gain(k, k as f64 - start_exact);
                 if shaped {
@@ -731,7 +886,7 @@ impl CompiledClip {
                 }
                 let idx = (k - ctx.seg_start) as usize;
                 l[idx] += sl * g;
-                r[idx] += sr * g;
+                r[idx] += sr_s * g;
             }
             n = chunk_end;
         }
@@ -796,7 +951,16 @@ mod tests {
 
     fn audio_clip(clip: &Clip, data: Vec<f32>, original_bpm: Option<f64>) -> CompiledClip {
         let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
-        let data = AudioClipData { audio: Some(audio), warped: original_bpm.is_some(), original_bpm: original_bpm.unwrap_or(120.0), ratio: 1.0, reverse: false };
+        let data = AudioClipData {
+            audio: Some(audio),
+            warped: original_bpm.is_some(),
+            original_bpm: original_bpm.unwrap_or(120.0),
+            ratio: 1.0,
+            mode: WarpMode::Repitch,
+            pitch_preserving: false,
+            transients: Arc::from([]),
+            reverse: false,
+        };
         CompiledClip::audio(ClipId(1), clip, data)
     }
 
@@ -818,7 +982,42 @@ mod tests {
 
     fn pitched_clip(clip: &Clip, data: Vec<f32>, ratio: f64, reverse: bool) -> CompiledClip {
         let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
-        CompiledClip::audio(ClipId(1), clip, AudioClipData { audio: Some(audio), warped: false, original_bpm: 120.0, ratio, reverse })
+        CompiledClip::audio(
+            ClipId(1),
+            clip,
+            AudioClipData {
+                audio: Some(audio),
+                warped: false,
+                original_bpm: 120.0,
+                ratio,
+                mode: WarpMode::Repitch,
+                pitch_preserving: false,
+                transients: Arc::from([]),
+                reverse,
+            },
+        )
+    }
+
+    #[test]
+    fn pitch_preserving_warp_modes_keep_duration_and_shift_pitch() {
+        use aitrack_model::Warp;
+        let len = 48_000usize;
+        let sine: Vec<f32> = (0..len).map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin()).collect();
+        let audio = Arc::new(DecodedAudio::from_planar(vec![sine], 48_000));
+        let c = clip(0, 2 * PPQ, None);
+        for mode in [WarpMode::Beats, WarpMode::Tones, WarpMode::Texture, WarpMode::Complex, WarpMode::ComplexPro] {
+            let warp = Warp { enabled: true, mode, original_bpm: Some(120.0), transpose: 12.0, ..Warp::default() };
+            let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&warp, Some(audio.clone()), 120.0));
+            let out = play(&compiled, 120.0, 0, Some(2 * PPQ), 48_000);
+            // Clip still fills all 1.0s (48_000 samples) instead of finishing at 0.5s like Re-Pitch.
+            let tail_energy: f32 = out[30_000..44_000].iter().map(|s| s * s).sum();
+            assert!(tail_energy > 1.0, "{mode:?} must keep clip duration when transposed");
+            // Frequency doubled from 440 Hz to ~880 Hz.
+            let seg = &out[8_000..16_000];
+            let crossings = seg.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+            let hz = crossings as f32 * 48_000.0 / seg.len() as f32;
+            assert!((hz - 880.0).abs() < 45.0, "{mode:?} +12st expected ~880 Hz, got {hz}");
+        }
     }
 
     #[test]

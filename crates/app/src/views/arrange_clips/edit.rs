@@ -489,10 +489,19 @@ mod tests {
         assert_eq!(heard(&f.s), playing, "it plays the same");
         let source = f.s.project.clips[&place.clip].source;
         let Some(Source::Notes(n)) = f.s.project.sources.get(&source) else { panic!("notes") };
-        assert!(n.notes.iter().all(|n| n.start >= 0), "no note starts before the clip");
+        assert!(n.notes.iter().any(|n| n.start < 0), "trimmed-off notes stay stored before tick 0 for non-destructive reveal");
         assert!(!finish_trim(&mut f.s, &origin), "settled already");
         assert!(f.s.undo());
         assert_eq!(f.s.project.clips[&place.clip], old);
+        assert!(f.s.redo());
+        // Expanding the left edge back to the original start brings hidden notes back.
+        let back = Origin::take(&f.s, place.id).unwrap();
+        assert!(apply(&mut f.s, &back, Edit::Start(place.start)));
+        assert!(finish_trim(&mut f.s, &back));
+        f.s.seal();
+        let after_restore = f.s.project.clips[&place.clip].source;
+        let Some(Source::Notes(n2)) = f.s.project.sources.get(&after_restore) else { panic!("notes") };
+        assert!(ops::heard_notes(&f.s.project.clips[&place.clip], &n2.notes).len() > playing.len(), "earlier notes come back");
     }
 
     #[test]

@@ -78,6 +78,28 @@ pub enum NumKey {
     Cancel,
 }
 
+/// Key context on the workspace and floating device windows: when an inline
+/// number box is open, adding `TextInput` suppresses single-key shortcuts (`1`-`4`,
+/// `0`, `-`, `+`, `backspace`, `escape`, `space`, ...) before GPUI dispatches them.
+pub(crate) fn workspace_key_context(editing_num: bool) -> &'static str {
+    if editing_num { "Workspace TextInput" } else { "Workspace" }
+}
+
+/// Extract a numeric character from `k`, allowing `Shift`/`fn` (needed for `+`
+/// and international/numpad layouts) while ignoring shortcut modifiers.
+pub(crate) fn num_edit_char(k: &gpui::Keystroke) -> Option<&str> {
+    let m = &k.modifiers;
+    if m.secondary() || m.control || m.alt {
+        return None;
+    }
+    let raw = k
+        .key_char
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (k.key.len() == 1).then_some(k.key.as_str()))?;
+    raw.chars().all(|c| c.is_ascii_digit() || "-+.,".contains(c)).then_some(raw)
+}
+
 /// What a value-box text parses to (`,` works as the decimal mark).
 pub fn parse_plain(text: &str) -> Option<f32> {
     text.trim().replace(',', ".").parse().ok()
@@ -148,6 +170,8 @@ pub enum Drag {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuKind {
     Scale,
+    TrackScale(TrackId),
+    ClipScale(ClipId),
     Snap,
     PianoTools,
     AddDevice(TrackId),
@@ -162,6 +186,8 @@ pub enum MenuKind {
     TrackContext(TrackId),
     /// Right-click on a device's title bar (acts on the picked devices).
     DeviceContext(DeviceId),
+    /// Right-click on a device row in the Cmd+K palette (favorite / reassign group).
+    PaletteDevice { key: String, name: String, instrument: bool },
     TimeSignature,
     /// File: new from a template, open, save.
     File,
@@ -210,6 +236,7 @@ pub struct Workspace {
     pub piano_keyboard: bool,
     pub piano_preview: bool,
     pub piano_octave: u8,
+    pub piano_velocity: u8,
     pub drag: Option<Drag>,
     /// The value box being typed into, if any (`click_dragged` guards it
     /// against drags).
@@ -230,12 +257,21 @@ pub struct Workspace {
     pub sample: views::sample_editor::UiState,
     /// Waveform peaks for the audio clips on screen.
     pub waves: crate::waveform::WaveformCache,
+    /// Timestamp of the last rendered frame (used by low-power throttling).
+    pub last_frame: Instant,
     /// The meter strip under the top bar.
     pub meters: views::meters::MeterStrip,
     /// CPU and memory of this process, for the status bar.
     pub usage: crate::usage::Usage,
     /// The `.aitrack` file the project was opened from or saved to.
     pub project_path: Option<std::path::PathBuf>,
+    /// Recently opened/saved `.aitrack` project files (most recent first).
+    pub recent_projects: Vec<std::path::PathBuf>,
+    /// Whether the File → Open Recent cascading submenu is expanded.
+    pub file_recent_open: bool,
+    /// Hovered group and search box in the Add Device popup menu.
+    pub device_menu_hover: Option<views::menus::DeviceMenuGroup>,
+    pub device_menu_search: Entity<TextInput>,
     /// Height of the detail panel (drag its top edge: [`Workspace::begin_bottom_resize`]).
     pub bottom_h: f32,
     pub bottom_open: bool,
@@ -332,6 +368,7 @@ impl Workspace {
         let search = cx.new(|cx| TextInput::new(cx, "Search samples, devices, presets and commands", Some(Icon::Search)));
         let export_name = cx.new(|cx| TextInput::new(cx, "File name", Some(Icon::File)));
         let auto_search = cx.new(|cx| TextInput::new(cx, "Search parameters", Some(Icon::Search)));
+        let device_menu_search = cx.new(|cx| TextInput::new(cx, "Search effects & synths…", Some(Icon::Search)));
         let look = views::prefs::Look::load(cx);
         let subs = vec![
             cx.subscribe(&search, |this, _, e: &InputEvent, cx| {
@@ -340,6 +377,10 @@ impl Workspace {
                 cx.notify();
             }),
             cx.subscribe(&auto_search, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&device_menu_search, |this, _, _: &InputEvent, cx| {
+                this.device_menu_hover = None;
+                cx.notify();
+            }),
         ];
         // Main-thread plugin work, background scan results and engine
         // messages, on a short timer that runs even while nothing animates.
@@ -360,6 +401,7 @@ impl Workspace {
             piano_keyboard: false,
             piano_preview: true,
             piano_octave: 4,
+            piano_velocity: 100,
             drag: None,
             num_edit: None,
             menu: None,
@@ -372,7 +414,12 @@ impl Workspace {
             waves: Default::default(),
             meters: views::meters::MeterStrip::default(),
             usage: crate::usage::Usage::default(),
+            last_frame: Instant::now(),
             project_path: None,
+            recent_projects: crate::project_io::load_recent_projects(),
+            file_recent_open: false,
+            device_menu_hover: None,
+            device_menu_search,
             bottom_h: 300.,
             bottom_open: true,
             window_h: 920.,
@@ -471,6 +518,11 @@ impl Workspace {
                 "prefs=audio" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Audio,
+                    ))
+                }
+                "prefs=performance" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Performance,
                     ))
                 }
                 "play" => self.b.engine.play(),
@@ -785,9 +837,9 @@ impl Workspace {
         // While recording with Automation Arm on, they are written into their lanes too.
         let t = self.b.engine.transport();
         changed |= self.s.apply_plugin_edits(&edits, (t.recording && t.playing).then_some(t.position));
-        // The usage read-out moves about once a second even when nothing else does.
+        // The usage read-out moves about once a second (3s in low-power mode) even when nothing else does.
         let (cpu, mem) = (self.usage.cpu, self.usage.memory);
-        self.usage.tick();
+        self.usage.tick(self.look.app.low_power);
         changed |= (self.usage.cpu - cpu).abs() >= 0.005 || self.usage.memory.abs_diff(mem) >= 4 * 1024 * 1024;
         changed |= self.b.plugins.poll();
         changed |= self.b.library.poll();
@@ -840,9 +892,14 @@ impl Workspace {
     }
 
     pub fn open_menu(&mut self, kind: MenuKind, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.file_recent_open = false;
+        self.device_menu_hover = None;
         if self.menu.as_ref().is_some_and(|m| m.kind == kind) {
             self.menu = None;
         } else {
+            if matches!(kind, MenuKind::AddDevice(_)) {
+                self.device_menu_search.update(cx, |i, cx| i.set_text("", cx));
+            }
             self.menu_counter += 1;
             self.menu = Some(Menu { kind, at, opened: self.menu_counter });
         }
@@ -856,6 +913,30 @@ impl Workspace {
         self.menu_counter += 1;
         self.param_menu = Some((track, target, at));
         cx.notify();
+    }
+
+    /// Right-click on any knob (`knob_control`, device UIs, mixer): resolve its
+    /// [`AutomationTarget`] and open the automation context menu.
+    pub fn open_knob_menu(&mut self, target: KnobTarget, at: Point<Pixels>, cx: &mut Context<Self>) {
+        match target {
+            KnobTarget::Param { device, param, .. } => {
+                if let Some(track) = self.s.project.device_track(device) {
+                    self.open_param_menu(track, AutomationTarget::DeviceParam { device, param }, at, cx);
+                }
+            }
+            KnobTarget::Macro { rack, index } => {
+                if let Some(track) = self.s.project.device_track(rack) {
+                    self.open_param_menu(track, AutomationTarget::Macro { device: rack, index: index as u8 }, at, cx);
+                }
+            }
+            KnobTarget::Pan { track } => {
+                self.open_param_menu(track, AutomationTarget::Pan, at, cx);
+            }
+            KnobTarget::Send { track, index } => {
+                self.open_param_menu(track, AutomationTarget::Send { index: index as u16 }, at, cx);
+            }
+            KnobTarget::Transpose { .. } | KnobTarget::Detune { .. } => {}
+        }
     }
 
     /// Show `track`'s automation lane for `target` in the arrangement (the
@@ -883,6 +964,8 @@ impl Workspace {
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.file_recent_open = false;
+        self.device_menu_hover = None;
         if self.menu.take().is_some() {
             cx.notify();
         }
@@ -917,7 +1000,7 @@ impl Workspace {
     /// A (Live): show or hide the automation of the selected tracks (all
     /// shown when any is hidden). While musical typing is on, A is a note.
     fn toggle_automation_mode(&mut self, _: &ToggleAutomationMode, _: &mut Window, cx: &mut Context<Self>) {
-        if self.piano_keyboard && self.bottom_open && self.s.bottom_tab == BottomTab::PianoRoll && self.modal.is_none() {
+        if self.is_typing_notes() {
             cx.propagate();
             return;
         }
@@ -1053,8 +1136,74 @@ impl Workspace {
         }).or_else(|| self.s.clip_track(clip).filter(|id| self.s.project.track(*id).is_some_and(|t| t.kind == TrackKind::Instrument)))
     }
 
+    /// Whether Computer MIDI Keyboard mode is actively intercepting letter keys to play notes.
+    pub fn is_typing_notes(&self) -> bool {
+        self.piano_keyboard && self.modal.is_none() && self.num_edit.is_none() && !self.palette.open
+    }
+
+    /// Instrument tracks that currently receive live notes from the computer MIDI keyboard.
+    pub fn keyboard_tracks(&self) -> Vec<TrackId> {
+        let explicit: Vec<TrackId> = self
+            .s
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Instrument && t.keyboard_input)
+            .map(|t| t.id)
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        let armed: Vec<TrackId> = self
+            .s
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Instrument && t.arm)
+            .map(|t| t.id)
+            .collect();
+        if !armed.is_empty() {
+            return armed;
+        }
+        self.audition_track()
+            .or_else(|| self.s.selected_track.filter(|id| self.s.project.track(*id).is_some_and(|t| t.kind == TrackKind::Instrument)))
+            .into_iter()
+            .collect()
+    }
+
+    pub fn toggle_computer_keyboard(&mut self, cx: &mut Context<Self>) {
+        self.piano_keyboard = !self.piano_keyboard;
+        if !self.piano_keyboard {
+            self.release_audition(cx);
+            self.toast("Computer MIDI Keyboard off", cx);
+        } else {
+            self.toast(format!("Computer MIDI Keyboard on (Octave C{})", self.piano_octave), cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_track_keyboard(&mut self, id: TrackId, cx: &mut Context<Self>) {
+        let Some(t) = self.s.project.track(id) else { return };
+        let next = !t.keyboard_input;
+        self.release_audition(cx);
+        self.s.set_track_keyboard(id, next);
+        if next {
+            self.piano_keyboard = true;
+        }
+        cx.notify();
+    }
+
     pub fn press_audition(&mut self, source: &str, track: TrackId, key: u8, cx: &mut Context<Self>) -> bool {
         let ok = self.audition.press(source, track, key, |t, k, v| self.b.engine.audition_note(t, k, v));
+        if !ok {
+            self.toast("Cannot audition: check the audio device and instrument", cx);
+        }
+        cx.notify();
+        ok
+    }
+
+    pub fn press_audition_many(&mut self, source: &str, tracks: &[TrackId], key: u8, velocity: u8, cx: &mut Context<Self>) -> bool {
+        let ok = self.audition.press_many(source, tracks, key, velocity, |t, k, v| self.b.engine.audition_note(t, k, v));
         if !ok {
             self.toast("Cannot audition: check the audio device and instrument", cx);
         }
@@ -1076,20 +1225,56 @@ impl Workspace {
     }
 
     fn piano_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.piano_keyboard || !self.bottom_open || self.s.bottom_tab != BottomTab::PianoRoll
-            || self.modal.is_some() || !self.focus.is_focused(window) || e.keystroke.modifiers.modified()
-        {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        self.handle_keyboard_midi_down(e, cx);
+    }
+
+    pub fn handle_keyboard_midi_down(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.is_typing_notes() || e.keystroke.modifiers.modified() {
+            return;
+        }
+        if let Some(ctrl) = crate::audition::keyboard_control(&e.keystroke.key) {
+            if !e.is_held {
+                use crate::audition::KeyboardControl::*;
+                match ctrl {
+                    OctaveDown => {
+                        self.release_audition(cx);
+                        self.piano_octave = self.piano_octave.saturating_sub(1);
+                        self.toast(format!("Keyboard octave C{}", self.piano_octave), cx);
+                    }
+                    OctaveUp => {
+                        self.release_audition(cx);
+                        self.piano_octave = (self.piano_octave + 1).min(9);
+                        self.toast(format!("Keyboard octave C{}", self.piano_octave), cx);
+                    }
+                    VelocityDown => {
+                        self.piano_velocity = self.piano_velocity.saturating_sub(15).max(10);
+                        self.toast(format!("Keyboard velocity {}", self.piano_velocity), cx);
+                    }
+                    VelocityUp => {
+                        self.piano_velocity = (self.piano_velocity + 15).min(127);
+                        self.toast(format!("Keyboard velocity {}", self.piano_velocity), cx);
+                    }
+                }
+                cx.notify();
+            }
+            cx.stop_propagation();
             return;
         }
         let Some(key) = crate::audition::keyboard_note(&e.keystroke.key, self.piano_octave) else { return };
-        let Some(track) = self.audition_track() else { return };
+        let tracks = self.keyboard_tracks();
+        if tracks.is_empty() {
+            return;
+        }
         if !e.is_held {
-            self.press_audition(&e.keystroke.key, track, key, cx);
+            self.press_audition_many(&e.keystroke.key, &tracks, key, self.piano_velocity, cx);
         }
         cx.stop_propagation();
     }
 
-    fn piano_key_up(&mut self, e: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn piano_key_up(&mut self, e: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.audition.release(&e.keystroke.key, |t, k, v| self.b.engine.audition_note(t, k, v)) {
             cx.stop_propagation();
             cx.notify();
@@ -1135,7 +1320,7 @@ impl Workspace {
                 self.num_edit = None;
                 NumKey::Cancel
             }
-            "backspace" => {
+            "backspace" | "delete" => {
                 if edit.fresh {
                     edit.text.clear();
                     edit.fresh = false;
@@ -1144,12 +1329,8 @@ impl Workspace {
                 }
                 NumKey::Typed
             }
-            _ if !k.modifiers.modified() => {
-                let Some(ch) = k
-                    .key_char
-                    .as_ref()
-                    .filter(|c| c.chars().all(|c| c.is_ascii_digit() || "-+.,".contains(c)))
-                else {
+            _ => {
+                let Some(ch) = num_edit_char(k) else {
                     return NumKey::Ignored;
                 };
                 if edit.fresh {
@@ -1159,7 +1340,6 @@ impl Workspace {
                 edit.text.push_str(ch);
                 NumKey::Typed
             }
-            _ => return NumKey::Ignored,
         };
         cx.stop_propagation();
         cx.notify();
@@ -1168,7 +1348,7 @@ impl Workspace {
 
     /// The root's key hook for value-box typing; runs before the piano keys.
     pub(crate) fn num_edit_key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.num_edit.is_none() {
+        if self.num_edit.is_none() || self.palette.open || self.modal.is_some() {
             return;
         }
         if matches!(self.num_edit_key(e, cx), NumKey::Commit) {
@@ -1326,9 +1506,25 @@ impl Workspace {
                 let (tick, key) = self.piano_pos(e.position);
                 let raw = tick - origin.0;
                 let dt = self.s.snap_tick(crate::editing::GridView::Piano, raw, e.modifiers.alt);
-                let dk = if *resize { 0 } else { key - origin.1 };
+                let diatonic = self.s.scale_folded(Some(*clip)).is_some();
+                let dk = if *resize {
+                    0
+                } else if diatonic {
+                    let rows = self.s.piano_rows(Some(*clip));
+                    let r0 = crate::state::piano_nearest_row(&rows, origin.1.clamp(0, 127) as u8) as i32;
+                    let r1 = self.piano_row_clamped(e.position.y, rows.len());
+                    r0 - r1
+                } else {
+                    key - origin.1
+                };
                 if let Some((track, previous)) = *preview {
-                    let next = (origin.1 + dk).clamp(0, 127) as u8;
+                    let next = if diatonic {
+                        self.s
+                            .clip_scale(Some(*clip))
+                            .map_or((origin.1 + dk).clamp(0, 127) as u8, |s| crate::state::step_note_in_scale(s, origin.1.clamp(0, 127) as u8, dk))
+                    } else {
+                        (origin.1 + dk).clamp(0, 127) as u8
+                    };
                     if next != previous {
                         self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
                         *preview = self.press_audition(crate::audition::NOTE, track, next, cx).then_some((track, next));
@@ -1339,7 +1535,7 @@ impl Workspace {
                     if *resize {
                         self.s.resize_notes(*clip, originals, dt);
                     } else {
-                        self.s.move_notes(*clip, originals, dt, dk);
+                        self.s.move_notes_scale(*clip, originals, dt, dk, diatonic);
                     }
                 }
             }
@@ -1461,14 +1657,21 @@ impl Workspace {
         }
     }
 
+    fn piano_row_clamped(&self, y_win: Pixels, rows_len: usize) -> i32 {
+        let b = self.regions.piano.get();
+        let y = f32::from(y_win - b.origin.y) + self.s.piano.scroll_y;
+        ((y / self.s.piano.row_h).floor() as i32).clamp(0, rows_len.saturating_sub(1) as i32)
+    }
+
     /// Window position → (tick, key) in the piano roll.
     pub fn piano_pos(&self, pos: Point<Pixels>) -> (Tick, i32) {
         let b = self.regions.piano.get();
         let x = f32::from(pos.x - b.origin.x) + self.s.piano.scroll_x;
-        let y = f32::from(pos.y - b.origin.y) + self.s.piano.scroll_y;
         let tick = (x / self.s.piano.px_per_beat * PPQ as f32) as Tick;
-        let key = 127 - (y / self.s.piano.row_h).floor() as i32;
-        (tick, key.clamp(0, 127))
+        let rows = self.s.piano_rows(self.s.selected_clip);
+        let r = self.piano_row_clamped(pos.y, rows.len()) as usize;
+        let key = rows.get(r).copied().unwrap_or(60) as i32;
+        (tick, key)
     }
 
     /// Window position → (tick, track row) in the arrangement.
@@ -2104,6 +2307,37 @@ impl Workspace {
         )
     }
 
+    /// A dismissable strip when the sandbox watchdog kills or fails to start a plugin.
+    fn render_watchdog_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.b.engine.watchdog_warning()?;
+        let pal = p();
+        Some(
+            div()
+                .flex_none()
+                .mx(px(SP1))
+                .mt(px(SP1))
+                .px(px(SP3))
+                .py(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .rounded(px(r_lg()))
+                .bg(with_alpha(pal.record, 0.14))
+                .border_1()
+                .border_color(with_alpha(pal.record, 0.5))
+                .child(crate::icons::icon(Icon::Device, 14., pal.record))
+                .child(div().flex_1().min_w(px(0.)).child(crate::widgets::label(text, TEXT_SM, pal.text)))
+                .child(crate::widgets::text_button("banner-plugins", "Plugin settings", None, false).on_click(cx.listener(|this, _, _, cx| {
+                    this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Audio), cx);
+                })))
+                .child(crate::widgets::icon_button("watchdog-close", Icon::X, false).on_click(cx.listener(|this, _, _, cx| {
+                    this.b.engine.dismiss_watchdog_warning();
+                    cx.notify();
+                })))
+                .into_any_element(),
+        )
+    }
+
     fn render_toast(&self) -> Option<AnyElement> {
         let (text, at) = self.toast.clone()?;
         if at.elapsed() > Duration::from_millis(2600) {
@@ -2246,7 +2480,10 @@ impl Render for Workspace {
             views::palette::close(self, window, cx);
         }
         let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
-        if self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self) {
+        let animate = self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self);
+        let throttle_ok = !self.look.app.low_power || self.drag.is_some() || self.last_frame.elapsed() >= Duration::from_millis(50);
+        if animate && throttle_ok {
+            self.last_frame = Instant::now();
             window.request_animation_frame();
         }
         self.fx.sample_rate = f64::from(self.b.engine.audio_config().sample_rate.max(8_000));
@@ -2304,11 +2541,14 @@ impl Render for Workspace {
         let toast = self.render_toast();
         let status = self.render_status(cx);
         let banner = self.render_banner(cx);
+        let watchdog_banner = self.render_watchdog_banner(cx);
         let palette = views::palette::render(self, window, cx);
+
+        let editing_num = self.num_edit.is_some() && !self.palette.open && self.modal.is_none();
 
         div()
             .id("workspace")
-            .key_context("Workspace")
+            .key_context(workspace_key_context(editing_num))
             .track_focus(&self.focus)
             // Clicks here are main-window clicks (popovers open in this window).
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.fx.surface = None))
@@ -2318,7 +2558,7 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
-            .on_key_down(cx.listener(Self::num_edit_key_down))
+            .capture_key_down(cx.listener(Self::num_edit_key_down))
             .on_key_down(cx.listener(Self::piano_key_down))
             .on_key_up(cx.listener(Self::piano_key_up))
             // The commands of the key table (clipboard, grid, navigation…).
@@ -2359,6 +2599,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ArrangeZoomIn, _, cx| this.arrange_zoom(1.25, cx)))
             .on_action(cx.listener(|this, _: &ArrangeZoomOut, _, cx| this.arrange_zoom(0.8, cx)))
             .on_action(cx.listener(|this, _: &ArrangeFit, _, cx| {
+                if this.is_typing_notes() {
+                    cx.propagate();
+                    return;
+                }
                 // Fit the whole song to the width of the lanes.
                 let width = f32::from(this.regions.arrange.get().size.width).max(200.);
                 let beats = (this.s.project.arrangement_end() as f32 / PPQ as f32).max(4.);
@@ -2450,6 +2694,7 @@ impl Render for Workspace {
             .children(backdrop)
             .child(views::topbar::render(self, window, cx))
             .children(banner)
+            .children(watchdog_banner)
             .children(meter_strip)
             .child(
                 div()
@@ -2524,5 +2769,35 @@ mod tests {
         assert_eq!(plain_text(120.), "120");
         assert_eq!(plain_text(-7.6), "-7.6");
         assert_eq!(parse_plain(&plain_text(0.5)), Some(0.5));
+    }
+
+    #[test]
+    fn num_edit_accepts_digits_shift_plus_and_key_fallback() {
+        use super::num_edit_char;
+        use gpui::{Keystroke, Modifiers};
+
+        let ks = |key: &str, key_char: Option<&str>, modifiers: Modifiers| Keystroke {
+            modifiers,
+            key: key.to_owned(),
+            key_char: key_char.map(str::to_owned),
+        };
+        assert_eq!(num_edit_char(&ks("1", Some("1"), Modifiers::none())), Some("1"));
+        assert_eq!(num_edit_char(&ks("0", Some("0"), Modifiers::none())), Some("0"));
+        assert_eq!(num_edit_char(&ks("-", Some("-"), Modifiers::none())), Some("-"));
+        assert_eq!(num_edit_char(&ks("=", Some("+"), Modifiers::shift())), Some("+"));
+        assert_eq!(num_edit_char(&ks("5", None, Modifiers::none())), Some("5"));
+        assert_eq!(num_edit_char(&ks("1", Some("1"), Modifiers::control())), None);
+        assert_eq!(num_edit_char(&ks("1", Some("1"), Modifiers::command())), None);
+        assert_eq!(num_edit_char(&ks("1", Some("1"), Modifiers::alt())), None);
+        assert_eq!(num_edit_char(&ks("a", Some("a"), Modifiers::none())), None);
+    }
+
+    #[test]
+    fn num_edit_key_context_suppresses_single_key_workspace_shortcuts() {
+        let editing_ctx = gpui::KeyContext::parse(super::workspace_key_context(true)).unwrap();
+        let normal_ctx = gpui::KeyContext::parse(super::workspace_key_context(false)).unwrap();
+        let pred = gpui::KeyBindingContextPredicate::parse("Workspace && !TextInput").unwrap();
+        assert!(pred.eval(&[normal_ctx]));
+        assert!(!pred.eval(&[editing_ctx]));
     }
 }

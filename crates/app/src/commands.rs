@@ -39,10 +39,9 @@ impl EditUi {
 }
 
 pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<Workspace>) {
-    // While musical typing is on, its letter keys (S, O…) play notes: the
-    // key goes on to the piano roll instead of running the command.
-    let typing_notes = ws.piano_keyboard && ws.bottom_open && ws.s.bottom_tab == crate::state::BottomTab::PianoRoll && ws.modal.is_none();
-    if typing_notes && crate::keys::is_note_key(cmd) {
+    // While musical typing is active, note & octave/velocity keys (A, S, W, O, Z, X, C…)
+    // go straight to live MIDI playing instead of firing editing shortcuts.
+    if ws.is_typing_notes() && crate::keys::is_musical_typing_key(cmd) {
         cx.propagate();
         return;
     }
@@ -158,6 +157,7 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
                 ws.toast("Select an audio or MIDI track to arm", cx);
             }
         }
+        Cmd::ComputerKeyboard => ws.toggle_computer_keyboard(cx),
         Cmd::Track1 | Cmd::Track2 | Cmd::Track3 | Cmd::Track4 | Cmd::Track5 | Cmd::Track6 | Cmd::Track7 | Cmd::Track8 => {
             let n = [Cmd::Track1, Cmd::Track2, Cmd::Track3, Cmd::Track4, Cmd::Track5, Cmd::Track6, Cmd::Track7, Cmd::Track8]
                 .iter()
@@ -290,13 +290,15 @@ fn render_consolidate(ws: &mut Workspace, job: ConsolidateJob, cx: &mut Context<
     }
     ws.toast("Rendering the audio clips…", cx);
     let project = job.project.clone();
+    let factory = ws.b.engine.export_factory();
     let tracks: Vec<TrackId> = job.groups.iter().map(|g| g.track).collect();
     let ranges: Vec<(Tick, Tick)> = job.groups.iter().map(|g| (g.start, g.end)).collect();
     let task = cx.background_executor().spawn(async move {
         let mut files = Vec::with_capacity(work.len());
         for w in work {
             let (track, range) = (tracks[w.group], ranges[w.group]);
-            let file = aitrack_engine::consolidate_to_wav(&project, track, &w.parts, range, w.rate, &w.path, None).map_err(|e| e.to_string())?;
+            let file = aitrack_engine::consolidate_to_wav_with(&project, track, &w.parts, range, w.rate, &w.path, None, &*factory)
+                .map_err(|e| e.to_string())?;
             files.push((w.group, file));
         }
         Ok::<_, String>(files)

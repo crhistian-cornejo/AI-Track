@@ -40,6 +40,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let (phase, gain) = (dev.m(0).clamp(0., 1.), dev.m(1).clamp(0., 1.));
     let (enabled, selected) = (dev.enabled, dev.selected);
     let rate = dev.text(p::RATE);
+    let mode = dev.choice(p::MODE);
+    let trig = dev.choice(p::TRIGGER);
+    let y_label = match mode {
+        1 => "cutoff",
+        2 => "L / R",
+        _ => "level",
+    };
 
     let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
         let pal = p();
@@ -47,11 +54,14 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         // Quarters of the cycle and of the level.
         for q in 1..4 {
             kit::vline(window, r, r.px(q as f32 / 4.), content(if q == 2 { 0.12 } else { 0.06 }));
-            kit::hline(window, r, r.py(q as f32 / 4.), content(0.05));
+            kit::hline(window, r, r.py(q as f32 / 4.), content(if mode == 2 && q == 2 { 0.14 } else { 0.05 }));
         }
         let n = ((r.w / 2.) as usize).clamp(48, 400);
-        // The gain applied: the curve scaled by Depth.
-        let applied = kit::sample_curve(r, n, |fx| level_frac(1. - depth * (1. - level_at(&points, tension, fx))));
+        // The modulation applied: the curve scaled by Depth.
+        let applied = kit::sample_curve(r, n, |fx| {
+            let v = level_at(&points, tension, fx);
+            level_frac(if mode == 2 { 0.5 + (v - 0.5) * depth } else { 1. - depth * (1. - v) })
+        });
         kit::fill_to(window, &applied, r.bottom(), with_alpha(color, 0.18));
         // The curve as drawn.
         let drawn = kit::sample_curve(r, n, |fx| level_frac(level_at(&points, tension, fx)));
@@ -64,17 +74,28 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::vline(window, r, r.px(phase), with_alpha(pal.text, 0.35));
             kit::dot(window, r.pt(phase, level_frac(gain)), 4., pal.text, None);
         }
-        kit::txt(window, cx, &format!("one cycle = {rate}"), r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, "level", r.right() - 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Right);
+        let trig_txt = if trig == 1 { format!("audio trig · {rate}") } else { format!("one cycle = {rate}") };
+        kit::txt(window, cx, &trig_txt, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, y_label, r.right() - 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Right);
     });
 
-    kit::panel(if dev.big { 640. } else { 420. })
+    let mut primary = vec![p::MODE, p::TRIGGER, p::RATE, p::DEPTH, p::SMOOTH, p::TENSION];
+    if trig == 1 {
+        primary.push(p::THRESHOLD);
+    }
+    if mode == 1 {
+        primary.push(p::CUTOFF);
+        primary.push(p::RESONANCE);
+    }
+    let more: Vec<u32> = [p::PHASE, p::THRESHOLD, p::CUTOFF, p::RESONANCE].into_iter().filter(|id| !primary.contains(id)).collect();
+
+    kit::panel(if dev.big { 640. } else { 440. })
         .child(div().flex_1().min_h(px(0.)).rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot))
         .child(kit::strip(
             ws,
             dev,
-            &[p::RATE, p::DEPTH, p::SMOOTH, p::TENSION, p::PHASE],
-            &[],
+            &primary,
+            &more,
             cx,
         ))
         .into_any_element()

@@ -27,6 +27,7 @@ pub enum PrefsPage {
     Appearance,
     /// Sample sources for the palette: Content Hub, Splice (opt-in).
     Sounds,
+    Performance,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,7 +120,7 @@ impl Workspace {
         let system_dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         self.look.effective = appearance::apply(&self.look.app, &self.look.lib, system_dark, animate);
         window.set_content_zoom(self.look.app.ui_scale.clamp(0.8, 1.5), cx);
-        cx.set_reduce_motion(self.look.app.reduced_motion);
+        cx.set_reduce_motion(self.look.app.reduced_motion || self.look.app.low_power);
         match self.look.app.background.clone().filter(|b| !b.path.as_os_str().is_empty()) {
             Some(bg) => {
                 let task = cx.background_executor().spawn(async move { appearance::prepare_background(&bg) });
@@ -259,6 +260,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
         PrefsPage::Audio => audio_page(ws, cx),
         PrefsPage::Appearance => appearance_page(ws, window, cx),
         PrefsPage::Sounds => sounds_page(ws, cx),
+        PrefsPage::Performance => performance_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
         let on = page == target;
@@ -292,11 +294,17 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .border_color(border())
                 .child(nav("nav-audio", Icon::Volume, "Audio", PrefsPage::Audio))
                 .child(nav("nav-look", Icon::Sparkles, "Appearance", PrefsPage::Appearance))
-                .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds)),
+                .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds))
+                .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance)),
         )
         .child(
             div()
-                .id(match page { PrefsPage::Audio => "audio-scroll", PrefsPage::Appearance => "look-scroll", PrefsPage::Sounds => "sounds-scroll" })
+                .id(match page {
+                    PrefsPage::Audio => "audio-scroll",
+                    PrefsPage::Appearance => "look-scroll",
+                    PrefsPage::Sounds => "sounds-scroll",
+                    PrefsPage::Performance => "perf-scroll",
+                })
                 .flex_1()
                 .min_w(px(0.))
                 .overflow_y_scroll()
@@ -653,12 +661,165 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             if scan.running {
                 row = row.child(widgets::hbar(scan.fraction, 160., 6., pal.accent));
             }
-            row.child(text_button("rescan", if scan.running { "Scanning…" } else { "Rescan" }, Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
+            row.child(text_button("add-plugin-folder", "Add folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
+                let rx = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Custom VST3 / CLAP folder".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = rx.await
+                        && let Some(dir) = paths.into_iter().next()
+                    {
+                        let _ = this.update(cx, |ws, cx| {
+                            if ws.b.plugins.add_plugin_folder(dir.clone()) {
+                                ws.b.plugins.rescan();
+                                ws.toast(format!("Scanning {}", dir.display()), cx);
+                            } else {
+                                ws.toast("Folder already in plugin search list", cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            })))
+            .child(text_button("rescan", if scan.running { "Scanning…" } else { "Rescan" }, Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
                 this.b.plugins.rescan();
                 cx.notify();
             })))
         }))
+        .child({
+            let defaults: Vec<String> = [aitrack_model::PluginFormat::Vst3, aitrack_model::PluginFormat::Clap]
+                .into_iter()
+                .flat_map(aitrack_host::scan::default_search_paths)
+                .map(|p| p.display().to_string())
+                .collect();
+            let custom = ws.b.plugins.plugin_folders();
+            let mut box_ = div()
+                .p(px(SP2))
+                .rounded(px(r_md()))
+                .bg(content(0.03))
+                .border_1()
+                .border_color(border())
+                .flex()
+                .flex_col()
+                .gap(px(SP1))
+                .child(label(format!("Default OS folders: {}", defaults.join(" · ")), TEXT_XS, pal.faint));
+            for (i, dir) in custom.into_iter().enumerate() {
+                let label_path = dir.display().to_string();
+                let remove_path = dir;
+                box_ = box_.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(SP2))
+                        .pt(px(SP1))
+                        .child(mono(label_path, TEXT_XS, pal.text))
+                        .child(
+                            widgets::sized_icon_button(("rm-plug-dir", i), Icon::X, false, 18., 11.)
+                                .tooltip(widgets::tip("Remove custom folder", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.b.plugins.remove_plugin_folder(&remove_path) {
+                                        this.b.plugins.rescan();
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                );
+            }
+            box_
+        })
         .child(div().pt(px(SP3)).child(label(format!("Engine: {}", ws.b.engine.status_label()), TEXT_SM, pal.faint)))
+        .into_any_element()
+}
+
+// ───────────────────────────── Performance ─────────────────────────────
+
+const CACHE_BUDGET_MB: &[usize] = &[128, 256, 512, 1024, 2048];
+
+fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let dsp_pct = ws.b.engine.cpu_load() * 100.;
+    let app_pct = ws.usage.cpu * 100.;
+    let ram = ws.usage.memory_label();
+    let (used_bytes, budget_bytes) = ws.b.engine.sample_cache_stats();
+    let used_mb = used_bytes as f64 / (1024. * 1024.);
+    let budget_mb = (budget_bytes / (1024 * 1024)).max(1);
+    let low_power = ws.look.app.low_power;
+    let sandbox = ws.b.engine.sandbox_plugins();
+
+    let tile = |caption: &'static str, value: String, detail: String| {
+        div()
+            .flex_1()
+            .p(px(SP2))
+            .rounded(px(r_md()))
+            .bg(content(0.03))
+            .border_1()
+            .border_color(border())
+            .flex()
+            .flex_col()
+            .gap(px(SP1))
+            .child(label(caption, TEXT_XS, pal.faint))
+            .child(mono(value, TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
+            .child(label(detail, TEXT_XS, pal.muted).whitespace_normal())
+    };
+    let tiles = div()
+        .py(px(SP2))
+        .flex()
+        .gap(px(SP2))
+        .child(tile("AUDIO DSP", format!("{dsp_pct:.1}%"), "Audio callback load relative to buffer window".into()))
+        .child(tile("PROCESS CPU", format!("{app_pct:.1}%"), "Total share across host & UI threads".into()))
+        .child(tile("MEMORY", ram, format!("Sample cache: {used_mb:.1} / {budget_mb} MB")));
+
+    let cache_items: Vec<(String, bool, bool)> = CACHE_BUDGET_MB
+        .iter()
+        .map(|mb| {
+            let text = if *mb >= 1024 { format!("{} GB", mb / 1024) } else { format!("{mb} MB") };
+            (text, *mb == budget_mb, true)
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .child(section_title("TELEMETRY"))
+        .child(tiles)
+        .child(section_title("POWER & UI"))
+        .child(setting_row(
+            "Low-power / battery mode",
+            Some("Throttles meter & playhead refresh to ~20 Hz and skips UI transitions".into()),
+            switch("low-power-mode", low_power).on_click(cx.listener(|this, _, _, cx| {
+                this.set_look(false, cx, |a| a.low_power = !a.low_power);
+            })),
+        ))
+        .child(section_title("MEMORY & CACHING"))
+        .child(setting_row(
+            "Sample cache budget",
+            Some("LRU cap for decoded audio files kept in RAM (evicts unused clips first)".into()),
+            chip_row("sample-cache-mb", cache_items, cx, |this, i, cx| {
+                this.b.engine.set_sample_cache_mb(CACHE_BUDGET_MB[i]);
+                cx.notify();
+            }),
+        ))
+        .child(setting_row(
+            "Idle DSP sleep & FTZ/DAZ",
+            Some("Silent effects sleep past their tail and subnormals flush to zero automatically".into()),
+            label("Active", TEXT_SM, pal.accent),
+        ))
+        .child(section_title("PLUGIN ISOLATION"))
+        .child(setting_row(
+            "Sandbox third-party plugins",
+            Some("Run VST3/CLAP plugins in external host processes to isolate crashes".into()),
+            switch("sandbox-plugins", sandbox).on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.b.engine.sandbox_plugins();
+                this.b.engine.set_sandbox_plugins(next);
+                this.toast(if next { "Plugin sandbox enabled for newly loaded plugins" } else { "Plugin sandbox disabled for newly loaded plugins" }, cx);
+                cx.notify();
+            })),
+        ))
         .into_any_element()
 }
 

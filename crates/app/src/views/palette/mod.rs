@@ -16,6 +16,7 @@
 //! own thread when auditioned or dragged, playing once they land.
 
 pub mod cloud;
+pub mod devices;
 pub mod libraries;
 pub mod packs;
 pub mod peaks;
@@ -118,9 +119,11 @@ pub enum DeviceRef {
 #[derive(Clone, Debug)]
 pub struct DeviceRow {
     pub dev: DeviceRef,
+    pub key: String,
     pub name: String,
     pub vendor: String,
     pub category: String,
+    pub group: devices::DeviceGroup,
     pub instrument: bool,
     pub format: &'static str,
 }
@@ -184,6 +187,11 @@ pub struct PaletteState {
     pub selected: usize,
     pub tab: Tab,
     pub kind: KindFilter,
+    pub device_kind: devices::DeviceKindTab,
+    pub device_group: Option<devices::DeviceGroup>,
+    pub device_groups_expanded: bool,
+    pub tags_expanded: bool,
+    pub plugin_prefs: crate::plugin_prefs::PluginPrefs,
     pub bpm: Option<(u32, u32)>,
     pub tags: Vec<String>,
     pub sort: SortCol,
@@ -237,6 +245,7 @@ impl PaletteState {
         if !self.loaded {
             self.loaded = true;
             self.settings = settings::PaletteSettings::load();
+            self.plugin_prefs = crate::plugin_prefs::PluginPrefs::load();
         }
     }
 
@@ -459,13 +468,28 @@ pub fn refresh(ws: &mut Workspace) {
 }
 
 fn device_rows(ws: &Workspace, q: &str) -> Vec<DeviceRow> {
+    let prefs = &ws.palette.plugin_prefs;
     let stock = ws.b.plugins.stock_devices().iter().filter_map(|d| {
-        let cat = d.category.label();
+        let group = devices::classify_stock(d.id, prefs);
+        let cat = group.label();
         let mut extra: Vec<&str> = d.tags.to_vec();
         extra.push(cat);
+        extra.push(d.category.label());
         extra.push("stock");
         let s = text_score(q, d.name, &extra)?;
-        Some((s + 0.1, DeviceRow { dev: DeviceRef::Stock(d.id), name: d.name.to_owned(), vendor: "AI-Track".into(), category: cat.to_owned(), instrument: d.is_instrument, format: "Stock" }))
+        Some((
+            s + 0.1,
+            DeviceRow {
+                dev: DeviceRef::Stock(d.id),
+                key: devices::stock_key(d.id),
+                name: d.name.to_owned(),
+                vendor: "AI-Track".into(),
+                category: cat.to_owned(),
+                group,
+                instrument: group.is_instrument(),
+                format: "Stock",
+            },
+        ))
     });
     let ext = ws.b.plugins.external_plugins().iter().filter_map(|p| {
         let format = match p.format {
@@ -474,8 +498,21 @@ fn device_rows(ws: &Workspace, q: &str) -> Vec<DeviceRow> {
             #[allow(unreachable_patterns)]
             _ => "Plugin",
         };
-        let s = text_score(q, &p.name, &[&p.vendor, format, if p.is_instrument { "instrument" } else { "effect" }])?;
-        Some((s, DeviceRow { dev: DeviceRef::Plugin(Box::new(p.clone())), name: p.name.clone(), vendor: p.vendor.clone(), category: if p.is_instrument { "Instrument" } else { "Effect" }.into(), instrument: p.is_instrument, format }))
+        let group = devices::classify_external(p.format, &p.uid, &p.name, &p.vendor, &p.category, p.is_instrument, prefs);
+        let s = text_score(q, &p.name, &[&p.vendor, format, group.label(), &p.category, if group.is_instrument() { "instrument" } else { "effect" }])?;
+        Some((
+            s,
+            DeviceRow {
+                dev: DeviceRef::Plugin(Box::new(p.clone())),
+                key: devices::external_key(p.format, &p.uid),
+                name: p.name.clone(),
+                vendor: p.vendor.clone(),
+                category: group.label().to_owned(),
+                group,
+                instrument: group.is_instrument(),
+                format,
+            },
+        ))
     });
     ranked(stock.chain(ext))
 }
@@ -578,7 +615,40 @@ pub fn rebuild(ws: &mut Workspace) {
             section(&mut rows, "Factory sounds", factory, search::SHOWN, both);
         }
         Tab::Splice => section(&mut rows, "", splice_items(ws), 100, false),
-        Tab::Devices => section(&mut rows, "", device_rows(ws, &q).into_iter().map(Item::Device).collect(), 400, false),
+        Tab::Devices => {
+            let mut all_devs = device_rows(ws, &q);
+            let prefs = &ws.palette.plugin_prefs;
+            let favs = prefs.favorite_set();
+            let kind_tab = ws.palette.device_kind;
+            let sub = ws.palette.device_group;
+            all_devs.retain(|d| {
+                let kind_ok = match kind_tab {
+                    devices::DeviceKindTab::All => true,
+                    devices::DeviceKindTab::Instruments => d.instrument,
+                    devices::DeviceKindTab::AudioEffects => !d.instrument,
+                    devices::DeviceKindTab::Favorites => favs.contains(d.key.as_str()),
+                };
+                kind_ok && sub.is_none_or(|g| d.group == g)
+            });
+            if kind_tab != devices::DeviceKindTab::Favorites && sub.is_none() {
+                let fav_items: Vec<Item> = all_devs.iter().filter(|d| favs.contains(d.key.as_str())).cloned().map(Item::Device).collect();
+                section(&mut rows, "Favorites", fav_items, 40, true);
+                if q.is_empty() {
+                    let recents: Vec<Item> = prefs
+                        .recents
+                        .iter()
+                        .filter_map(|rk| all_devs.iter().find(|d| &d.key == rk).cloned())
+                        .take(6)
+                        .map(Item::Device)
+                        .collect();
+                    section(&mut rows, "Recent", recents, 6, true);
+                }
+            }
+            for &g in &devices::DeviceGroup::ALL {
+                let items: Vec<Item> = all_devs.iter().filter(|d| d.group == g).cloned().map(Item::Device).collect();
+                section(&mut rows, g.header(), items, 100, true);
+            }
+        }
         Tab::Presets => section(&mut rows, "", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), 400, false),
         Tab::Commands => {
             let mut cmds: Vec<Item> = library_rows(ws, &q).into_iter().map(Item::Library).collect();
@@ -829,6 +899,8 @@ fn set_tab(ws: &mut Workspace, tab: Tab, cx: &mut Context<Workspace>) {
         ws.palette.tab = tab;
         ws.palette.selected = 0;
         ws.palette.tags.clear();
+        ws.palette.tags_expanded = false;
+        ws.palette.device_groups_expanded = false;
         ws.palette.scroll.scroll_to_item(0);
         refresh(ws);
     }
@@ -875,6 +947,7 @@ fn add_device(ws: &mut Workspace, d: &DeviceRow, cx: &mut Context<Workspace>) ->
         DeviceRef::Plugin(p) => ws.s.add_plugin_device(track, p).is_some(),
     };
     if added {
+        ws.palette.plugin_prefs.note_recent(&d.key);
         ws.bottom_open = true;
         ws.set_tab(crate::state::BottomTab::Devices, cx);
         ws.toast(format!("Added {}", d.name), cx);
@@ -1351,6 +1424,11 @@ fn device_thumb(ws: &mut Workspace, d: &DeviceRow) -> AnyElement {
 fn render_device(ws: &mut Workspace, i: usize, d: &DeviceRow, selected: bool, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let thumb = device_thumb(ws, d);
+    let fav = ws.palette.plugin_prefs.is_favorite(&d.key);
+    let key_fav = d.key.clone();
+    let key_menu = d.key.clone();
+    let menu_name = d.name.clone();
+    let inst = d.instrument;
     row_shell(i, selected, ITEM_ROW_H)
         .child(thumb)
         .child(
@@ -1364,6 +1442,26 @@ fn render_device(ws: &mut Workspace, i: usize, d: &DeviceRow, selected: bool, cx
         )
         .when(d.instrument, |r| r.child(icon(Icon::MusicNote, 12., pal.faint)))
         .child(widgets::badge(d.format, pal.muted))
+        .child(
+            div()
+                .id(("dev-fav", i))
+                .flex_none()
+                .child(if fav { icon(Icon::StarFilled, 12., pal.solo) } else { icon(Icon::Star, 12., content(0.2)) })
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.palette.plugin_prefs.toggle_favorite(&key_fav);
+                    rebuild(this);
+                    cx.notify();
+                })),
+        )
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_menu(
+                crate::workspace::MenuKind::PaletteDevice { key: key_menu.clone(), name: menu_name.clone(), instrument: inst },
+                e.position,
+                cx,
+            );
+        }))
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
             this.palette.selected = i;
             if e.click_count >= 2 {
@@ -1641,28 +1739,62 @@ fn filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .child(mono(format!("{count} results"), TEXT_XS, pal.faint))
 }
 
+const COMPACT_TAGS: usize = 6;
+
+/// Deduplicate tags case-insensitively and keep active selections first.
+fn compact_tag_list(tags: &[(String, usize)], selected: &[String]) -> Vec<(String, usize)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for sel in selected {
+        let lower = sel.to_lowercase();
+        if !seen.contains(&lower) {
+            seen.push(lower.clone());
+            let count = tags.iter().find(|(t, _)| t.eq_ignore_ascii_case(sel)).map_or(0, |x| x.1);
+            out.push((lower, count));
+        }
+    }
+    for (t, count) in tags {
+        let lower = t.to_lowercase();
+        if !seen.contains(&lower) {
+            seen.push(lower.clone());
+            out.push((lower, *count));
+        }
+    }
+    out
+}
+
 fn tag_row(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<Div> {
-    let tags: Vec<(String, usize)> = if ws.palette.tab == Tab::Splice {
+    let raw: Vec<(String, usize)> = if ws.palette.tab == Tab::Splice {
         ws.palette.splice.as_ref()?.tags.iter().map(|t| (t.label.to_lowercase(), t.count as usize)).collect()
     } else {
         ws.palette.sample_tags.clone()
     };
     let selected = &ws.palette.tags;
-    let mut shown: Vec<(String, usize)> = selected.iter().map(|t| (t.clone(), tags.iter().find(|x| &x.0 == t).map_or(0, |x| x.1))).collect();
-    shown.extend(tags.into_iter().filter(|t| !selected.contains(&t.0)).take(14usize.saturating_sub(selected.len())));
-    if shown.is_empty() {
+    let all = compact_tag_list(&raw, selected);
+    if all.is_empty() {
         return None;
     }
-    let mut row = div().id("tag-row").px(px(SP3)).flex().items_center().gap(px(SP1)).overflow_x_scroll();
-    for (i, (t, n)) in shown.into_iter().enumerate() {
-        let on = selected.contains(&t);
+    let expanded = ws.palette.tags_expanded;
+    let limit = COMPACT_TAGS.max(selected.len());
+    let hidden = all.len().saturating_sub(limit);
+    let shown = if expanded { &all[..] } else { &all[..all.len().min(limit)] };
+    let mut row = div()
+        .id("tag-row")
+        .px(px(SP3))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .when(expanded, |d| d.flex_wrap())
+        .when(!expanded, |d| d.overflow_hidden());
+    for (i, (t, n)) in shown.iter().enumerate() {
+        let on = selected.iter().any(|x| x.eq_ignore_ascii_case(t));
         let tag = t.clone();
         row = row.child(
-            chip(("tag", i), if n > 0 { format!("{t} {n}") } else { t.clone() }, on)
+            chip(("tag", i), if *n > 0 { format!("{t} {n}") } else { t.clone() }, on)
                 .h(px(20.))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let tags = &mut this.palette.tags;
-                    if let Some(p) = tags.iter().position(|x| *x == tag) {
+                    if let Some(p) = tags.iter().position(|x| x.eq_ignore_ascii_case(&tag)) {
                         tags.remove(p);
                     } else {
                         tags.push(tag.clone());
@@ -1673,7 +1805,107 @@ fn tag_row(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<Div> {
                 })),
         );
     }
+    if hidden > 0 {
+        let label_more = if expanded { "Less".to_owned() } else { format!("More (+{hidden})") };
+        row = row.child(
+            chip("tag-more", label_more, expanded)
+                .h(px(20.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.tags_expanded = !this.palette.tags_expanded;
+                    cx.notify();
+                })),
+        );
+    }
     Some(div().child(row))
+}
+
+fn device_filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
+    let pal = p();
+    let mut kinds = div().flex().items_center().gap(px(SP1));
+    for (i, k) in devices::DeviceKindTab::ALL.into_iter().enumerate() {
+        let on = ws.palette.device_kind == k;
+        kinds = kinds.child(chip(("dev-kind", i), k.label(), on).on_click(cx.listener(move |this, _, _, cx| {
+            this.palette.device_kind = k;
+            if let Some(sub) = this.palette.device_group {
+                let valid = match k {
+                    devices::DeviceKindTab::Instruments => sub.is_instrument(),
+                    devices::DeviceKindTab::AudioEffects => !sub.is_instrument(),
+                    _ => true,
+                };
+                if !valid {
+                    this.palette.device_group = None;
+                }
+            }
+            this.palette.selected = 0;
+            rebuild(this);
+            cx.notify();
+        })));
+    }
+    let count = ws.palette.rows.iter().filter(|r| matches!(r, Row::Item(_))).count();
+    let top = div()
+        .px(px(SP3))
+        .flex()
+        .items_center()
+        .gap(px(SP2))
+        .child(kinds)
+        .child(div().flex_1())
+        .child(mono(format!("{count} devices"), TEXT_XS, pal.faint));
+
+    let subgroups: Vec<devices::DeviceGroup> = match ws.palette.device_kind {
+        devices::DeviceKindTab::Instruments => devices::DeviceGroup::INSTRUMENTS.to_vec(),
+        devices::DeviceKindTab::AudioEffects => devices::DeviceGroup::EFFECTS.to_vec(),
+        devices::DeviceKindTab::All | devices::DeviceKindTab::Favorites => devices::DeviceGroup::ALL.to_vec(),
+    };
+    let expanded = ws.palette.device_groups_expanded;
+    let mut ordered = subgroups;
+    if let Some(sel) = ws.palette.device_group
+        && let Some(pos) = ordered.iter().position(|g| *g == sel)
+    {
+        let g = ordered.remove(pos);
+        ordered.insert(0, g);
+    }
+    let hidden = ordered.len().saturating_sub(COMPACT_TAGS);
+    let shown = if expanded { &ordered[..] } else { &ordered[..ordered.len().min(COMPACT_TAGS)] };
+    let mut strip = div()
+        .id("dev-group-strip")
+        .px(px(SP3))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .when(expanded, |d| d.flex_wrap())
+        .when(!expanded, |d| d.overflow_hidden())
+        .child(
+            chip("dev-grp-all", "All groups", ws.palette.device_group.is_none())
+                .h(px(20.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.device_group = None;
+                    this.palette.selected = 0;
+                    rebuild(this);
+                    cx.notify();
+                })),
+        );
+    for (i, g) in shown.iter().enumerate() {
+        let on = ws.palette.device_group == Some(*g);
+        let group = *g;
+        strip = strip.child(chip(("dev-grp", i), g.label(), on).h(px(20.)).on_click(cx.listener(move |this, _, _, cx| {
+            this.palette.device_group = if this.palette.device_group == Some(group) { None } else { Some(group) };
+            this.palette.selected = 0;
+            rebuild(this);
+            cx.notify();
+        })));
+    }
+    if hidden > 0 {
+        let label_more = if expanded { "Less".to_owned() } else { format!("More (+{hidden})") };
+        strip = strip.child(
+            chip("dev-grp-more", label_more, expanded)
+                .h(px(20.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.device_groups_expanded = !this.palette.device_groups_expanded;
+                    cx.notify();
+                })),
+        );
+    }
+    div().pb(px(SP2)).flex().flex_col().gap(px(SP2)).border_b_1().border_color(border()).child(top).child(strip)
 }
 
 fn empty_state(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
@@ -1802,6 +2034,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         });
     }
     let samples_tab = tab.samples();
+    let devices_tab = tab == Tab::Devices;
     let splice_note = (tab == Tab::Splice).then(|| {
         div().px(px(SP3)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(pal.faint).child("Splice results use Splice's unofficial web API. Previews are for auditioning; get sounds through your Splice account.")
     });
@@ -1832,7 +2065,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             d.child(div().pb(px(SP2)).flex().flex_col().gap(px(SP2)).child(filter_bar(ws, cx)).children(tags).children(splice_note))
                 .child(sort_header(ws, cx))
         })
-        .when(!samples_tab, |d| d.child(div().border_b_1().border_color(border())))
+        .when(devices_tab, |d| d.child(device_filter_bar(ws, cx)))
+        .when(!samples_tab && !devices_tab, |d| d.child(div().border_b_1().border_color(border())))
         .child(list)
         .child(footer(ws, cx));
     Some(
@@ -1912,5 +2146,14 @@ mod tests {
     fn short_keys() {
         assert_eq!(short_key(Scale::new(aitrack_model::Key(9), ScaleKind::Minor)), "Am");
         assert_eq!(short_key(Scale::new(aitrack_model::Key(6), ScaleKind::Major)), "F#");
+    }
+
+    #[test]
+    fn compact_tag_list_dedupes_case_insensitively_and_puts_selected_first() {
+        let tags = vec![("Drums".into(), 12), ("drums".into(), 8), ("Bass".into(), 9), ("Pad".into(), 4)];
+        let selected = vec!["Pad".into(), "drums".into()];
+        let compact = compact_tag_list(&tags, &selected);
+        let names: Vec<&str> = compact.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(names, vec!["pad", "drums", "bass"]);
     }
 }

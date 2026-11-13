@@ -81,6 +81,8 @@ pub struct Appearance {
     pub meter: MeterStyle,
     pub knob: KnobStyle,
     pub reduced_motion: bool,
+    /// Reduce UI frame/meter cadence & animations to save battery on laptops.
+    pub low_power: bool,
     /// The assistant's brain: a Claude model id, or `agent:<cli>`; empty
     /// for the default.
     pub assistant_model: String,
@@ -104,6 +106,7 @@ impl Default for Appearance {
             meter: MeterStyle::Zones,
             knob: KnobStyle::Arc,
             reduced_motion: false,
+            low_power: false,
             assistant_model: String::new(),
         }
     }
@@ -232,7 +235,7 @@ pub fn apply(app: &Appearance, lib: &ThemeLibrary, system_dark: bool, animate: b
         Some(bg) if !bg.path.as_os_str().is_empty() => (bg.glass.clone(), bg.glass_opacity.clamp(0.3, 1.)),
         _ => (Vec::new(), 1.),
     };
-    theme::install(&t.colors, t.dark, Resolved { style: t.style.clone(), clips: t.clips, glass, glass_alpha }, animate && !app.reduced_motion);
+    theme::install(&t.colors, t.dark, Resolved { style: t.style.clone(), clips: t.clips, glass, glass_alpha }, animate && !(app.reduced_motion || app.low_power));
     t
 }
 

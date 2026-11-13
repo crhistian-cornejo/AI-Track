@@ -1200,14 +1200,17 @@ fn a_plugin_gesture_shows_its_lane_and_is_written_while_recording_with_automatio
     let device = s.add_stock_device(audio, "fx.eq", "EQ").unwrap();
     let target = AutomationTarget::DeviceParam { device, param: 3 };
     let edit = |kind, value| PluginEdit { device, param: 3, value, kind };
-    // Automation hidden, not recording: just the parameter.
+    // Automation hidden, not recording: moving a plugin control opens automation and shows its lane.
     s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.2), edit(K::End, 0.)], None);
-    assert!(s.shown_lanes(audio).is_empty());
-    // Automation shown: touching the control shows its lane.
-    s.toggle_automation(audio);
-    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::End, 0.)], None);
-    assert_eq!(s.shown_lanes(audio), vec![target], "the empty Volume lane gave its place");
+    assert_eq!(s.shown_lanes(audio), vec![target], "touching a knob opens its automation lane");
     assert!(lane_of(&s, audio, target).is_none(), "touching writes nothing");
+    // A plugin emitting Value without Begin also reveals its automation lane.
+    let target2 = AutomationTarget::DeviceParam { device, param: 4 };
+    s.apply_plugin_edits(&[PluginEdit { device, param: 4, value: 0.35, kind: K::Value }], None);
+    assert_eq!(s.shown_lanes(audio), vec![target2], "empty first lane is reused for the newly touched param");
+    // Touching param 3 again when param 4 only has no breakpoints reuses it.
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::End, 0.)], None);
+    assert_eq!(s.shown_lanes(audio), vec![target]);
     // Recording without Automation Arm: no automation.
     s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.5), edit(K::End, 0.)], Some(0));
     assert!(lane_of(&s, audio, target).is_none());
@@ -1250,4 +1253,51 @@ fn the_header_volume_box_and_pan_use_the_mixer_commands() {
     let t = s.project.track(audio).unwrap().clone();
     let v = crate::views::arrangement::current_value(&s.project, &t, AutomationTarget::Pan).unwrap();
     assert!((v - 0.25).abs() < 1e-6, "a lane with nothing drawn shows the knob's value");
+}
+
+#[test]
+fn multi_clip_split_of_shared_clips_cleans_up_atomically() {
+    let Song { mut s, audio, .. } = song();
+    let (first, second, orig_clip) = linked_ramp(&mut s, audio);
+    // Cut both placements of the same shared clip at tick BEAT inside each.
+    // Put second placement so both span the marker by placing them on audio + midi-converted-to-audio or two tracks.
+    let audio2 = s.add_track(TrackKind::Audio).unwrap();
+    let move_cmd = Command::MovePlacement { track: audio, id: second, to_track: audio2, start: 4 * BEAT, lane: 0 };
+    assert!(s.edit("Move clip", vec![move_cmd]));
+    s.select_clips([first, second], Some(second));
+    s.ed.marker = 5 * BEAT;
+    let base = steps(&s);
+    assert_eq!(s.split(None), 2);
+    assert_eq!(steps(&s), base + 1, "splitting multiple clips is one atomic undo step");
+    assert_eq!(spans(&s, audio), [(4 * BEAT, BEAT), (5 * BEAT, BEAT)]);
+    assert_eq!(spans(&s, audio2), [(4 * BEAT, BEAT), (5 * BEAT, BEAT)]);
+    // Both left halves remain valid clips and undo restores the shared clip.
+    let c1 = s.placement(first).unwrap().1.clip;
+    let c2 = s.placement(second).unwrap().1.clip;
+    assert_ne!(c1, c2);
+    assert!(s.undo());
+    assert_eq!(s.placement(first).unwrap().1.clip, orig_clip);
+    assert_eq!(s.placement(second).unwrap().1.clip, orig_clip);
+}
+
+#[test]
+fn pitch_preserving_warp_modes_keep_clip_rate_at_one_when_transposed() {
+    let Song { mut s, audio, .. } = song();
+    let (pl, clip, _) = ramp_clip(&mut s, audio);
+    let orig_len = s.project.clips[&clip].length;
+    for mode in [WarpMode::Beats, WarpMode::Tones, WarpMode::Texture, WarpMode::Complex, WarpMode::ComplexPro] {
+        s.set_clip_warp("warp-test", clip, |w| {
+            w.enabled = true;
+            w.original_bpm = Some(120.0);
+            w.mode = mode;
+            w.transpose = 7.0;
+        });
+        assert_eq!(aitrack_model::ops::clip_rate(&s.project, clip), 1.0, "{mode:?} keeps clip rate at 1.0");
+        assert_eq!(s.project.clips[&clip].length, orig_len, "{mode:?} keeps duration unchanged");
+    }
+    // Switching to Re-Pitch couples speed with pitch again.
+    s.set_clip_warp("warp-test", clip, |w| w.mode = WarpMode::Repitch);
+    let rate = aitrack_model::ops::clip_rate(&s.project, clip);
+    assert!((rate - 2f64.powf(7.0 / 12.0)).abs() < 1e-6, "Re-Pitch changes clip rate");
+    let _ = pl;
 }

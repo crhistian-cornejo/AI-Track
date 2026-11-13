@@ -61,6 +61,8 @@ pub enum TrackProp {
     Vca(Option<TrackId>),
     Collapsed(bool),
     Height(f32),
+    Scale(Option<Scale>),
+    KeyboardInput(bool),
 }
 
 /// Where a device is inserted: a track's chain or a chain inside a rack.
@@ -153,6 +155,8 @@ impl Command {
                 TrackProp::Solo(_) => "Solo",
                 TrackProp::Sends(_) => "Change sends",
                 TrackProp::Output(_) => "Change routing",
+                TrackProp::Scale(_) => "Change track key",
+                TrackProp::KeyboardInput(_) => "Toggle computer keyboard",
                 _ => "Change track",
             },
             AddScene { .. } => "Add scene",
@@ -564,6 +568,8 @@ fn set_track_prop(t: &mut Track, change: TrackProp) -> TrackProp {
         TrackProp::Vca(v) => TrackProp::Vca(replace(&mut t.vca, v)),
         TrackProp::Collapsed(v) => TrackProp::Collapsed(replace(&mut t.collapsed, v)),
         TrackProp::Height(v) => TrackProp::Height(replace(&mut t.height, v.clamp(24.0, 400.0))),
+        TrackProp::Scale(v) => TrackProp::Scale(replace(&mut t.scale, v)),
+        TrackProp::KeyboardInput(v) => TrackProp::KeyboardInput(replace(&mut t.keyboard_input, v)),
     }
 }
 
@@ -740,5 +746,20 @@ mod tests {
         let mut p = Project::new("t");
         let main = p.main_track().id;
         assert_eq!(Command::RemoveTrack { id: main }.apply(&mut p), Err(CommandError::MainTrack));
+    }
+
+    #[test]
+    fn track_scale_and_keyboard_input_undo_cleanly() {
+        let (mut p, track) = project_with_track();
+        let scale = Some(Scale { root: crate::Key(2), kind: crate::ScaleKind::Minor });
+        let undo_scale = Command::SetTrack { id: track, change: TrackProp::Scale(scale) }.apply(&mut p).unwrap();
+        assert_eq!(p.track(track).unwrap().scale, scale);
+        undo_scale.apply(&mut p).unwrap();
+        assert_eq!(p.track(track).unwrap().scale, None);
+
+        let undo_kbd = Command::SetTrack { id: track, change: TrackProp::KeyboardInput(true) }.apply(&mut p).unwrap();
+        assert!(p.track(track).unwrap().keyboard_input);
+        undo_kbd.apply(&mut p).unwrap();
+        assert!(!p.track(track).unwrap().keyboard_input);
     }
 }

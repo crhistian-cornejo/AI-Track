@@ -259,6 +259,18 @@ impl ClapMain {
         self.gui.is_some()
     }
 
+    pub fn raise_editor(&mut self) {
+        let Some(state) = &self.gui else { return };
+        if let Some(window) = &state.window {
+            window.raise();
+        } else if state.floating
+            && let Some(gui) = self.gui_ext
+        {
+            let handle = self.instance.plugin_handle();
+            let _ = gui.show(&handle);
+        }
+    }
+
     fn api() -> GuiApiType<'static> {
         #[cfg(target_os = "macos")]
         {

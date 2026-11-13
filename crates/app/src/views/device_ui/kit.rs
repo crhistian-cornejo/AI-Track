@@ -519,16 +519,27 @@ pub fn num_w(
                 this.begin_drag(Drag::Knob { target: KnobTarget::Param { device, param: id, default }, last_y: f32::from(e.position.y), value }, cx);
             }),
         )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_knob_menu(KnobTarget::Param { device, param: id, default }, e.position, cx);
+            }),
+        )
         // A click that didn't move opens the box for typing (a moved click
         // was a drag; double-click resets, handled above on mouse-down).
         .on_click({
             let info = info_click;
-            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                 if e.click_count() >= 2 || click_dragged(e) {
                     return;
                 }
                 if matches!(&this.num_edit, Some(edit) if edit.target == NumTarget::Param { device, param: id }) {
                     return;
+                }
+                let in_device_win = this.device_windows.get(&device).is_some_and(|h| h.window_id() == window.window_handle().window_id());
+                if !in_device_win {
+                    this.focus.focus(window, cx);
                 }
                 let plain = info.to_plain(current(this, device, &info));
                 this.begin_num_edit(NumTarget::Param { device, param: id }, plain_text(plain as f64), cx);
@@ -690,6 +701,12 @@ pub fn state_paths(state: Option<&[u8]>) -> (Option<String>, Vec<Option<String>>
     let path = extra.get("path").and_then(|v| v.as_str()).map(str::to_owned);
     let pads = extra.get("pads").and_then(|v| v.as_array()).map(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
     (path, pads)
+}
+
+pub fn state_sfz_path(state: Option<&[u8]>) -> Option<String> {
+    let root = state.and_then(|s| serde_json::from_slice::<serde_json::Value>(s).ok())?;
+    let extra = root.get("extra").unwrap_or(&root);
+    extra.get("sfz_path").and_then(|v| v.as_str()).map(str::to_owned)
 }
 
 /// Paint a min/max overview into `r` (mirrored around its centre line).

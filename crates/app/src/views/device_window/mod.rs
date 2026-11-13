@@ -176,7 +176,15 @@ fn header(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>) -> 
             h.child(div().flex().items_center().gap(px(SP1)).child(div().size(px(8.)).rounded_full().bg(track_color(color))).child(label(name, TEXT_SM, pal.muted)))
         })
         .child(div().flex_1())
-        .when_some(d.preset.clone(), |h, preset| h.child(label(preset, TEXT_SM, pal.muted)))
+        .map(|h| {
+            if let Some(stepper) = crate::views::devices::preset_stepper(ws, device, &d.kind, d.preset.as_deref(), true, cx) {
+                h.child(stepper)
+            } else if let Some(preset) = d.preset.clone() {
+                h.child(label(preset, TEXT_SM, pal.muted))
+            } else {
+                h
+            }
+        })
         .child(label("Same edits as the Device View · Cmd+Z undoes either", TEXT_XS, pal.faint))
         .into_any_element()
 }
@@ -218,7 +226,7 @@ impl Render for DeviceWindow {
         }
         let title = ws.read(cx).s.project.device(device).map(|_| window_title(ws.read(cx), device)).unwrap_or_default();
         window.set_window_title(&title);
-        let (content, captures, frames) = ws.update(cx, |ws, cx| {
+        let (content, captures, frames, num_editing) = ws.update(cx, |ws, cx| {
             ws.fx.painting = Some(wid);
             let header = header(ws, device, cx);
             let body = body(ws, device, cx);
@@ -230,17 +238,20 @@ impl Render for DeviceWindow {
             caps.extend(device_ui::overlay(ws, Some(wid), cx));
             ws.fx.painting = None;
             let playing = ws.b.engine.transport().playing;
-            let frames = playing || ws.drag.is_some() || ws.fx.wants_frames() || synth::wants_frames(ws, device) || ws.audition.is_active();
-            (div().size_full().flex().flex_col().child(header).child(div().flex_1().min_h(px(0.)).child(body)), caps, frames)
+            let raw_frames = playing || ws.drag.is_some() || ws.fx.wants_frames() || synth::wants_frames(ws, device) || ws.audition.is_active();
+            let throttle_ok = !ws.look.app.low_power || ws.drag.is_some() || ws.last_frame.elapsed() >= std::time::Duration::from_millis(50);
+            let frames = raw_frames && throttle_ok;
+            let num_editing = ws.num_edit.is_some();
+            (div().size_full().flex().flex_col().child(header).child(div().flex_1().min_h(px(0.)).child(body)), caps, frames, num_editing)
         });
         if frames {
             window.request_animation_frame();
         }
         let weak = self.ws.clone();
-        let (w1, w2, w3, w4) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w1, w2, w3, w4, w5, w6) = (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         div()
             .id("device-window")
-            .key_context("Workspace")
+            .key_context(crate::workspace::workspace_key_context(num_editing))
             .track_focus(&self.focus)
             .size_full()
             .bg(pal.base)
@@ -253,9 +264,19 @@ impl Render for DeviceWindow {
                     ws.update(cx, |ws, _| ws.fx.surface = Some(wid));
                 }
             })
-            .on_key_down(move |e, window, cx| {
+            .capture_key_down(move |e, window, cx| {
                 if let Some(ws) = w2.upgrade() {
                     ws.update(cx, |ws, cx| ws.num_edit_key_down(e, window, cx));
+                }
+            })
+            .on_key_down(move |e, _, cx| {
+                if let Some(ws) = w5.upgrade() {
+                    ws.update(cx, |ws, cx| ws.handle_keyboard_midi_down(e, cx));
+                }
+            })
+            .on_key_up(move |e, window, cx| {
+                if let Some(ws) = w6.upgrade() {
+                    ws.update(cx, |ws, cx| ws.piano_key_up(e, window, cx));
                 }
             })
             .on_action(move |a: &Undo, window, cx| {

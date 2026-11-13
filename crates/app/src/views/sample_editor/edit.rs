@@ -294,6 +294,16 @@ pub fn reset_shaping(s: &mut AppState, clip: ClipId) -> bool {
     *old != new && sealed(s, "Reset fades and volume", vec![Command::UpdateClip { id: clip, clip: Box::new(new) }])
 }
 
+/// Whether `u` falls strictly inside the clip's placed range in the arrangement.
+pub fn can_split(s: &AppState, clip: ClipId, u: Tick) -> bool {
+    let Some(c) = s.project.clips.get(&clip) else { return false };
+    if placement_of(s, clip).is_none() {
+        return false;
+    }
+    let local = clip_time(u, c.offset, ops::clip_rate(&s.project, clip));
+    local > 0 && local < c.length
+}
+
 /// Cut the clip in two at unrolled position `u`. The left part keeps its
 /// placement and stays selected (it keeps the clip's id too, unless the clip
 /// is used somewhere else, which is left as it is). Needs the clip to be in

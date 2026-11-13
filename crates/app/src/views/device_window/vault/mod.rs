@@ -132,6 +132,13 @@ pub fn macro_dial(dev: &Dev, m: u32, name: &str, side: f32, cx: &mut Context<Wor
                 let value = info.as_ref().map_or(0., |i| current(this, device, i));
                 this.begin_drag(Drag::Knob { target: KnobTarget::Param { device, param: id, default }, last_y: f32::from(e.position.y), value }, cx);
             }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_knob_menu(KnobTarget::Param { device, param: id, default }, e.position, cx);
+            }),
         );
     div()
         .flex_none()

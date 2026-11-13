@@ -229,6 +229,10 @@ impl Scanner {
         &self.cache
     }
 
+    pub fn has_scanner_exe(&self) -> bool {
+        self.scanner_exe.is_some()
+    }
+
     pub fn plugins(&self) -> Vec<HostedPluginInfo> {
         self.cache.plugins().cloned().collect()
     }

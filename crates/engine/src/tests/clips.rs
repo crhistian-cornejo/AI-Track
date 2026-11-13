@@ -566,7 +566,7 @@ fn consolidate_renders_the_clips_with_their_gain_and_the_gaps() {
     // Written out: mono, because the file is mono, and warped at the song tempo.
     let dir = std::env::temp_dir().join(format!("aitrack-consolidate-{}", std::process::id()));
     let path = dir.join("joined.wav");
-    let file = consolidate_to_wav(&b.p, t, &ids, (PPQ, 4 * PPQ), 48_000, &path, Some(samples)).unwrap();
+    let file = consolidate_to_wav(&b.p, t, &ids, (PPQ, 4 * PPQ), 48_000, &path, Some(samples.clone())).unwrap();
     assert_eq!((file.channels, file.frames, file.sample_rate), (1, 3 * BEAT as u64, 48_000));
     assert_eq!((file.warp.enabled, file.warp.original_bpm), (true, Some(120.0)));
     assert_eq!(file.length_ticks(90.0), 3 * PPQ, "it stays three beats long at another tempo");
@@ -576,4 +576,47 @@ fn consolidate_renders_the_clips_with_their_gain_and_the_gaps() {
     let _ = std::fs::remove_dir_all(&dir);
     // Notes clips are refused.
     assert!(render_clips(&b.p, t, &[PlacementId(9999)], (0, PPQ), SR, None).is_err());
+
+    // With a processor factory, track insert effects are baked into consolidated audio.
+    struct HalfGain(aitrack_dsp::PluginInfo);
+    impl aitrack_dsp::Processor for HalfGain {
+        fn info(&self) -> &aitrack_dsp::PluginInfo {
+            &self.0
+        }
+        fn prepare(&mut self, _: f64, _: usize) {}
+        fn reset(&mut self) {}
+        fn process(&mut self, ctx: &mut aitrack_dsp::ProcessContext<'_>) {
+            for ch in 0..ctx.buffer.channels() {
+                for s in ctx.buffer.channel_mut(ch) {
+                    *s *= 0.5;
+                }
+            }
+        }
+        fn set_param(&mut self, _: u32, _: f32) {}
+        fn get_param(&self, _: u32) -> f32 {
+            0.0
+        }
+    }
+    struct HalfGainFactory;
+    impl crate::factory::ProcessorFactory for HalfGainFactory {
+        fn create(&self, _: &Device, _: f64, _: usize) -> Option<Box<dyn aitrack_dsp::Processor>> {
+            Some(Box::new(HalfGain(aitrack_dsp::PluginInfo {
+                id: "fx.test",
+                name: "HalfGain",
+                vendor: "AI-Track",
+                category: aitrack_dsp::Category::Effect,
+                tags: &[],
+                params: Vec::new(),
+                inputs: 2,
+                outputs: 2,
+                has_sidechain: false,
+            })))
+        }
+    }
+    let did = b.p.alloc_device_id();
+    b.p.track_mut(t).unwrap().devices.push(Device::stock(did, "fx.test", "HalfGain"));
+    let fx_out = render_clips_with(&b.p, t, &ids, (PPQ, 4 * PPQ), SR, Some(samples), &HalfGainFactory).unwrap();
+    for i in (500..BEAT).step_by(997) {
+        assert!((fx_out.channel(0)[2 * BEAT + i] - 0.5 * data[BEAT + i]).abs() < 1e-4);
+    }
 }

@@ -153,6 +153,13 @@ impl MainSide {
         }
     }
 
+    fn raise_editor(&mut self) {
+        match self {
+            MainSide::Vst3(m) => m.raise_editor(),
+            MainSide::Clap(m) => m.raise_editor(),
+        }
+    }
+
     fn idle(&mut self, state: &SharedState) {
         match self {
             MainSide::Vst3(m) => m.idle(state),
@@ -482,7 +489,14 @@ impl PluginController {
 
     pub fn open_editor(&self) -> Result<()> {
         let title = format!("{} — {}", self.shared.state.hosted.name, self.shared.state.hosted.vendor);
-        self.call(|m| if m.is_editor_open() { Ok(()) } else { m.open_editor(&title) })??;
+        self.call(|m| {
+            if m.is_editor_open() {
+                m.raise_editor();
+                Ok(())
+            } else {
+                m.open_editor(&title)
+            }
+        })??;
         self.shared.state.editor_opened.store(true, Ordering::Relaxed);
         Ok(())
     }

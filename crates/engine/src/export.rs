@@ -315,14 +315,28 @@ pub fn render_clips(
     sample_rate: f64,
     samples: Option<SampleCache>,
 ) -> Result<AudioBuffer, EngineError> {
-    let scratch = clips_only(project, track, placements)?;
-    let samples = samples.unwrap_or_else(SampleCache::blocking);
-    render_offline_with(&scratch, &crate::factory::NullFactory, range, sample_rate, 512, samples)
+    render_clips_with(project, track, placements, range, sample_rate, samples, &crate::factory::NullFactory)
 }
 
-/// A project with one plain audio track (no devices, unity gain, centred)
-/// holding copies of the given placements, the tempo of `project` and
-/// nothing else.
+/// [`render_clips`] with a processor factory so the track's insert effects
+/// and device automation are baked into the consolidated audio.
+pub fn render_clips_with(
+    project: &Project,
+    track: TrackId,
+    placements: &[PlacementId],
+    range: (Tick, Tick),
+    sample_rate: f64,
+    samples: Option<SampleCache>,
+    factory: &dyn ProcessorFactory,
+) -> Result<AudioBuffer, EngineError> {
+    let scratch = clips_only(project, track, placements)?;
+    let samples = samples.unwrap_or_else(SampleCache::blocking);
+    render_offline_with(&scratch, factory, range, sample_rate, 512, samples)
+}
+
+/// A project with one audio track (insert devices and device automation preserved,
+/// unity mixer gain, centred) holding copies of the given placements, the tempo
+/// of `project` and nothing else.
 fn clips_only(project: &Project, track: TrackId, placements: &[PlacementId]) -> Result<Project, EngineError> {
     let from = project.track(track).ok_or_else(|| EngineError::Export("the track is gone".into()))?;
     let mut p = Project::new(project.name.clone());
@@ -335,6 +349,18 @@ fn clips_only(project: &Project, track: TrackId, placements: &[PlacementId]) -> 
     }
     let id = p.alloc_track_id();
     let mut lane = Track::new(id, TrackKind::Audio, "Consolidate", Color(0));
+    lane.devices = from.devices.clone();
+    lane.automation = from
+        .automation
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.target,
+                AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }
+            )
+        })
+        .cloned()
+        .collect();
     let mut sources = std::collections::BTreeMap::new();
     for want in placements {
         let pl = from.arrangement.iter().find(|pl| pl.id == *want).ok_or_else(|| EngineError::Export("a clip is gone".into()))?;
@@ -371,7 +397,23 @@ pub fn consolidate_to_wav(
     path: &Path,
     samples: Option<SampleCache>,
 ) -> Result<AudioSource, EngineError> {
-    let mut buf = render_clips(project, track, placements, range, sample_rate as f64, samples)?;
+    consolidate_to_wav_with(project, track, placements, range, sample_rate, path, samples, &crate::factory::NullFactory)
+}
+
+/// [`consolidate_to_wav`] with a processor factory so the track's insert
+/// effects and device automation are baked into the output file.
+#[allow(clippy::too_many_arguments)]
+pub fn consolidate_to_wav_with(
+    project: &Project,
+    track: TrackId,
+    placements: &[PlacementId],
+    range: (Tick, Tick),
+    sample_rate: u32,
+    path: &Path,
+    samples: Option<SampleCache>,
+    factory: &dyn ProcessorFactory,
+) -> Result<AudioSource, EngineError> {
+    let mut buf = render_clips_with(project, track, placements, range, sample_rate as f64, samples, factory)?;
     let files: Vec<&AudioSource> = project
         .track(track)
         .into_iter()

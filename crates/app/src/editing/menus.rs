@@ -7,7 +7,7 @@ use crate::icons::Icon;
 use crate::keys::{self, Cmd};
 use crate::theme::*;
 use crate::widgets::{self, menu_item, mono};
-use crate::workspace::Workspace;
+use crate::workspace::{MenuKind, Workspace};
 use aitrack_model::{DeviceId, TrackId, TrackKind};
 use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window};
 
@@ -130,6 +130,24 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
     let many = ws.s.selected_tracks().len() > 1;
     let mut card = widgets::menu_card("track-menu", 232.);
     if groupable {
+        if t.kind == TrackKind::Instrument {
+            let kbd = t.keyboard_input;
+            card = card.child(
+                item("track-kbd", Icon::Keyboard, "Play with Computer Keyboard", None, kbd)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.toggle_track_keyboard(track, cx);
+                    })),
+            );
+        }
+        let key_hint = t.scale.map(|s| s.display()).unwrap_or_else(|| "Project".into());
+        card = card.child(
+            item("track-key", Icon::MusicNote, "Track Key / Scale…", Some(key_hint), t.scale.is_some())
+                .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                    let at = e.position();
+                    this.open_menu(MenuKind::TrackScale(track), gpui::point(at.x, at.y + gpui::px(8.)), cx);
+                })),
+        );
         card = card.child(action(
             "track-group",
             Icon::Group,

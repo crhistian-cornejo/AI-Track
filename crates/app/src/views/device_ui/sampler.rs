@@ -14,8 +14,14 @@ use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, TextAlign, d
 pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let (path, _) = kit::state_paths(d.state.as_deref());
+    let sfz_path = kit::state_sfz_path(d.state.as_deref());
+    let zone_count = dev.m(3).round() as usize;
     let wave = path.as_deref().map(|p| ws.fx.waves.get(p)).unwrap_or_default();
-    let name = path.as_deref().and_then(|p| std::path::Path::new(p).file_name()).map(|n| n.to_string_lossy().into_owned());
+    let name = sfz_path
+        .as_deref()
+        .or(path.as_deref())
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().into_owned());
     let looping = dev.choice(p::MODE) == 2;
     let frac = |id: u32| dev.plain(id) / 100.;
     let (start, end, loop_start, loop_end) = (frac(p::START), frac(p::END), frac(p::LOOP_START), frac(p::LOOP_END));
@@ -31,7 +37,14 @@ pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Worksp
         let pal = p();
         kit::hline(window, r, r.py(0.5), pal.grid_bar);
         if wave.is_empty() {
-            kit::txt(window, cx, "No sample loaded", r.px(0.5), r.py(0.5) - 7., TEXT_SM, pal.faint, TextAlign::Center);
+            let empty_msg = if zone_count > 0 {
+                format!("SFZ instrument · {zone_count} zones mapped")
+            } else if sfz_path.is_some() {
+                "SFZ multi-zone instrument loaded".to_string()
+            } else {
+                "No sample loaded".to_string()
+            };
+            kit::txt(window, cx, &empty_msg, r.px(0.5), r.py(0.5) - 7., TEXT_SM, if zone_count > 0 { pal.accent } else { pal.faint }, TextAlign::Center);
         } else {
             kit::paint_wave(window, r.inset(2.), &wave, if enabled { pal.waveform } else { pal.muted });
         }

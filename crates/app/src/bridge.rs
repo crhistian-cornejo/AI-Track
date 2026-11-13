@@ -118,6 +118,25 @@ pub trait EngineBridge {
         None
     }
     fn dismiss_banner(&mut self) {}
+    /// Persistent warning when a sandboxed plugin hung/crashed or failed to load.
+    fn watchdog_warning(&self) -> Option<String> {
+        None
+    }
+    fn dismiss_watchdog_warning(&mut self) {}
+    /// Warning text for a specific device whose host hung, crashed, or failed to start.
+    fn device_warning(&self, _device: aitrack_model::DeviceId) -> Option<String> {
+        None
+    }
+    /// Processor factory for offline clip consolidation and audio rendering.
+    fn export_factory(&self) -> std::sync::Arc<dyn aitrack_engine::ProcessorFactory> {
+        std::sync::Arc::new(aitrack_engine::NullFactory)
+    }
+    /// Memory budget for decoded audio files in MB.
+    fn set_sample_cache_mb(&mut self, _mb: usize) {}
+    /// `(used_bytes, budget_bytes)` of decoded audio in memory.
+    fn sample_cache_stats(&self) -> (usize, usize) {
+        (0, 512 * 1024 * 1024)
+    }
     /// Short status-bar text ("WASAPI · 48 kHz · 256").
     fn status_label(&self) -> String {
         "Engine: stub".into()
@@ -316,6 +335,8 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
         "fx.utility" => put(&[0.7 * env, 0.64 * env, 0.55 + 0.3 * (secs * 0.7).sin()]),
         "fx.filter" => put(&[0.0, 0.0, env]),
         "instrument.wavetable" => put(&[if playing { 3.0 } else { 0.0 }, 0.5 * env, 0.46 * env]),
+        "instrument.acid303" => put(&[if playing { 1.0 } else { 0.0 }, if playing { ((beat * 4.0) as usize % 16) as f32 } else { -1.0 }, 0.6 * env, env]),
+        "instrument.kick808" => put(&[if playing { 1.0 } else { 0.0 }, 0.25, 0.85 * env, env]),
         "instrument.sampler" => put(&[if playing { 1.0 } else { 0.0 }, if playing { beat.fract() } else { 0.0 }, 0.5 * env]),
         "instrument.drum" => {
             let mut v = [0.0f32; 18];
@@ -840,6 +861,7 @@ pub struct DeviceInfo {
     pub category: DeviceCategory,
     pub tags: &'static [&'static str],
     pub params: Vec<ParamInfo>,
+    #[allow(dead_code)]
     pub is_instrument: bool,
 }
 
@@ -849,6 +871,7 @@ pub struct ExternalPlugin {
     pub name: String,
     pub vendor: String,
     pub format: PluginFormat,
+    pub category: String,
     pub path: PathBuf,
     pub is_instrument: bool,
 }
@@ -900,6 +923,15 @@ pub trait PluginCatalog {
     fn poll(&mut self) -> bool {
         false
     }
+    fn plugin_folders(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    fn add_plugin_folder(&mut self, _path: PathBuf) -> bool {
+        false
+    }
+    fn remove_plugin_folder(&mut self, _path: &Path) -> bool {
+        false
+    }
 }
 
 pub struct StubCatalog {
@@ -912,11 +944,12 @@ impl Default for StubCatalog {
         // The real stock devices: listing them needs no audio device, and the
         // demo project (and every device editor) uses their parameter ids.
         let stock = crate::real::plugins::stock_devices();
-        let ext = |name: &str, vendor: &str, format, inst| ExternalPlugin {
+        let ext = |name: &str, vendor: &str, format, category: &str, inst| ExternalPlugin {
             uid: format!("{vendor}.{name}").to_lowercase().replace(' ', "-"),
             name: name.into(),
             vendor: vendor.into(),
             format,
+            category: category.into(),
             path: PathBuf::from(match format {
                 PluginFormat::Vst3 => format!("C:/Program Files/Common Files/VST3/{name}.vst3"),
                 PluginFormat::Clap => format!("C:/Program Files/Common Files/CLAP/{name}.clap"),
@@ -924,13 +957,13 @@ impl Default for StubCatalog {
             is_instrument: inst,
         };
         let external = vec![
-            ext("Surge XT", "Surge Synth Team", PluginFormat::Clap, true),
-            ext("Vital", "Vital Audio", PluginFormat::Vst3, true),
-            ext("Dexed", "Digital Suburban", PluginFormat::Vst3, true),
-            ext("OTT", "Xfer Records", PluginFormat::Vst3, false),
-            ext("Valhalla Supermassive", "Valhalla DSP", PluginFormat::Vst3, false),
-            ext("Airwindows Consolidated", "Airwindows", PluginFormat::Clap, false),
-            ext("Chow Tape Model", "Chowdhury DSP", PluginFormat::Clap, false),
+            ext("Surge XT", "Surge Synth Team", PluginFormat::Clap, "instrument|synthesizer", true),
+            ext("Vital", "Vital Audio", PluginFormat::Vst3, "Instrument|Synth", true),
+            ext("Dexed", "Digital Suburban", PluginFormat::Vst3, "Instrument|Synth", true),
+            ext("OTT", "Xfer Records", PluginFormat::Vst3, "Fx|Dynamics", false),
+            ext("Valhalla Supermassive", "Valhalla DSP", PluginFormat::Vst3, "Fx|Reverb", false),
+            ext("Airwindows Consolidated", "Airwindows", PluginFormat::Clap, "audio-effect", false),
+            ext("Chow Tape Model", "Chowdhury DSP", PluginFormat::Clap, "audio-effect|distortion", false),
         ];
         Self { stock, external }
     }

@@ -50,6 +50,11 @@ impl Window {
         self.shown.set(true);
     }
 
+    pub fn raise(&self) {
+        self.window.makeKeyAndOrderFront(None);
+        self.window.orderFrontRegardless();
+    }
+
     pub fn client_size(&self) -> (u32, u32) {
         let frame = self.view.frame();
         (frame.size.width.max(0.0) as u32, frame.size.height.max(0.0) as u32)

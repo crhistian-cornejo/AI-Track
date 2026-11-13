@@ -114,10 +114,11 @@ pub fn toggle_loop(p: &Project, clip: ClipId) -> Option<Command> {
 }
 
 /// Source ticks an audio clip plays per tick of clip time: its transpose and
-/// detune as a speed (Re-Pitch). 1 for a notes clip.
+/// detune as a speed when unwarped or in Re-Pitch, or 1 for pitch-preserving
+/// warp modes (`Beats`, `Tones`, `Texture`, `Complex`, `ComplexPro`).
 pub fn clip_rate(p: &Project, clip: ClipId) -> f64 {
     match p.clips.get(&clip).and_then(|c| p.sources.get(&c.source)) {
-        Some(Source::Audio(a)) => a.warp.pitch_ratio().max(1e-6),
+        Some(Source::Audio(a)) => a.warp.speed_ratio().max(1e-6),
         _ => 1.0,
     }
 }
@@ -213,8 +214,10 @@ pub fn stretched(clip: &Clip, warp: &Warp, bpm: f64, new_length: Tick) -> Option
         _ => bpm,
     };
     let mut w = warp.clone();
+    if !w.enabled {
+        w.mode = WarpMode::Repitch;
+    }
     w.enabled = true;
-    w.mode = WarpMode::Repitch;
     w.original_bpm = Some(original * k);
     for m in &mut w.markers {
         m.1 = scale(m.1);
@@ -415,21 +418,21 @@ pub fn heard_notes(clip: &Clip, notes: &[Note]) -> Vec<Note> {
 }
 
 /// Settle a notes clip that does not loop onto offset 0: its notes move by
-/// the offset so they keep their place on the timeline, and the notes that
-/// start before the clip (never played, crossing its start included) go.
-/// Notes past the clip's end are kept, so dragging the right edge out still
-/// reveals them. The clip gets notes of its own; the old ones are removed
+/// the offset so they keep their place on the timeline. Notes that start
+/// before the clip (`start < 0`) or past its end are kept (neither plays while
+/// outside `0..length`), so dragging the left or right edge back out restores
+/// them. The clip gets notes of its own; the old ones are removed
 /// when nothing else uses them. `None` when there is nothing to settle (a
 /// looping or audio clip, or offset 0 already). This is what the left-edge
 /// trim ends with, so the piano roll, which shows a clip's notes from tick
-/// 0, shows and edits exactly what plays.
+/// 0, displays and edits the active region non-destructively.
 pub fn rebase_notes(p: &mut Project, clip: ClipId) -> Option<Vec<Command>> {
     let old = p.clips.get(&clip)?.clone();
     if old.offset == 0 || old.looping.is_some_and(|l| l.end > l.start) {
         return None;
     }
     let Some(Source::Notes(src)) = p.sources.get(&old.source) else { return None };
-    let kept: Vec<Note> = src.notes.iter().filter(|n| n.start >= old.offset).map(|n| Note { start: n.start - old.offset, ..n.clone() }).collect();
+    let kept: Vec<Note> = src.notes.iter().map(|n| Note { start: n.start - old.offset, ..n.clone() }).collect();
     let source = p.alloc_source_id();
     let notes = kept.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
     let looping = old.looping.map(|l| LoopRegion { start: l.start - old.offset, end: l.end - old.offset });
@@ -1403,9 +1406,25 @@ mod tests {
             let c = &p.clips[&clip];
             assert_eq!((c.offset, c.length), (0, 3 * BEAT - BEAT / 4));
             let q = BEAT / 4;
-            assert_eq!(notes_of(p, clip), [(BEAT - q, 62, BEAT / 2), (2 * BEAT - q, 63, BEAT / 2), (5 * BEAT - q, 70, BEAT)], "the crossing note went; the rest kept their place");
+            assert_eq!(
+                notes_of(p, clip),
+                [(-BEAT - q, 60, BEAT / 2), (-q, 61, BEAT), (BEAT - q, 62, BEAT / 2), (2 * BEAT - q, 63, BEAT / 2), (5 * BEAT - q, 70, BEAT)],
+                "earlier notes shift before 0 so dragging left back out restores them"
+            );
+            let Some(Source::Notes(src)) = p.sources.get(&c.source) else { unreachable!() };
+            assert_eq!(heard_notes(c, &src.notes).len(), 2, "only notes inside 0..length play");
             assert!(!p.sources.contains_key(&original));
         });
+        // `round_trip` leaves the project before `rebase_notes`; settle it, then trim back left.
+        let settle_trimmed = rebase_notes(&mut f.p, clip).unwrap();
+        Command::Batch { commands: settle_trimmed }.apply(&mut f.p).unwrap();
+        let restore = trim_start(&f.p, track, placement, 4 * BEAT).unwrap();
+        Command::Batch { commands: restore }.apply(&mut f.p).unwrap();
+        let settle_back = rebase_notes(&mut f.p, clip).unwrap();
+        Command::Batch { commands: settle_back }.apply(&mut f.p).unwrap();
+        let c = &f.p.clips[&clip];
+        let Some(Source::Notes(src)) = f.p.sources.get(&c.source) else { unreachable!() };
+        assert_eq!(heard_notes(c, &src.notes).len(), 4, "earlier notes return when trimmed left again");
         assert_eq!(rebase_notes(&mut f.p, ClipId(9999)), None);
     }
 
@@ -1441,7 +1460,10 @@ mod tests {
         edit(&mut old, |c| c.offset = BEAT);
         let cmds = rebase_all_notes(&mut old.p);
         Command::Batch { commands: cmds }.apply(&mut old.p).unwrap();
-        assert_eq!(notes_of(&old.p, old.clip).len(), 3);
+        assert_eq!(notes_of(&old.p, old.clip).len(), 4);
+        let c = &old.p.clips[&old.clip];
+        let Some(Source::Notes(src)) = old.p.sources.get(&c.source) else { unreachable!() };
+        assert_eq!(heard_notes(c, &src.notes).len(), 3);
         assert!(rebase_all_notes(&mut old.p).is_empty());
     }
 }

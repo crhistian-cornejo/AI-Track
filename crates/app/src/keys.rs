@@ -134,6 +134,7 @@ commands! {
     Follow,
     FoldTrack,
     ArmTrack,
+    ComputerKeyboard,
     Track1,
     Track2,
     Track3,
@@ -216,6 +217,7 @@ pub static TABLE: &[Entry] = &[
     ),
     cmd(Cmd::FoldTrack, "Fold / Unfold Group", "Fold the selected group, or the group the selected track is in.", C::Tracks, &["s"]),
     cmd(Cmd::ArmTrack, "Arm", "Arm the selected track for recording.", C::Tracks, &["c"]),
+    cmd(Cmd::ComputerKeyboard, "Computer MIDI Keyboard", "Play instruments with your PC/Mac keyboard (Z/X octave, C/V velocity).", C::Tracks, &["m"]),
     main("ToggleAutomationMode", "Show Automation", "Show or hide the automation lanes of the selected tracks.", C::Tracks, K, &["a"]),
     main("ToggleAutomationArm", "Automation Arm", "While recording, moving a control in a plugin's window writes its automation.", C::Transport, W, &[]),
     cmd(Cmd::Track1, "Track 1 Activator", "Switch the first track on or off.", C::Tracks, &["f1"]),
@@ -354,6 +356,16 @@ pub fn hint(cmd: Cmd) -> Option<String> {
 /// Whether one of the command's keys is a note key of musical typing.
 pub fn is_note_key(cmd: Cmd) -> bool {
     TABLE.iter().filter(|e| e.bound == Bound::Cmd(cmd)).flat_map(|e| e.keys).any(|k| crate::audition::keyboard_note(k, 4).is_some())
+}
+
+/// Whether a command's key is used for note playing or octave/velocity control when Computer MIDI Keyboard is active.
+pub fn is_musical_typing_key(cmd: Cmd) -> bool {
+    is_note_key(cmd)
+        || TABLE
+            .iter()
+            .filter(|e| e.bound == Bound::Cmd(cmd))
+            .flat_map(|e| e.keys)
+            .any(|k| crate::audition::keyboard_control(k).is_some())
 }
 
 /// The shortcut of an action bound in `actions.rs`.

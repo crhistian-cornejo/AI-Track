@@ -25,7 +25,7 @@ use aitrack_model::{Device, DeviceId, DeviceKind};
 use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -109,6 +109,10 @@ pub struct PluginRuntime {
     instances: Mutex<Instances>,
     pub sandbox: AtomicBool,
     messages: Mutex<Vec<String>>,
+    /// Per-device runtime warning (hung by watchdog, crashed, failed to start).
+    warnings: Mutex<HashMap<DeviceId, (u64, String)>>,
+    /// Sticky banner alert when a sandboxed plugin hung or crashed.
+    watchdog_alert: Mutex<Option<String>>,
     /// GUI edits drained from the queues, waiting for the UI to turn them
     /// into commands.
     edits: Mutex<Vec<PluginEdit>>,
@@ -136,6 +140,8 @@ impl PluginRuntime {
             instances: Mutex::new(Instances::default()),
             sandbox: AtomicBool::new(sandbox),
             messages: Mutex::new(Vec::new()),
+            warnings: Mutex::new(HashMap::new()),
+            watchdog_alert: Mutex::new(None),
             edits: Mutex::new(Vec::new()),
             next_token: AtomicU64::new(1),
         })
@@ -151,6 +157,23 @@ impl PluginRuntime {
 
     pub fn take_messages(&self) -> Vec<String> {
         std::mem::take(&mut *self.messages.lock())
+    }
+
+    pub fn set_device_warning(&self, device: DeviceId, token: u64, msg: impl Into<String>) {
+        let text = msg.into();
+        self.warnings.lock().insert(device, (token, text));
+    }
+
+    pub fn device_warning(&self, device: DeviceId) -> Option<String> {
+        self.warnings.lock().get(&device).map(|(_, s)| s.clone())
+    }
+
+    pub fn watchdog_warning(&self) -> Option<String> {
+        self.watchdog_alert.lock().clone()
+    }
+
+    pub fn dismiss_watchdog_warning(&self) {
+        *self.watchdog_alert.lock() = None;
     }
 
     /// The full description of a project's plugin device.
@@ -179,9 +202,18 @@ impl PluginRuntime {
     /// report sandboxed plugins whose host stopped responding.
     pub fn idle(&self) -> bool {
         let ran = self.main.pump();
-        let hung: Vec<&'static str> = self.instances.lock().sandboxed.values().filter(|(_, e)| e.take_hung()).map(|(_, e)| e.name()).collect();
-        for name in &hung {
-            self.message(format!("{name} stopped responding and was closed. It stays silent until you remove it and add it again."));
+        let hung: Vec<(DeviceId, u64, &'static str)> = {
+            let mut inst = self.instances.lock();
+            inst.sandboxed
+                .iter_mut()
+                .filter_map(|(&device, (token, e))| e.take_hung().then_some((device, *token, e.name())))
+                .collect()
+        };
+        for &(device, token, name) in &hung {
+            let msg = format!("{name} stopped responding and was killed by the sandbox watchdog. It stays silent until you remove and re-add it.");
+            self.set_device_warning(device, token, msg.clone());
+            *self.watchdog_alert.lock() = Some(msg.clone());
+            self.message(msg);
         }
         let controllers: Vec<PluginController> = self.instances.lock().controllers.values().map(|(_, c)| c.clone()).collect();
         for c in controllers {
@@ -266,6 +298,10 @@ impl PluginRuntime {
         if i.params.get(&device).is_some_and(|(t, _)| *t == token) {
             i.params.remove(&device);
         }
+        let mut w = self.warnings.lock();
+        if w.get(&device).is_some_and(|(t, _)| *t == token) {
+            w.remove(&device);
+        }
     }
 }
 
@@ -301,7 +337,12 @@ impl ProcessorFactory for HostedFactory {
                     Some(Box::new(Tracked { inner: p, rt: self.rt.clone(), key: self.live.then_some((device.id, token)) }))
                 }
                 Err(e) => {
-                    self.rt.message(format!("Could not start {name} in the sandbox: {e}"));
+                    let msg = format!("Could not start {name} in the sandbox: {e}");
+                    if self.live {
+                        self.rt.set_device_warning(device.id, token, msg.clone());
+                        *self.rt.watchdog_alert.lock() = Some(msg.clone());
+                    }
+                    self.rt.message(msg);
                     None
                 }
             };
@@ -328,11 +369,19 @@ impl ProcessorFactory for HostedFactory {
                 }))
             }
             Some(Err(e)) => {
-                self.rt.message(format!("Could not load {name}: {e}"));
+                let msg = format!("Could not load {name}: {e}");
+                if self.live {
+                    self.rt.set_device_warning(device.id, token, msg.clone());
+                }
+                self.rt.message(msg);
                 None
             }
             None => {
-                self.rt.message(format!("Loading {name} timed out"));
+                let msg = format!("Loading {name} timed out");
+                if self.live {
+                    self.rt.set_device_warning(device.id, token, msg.clone());
+                }
+                self.rt.message(msg);
                 None
             }
         }
@@ -483,6 +532,7 @@ pub struct RealCatalog {
     external: Vec<ExternalPlugin>,
     rt: Arc<PluginRuntime>,
     cache_path: PathBuf,
+    folders: Vec<PathBuf>,
     scan: Option<Receiver<ScanMsg>>,
     status: ScanStatus,
 }
@@ -495,6 +545,7 @@ fn external(infos: &[HostedPluginInfo]) -> Vec<ExternalPlugin> {
             name: i.name.clone(),
             vendor: i.vendor.clone(),
             format: i.format,
+            category: i.category.clone(),
             path: i.path.clone(),
             is_instrument: i.is_instrument,
         })
@@ -507,12 +558,14 @@ impl RealCatalog {
     /// Lists the cached plugins right away and starts a background rescan.
     pub fn new(rt: Arc<PluginRuntime>, cache_path: PathBuf) -> Self {
         let cached = Scanner::new(&cache_path).plugins();
+        let folders = crate::plugin_prefs::PluginPrefs::load().folders;
         rt.set_known(cached.clone());
         let mut this = Self {
             stock: stock_devices(),
             external: external(&cached),
             rt,
             cache_path,
+            folders,
             scan: None,
             status: ScanStatus { running: false, fraction: 0., message: format!("{} plugins (cached)", cached.len()) },
         };
@@ -553,9 +606,15 @@ impl PluginCatalog for RealCatalog {
         }
         let (tx, rx) = unbounded();
         let path = self.cache_path.clone();
+        let custom = self.folders.clone();
         let spawned = std::thread::Builder::new().name("aitrack-plugin-scan".into()).spawn(move || {
             let mut scanner = Scanner::new(&path);
+            for dir in &custom {
+                scanner.add_search_path(aitrack_model::PluginFormat::Vst3, dir);
+                scanner.add_search_path(aitrack_model::PluginFormat::Clap, dir);
+            }
             let files = scanner.discover();
+            let has_scanner = scanner.has_scanner_exe();
             let n = files.len().max(1);
             // Small batches so the dialog can show progress (each batch is
             // scanned out of process, a few in parallel).
@@ -571,7 +630,9 @@ impl PluginCatalog for RealCatalog {
                 .map(|report| {
                     let plugins = scanner.plugins();
                     let failed = report.failed.len() + report.skipped_blocked;
-                    let summary = if failed > 0 {
+                    let summary = if !has_scanner && failed > 0 {
+                        format!("{} plugins · aitrack-plugin-scanner missing ({failed} skipped)", plugins.len())
+                    } else if failed > 0 {
                         format!("{} plugins · {failed} failed or blocked", plugins.len())
                     } else {
                         format!("{} plugins", plugins.len())
@@ -585,6 +646,28 @@ impl PluginCatalog for RealCatalog {
             self.scan = Some(rx);
             self.status = ScanStatus { running: true, fraction: 0., message: "Looking for plugins…".into() };
         }
+    }
+
+    fn plugin_folders(&self) -> Vec<PathBuf> {
+        self.folders.clone()
+    }
+
+    fn add_plugin_folder(&mut self, path: PathBuf) -> bool {
+        let mut prefs = crate::plugin_prefs::PluginPrefs::load();
+        if !prefs.add_folder(path.clone()) {
+            return false;
+        }
+        self.folders = prefs.folders;
+        true
+    }
+
+    fn remove_plugin_folder(&mut self, path: &Path) -> bool {
+        let mut prefs = crate::plugin_prefs::PluginPrefs::load();
+        if !prefs.remove_folder(path) {
+            return false;
+        }
+        self.folders = prefs.folders;
+        true
     }
 
     fn scan_status(&self) -> ScanStatus {

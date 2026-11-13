@@ -257,13 +257,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .justify_center()
                 .gap(px(SP2))
                 .when(!is_vca, |d| {
-                    d.child(knob_control(("pan", id.0 as usize), (pan + 1.) / 2., true, true, KnobTarget::Pan { track: id }, cx).on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.open_param_menu(id, AutomationTarget::Pan, e.position, cx);
-                        }),
-                    ))
+                    d.child(knob_control(("pan", id.0 as usize), (pan + 1.) / 2., true, true, KnobTarget::Pan { track: id }, cx))
                 })
                 .child(mono(if is_vca { "—".into() } else { pan_text }, TEXT_XS, pal.muted).w(px(24.))),
         ))
@@ -299,6 +293,17 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                         this.s.set_track(id, TrackProp::Arm(!arm));
                         cx.notify();
                     })))
+                })
+                .when(t.kind == TrackKind::Instrument, |d| {
+                    let kbd = t.keyboard_input;
+                    let kbd_color = if ws.piano_keyboard { pal.accent } else { pal.muted };
+                    d.child(
+                        widgets::icon_chip(("m-kbd", id.0 as usize), Icon::Keyboard, kbd, kbd_color)
+                            .tooltip(widgets::tip("Play this track with the PC/Mac keyboard (Z/X octave, C/V velocity)", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_track_keyboard(id, cx);
+                            })),
+                    )
                 }),
         )
         .child(

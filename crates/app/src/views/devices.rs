@@ -79,7 +79,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             }))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 let at = e.position();
-                this.open_menu(MenuKind::AddDevice(tid), point(at.x - px(116.), at.y - px(260.)), cx);
+                this.open_menu(MenuKind::AddDevice(tid), point(at.x - px(124.), at.y - px(260.)), cx);
             }))
             .child(icon(Icon::Add, 20., pal.muted))
             .child(label(if ids.is_empty() { "Add an instrument or effect" } else { "Add device" }, TEXT_SM, pal.muted)),
@@ -369,9 +369,14 @@ fn card(
         .child(name)
         .into_any_element();
     }
-    let has_presets = matches!(&d.kind, DeviceKind::Stock { plugin_id } if !ws.b.plugins.presets(plugin_id).is_empty());
-    let preset_name = d.preset.clone().unwrap_or_else(|| "Presets".into());
+    let preset_pill = preset_stepper(ws, id, &d.kind, d.preset.as_deref(), false, cx);
     // The title bar (Live): on/off, fold, name; double-click folds, drag moves.
+    let plugin_warning = if matches!(&d.kind, DeviceKind::Plugin { .. }) {
+        ws.b.engine.device_warning(id)
+    } else {
+        None
+    };
+
     let header = div()
         .id(("device-header", id.0 as usize))
         .map(|h| pickable(h, id, cx))
@@ -403,30 +408,9 @@ fn card(
                 .overflow_hidden()
                 .child(label(d.name.clone(), TEXT_MD, if enabled { pal.text } else { pal.muted }).font_weight(FontWeight::SEMIBOLD)),
         )
-        .when(has_presets, |h| {
-            h.child(
-                div()
-                    .id(("presets", id.0 as usize))
-                    .flex_none()
-                    .h(px(20.))
-                    .px(px(SP2))
-                    .flex()
-                    .items_center()
-                    .gap(px(SP1))
-                    .rounded(px(r_sm()))
-                    .bg(content(0.06))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(content(0.12)))
-                    .child(label(crate::paint::fit(&preset_name, 96., TEXT_XS), TEXT_XS, pal.muted))
-                    .child(icon(Icon::ChevronDown, 10., pal.faint))
-                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        let at = e.position();
-                        this.open_menu(MenuKind::Presets(id), point(at.x - px(8.), at.y + px(12.)), cx);
-                    })),
-            )
-        })
+        .when_some(preset_pill, |h, pill| h.child(pill))
         .when(!matches!(&d.kind, DeviceKind::Stock { .. }), |h| h.child(badge(kind_label, pal.muted)))
+        .when(plugin_warning.is_some(), |h| h.child(badge("SILENCED", pal.record)))
         .when(matches!(&d.kind, DeviceKind::Rack(r) if r.kind != RackKind::Drum), |h| {
             let shown = ws.fx.macros.contains(&id);
             h.child(
@@ -487,6 +471,17 @@ fn card(
             .gap(px(SP2))
             .child(label(vendor.clone(), TEXT_SM, pal.muted))
             .child(label(crate::paint::fit(&path.display().to_string(), 208., TEXT_XS), TEXT_XS, pal.faint))
+            .when_some(plugin_warning, |d, warn| {
+                d.child(
+                    div()
+                        .p(px(SP2))
+                        .rounded(px(r_sm()))
+                        .bg(with_alpha(pal.record, 0.12))
+                        .border_1()
+                        .border_color(with_alpha(pal.record, 0.35))
+                        .child(label(warn, TEXT_XS, pal.record)),
+                )
+            })
             .child(div().h(px(SP2)))
             .child(widgets::text_button(("open-editor", id.0 as usize), "Open plugin editor", Some(Icon::Device), false).on_click(cx.listener(move |this, _, _, cx| {
                 if let Err(e) = this.b.engine.open_editor(id) {
@@ -562,6 +557,10 @@ pub fn knob_control(
             return;
         }
         this.begin_drag(Drag::Knob { target, last_y: f32::from(e.position.y), value }, cx);
+    }))
+    .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+        cx.stop_propagation();
+        this.open_knob_menu(target, e.position, cx);
     }))
 }
 
@@ -776,9 +775,124 @@ fn chains(
         .into_any_element()
 }
 
+fn step_preset_index(len: usize, current: Option<usize>, dir: i32) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        Some(i) => (i as isize + dir as isize).rem_euclid(len as isize) as usize,
+        None => if dir >= 0 { 0 } else { len - 1 },
+    })
+}
+
+/// Step backward (`dir < 0`) or forward (`dir > 0`) through a stock FX or synth plugin's presets.
+pub fn step_preset(ws: &mut Workspace, device: DeviceId, dir: i32, cx: &mut Context<Workspace>) {
+    let Some(d) = ws.s.project.device(device) else { return };
+    let DeviceKind::Stock { plugin_id } = &d.kind else { return };
+    if plugin_id == "instrument.vault" {
+        crate::views::device_window::vault::step_preset(ws, device, dir, cx);
+        return;
+    }
+    let presets = ws.b.plugins.presets(plugin_id);
+    let current = d.preset.as_deref().and_then(|cur| presets.iter().position(|pr| pr.name == cur));
+    let Some(next) = step_preset_index(presets.len(), current, dir) else { return };
+    let path = presets[next].path.clone();
+    match ws.b.plugins.load_preset(&path) {
+        Ok((name, params)) => {
+            ws.s.load_preset(device, &name, &params);
+        }
+        Err(e) => ws.toast(e, cx),
+    }
+    cx.notify();
+}
+
+/// Segmented `[<] [Preset ▾] [>]` control for stock FX and synth device headers.
+pub fn preset_stepper(
+    ws: &Workspace,
+    id: DeviceId,
+    kind: &DeviceKind,
+    preset: Option<&str>,
+    in_window: bool,
+    cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    let DeviceKind::Stock { plugin_id } = kind else { return None };
+    if ws.b.plugins.presets(plugin_id).is_empty() {
+        return None;
+    }
+    let pal = p();
+    let preset_name = preset.unwrap_or("Presets");
+    let step_btn = |dir: i32, ic: Icon, tip_text: &'static str| {
+        div()
+            .id((if dir < 0 { "preset-prev" } else { "preset-next" }, id.0 as usize))
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.12)))
+            .tooltip(widgets::tip(tip_text, None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                step_preset(this, id, dir, cx);
+            }))
+            .child(icon(ic, 10., pal.muted))
+    };
+    Some(
+        div()
+            .flex_none()
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .rounded(px(r_sm()))
+            .overflow_hidden()
+            .bg(content(0.06))
+            .child(step_btn(-1, Icon::ChevronLeft, "Previous preset"))
+            .child(
+                div()
+                    .id((if in_window { "win-presets" } else { "presets" }, id.0 as usize))
+                    .h_full()
+                    .px(px(SP1))
+                    .flex()
+                    .items_center()
+                    .gap(px(SP1))
+                    .cursor_pointer()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(border())
+                    .hover(|s| s.bg(content(0.12)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(label(crate::paint::fit(preset_name, if in_window { 132. } else { 96. }, TEXT_XS), TEXT_XS, pal.muted))
+                    .child(icon(Icon::ChevronDown, 10., pal.faint))
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        let at = e.position();
+                        if in_window {
+                            this.fx.open_pop(crate::views::device_ui::PopKind::Presets(id), point(at.x - px(8.), at.y + px(12.)));
+                            cx.notify();
+                        } else {
+                            this.open_menu(MenuKind::Presets(id), point(at.x - px(8.), at.y + px(12.)), cx);
+                        }
+                    })),
+            )
+            .child(step_btn(1, Icon::ChevronRight, "Next preset"))
+            .into_any_element(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_stepper_wraps_both_ways() {
+        assert_eq!(step_preset_index(0, None, 1), None);
+        assert_eq!(step_preset_index(4, None, 1), Some(0));
+        assert_eq!(step_preset_index(4, None, -1), Some(3));
+        assert_eq!(step_preset_index(4, Some(0), -1), Some(3));
+        assert_eq!(step_preset_index(4, Some(3), 1), Some(0));
+        assert_eq!(step_preset_index(4, Some(1), 1), Some(2));
+    }
 
     #[test]
     fn insertion_points_count_after_the_device_leaves() {

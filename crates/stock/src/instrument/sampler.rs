@@ -1,23 +1,27 @@
-//! `instrument.sampler` — one-sample, 16-voice multi-mode sampler.
+//! `instrument.sampler` — 16-voice multi-mode sampler & SFZ v2 instrument player.
 //!
-//! Modes: *Classic* (plays start→end while held, ADSR), *One-Shot* (ignores
-//! note-off, plays to the end) and *Loop* (loops between the loop points with
-//! a crossfade, also through the release). Root key, key tracking,
-//! transpose/fine, pitch bend, glide, an SVF filter with envelope amount
-//! and velocity sensitivity. Playback is resampled on the fly with cubic
-//! Hermite interpolation.
+//! Supports single-sample mode (*Classic*, *One-Shot*, *Loop*) and multi-zone
+//! **SFZ v2** instruments (key ranges, velocity layers, round-robin
+//! `seq_length`/`seq_position`, `trigger=release` samples, and windowed disk
+//! streaming for large WAV files so multi-GB libraries load with a small RAM
+//! preroll and background page streaming). Zero allocations or locks on the
+//! audio thread.
 //!
-//! The sample is part of the state (`extra.path`) and is decoded on the
-//! control thread in `load_state` / [`Sampler::load_wav`].
+//! State: `extra.path` (single WAV) or `extra.sfz_path` (SFZ instrument),
+//! loaded on the control thread in `load_state` / [`Sampler::load_sfz`].
 //!
-//! Meter layout: `[active voices, playhead of the newest voice (0..1), peak]`.
+//! Meter layout: `[active voices, playhead of the newest voice (0..1), peak, sfz zone count]`.
 
-use super::sample::{SampleData, load_wav};
+use super::sample::{DEFAULT_PREROLL_FRAMES, DEFAULT_STREAM_THRESHOLD_FRAMES, SampleData, StreamBacking, StreamWorker, load_wav};
+use super::sfz::{LoopMode, RegionDef, Trigger, parse_sfz};
 use crate::common::{ParamStore, Segmented, drive, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::envelope::Adsr;
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const ID: &str = "instrument.sampler";
 pub const MAX_VOICES: usize = 16;
@@ -93,6 +97,21 @@ struct Region {
     xfade: f64,
 }
 
+#[derive(Clone)]
+struct Zone {
+    def: RegionDef,
+    audio: Arc<StreamBacking>,
+    gain_l: f32,
+    gain_r: f32,
+    start: f64,
+    end: f64,
+    loop_start: f64,
+    loop_end: f64,
+    looping: bool,
+    one_shot: bool,
+    tune_semis: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Voice {
     active: bool,
@@ -109,7 +128,9 @@ struct Voice {
     coeffs: SvfCoeffs,
     fade: f32,
     fading: bool,
-    pending: Option<(u8, f32)>,
+    pending: Option<(u8, f32, Option<usize>)>,
+    zone_idx: Option<usize>,
+    release_trigger: bool,
 }
 
 impl Voice {
@@ -130,6 +151,8 @@ impl Voice {
             fade: 1.0,
             fading: false,
             pending: None,
+            zone_idx: None,
+            release_trigger: false,
         }
     }
 }
@@ -139,6 +162,11 @@ pub struct Sampler {
     params: ParamStore,
     sr: f64,
     sample: Option<Box<SampleData>>,
+    sfz_path: Option<String>,
+    zones: Vec<Zone>,
+    _stream_worker: Option<StreamWorker>,
+    rr_counter: [u8; 128],
+    last_vel: [f32; 128],
     region: Region,
     voices: [Voice; MAX_VOICES],
     mode: usize,
@@ -181,7 +209,7 @@ impl Sampler {
                 name: "Sampler",
                 vendor: "AI-Track",
                 category: Category::Instrument,
-                tags: &["sampler", "one-shot", "loop"],
+                tags: &["sampler", "one-shot", "loop", "sfz", "streaming"],
                 params: params.clone(),
                 inputs: 0,
                 outputs: 2,
@@ -190,6 +218,11 @@ impl Sampler {
             params: ParamStore::new(&params),
             sr,
             sample: None,
+            sfz_path: None,
+            zones: Vec::new(),
+            _stream_worker: None,
+            rr_counter: [0; 128],
+            last_vel: [0.8; 128],
             region: Region::default(),
             voices: [Voice::new(sr); MAX_VOICES],
             mode: 0,
@@ -228,11 +261,101 @@ impl Sampler {
     }
 
     pub fn set_sample_data(&mut self, data: SampleData) {
+        self.zones.clear();
+        self._stream_worker = None;
+        self.sfz_path = None;
         self.sample = if data.frames() > 1 { Some(Box::new(data)) } else { None };
         for v in &mut self.voices {
             v.active = false;
+            v.pending = None;
         }
         self.params.mark_dirty();
+    }
+
+    /// Load an SFZ v2 instrument (multi-zone key/velocity splits, round-robin,
+    /// `trigger=release`, and windowed disk streaming for large WAVs) on the control thread.
+    pub fn load_sfz(&mut self, path: &str) -> Result<(), String> {
+        self.load_sfz_with_threshold(path, DEFAULT_STREAM_THRESHOLD_FRAMES, DEFAULT_PREROLL_FRAMES)
+    }
+
+    /// Like [`Sampler::load_sfz`] with explicit streaming threshold and preroll frames.
+    pub fn load_sfz_with_threshold(&mut self, path: &str, stream_threshold: usize, preroll_frames: usize) -> Result<(), String> {
+        let sfz_file = Path::new(path);
+        let src = std::fs::read_to_string(sfz_file).map_err(|e| format!("{path}: {e}"))?;
+        let base_dir = sfz_file.parent().unwrap_or_else(|| Path::new("."));
+        let defs = parse_sfz(&src, base_dir);
+        let mut cache: HashMap<PathBuf, Arc<StreamBacking>> = HashMap::new();
+        let mut zones = Vec::new();
+        let mut streams = Vec::new();
+        for def in defs {
+            let audio = if let Some(existing) = cache.get(&def.sample) {
+                existing.clone()
+            } else {
+                let Some(s) = def.sample.to_str() else { continue };
+                let Ok(b) = StreamBacking::open(s, stream_threshold, preroll_frames) else { continue };
+                streams.push(b.clone());
+                cache.insert(def.sample.clone(), b.clone());
+                b
+            };
+            let frames = audio.frames();
+            if frames <= 1 {
+                continue;
+            }
+            let start = (def.offset as f64).min((frames - 2) as f64);
+            let end = def.end.map_or(frames as f64, |e| (e as f64).clamp(start + 1.0, frames as f64));
+            let ls = (def.loop_start as f64).clamp(start, end);
+            let le = def.loop_end.map_or(end, |e| (e as f64).clamp(start, end));
+            let (ls, le) = if le > ls + 8.0 { (ls, le) } else { (start, end) };
+            let g = db_to_gain(def.volume_db);
+            let p_norm = (def.pan / 100.0).clamp(-1.0, 1.0);
+            let (pl, pr) = if p_norm >= 0.0 {
+                ((p_norm * std::f32::consts::FRAC_PI_2).cos(), 1.0)
+            } else {
+                (1.0, (p_norm * std::f32::consts::FRAC_PI_2).cos())
+            };
+            let looping = matches!(def.loop_mode, LoopMode::Continuous | LoopMode::Sustain);
+            let one_shot = matches!(def.loop_mode, LoopMode::OneShot);
+            let tune_semis = def.transpose as f32 + def.tune_cents / 100.0;
+            zones.push(Zone {
+                def,
+                audio,
+                gain_l: g * pl,
+                gain_r: g * pr,
+                start,
+                end,
+                loop_start: ls,
+                loop_end: le,
+                looping,
+                one_shot,
+                tune_semis,
+            });
+        }
+        if zones.is_empty() {
+            return Err(format!("{path}: no playable WAV regions found"));
+        }
+        self._stream_worker = StreamWorker::spawn(streams);
+        self.zones = zones;
+        self.sample = None;
+        self.sfz_path = Some(path.to_string());
+        self.rr_counter.fill(0);
+        for v in &mut self.voices {
+            v.active = false;
+            v.pending = None;
+        }
+        self.params.mark_dirty();
+        Ok(())
+    }
+
+    pub fn zone_count(&self) -> usize {
+        self.zones.len()
+    }
+
+    pub fn streamed_zone_count(&self) -> usize {
+        self.zones.iter().filter(|z| z.audio.is_streamed()).count()
+    }
+
+    pub fn sfz_path(&self) -> Option<&str> {
+        self.sfz_path.as_deref()
     }
 
     pub fn sample(&self) -> Option<&SampleData> {
@@ -284,63 +407,127 @@ impl Sampler {
         }
     }
 
+    fn alloc_voice(&mut self) -> Option<usize> {
+        if let Some(free) = (0..self.poly).find(|&i| !self.voices[i].active) {
+            return Some(free);
+        }
+        None
+    }
+
+    fn steal_voice(&mut self, key: u8, vel: f32, zone: Option<usize>) {
+        let vi = (0..self.poly)
+            .filter(|&i| !self.voices[i].fading)
+            .min_by_key(|&i| (!self.voices[i].released as u8, self.voices[i].age))
+            .unwrap_or(0);
+        self.voices[vi].fading = true;
+        self.voices[vi].pending = Some((key, vel, zone));
+    }
+
     fn note_on(&mut self, key: u8, vel: f32) {
         if vel <= 0.0 {
             self.note_off(key);
             return;
         }
+        if !self.zones.is_empty() {
+            let k_idx = usize::from(key.min(127));
+            self.last_vel[k_idx] = vel;
+            let vel_midi = (vel.clamp(0.0, 1.0) * 127.0).round().clamp(1.0, 127.0) as u8;
+            let rr = self.rr_counter[k_idx];
+            self.rr_counter[k_idx] = rr.wrapping_add(1);
+            for zi in 0..self.zones.len() {
+                let d = &self.zones[zi].def;
+                if matches!(d.trigger, Trigger::Release) {
+                    continue;
+                }
+                if key < d.lokey || key > d.hikey || vel_midi < d.lovel || vel_midi > d.hivel {
+                    continue;
+                }
+                if d.seq_length > 1 && ((rr % d.seq_length) + 1) != d.seq_position {
+                    continue;
+                }
+                if let Some(vi) = self.alloc_voice() {
+                    self.start(vi, key, vel, Some(zi), false);
+                } else {
+                    self.steal_voice(key, vel, Some(zi));
+                }
+            }
+            return;
+        }
         if self.sample.is_none() {
             return;
         }
-        let free = (0..self.poly).find(|&i| !self.voices[i].active);
-        let vi = match free {
-            Some(i) => i,
-            None => {
-                let vi = (0..self.poly).filter(|&i| !self.voices[i].fading).min_by_key(|&i| (!self.voices[i].released as u8, self.voices[i].age)).unwrap_or(0);
-                self.voices[vi].fading = true;
-                self.voices[vi].pending = Some((key, vel));
-                return;
-            }
-        };
-        self.start(vi, key, vel);
+        if let Some(vi) = self.alloc_voice() {
+            self.start(vi, key, vel, None, false);
+        } else {
+            self.steal_voice(key, vel, None);
+        }
     }
 
-    fn start(&mut self, vi: usize, key: u8, vel: f32) {
+    fn start(&mut self, vi: usize, key: u8, vel: f32, zone: Option<usize>, release_trigger: bool) {
         self.age += 1;
+        let start_pos = match zone {
+            Some(zi) => self.zones[zi].start,
+            None => self.region.start,
+        };
         let v = &mut self.voices[vi];
         v.active = true;
         v.released = false;
         v.fading = false;
         v.fade = 1.0;
         v.pending = None;
+        v.zone_idx = zone;
+        v.release_trigger = release_trigger;
         v.key = key;
         v.target = key as f32;
-        v.pitch = if self.glide_ms > 0.0 { self.last_pitch } else { key as f32 };
-        v.pos = self.region.start;
+        v.pitch = if self.glide_ms > 0.0 && !release_trigger { self.last_pitch } else { key as f32 };
+        v.pos = start_pos;
         let vel = vel.clamp(0.0, 1.0);
         v.vel_gain = 1.0 - self.vel_sens + self.vel_sens * vel * vel;
         v.age = self.age;
         v.env.retrigger();
         v.filt = [SvfState::default(); 2];
-        self.last_pitch = key as f32;
+        if !release_trigger {
+            self.last_pitch = key as f32;
+        }
     }
 
     fn note_off(&mut self, key: u8) {
-        if self.mode == 1 {
-            return; // one-shot plays out
+        let has_zones = !self.zones.is_empty();
+        if !has_zones && self.mode == 1 {
+            return; // single-sample one-shot plays out
         }
         for v in &mut self.voices {
-            if v.active && v.key == key && !v.released {
+            let zone_one_shot = v.zone_idx.is_some_and(|zi| self.zones[zi].one_shot || v.release_trigger);
+            if v.active && v.key == key && !v.released && !zone_one_shot {
                 v.env.gate_off();
                 v.released = true;
             }
-            if matches!(v.pending, Some((k, _)) if k == key) {
+            if matches!(v.pending, Some((k, _, _)) if k == key) {
                 v.pending = None;
+            }
+        }
+        if has_zones {
+            let k_idx = usize::from(key.min(127));
+            let vel = self.last_vel[k_idx].clamp(0.05, 1.0);
+            let vel_midi = (vel * 127.0).round().clamp(1.0, 127.0) as u8;
+            for zi in 0..self.zones.len() {
+                let d = &self.zones[zi].def;
+                if d.trigger != Trigger::Release {
+                    continue;
+                }
+                if key < d.lokey || key > d.hikey || vel_midi < d.lovel || vel_midi > d.hivel {
+                    continue;
+                }
+                if let Some(vi) = self.alloc_voice() {
+                    self.start(vi, key, vel, Some(zi), true);
+                } else {
+                    self.steal_voice(key, vel, Some(zi));
+                }
             }
         }
     }
 
-    fn control(&mut self, vi: usize, n: usize, sample_rate: f64) {
+    fn control(&mut self, vi: usize, n: usize, sample_rate: f64, zone_root: f32, zone_tune: f32) {
         let v = &mut self.voices[vi];
         if self.glide_ms > 0.0 && v.pitch != v.target {
             let k = 1.0 - (-(n as f32) / (self.glide_ms * 0.00025 * self.sr as f32)).exp();
@@ -351,7 +538,7 @@ impl Sampler {
         } else {
             v.pitch = v.target;
         }
-        let semis = self.key_track * (v.pitch - self.root) + self.tune + self.bend * self.bend_range;
+        let semis = self.key_track * (v.pitch - zone_root) + self.tune + zone_tune + self.bend * self.bend_range;
         v.rate = sample_rate / self.sr * 2f64.powf(semis as f64 / 12.0);
         if self.filter > 0 {
             let mode = match self.filter {
@@ -397,35 +584,56 @@ impl Segmented for Sampler {
         for ch in 0..buf.channels() {
             buf.channel_mut(ch)[start..end].fill(0.0);
         }
-        let Some(smp) = self.sample.take() else { return };
-        let r = self.region;
-        let looping = self.mode == 2;
-        let one_shot = self.mode == 1;
+        if self.sample.is_none() && self.zones.is_empty() {
+            return;
+        }
+        let smp = self.sample.take();
+        let zones = std::mem::take(&mut self.zones);
+        let single_region = self.region;
+        let single_looping = self.mode == 2;
         let filter = self.filter > 0;
         let mut pos = start;
-        let mut peak = self.peak * (-((end - start) as f32) / (0.15 * self.sr as f32)).exp();
+        let peak = self.peak * (-((end - start) as f32) / (0.15 * self.sr as f32)).exp();
         while pos < end {
             let n = CHUNK.min(end - pos);
+            let mut stolen: [Option<(u8, f32, Option<usize>)>; MAX_VOICES] = [None; MAX_VOICES];
             for vi in 0..MAX_VOICES {
                 if !self.voices[vi].active {
                     continue;
                 }
-                self.control(vi, n, smp.sample_rate);
-                let (gl, gr) = (self.gain_l, self.gain_r);
+                let zi = self.voices[vi].zone_idx;
+                let (src_sr, z_root, z_tune, gl, gr, r, looping) = match (zi, &smp) {
+                    (Some(z_idx), _) if z_idx < zones.len() => {
+                        let z = &zones[z_idx];
+                        let reg = Region { start: z.start, end: z.end, loop_start: z.loop_start, loop_end: z.loop_end, xfade: 0.0 };
+                        (z.audio.sample_rate(), f32::from(z.def.pitch_keycenter), z.tune_semis, self.gain_l * z.gain_l, self.gain_r * z.gain_r, reg, z.looping)
+                    }
+                    (_, Some(s)) => (s.sample_rate, self.root, 0.0, self.gain_l, self.gain_r, single_region, single_looping),
+                    _ => {
+                        self.voices[vi].active = false;
+                        continue;
+                    }
+                };
+                self.control(vi, n, src_sr, z_root, z_tune);
                 let v = &mut self.voices[vi];
                 let mut done = false;
                 for i in pos..pos + n {
-                    let mut a = smp.read(0, v.pos);
-                    let mut b = smp.read(1, v.pos);
+                    let (mut a, mut b) = match (zi, &smp) {
+                        (Some(z_idx), _) => (zones[z_idx].audio.read(0, v.pos), zones[z_idx].audio.read(1, v.pos)),
+                        (_, Some(s)) => (s.read(0, v.pos), s.read(1, v.pos)),
+                        _ => (0.0, 0.0),
+                    };
                     if looping && r.xfade > 0.0 && v.pos >= r.loop_end - r.xfade {
-                        // Crossfade the loop end into the material before the
-                        // loop start, so the jump lands on identical audio.
                         let t = ((v.pos - (r.loop_end - r.xfade)) / r.xfade) as f32;
                         let p2 = v.pos - (r.loop_end - r.loop_start);
-                        a = a * (1.0 - t) + smp.read(0, p2) * t;
-                        b = b * (1.0 - t) + smp.read(1, p2) * t;
+                        let (a2, b2) = match (zi, &smp) {
+                            (Some(z_idx), _) => (zones[z_idx].audio.read(0, p2), zones[z_idx].audio.read(1, p2)),
+                            (_, Some(s)) => (s.read(0, p2), s.read(1, p2)),
+                            _ => (0.0, 0.0),
+                        };
+                        a = a * (1.0 - t) + a2 * t;
+                        b = b * (1.0 - t) + b2 * t;
                     }
-                    // Short fade into the end of a non-looping region.
                     let tail = if looping { 1.0 } else { ((r.end - v.pos) / (32.0 * v.rate.max(1e-6))).clamp(0.0, 1.0) as f32 };
                     if filter {
                         a = v.filt[0].process(&v.coeffs, a);
@@ -450,20 +658,35 @@ impl Segmented for Sampler {
                         break;
                     }
                 }
-                let _ = one_shot;
                 if done {
                     v.active = false;
-                    if let Some((key, vel)) = v.pending.take() {
-                        self.start(vi, key, vel);
-                    }
+                    stolen[vi] = v.pending.take();
                 }
-                let v = &mut self.voices[vi];
                 if !(v.filt[0].is_finite() && v.filt[1].is_finite()) {
                     v.filt = [SvfState::default(); 2];
                 }
             }
+            if stolen.iter().any(Option::is_some) {
+                self.zones = zones;
+                self.sample = smp;
+                for (vi, pending) in stolen.into_iter().enumerate() {
+                    if let Some((key, vel, z)) = pending {
+                        self.start(vi, key, vel, z, false);
+                    }
+                }
+                // Resume cleanly next chunk on remaining frames after restoring borrows:
+                return self.finish_render_tail(buf, start, end, peak);
+            }
             pos += n;
         }
+        self.zones = zones;
+        self.sample = smp;
+        self.finish_render_tail(buf, start, end, peak);
+    }
+}
+
+impl Sampler {
+    fn finish_render_tail(&mut self, buf: &mut aitrack_dsp::AudioBuffer, start: usize, end: usize, mut peak: f32) {
         for ch in 0..buf.channels() {
             for x in &mut buf.channel_mut(ch)[start..end] {
                 *x = sanitize(*x);
@@ -471,7 +694,6 @@ impl Segmented for Sampler {
             }
         }
         self.peak = peak;
-        self.sample = Some(smp);
     }
 }
 
@@ -535,12 +757,14 @@ impl Processor for Sampler {
 
     fn save_state(&self) -> Vec<u8> {
         let path = self.sample.as_ref().and_then(|s| s.path.clone());
-        save_state(&self.params, json!({ "path": path }))
+        save_state(&self.params, json!({ "path": path, "sfz_path": self.sfz_path }))
     }
 
     fn load_state(&mut self, data: &[u8]) {
         let extra = load_state(&mut self.params, data);
-        if let Some(path) = extra.get("path").and_then(Value::as_str) {
+        if let Some(sfz) = extra.get("sfz_path").and_then(Value::as_str) {
+            let _ = self.load_sfz(sfz);
+        } else if let Some(path) = extra.get("path").and_then(Value::as_str) {
             // A missing file leaves the sampler empty rather than failing.
             let _ = self.load_wav(path);
         }
@@ -551,9 +775,13 @@ impl Processor for Sampler {
         let n = self.voices.iter().filter(|v| v.active).count() as f32;
         let head = match (&self.sample, self.voices.iter().filter(|v| v.active).max_by_key(|v| v.age)) {
             (Some(s), Some(v)) => (v.pos / s.frames() as f64) as f32,
+            (None, Some(v)) => v
+                .zone_idx
+                .and_then(|zi| self.zones.get(zi))
+                .map_or(0.0, |z| (v.pos / z.audio.frames().max(1) as f64) as f32),
             _ => 0.0,
         };
-        write_meter(out, 0, &[n, head, self.peak])
+        write_meter(out, 0, &[n, head, self.peak, self.zones.len() as f32])
     }
 }
 
@@ -658,6 +886,77 @@ mod tests {
         assert_eq!(t.sample().map(|s| s.frames()), Some(24_000));
         let (l, _) = render_notes(&mut t, &[(0, 72, 1.0, true)], 12_000);
         assert!((pitch_hz(&l[1000..]) - 300.0).abs() < 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sfz_v2_zones_round_robin_release_trigger_and_disk_streaming() {
+        let dir = std::env::temp_dir().join(format!("aitrack-sfz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_tone = |name: &str, freq: f64, frames: usize, amp: f32| {
+            let p = dir.join(name);
+            let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for i in 0..frames {
+                let s = (std::f64::consts::TAU * freq * i as f64 / 48_000.0).sin() as f32 * amp;
+                w.write_sample((s * 30_000.0) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        };
+        write_tone("rr1.wav", 220.0, 20_000, 0.7);
+        write_tone("rr2.wav", 440.0, 20_000, 0.7);
+        write_tone("rel.wav", 880.0, 8_000, 0.6);
+        write_tone("long_stream.wav", 330.0, 48_000, 0.7);
+
+        let sfz_path = dir.join("piano.sfz");
+        std::fs::write(
+            &sfz_path,
+            r#"
+<group> lokey=60 hikey=60 pitch_keycenter=60 seq_length=2
+<region> seq_position=1 sample=rr1.wav
+<region> seq_position=2 sample=rr2.wav
+<group> lokey=60 hikey=60 trigger=release pitch_keycenter=60
+<region> sample=rel.wav
+<group> lokey=62 hikey=62 pitch_keycenter=62
+<region> sample=long_stream.wav
+"#,
+        )
+        .unwrap();
+
+        let mut s = Sampler::new();
+        // Force streaming threshold at 24_000 frames with 4_096 preroll so `long_stream.wav` opens in streamed mode!
+        s.load_sfz_with_threshold(sfz_path.to_str().unwrap(), 24_000, 4_096).unwrap();
+        assert_eq!(s.zone_count(), 4);
+        assert_eq!(s.streamed_zone_count(), 1, "large zone stays streamed with small RAM preroll");
+        assert!(s.zones[3].audio.preroll_frames() < s.zones[3].audio.frames());
+
+        // 1st hit C4 -> rr1 (220 Hz)
+        let (l1, _) = render_notes(&mut s, &[(0, 60, 0.8, true), (6_000, 60, 0.0, false)], 12_000);
+        assert!((pitch_hz(&l1[500..4_500]) - 220.0).abs() < 4.0);
+        // After NoteOff at frame 6000, release trigger (880 Hz) fires cleanly!
+        assert!((pitch_hz(&l1[7_000..10_000]) - 880.0).abs() < 12.0, "release trigger plays 880 Hz");
+
+        // 2nd hit C4 -> rr2 (440 Hz)
+        let (l2, _) = render_notes(&mut s, &[(0, 60, 0.8, true)], 6_000);
+        assert!((pitch_hz(&l2[500..4_500]) - 440.0).abs() < 6.0, "round-robin cycles to rr2");
+
+        // Streamed zone D4 (62): plays preroll and seamlessly reads past preroll via background page streaming.
+        let (ls, _) = render_notes(&mut s, &[(0, 62, 0.9, true)], 32_000);
+        // Wait briefly for lookahead page & render tail block if background reader was mid-page:
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut tail_buf = aitrack_dsp::AudioBuffer::new(2, 1024);
+        let tr = aitrack_dsp::Transport::default();
+        let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut tail_buf, sidechain: None, events: &[], transport: &tr };
+        s.process(&mut ctx);
+        assert!(rms(&ls[500..3_500]) > 0.1, "streamed zone preroll audible immediately");
+        assert!(rms(tail_buf.channel(0)) > 0.1, "streamed zone continues past preroll without silence");
+
+        // State save/restore reloads SFZ cleanly.
+        let st = s.save_state();
+        let mut restored = Sampler::new();
+        restored.load_state(&st);
+        assert_eq!(restored.zone_count(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -318,10 +318,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             }
             let body = match ws.s.project.sources.get(&c.source) {
                 Some(Source::Notes(n)) => {
-                    let lo = n.notes.iter().map(|n| n.key).min().unwrap_or(60);
-                    let hi = n.notes.iter().map(|n| n.key).max().unwrap_or(60);
+                    let visible: Vec<(u8, Tick, Tick)> = n.notes.iter().filter(|n| n.start >= c.offset).map(|n| (n.key, n.start, n.length)).collect();
+                    let lo = visible.iter().map(|n| n.0).min().unwrap_or_else(|| n.notes.iter().map(|n| n.key).min().unwrap_or(60));
+                    let hi = visible.iter().map(|n| n.0).max().unwrap_or_else(|| n.notes.iter().map(|n| n.key).max().unwrap_or(60));
                     Body::Notes {
-                        notes: n.notes.iter().map(|n| (n.key, n.start, n.length)).collect(),
+                        notes: visible,
                         lo,
                         hi,
                         loop_len: c.looping.map_or(c.length, |l| l.end - l.start).max(1),
@@ -333,7 +334,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         let base = TimeBase { sample_rate: f64::from(peaks.sample_rate().max(1)), ..TimeBase::of(file, bpm) };
                         Wave {
                             frames_per_tick: base.tick_to_frame(1.),
-                            ratio: file.warp.pitch_ratio(),
+                            ratio: file.warp.speed_ratio(),
                             reverse: file.warp.reverse,
                             peaks,
                         }
@@ -572,7 +573,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(ruler)
         .on_pinch(cx.listener(on_pinch))
         .tooltip(widgets::tip("Click to place the insert marker · drag the top strip to set the loop", None))
-        .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+        .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
+            this.focus.focus(window, cx);
             let b = this.regions.ruler.get();
             let y = f32::from(e.position.y - b.origin.y);
             let x = f32::from(e.position.x - b.origin.x) + this.s.arrange.scroll_x;
@@ -855,7 +857,8 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
         .border_b_1()
         .border_color(border())
         .cursor_pointer()
-        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+            this.focus.focus(window, cx);
             let m = e.modifiers();
             this.s.ed.area = crate::editing::Area::Arrange;
             this.s.click_track(id, m.secondary(), m.shift);
@@ -938,6 +941,18 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                                 this.s.set_track(id, TrackProp::Arm(!arm));
                                 cx.notify();
                             })))
+                        })
+                        .when(t.kind == TrackKind::Instrument, |d| {
+                            let kbd = t.keyboard_input;
+                            let kbd_color = if ws.piano_keyboard { pal.accent } else { pal.muted };
+                            d.child(
+                                icon_chip(("a-kbd", id.0 as usize), Icon::Keyboard, kbd, kbd_color)
+                                    .tooltip(widgets::tip("Play this track with the PC/Mac keyboard (Z/X octave, C/V velocity)", None))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_track_keyboard(id, cx);
+                                    })),
+                            )
                         })
                         .child(div().flex_1())
                         .when(audio, |d| d.child(pan_knob(id, t.pan, cx)))
@@ -1101,11 +1116,12 @@ fn volume_box(ws: &Workspace, id: TrackId, db: f32, cx: &mut Context<Workspace>)
             this.begin_drag(Drag::Fader { track: id, last_y: f32::from(e.position.y), pos, travel: 160. }, cx);
         }))
         // A click that didn't move opens the box for typing.
-        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
             cx.stop_propagation();
             if e.click_count() >= 2 || crate::workspace::click_dragged(e) || this.num_edit.as_ref().is_some_and(|n| n.target == target) {
                 return;
             }
+            this.focus.focus(window, cx);
             let db = this.s.project.track(id).map_or(0., |t| t.volume_db);
             this.begin_num_edit(target, crate::workspace::plain_text(f64::from((db * 10.).round() / 10.)), cx);
         }))
@@ -1303,7 +1319,8 @@ fn lane_hit(ws: &Workspace, pos: Point<Pixels>) -> Option<(LaneRow, Tick, f32, f
     })
 }
 
-fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
+fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Workspace>) {
+    ws.focus.focus(window, cx);
     if e.first_mouse {
         // The click that brings the window forward only places the insert
         // marker, so a single click is enough and nothing is edited by it.

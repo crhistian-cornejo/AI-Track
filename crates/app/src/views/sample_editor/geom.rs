@@ -350,7 +350,13 @@ pub fn hit_test(l: &Layout, c: &Clip, x: f32, y: f32) -> Hit {
 /// While its lines are close together every position goes to the nearest
 /// line; zoomed in past the finest step the lines only pull nearby, leaving
 /// the space between them free (single samples are reachable).
+#[cfg(test)]
 pub fn snap(u: f64, grid: &GridSpec, origin: Tick, px_per_tick: f64, magnets: &[Tick], free: bool) -> Tick {
+    snap_scaled(u, grid, origin as f64, 1.0, px_per_tick, magnets, free)
+}
+
+/// [`snap`] scaled by `rate` axis ticks per song tick (transposed / repitched clips).
+pub fn snap_scaled(u: f64, grid: &GridSpec, origin: f64, rate: f64, px_per_tick: f64, magnets: &[Tick], free: bool) -> Tick {
     let raw = u.round() as Tick;
     if free {
         return raw;
@@ -361,8 +367,10 @@ pub fn snap(u: f64, grid: &GridSpec, origin: Tick, px_per_tick: f64, magnets: &[
     {
         return m;
     }
-    let line = origin + grid.round(raw - origin);
-    if grid.step as f64 * px_per_tick <= GRID_FREE_PX || px(line) <= GRID_PULL_PX { line } else { raw }
+    let r = rate.max(1e-6);
+    let song = ((u - origin) / r).round() as Tick;
+    let line = (origin + grid.round(song) as f64 * r).round() as Tick;
+    if grid.step as f64 * r * px_per_tick <= GRID_FREE_PX || px(line) <= GRID_PULL_PX { line } else { raw }
 }
 
 // ───────────────────────────── Read-outs ─────────────────────────────
@@ -661,6 +669,10 @@ mod tests {
         assert_eq!(snap(960.4, &g, 0, ppt, &[], false), 960);
         assert_eq!(snap(975., &g, 0, ppt, &[], false), 975);
         assert_eq!(snap(989.6, &g, 0, ppt, &[], false), 990);
+        // Transposed / repitched clip at double speed (rate = 2.0): song beats span 2*BEAT on the axis.
+        let g2 = grid::adaptive(200., FOUR_FOUR, 0, false);
+        assert_eq!(snap_scaled(485., &g2, 0., 2.0, l.axis.px_per_tick(), &[], false), 480);
+        assert_eq!(snap_scaled(1930., &g2, 0., 2.0, l.axis.px_per_tick(), &[], false), 1920);
     }
 
     #[test]

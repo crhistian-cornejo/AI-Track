@@ -43,7 +43,7 @@ pub enum Clipboard {
 }
 
 /// A multi-step edit worked out on a scratch copy of the project.
-pub(super) struct Plan {
+pub(crate) struct Plan {
     pub p: Project,
     pub cmds: Vec<Command>,
     /// Clips whose placements were removed; dropped at the end when nothing uses them.
@@ -204,7 +204,7 @@ fn kind_of(source: &Source) -> TrackKind {
 impl AppState {
     /// Apply a plan as one undo step. `false` when it has nothing to do or
     /// one of its steps did not apply.
-    pub(super) fn commit(&mut self, label: &str, mut plan: Plan) -> bool {
+    pub(crate) fn commit(&mut self, label: &str, mut plan: Plan) -> bool {
         plan.sweep();
         if plan.failed || plan.cmds.is_empty() {
             return false;

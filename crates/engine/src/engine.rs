@@ -140,6 +140,7 @@ impl Engine {
         let samples = SampleCache::with_loader(move || {
             let _ = loader_tx.send(Msg::Recompile);
         });
+        let handle_samples = samples.clone();
         let mut control = Control {
             factory,
             pool: ProcessorPool::new(),
@@ -180,7 +181,7 @@ impl Engine {
             .spawn(move || control.run(rx))
             .map_err(EngineError::Io)?;
         Ok((
-            EngineHandle { tx, shared, status, thread: Some(thread), _graveyard: Some(graveyard) },
+            EngineHandle { tx, shared, status, samples: handle_samples, thread: Some(thread), _graveyard: Some(graveyard) },
             manual,
         ))
     }
@@ -192,6 +193,7 @@ pub struct EngineHandle {
     tx: Sender<Msg>,
     shared: Arc<HandleShared>,
     status: Arc<SharedStatus>,
+    samples: SampleCache,
     thread: Option<JoinHandle<()>>,
     _graveyard: Option<JoinHandle<()>>,
 }
@@ -379,6 +381,14 @@ impl EngineHandle {
 
     pub fn sample_rate(&self) -> u32 {
         self.status.sample_rate.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sample_cache_bytes(&self, bytes: usize) {
+        self.samples.set_budget_bytes(bytes);
+    }
+
+    pub fn sample_cache_stats(&self) -> (usize, usize) {
+        (self.samples.used_bytes(), self.samples.budget_bytes())
     }
 
     /// Last compile or device error.

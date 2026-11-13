@@ -145,6 +145,8 @@ pub struct AppState {
     pub auto_clip: Option<(Vec<AutomationPoint>, Tick)>,
     /// Length new notes get (the last drawn or resized length, FL-style).
     pub note_length: Tick,
+    /// Ableton-style Scale Mode in the piano roll: fold vertically to show only keys in the active scale.
+    pub piano_scale_fold: bool,
     pub last_error: Option<String>,
 }
 
@@ -172,6 +174,7 @@ impl AppState {
             auto_sel: None,
             auto_clip: None,
             note_length: PPQ / 2,
+            piano_scale_fold: true,
             last_error: None,
         };
         // Start on a melodic clip so the piano roll has something to show.
@@ -305,9 +308,40 @@ impl AppState {
         self.project.tracks.iter().find_map(|t| t.session_slots.iter().find(|(_, c)| **c == clip).map(|(s, _)| *s))
     }
 
-    /// The scale tools and highlighting use for a clip: its own, else the project's.
+    /// The scale tools and highlighting use for a clip: its own, else its track's, else the project's.
     pub fn clip_scale(&self, clip: Option<ClipId>) -> Option<Scale> {
-        clip.and_then(|c| self.project.clips.get(&c)).and_then(|c| c.scale).or(self.project.scale)
+        let track_scale = clip
+            .and_then(|c| self.clip_track(c))
+            .or(self.selected_track)
+            .and_then(|id| self.project.track(id))
+            .and_then(|t| t.scale);
+        clip.and_then(|c| self.project.clips.get(&c))
+            .and_then(|c| c.scale)
+            .or(track_scale)
+            .or(self.project.scale)
+    }
+
+    /// Active scale when Scale Fold mode is enabled in the Piano Roll (off on drum racks).
+    pub fn scale_folded(&self, clip: Option<ClipId>) -> Option<Scale> {
+        if !self.piano_scale_fold {
+            return None;
+        }
+        let scale = self.clip_scale(clip)?;
+        let drum = clip
+            .and_then(|c| self.clip_track(c))
+            .or(self.selected_track)
+            .and_then(|id| self.project.track(id))
+            .is_some_and(is_drum_track);
+        (!drum).then_some(scale)
+    }
+
+    /// Descending list of MIDI keys rendered in the piano roll (only scale notes when Scale mode folds).
+    pub fn piano_rows(&self, clip: Option<ClipId>) -> Vec<u8> {
+        if let Some(scale) = self.scale_folded(clip) {
+            (0..=127u8).rev().filter(|k| scale.contains(*k)).collect()
+        } else {
+            (0..=127u8).rev().collect()
+        }
     }
 
     /// FL-style ghost notes: the other MIDI clips in the same scene.
@@ -388,13 +422,26 @@ impl AppState {
     }
 
     /// Move `originals` by `dt` ticks and `dk` semitones (one coalesced drag).
+    #[cfg(test)]
     pub fn move_notes(&mut self, clip: ClipId, originals: &[Note], dt: Tick, dk: i32) -> bool {
+        self.move_notes_scale(clip, originals, dt, dk, false)
+    }
+
+    /// Move `originals` by `dt` ticks and either `dsteps` scale degrees (when `diatonic` and a scale exists) or semitones.
+    pub fn move_notes_scale(&mut self, clip: ClipId, originals: &[Note], dt: Tick, dsteps: i32, diatonic: bool) -> bool {
         let Some((source, _)) = self.clip_notes(clip) else { return false };
         let min_start = originals.iter().map(|n| n.start).min().unwrap_or(0);
         let dt = dt.max(-min_start);
+        let scale = diatonic.then(|| self.clip_scale(Some(clip))).flatten();
         let notes = originals
             .iter()
-            .map(|n| Note { start: n.start + dt, key: (n.key as i32 + dk).clamp(0, 127) as u8, ..n.clone() })
+            .map(|n| {
+                let key = match scale {
+                    Some(s) => step_note_in_scale(s, n.key, dsteps),
+                    None => (n.key as i32 + dsteps).clamp(0, 127) as u8,
+                };
+                Note { start: n.start + dt, key, ..n.clone() }
+            })
             .collect();
         self.edit_coalesced("notes-move", "Move notes", vec![Command::UpdateNotes { source, notes }])
     }
@@ -461,6 +508,291 @@ impl AppState {
         let count = changed.len();
         if count > 0 {
             self.edit("Snap to scale", vec![Command::UpdateNotes { source, notes: changed }]);
+        }
+        count
+    }
+
+    /// Build scale-aware chords (`Triad`, `Seventh`, `Ninth`, `Sus2`, `Sus4`, `Power`) on the target notes (or at the marker if empty).
+    pub fn build_chord(&mut self, clip: ClipId, kind: ChordKind) -> usize {
+        let Some((source, src)) = self.clip_notes(clip) else { return 0 };
+        let scale = self.clip_scale(Some(clip));
+        let existing: BTreeSet<(Tick, u8)> = src.notes.iter().map(|n| (n.start, n.key)).collect();
+        let anchors: Vec<Note> = {
+            let mut base = if self.selected_notes.is_empty() {
+                if src.notes.is_empty() {
+                    let root_note = scale.map_or(60, |s| (s.root.0 + 60).min(127));
+                    vec![Note::new(self.project.alloc_note_id(), root_note, self.ed.piano_marker.max(0), self.note_length.max(PPQ / 4), 0.85)]
+                } else {
+                    src.notes.clone()
+                }
+            } else {
+                src.notes.iter().filter(|n| self.selected_notes.contains(&n.id)).cloned().collect()
+            };
+            // Keep one root anchor (lowest pitch) per unique start tick so applying twice doesn't explode stacks.
+            base.sort_by_key(|n| (n.start, n.key));
+            base.dedup_by_key(|n| n.start);
+            base
+        };
+        let mut added = Vec::new();
+        for anchor in &anchors {
+            if !existing.contains(&(anchor.start, anchor.key)) {
+                added.push(anchor.clone());
+            }
+            for &step in kind.steps(scale) {
+                let key = match scale {
+                    Some(s) => step_note_in_scale(s, anchor.key, step),
+                    None => (anchor.key as i32 + step).clamp(0, 127) as u8,
+                };
+                if key == anchor.key
+                    || existing.contains(&(anchor.start, key))
+                    || added.iter().any(|n| n.start == anchor.start && n.key == key)
+                {
+                    continue;
+                }
+                added.push(Note {
+                    id: self.project.alloc_note_id(),
+                    key,
+                    ..anchor.clone()
+                });
+            }
+        }
+        let count = added.len();
+        if count > 0 {
+            let new_ids: BTreeSet<NoteId> = added.iter().map(|n| n.id).collect();
+            if self.edit(kind.edit_label(), vec![Command::AddNotes { source, notes: added }]) {
+                self.selected_notes.extend(new_ids);
+            }
+        }
+        count
+    }
+
+    /// Invert each chord (`dir > 0` moves its lowest note up an octave, `dir < 0` moves its highest note down an octave).
+    pub fn invert_chords(&mut self, clip: ClipId, dir: i32) -> usize {
+        let Some((source, notes)) = self.tool_targets(clip) else { return 0 };
+        let mut by_start: BTreeMap<Tick, Vec<Note>> = BTreeMap::new();
+        for n in notes {
+            by_start.entry(n.start).or_default().push(n);
+        }
+        let mut changed = Vec::new();
+        for (_, mut group) in by_start {
+            if group.len() < 2 {
+                continue;
+            }
+            group.sort_by_key(|n| n.key);
+            if dir >= 0 {
+                let lo = group.first().unwrap().clone();
+                if lo.key <= 115 {
+                    changed.push(Note { key: lo.key + 12, ..lo });
+                }
+            } else {
+                let hi = group.last().unwrap().clone();
+                if hi.key >= 12 {
+                    changed.push(Note { key: hi.key - 12, ..hi });
+                }
+            }
+        }
+        let count = changed.len();
+        if count > 0 {
+            self.edit("Invert chord", vec![Command::UpdateNotes { source, notes: changed }]);
+        }
+        count
+    }
+
+    /// Generate a 4-bar diatonic chord progression using the clip/track/project key (defaults to C Minor if unset).
+    pub fn generate_scale_progression(&mut self, clip: ClipId) -> usize {
+        let Some((source, src)) = self.clip_notes(clip) else { return 0 };
+        let scale = self.clip_scale(Some(clip)).unwrap_or(Scale::new(Key(0), ScaleKind::Minor));
+        let bar = PPQ * 4;
+        // Scale degrees (0-based): Minor-family -> i - VI - III - VII; Major-family -> I - V - vi - IV.
+        let progression: [usize; 4] = match scale.kind {
+            ScaleKind::Major | ScaleKind::Lydian | ScaleKind::Mixolydian | ScaleKind::MajorPentatonic => [0, 4, 5, 3],
+            _ => [0, 5, 2, 6],
+        };
+        let old_ids: Vec<NoteId> = if self.selected_notes.is_empty() {
+            Vec::new()
+        } else {
+            self.selected_notes.iter().copied().collect()
+        };
+        let mut cmds = Vec::new();
+        if !old_ids.is_empty() {
+            cmds.push(Command::RemoveNotes { source, ids: old_ids });
+        }
+        let start_tick = if src.notes.is_empty() { 0 } else { self.ed.piano_marker.max(0) };
+        let existing: BTreeSet<(Tick, u8)> = src.notes.iter().map(|n| (n.start, n.key)).collect();
+        let mut added = Vec::new();
+        for (i, deg) in progression.into_iter().enumerate() {
+            let root = scale.degree_to_note(deg as i32, 3);
+            let tick = start_tick + i as Tick * bar;
+            for step in [0, 2, 4] {
+                let key = step_note_in_scale(scale, root, step);
+                if existing.contains(&(tick, key)) {
+                    continue;
+                }
+                added.push(Note::new(self.project.alloc_note_id(), key, tick, bar - PPQ / 16, 0.78));
+            }
+        }
+        let count = added.len();
+        let new_ids: BTreeSet<NoteId> = added.iter().map(|n| n.id).collect();
+        if !added.is_empty() {
+            cmds.push(Command::AddNotes { source, notes: added });
+        }
+        if !cmds.is_empty() && self.edit("Chord progression", cmds) {
+            self.selected_notes = new_ids;
+        }
+        count
+    }
+
+    /// Turn target notes or chords into rhythmic arpeggio steps at the current snap grid.
+    pub fn arpeggiate(&mut self, clip: ClipId, pattern: ArpPattern) -> usize {
+        let Some((source, targets)) = self.tool_targets(clip) else { return 0 };
+        if targets.is_empty() {
+            return 0;
+        }
+        let step = self.grid().max(PPQ / 16);
+        let scale = self.clip_scale(Some(clip));
+        let mut by_start: BTreeMap<Tick, Vec<Note>> = BTreeMap::new();
+        for n in &targets {
+            by_start.entry(n.start).or_default().push(n.clone());
+        }
+        let mut added = Vec::new();
+        for (start, mut chord) in by_start {
+            chord.sort_by_key(|n| n.key);
+            let total_len = chord.iter().map(|n| n.length).max().unwrap_or(step).max(step);
+            let vel = chord.iter().map(|n| n.velocity).sum::<f32>() / chord.len() as f32;
+            let muted = chord.iter().all(|n| n.muted);
+            // If only a single note is in the group, build a 1-3-5-8 pattern in scale (or +4,+7,+12).
+            let mut pitches: Vec<u8> = if chord.len() == 1 {
+                let base = chord[0].key;
+                match scale {
+                    Some(s) => [0, 2, 4, 7].into_iter().map(|st| step_note_in_scale(s, base, st)).collect(),
+                    None => [0, 4, 7, 12].into_iter().map(|st| (base as i32 + st).clamp(0, 127) as u8).collect(),
+                }
+            } else {
+                chord.into_iter().map(|n| n.key).collect()
+            };
+            pitches.dedup();
+            if pattern == ArpPattern::Down {
+                pitches.reverse();
+            } else if pattern == ArpPattern::UpDown && pitches.len() > 2 {
+                let mut rev = pitches[1..pitches.len() - 1].to_vec();
+                rev.reverse();
+                pitches.extend(rev);
+            }
+            let steps = ((total_len + step - 1) / step).max(1) as usize;
+            let mut tick = start;
+            for idx in 0..steps {
+                let end = (start + total_len).min(tick + step);
+                let len = (end - tick).max(PPQ / 16);
+                let key = pitches[idx % pitches.len()];
+                added.push(Note { muted, ..Note::new(self.project.alloc_note_id(), key, tick, len, vel) });
+                tick += step;
+            }
+        }
+        let remove_ids: Vec<NoteId> = targets.into_iter().map(|n| n.id).collect();
+        let new_ids: BTreeSet<NoteId> = added.iter().map(|n| n.id).collect();
+        let count = added.len();
+        if count > 0
+            && self.edit(
+                "Arpeggiate",
+                vec![Command::RemoveNotes { source, ids: remove_ids }, Command::AddNotes { source, notes: added }],
+            )
+        {
+            self.selected_notes = new_ids;
+        }
+        count
+    }
+
+    /// Offset notes in each chord sequentially (`PPQ / 32` per voice) to simulate a human strum.
+    pub fn strum(&mut self, clip: ClipId, downward: bool) -> usize {
+        let Some((source, targets)) = self.tool_targets(clip) else { return 0 };
+        let mut by_start: BTreeMap<Tick, Vec<Note>> = BTreeMap::new();
+        for n in targets {
+            by_start.entry(n.start).or_default().push(n);
+        }
+        let offset_step = PPQ / 32;
+        let min_len = PPQ / 16;
+        let mut changed = Vec::new();
+        for (_, mut chord) in by_start {
+            if chord.len() < 2 {
+                continue;
+            }
+            chord.sort_by_key(|n| n.key);
+            if downward {
+                chord.reverse();
+            }
+            for (i, n) in chord.into_iter().enumerate() {
+                let shift = (i as Tick * offset_step).min(n.length.saturating_sub(min_len));
+                if shift > 0 {
+                    changed.push(Note { start: n.start + shift, length: n.length - shift, ..n });
+                }
+            }
+        }
+        let count = changed.len();
+        if count > 0 {
+            self.edit("Strum", vec![Command::UpdateNotes { source, notes: changed }]);
+        }
+        count
+    }
+
+    /// Slice each target note longer than the snap grid into repeated equal grid slices.
+    pub fn chop(&mut self, clip: ClipId) -> usize {
+        let Some((source, targets)) = self.tool_targets(clip) else { return 0 };
+        let step = self.grid().max(PPQ / 16);
+        let mut remove_ids = Vec::new();
+        let mut added = Vec::new();
+        for n in &targets {
+            if n.length <= step {
+                continue;
+            }
+            remove_ids.push(n.id);
+            let mut tick = n.start;
+            let end = n.end();
+            while tick < end {
+                let len = (end - tick).min(step).max(PPQ / 16);
+                added.push(Note {
+                    id: self.project.alloc_note_id(),
+                    start: tick,
+                    length: len,
+                    ..n.clone()
+                });
+                tick += step;
+            }
+        }
+        let count = added.len();
+        if count > 0 {
+            let new_ids: BTreeSet<NoteId> = added.iter().map(|n| n.id).collect();
+            let had_sel = !self.selected_notes.is_empty();
+            if self.edit("Chop", vec![Command::RemoveNotes { source, ids: remove_ids }, Command::AddNotes { source, notes: added }]) && had_sel {
+                self.selected_notes = new_ids;
+            }
+        }
+        count
+    }
+
+    /// Randomize pitch within the active scale (±3 steps) and humanize velocity cleanly.
+    pub fn randomize_notes(&mut self, clip: ClipId, seed: u64) -> usize {
+        let Some((source, targets)) = self.tool_targets(clip) else { return 0 };
+        let scale = self.clip_scale(Some(clip));
+        let mut changed = Vec::new();
+        for (idx, n) in targets.into_iter().enumerate() {
+            let h = n.id.0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(seed.wrapping_mul(1442695040888963407))
+                .wrapping_add(idx as u64);
+            let pitch_delta = ((h >> 16) % 7) as i32 - 3; // -3..=+3 steps
+            let vel_jitter = (((h >> 32) % 37) as f32 - 18.0) / 100.0; // -0.18..=+0.18
+            let key = match scale {
+                Some(s) => step_note_in_scale(s, n.key, pitch_delta),
+                None => (n.key as i32 + pitch_delta).clamp(0, 127) as u8,
+            };
+            let velocity = (n.velocity + vel_jitter).clamp(0.25, 1.0);
+            if key != n.key || (velocity - n.velocity).abs() > 1e-4 {
+                changed.push(Note { key, velocity, ..n });
+            }
+        }
+        let count = changed.len();
+        if count > 0 {
+            self.edit("Randomize", vec![Command::UpdateNotes { source, notes: changed }]);
         }
         count
     }
@@ -634,29 +966,26 @@ impl AppState {
         {
             targets.extend(t.arrangement.iter().filter(|pl| spans(&self.project, pl)).map(|pl| (track, pl.clone())));
         }
-        let mut cmds = Vec::new();
+        let mut plan = crate::editing::Plan::new(self);
+        let mut cut = 0usize;
         let mut last = None;
         for (track, pl) in &targets {
             // The model's split keeps the fades on the outer edges, divides the
             // volume envelope, gives a notes half its own notes and leaves a
-            // clip that is used elsewhere as it is there.
-            let Some(split) = aitrack_model::ops::split_placement(&mut self.project, *track, pl.id, tick) else { continue };
+            // clip that is used elsewhere as it is there. Running on a Plan
+            // applies each split sequentially and keeps IDs/clips atomic.
+            let Some(split) = aitrack_model::ops::split_placement(&mut plan.p, *track, pl.id, tick) else { continue };
+            plan.run_all(split.commands);
             last = Some(pl.id);
-            cmds.extend(split.commands);
+            cut += 1;
         }
-        if cmds.is_empty() {
-            return 0;
-        }
-        self.seal();
-        let ok = self.edit("Split clip", cmds);
-        self.seal();
-        if ok {
+        if self.commit("Split clip", plan) {
             // The part before the cut keeps its placement and stays selected,
             // in the lane and in the Clip tab alike.
             let ids = if selected { self.selected_clip_ids() } else { targets.iter().map(|(_, pl)| pl.id).collect() };
             let last = self.selected_placement.map(|(_, id)| id).filter(|id| ids.contains(id)).or(last);
             self.select_clips(ids, last);
-            targets.len()
+            cut
         } else {
             0
         }
@@ -994,6 +1323,22 @@ impl AppState {
         self.edit("Change scale", vec![Command::SetScale { scale }])
     }
 
+    pub fn set_track_scale(&mut self, track: TrackId, scale: Option<Scale>) -> bool {
+        self.edit("Change track key", vec![Command::SetTrack { id: track, change: TrackProp::Scale(scale) }])
+    }
+
+    pub fn set_track_keyboard(&mut self, track: TrackId, on: bool) -> bool {
+        self.edit("Toggle computer keyboard", vec![Command::SetTrack { id: track, change: TrackProp::KeyboardInput(on) }])
+    }
+
+    pub fn set_clip_scale(&mut self, clip: ClipId, scale: Option<Scale>) -> bool {
+        let Some(c) = self.project.clips.get(&clip).cloned() else { return false };
+        if c.scale == scale {
+            return false;
+        }
+        self.edit("Change clip key", vec![Command::UpdateClip { id: clip, clip: Box::new(Clip { scale, ..c }) }])
+    }
+
     pub fn set_loop(&mut self, region: Option<(Tick, Tick)>) -> bool {
         self.edit_coalesced("loop", "Set loop", vec![Command::SetLoop { region }])
     }
@@ -1069,7 +1414,7 @@ impl AppState {
             match e.kind {
                 PluginEditKind::Begin => {
                     if let Some(track) = track
-                        && (record_at.is_some() || self.automation_shown.contains(&track))
+                        && (!self.automation_shown.contains(&track) || !self.shown_lanes(track).contains(&target))
                     {
                         self.show_automation(track, target);
                         changed = true;
@@ -1087,13 +1432,19 @@ impl AppState {
                     if !same {
                         cmds.push(Command::SetParam { device: e.device, param: e.param, value: Some(value) });
                     }
+                    // Plugins that move a control without a Begin edit (or when
+                    // automation is still hidden) should reveal its lane too.
+                    if let Some(track) = track
+                        && (!same || record_at.is_some())
+                        && (!self.automation_shown.contains(&track) || !self.shown_lanes(track).contains(&target))
+                    {
+                        self.show_automation(track, target);
+                        changed = true;
+                    }
                     if let (Some(tick), Some(track)) = (record_at, track) {
                         let from = *self.auto_writes.get(&(e.device, e.param)).unwrap_or(&tick);
                         let points = aitrack_model::automation::write(&self.lane_points(track, target), from, tick, value);
                         self.auto_writes.insert((e.device, e.param), tick);
-                        if !self.shown_lanes(track).contains(&target) {
-                            self.show_automation(track, target);
-                        }
                         cmds.push(self.lane_command(track, target, points));
                     }
                     if !cmds.is_empty() {
@@ -1519,6 +1870,72 @@ pub enum KeyEdit {
 }
 
 /// The next note of `scale` above (`dir` = 1) or below (`dir` = -1) `key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordKind {
+    Triad,
+    Seventh,
+    Ninth,
+    Sus2,
+    Sus4,
+    Power,
+}
+
+impl ChordKind {
+    pub fn steps(self, scale: Option<Scale>) -> &'static [i32] {
+        match (self, scale.is_some()) {
+            (Self::Triad, true) => &[2, 4],
+            (Self::Triad, false) => &[4, 7],
+            (Self::Seventh, true) => &[2, 4, 6],
+            (Self::Seventh, false) => &[4, 7, 11],
+            (Self::Ninth, true) => &[2, 4, 6, 8],
+            (Self::Ninth, false) => &[4, 7, 11, 14],
+            (Self::Sus2, true) => &[1, 4],
+            (Self::Sus2, false) => &[2, 7],
+            (Self::Sus4, true) => &[3, 4],
+            (Self::Sus4, false) => &[5, 7],
+            (Self::Power, true) => &[4],
+            (Self::Power, false) => &[7],
+        }
+    }
+
+    pub fn edit_label(self) -> &'static str {
+        match self {
+            Self::Triad => "Build triad chord",
+            Self::Seventh => "Build 7th chord",
+            Self::Ninth => "Build 9th chord",
+            Self::Sus2 => "Build sus2 chord",
+            Self::Sus4 => "Build sus4 chord",
+            Self::Power => "Build power chord",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArpPattern {
+    Up,
+    Down,
+    UpDown,
+}
+
+/// Find the closest row index for `key` in a descending [`AppState::piano_rows`] list.
+pub fn piano_nearest_row(rows: &[u8], key: u8) -> usize {
+    rows.iter()
+        .enumerate()
+        .min_by_key(|(_, k)| (**k as i32 - key as i32).abs())
+        .map_or(0, |(r, _)| r)
+}
+
+/// Step `key` by `steps` scale degrees (`steps > 0` moves up, `steps < 0` moves down).
+pub fn step_note_in_scale(scale: Scale, key: u8, steps: i32) -> u8 {
+    let mut k = key;
+    let dir = steps.signum();
+    for _ in 0..steps.abs() {
+        k = step_in_scale(scale, k, dir);
+    }
+    k
+}
+
+/// Move `key` one step inside `scale` (`dir` is ±1).
 /// A note outside the scale lands on the nearest scale note in that direction.
 pub fn step_in_scale(scale: Scale, key: u8, dir: i32) -> u8 {
     let mut k = key as i32;
@@ -1993,5 +2410,60 @@ mod tests {
         s.seal();
         assert_eq!(s.history.steps().count(), steps_before + 1);
         assert_eq!(s.project.device(dev).unwrap().params[&0], 0.3);
+    }
+
+    #[test]
+    fn scale_fold_rows_and_track_scale_resolution() {
+        let mut s = state();
+        let clip = lead_clip(&s);
+        let track = s.clip_track(clip).unwrap();
+        let track_scale = Scale::new(Key(0), ScaleKind::Major);
+        assert!(s.set_track_scale(track, Some(track_scale)));
+        assert_eq!(s.clip_scale(Some(clip)), Some(track_scale));
+        let rows = s.piano_rows(Some(clip));
+        assert!(rows.len() < 128);
+        assert!(rows.iter().all(|k| track_scale.contains(*k)));
+        s.piano_scale_fold = false;
+        assert_eq!(s.piano_rows(Some(clip)).len(), 128);
+    }
+
+    #[test]
+    fn scale_chord_arp_strum_chop_and_invert() {
+        let mut s = state();
+        let clip = lead_clip(&s);
+        let source = s.clip_notes(clip).unwrap().0;
+        let ids: Vec<_> = s.clip_notes(clip).unwrap().1.notes.iter().map(|n| n.id).collect();
+        s.edit("Clear", vec![Command::RemoveNotes { source, ids }]);
+        s.set_scale(Some(Scale::new(Key(0), ScaleKind::Major))); // C Major
+        let root_id = s.draw_note(clip, 60, 0).unwrap();
+        s.selected_notes = [root_id].into();
+        // Triad from C4 in C Major -> C4 (60), E4 (64), G4 (67)
+        assert_eq!(s.build_chord(clip, ChordKind::Triad), 2);
+        let mut keys: Vec<u8> = s.clip_notes(clip).unwrap().1.notes.iter().map(|n| n.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec![60, 64, 67]);
+        // Diatonic transposition up 1 scale step -> D4 (62), F4 (65), A4 (69)
+        let originals = s.clip_notes(clip).unwrap().1.notes.clone();
+        s.move_notes_scale(clip, &originals, 0, 1, true);
+        s.seal();
+        let mut moved: Vec<u8> = s.clip_notes(clip).unwrap().1.notes.iter().map(|n| n.key).collect();
+        moved.sort();
+        assert_eq!(moved, vec![62, 65, 69]);
+        // Invert up moves D4 (62) -> D5 (74)
+        assert_eq!(s.invert_chords(clip, 1), 1);
+        let mut inverted: Vec<u8> = s.clip_notes(clip).unwrap().1.notes.iter().map(|n| n.key).collect();
+        inverted.sort();
+        assert_eq!(inverted, vec![65, 69, 74]);
+        // Strum shifts voices slightly
+        assert!(s.strum(clip, false) > 0);
+        // Arpeggiate replaces chord with sequential steps
+        let count = s.arpeggiate(clip, ArpPattern::Up);
+        assert!(count >= 2);
+        // Chop splits long note at snap grid
+        let note_id = s.draw_note(clip, 60, PPQ * 4).unwrap();
+        s.selected_notes = [note_id].into();
+        s.resize_notes(clip, &[s.clip_notes(clip).unwrap().1.notes.iter().find(|n| n.id == note_id).unwrap().clone()], PPQ * 2);
+        s.seal();
+        assert!(s.chop(clip) >= 2);
     }
 }

@@ -56,6 +56,8 @@ static REGISTRY: &[StockPlugin] = &[
     StockPlugin { id: fx::analyzer::ID, name: "Analyzer", category: Category::Analyzer, tags: &["analyzer", "spectrum", "loudness", "meter"], create: fx::analyzer::create },
     StockPlugin { id: instrument::wavetable::ID, name: "Wavetable Synth", category: Category::Instrument, tags: &["synth", "wavetable", "polyphonic"], create: instrument::wavetable::create },
     StockPlugin { id: instrument::vault::ID, name: "Vault", category: Category::Instrument, tags: &["synth", "analog", "fm", "electric piano", "organ", "strings", "presets", "macros"], create: instrument::vault::create },
+    StockPlugin { id: instrument::acid303::ID, name: "Acid 303", category: Category::Instrument, tags: &["synth", "acid", "303", "bass", "mono", "sequencer"], create: instrument::acid303::create },
+    StockPlugin { id: instrument::kick808::ID, name: "Kick 808", category: Category::Instrument, tags: &["808", "kick", "sub", "bass", "drums"], create: instrument::kick808::create },
     StockPlugin { id: instrument::sampler::ID, name: "Sampler", category: Category::Instrument, tags: &["sampler", "one-shot", "loop"], create: instrument::sampler::create },
     StockPlugin { id: instrument::drum::ID, name: "Drum Sampler", category: Category::Instrument, tags: &["drums", "sampler", "pads"], create: instrument::drum::create },
 ];

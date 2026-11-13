@@ -431,6 +431,12 @@ impl Vst3Main {
         self.view.is_some()
     }
 
+    pub fn raise_editor(&mut self) {
+        if let Some(window) = &self.window {
+            window.raise();
+        }
+    }
+
     fn platform_type() -> FIDString {
         #[cfg(target_os = "macos")]
         {

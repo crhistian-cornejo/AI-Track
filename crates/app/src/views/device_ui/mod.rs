@@ -16,6 +16,7 @@
 //! Frames are requested only while the transport plays (the workspace does
 //! that), a handle is dragged, or meter data is still changing.
 
+pub mod acid303;
 pub mod analyzer;
 pub mod chorus;
 pub mod clipper;
@@ -25,6 +26,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod filter;
 pub mod generic;
+pub mod kick808;
 pub mod kit;
 pub mod limiter;
 pub mod midside;
@@ -206,6 +208,8 @@ pub enum PopKind {
     /// The track a device listens to on its sidechain; `param` is its
     /// Internal/External switch, set along with the source.
     Sidechain { device: DeviceId, param: u32 },
+    /// Preset list for a stock FX or synth plugin opened inside a Device Window.
+    Presets(DeviceId),
     /// The synth window's menus (wavetables, matrix sources and destinations…).
     Synth(crate::views::device_window::synth::SynthPop),
 }
@@ -491,6 +495,7 @@ pub fn overlay(ws: &mut Workspace, window: Option<WindowId>, cx: &mut Context<Wo
         PopKind::Choice { device, param } => choice_menu(ws, *device, *param, cx)?,
         PopKind::EqBand { device, band } => eq::band_menu(ws, *device, *band, cx)?,
         PopKind::Sidechain { device, param } => sidechain_menu(ws, *device, *param, cx)?,
+        PopKind::Presets(device) => crate::views::menus::preset_menu_card(ws, *device, true, cx)?,
         PopKind::Synth(pop) => crate::views::device_window::synth::pop_menu(ws, pop, cx)?,
     };
     let id = gpui::ElementId::Name(format!("fx-pop-{}", pop.seq).into());
@@ -629,6 +634,8 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.utility"
             | "fx.analyzer"
             | "instrument.wavetable"
+            | "instrument.acid303"
+            | "instrument.kick808"
             | "instrument.sampler"
             | "instrument.drum"
             | "instrument.vault"
@@ -656,6 +663,8 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.utility" => utility::render(ws, dev, cx),
         "fx.analyzer" => analyzer::render(ws, dev, cx),
         "instrument.wavetable" => wavetable::render(ws, dev, cx),
+        "instrument.acid303" => acid303::render(ws, dev, cx),
+        "instrument.kick808" => kick808::render(ws, dev, cx),
         "instrument.sampler" => sampler::render(ws, dev, d, cx),
         "instrument.drum" => drum::render(ws, dev, d, cx),
         "instrument.vault" => vault::render(ws, dev, cx),

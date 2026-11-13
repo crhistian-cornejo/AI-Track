@@ -191,6 +191,17 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
                     cx.notify();
                 })))
             })
+            .when(t.kind == aitrack_model::TrackKind::Instrument, |d| {
+                let kbd = t.keyboard_input;
+                let kbd_color = if ws.piano_keyboard { pal.accent } else { pal.muted };
+                d.child(
+                    widgets::icon_chip(("s-kbd", tid.0 as usize), Icon::Keyboard, kbd, kbd_color)
+                        .tooltip(widgets::tip("Play this track with the PC/Mac keyboard (Z/X octave, C/V velocity)", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_track_keyboard(tid, cx);
+                        })),
+                )
+            })
             .child(div().flex_1())
             .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted)),
     )

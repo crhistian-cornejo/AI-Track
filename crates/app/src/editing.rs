@@ -26,6 +26,7 @@ mod timeline;
 mod tests;
 
 pub use clipboard::Clipboard;
+pub(crate) use clipboard::Plan;
 pub use timeline::{ConsolidateJob, Consolidation};
 
 use crate::grid::{self, GridSpec};

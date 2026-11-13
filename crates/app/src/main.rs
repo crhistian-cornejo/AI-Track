@@ -19,6 +19,7 @@ mod grid;
 mod icons;
 mod motion;
 mod paint;
+mod plugin_prefs;
 mod project_io;
 mod real;
 mod state;

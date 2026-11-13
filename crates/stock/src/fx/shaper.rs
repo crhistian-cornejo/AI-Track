@@ -1,18 +1,17 @@
-//! `fx.shaper` — a volume shaper: a drawn curve repeats in time with the song
-//! and scales the level. The classic use is the pumping "sidechain" duck
-//! without a kick to trigger it; the same curve makes gates, tremolos and
-//! fades. Zero latency.
+//! `fx.shaper` — a beat- or audio-triggered envelope shaper for **Volume**,
+//! **Filter LP**, and **Pan**. Zero latency.
 //!
 //! The curve has six nodes: the first sits at the start of the cycle, the
 //! last at its end, and four in between move freely. One `Tension` bends
-//! every segment. While the transport plays the cycle follows the song
-//! position (so it always lands on the beat); stopped, it free-runs at the
-//! tempo so the effect can still be auditioned.
+//! every segment. In `Sync` trigger mode, transport playback follows song
+//! position (free-running when stopped). In `Audio` mode, incoming stereo
+//! peaks crossing `Threshold` trigger one cycle of the curve cleanly.
 //!
-//! Meter layout: `[phase 0..1, gain 0..1]`.
+//! Meter layout: `[phase 0..1, shaped 0..1]`.
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
-use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor};
+use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
+use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
 
 pub const ID: &str = "fx.shaper";
 
@@ -34,6 +33,11 @@ pub mod p {
     pub const Y4: u32 = 13;
     /// Level at the end of the cycle.
     pub const Y5: u32 = 14;
+    pub const MODE: u32 = 15;
+    pub const TRIGGER: u32 = 16;
+    pub const THRESHOLD: u32 = 17;
+    pub const CUTOFF: u32 = 18;
+    pub const RESONANCE: u32 = 19;
 
     /// `(x, y)` parameter ids of the four free nodes.
     pub const NODES: [(u32, u32); 4] = [(X1, Y1), (X2, Y2), (X3, Y3), (X4, Y4)];
@@ -42,6 +46,8 @@ pub mod p {
 /// Cycle lengths, in quarter notes.
 pub const RATE_BEATS: [f64; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
 const RATES: &[&str] = &["1/16", "1/8", "1/4", "1/2", "1 bar", "2 bars", "4 bars"];
+pub const MODES: &[&str] = &["Volume", "Filter LP", "Pan"];
+pub const TRIGGERS: &[&str] = &["Sync", "Audio"];
 
 pub fn params() -> Vec<ParamInfo> {
     let node = |id, name, short, default| ParamInfo::new(id, name, 0.0, 1.0, default).short(short);
@@ -62,6 +68,11 @@ pub fn params() -> Vec<ParamInfo> {
         node(p::X4, "Node 4 Time", "T4", 0.9),
         node(p::Y4, "Node 4 Level", "L4", 1.0),
         node(p::Y5, "End Level", "End", 1.0),
+        ParamInfo::new(p::MODE, "Target", 0.0, 2.0, 0.0).choices(MODES).short("Mode"),
+        ParamInfo::new(p::TRIGGER, "Trigger", 0.0, 1.0, 0.0).choices(TRIGGERS).short("Trig"),
+        ParamInfo::new(p::THRESHOLD, "Trigger Threshold", -48.0, 0.0, -18.0).unit("dB").short("Thresh"),
+        ParamInfo::new(p::CUTOFF, "Filter Base Cutoff", 40.0, 18_000.0, 320.0).unit("Hz").log().short("Cut"),
+        ParamInfo::new(p::RESONANCE, "Filter Resonance", 0.0, 100.0, 25.0).unit("%").short("Res"),
     ]
 }
 
@@ -102,8 +113,18 @@ pub struct Shaper {
     cycle_beats: f64,
     offset: f64,
     smooth: f32,
+    mode: usize,
+    audio_trigger: bool,
+    threshold: f32,
+    cutoff_hz: f32,
+    res_q: f32,
     /// Free-running position (in cycles) while the transport is stopped.
     free: f64,
+    /// Current phase in Audio-trigger one-shot mode (1.0 = idle at end).
+    trig_phase: f32,
+    trig_holdoff: u32,
+    prev_over: bool,
+    filt: [SvfState; 2],
     gain: f32,
     phase: f32,
     first: bool,
@@ -128,7 +149,7 @@ impl Shaper {
                 name: "Shaper",
                 vendor: "AI-Track",
                 category: Category::Effect,
-                tags: &["dynamics", "sidechain", "pump", "gate", "tremolo", "volume"],
+                tags: &["dynamics", "sidechain", "pump", "gate", "tremolo", "volume", "filter", "pan"],
                 params: params.clone(),
                 inputs: 2,
                 outputs: 2,
@@ -142,7 +163,16 @@ impl Shaper {
             cycle_beats: 1.0,
             offset: 0.0,
             smooth: 1.0,
+            mode: 0,
+            audio_trigger: false,
+            threshold: 0.125,
+            cutoff_hz: 320.0,
+            res_q: 1.4,
             free: 0.0,
+            trig_phase: 1.0,
+            trig_holdoff: 0,
+            prev_over: false,
+            filt: [SvfState::default(); 2],
             gain: 1.0,
             phase: 0.0,
             first: true,
@@ -160,6 +190,12 @@ impl Shaper {
         self.offset = f64::from(self.params.plain(p::PHASE)) / 100.0;
         let ms = self.params.plain(p::SMOOTH);
         self.smooth = if ms <= 0.01 { 1.0 } else { 1.0 - (-1.0 / (ms * 0.001 * self.sr as f32)).exp() };
+        self.mode = self.params.choice(p::MODE);
+        self.audio_trigger = self.params.choice(p::TRIGGER) == 1;
+        self.threshold = db_to_gain(self.params.plain(p::THRESHOLD));
+        self.cutoff_hz = self.params.plain(p::CUTOFF);
+        let r = (self.params.plain(p::RESONANCE) / 100.0).clamp(0.0, 1.0);
+        self.res_q = std::f32::consts::FRAC_1_SQRT_2 * (12.0f32 / std::f32::consts::FRAC_1_SQRT_2).powf(r);
     }
 }
 
@@ -178,26 +214,69 @@ impl Segmented for Shaper {
         let cycles_per_sample = tr.bpm.max(1.0) / 60.0 / self.sr / self.cycle_beats;
         let playing = tr.playing;
         let (points, tension, depth, smooth, offset) = (self.points, self.tension, self.depth, self.smooth, self.offset);
+        let (mode, audio_trig, thresh, base_cut, res_q, sr) = (self.mode, self.audio_trigger, self.threshold, self.cutoff_hz, self.res_q, self.sr);
+        let holdoff_len = (0.04 * sr) as u32;
         let mut gain = self.gain;
         let mut free = self.free;
+        let mut trig_phase = self.trig_phase;
+        let mut trig_holdoff = self.trig_holdoff;
+        let mut prev_over = self.prev_over;
+        let mut filt = self.filt;
         let mut phase = self.phase;
         let mut first = self.first;
         for_frames(ctx.buffer, start, end, |i, l, r| {
-            let cycles = if playing { tr.position_beats / self.cycle_beats + i as f64 * cycles_per_sample } else { free };
-            free += cycles_per_sample;
-            phase = (cycles + offset).rem_euclid(1.0) as f32;
-            let target = 1.0 - depth * (1.0 - level_at(&points, tension, phase));
+            if audio_trig {
+                let over = l.abs().max(r.abs()) >= thresh;
+                if over && !prev_over && trig_holdoff == 0 {
+                    trig_phase = 0.0;
+                    trig_holdoff = holdoff_len;
+                }
+                prev_over = over;
+                trig_holdoff = trig_holdoff.saturating_sub(1);
+                phase = ((trig_phase as f64 + offset).clamp(0.0, 1.0)) as f32;
+                trig_phase = (trig_phase + cycles_per_sample as f32).min(1.0);
+            } else {
+                let cycles = if playing { tr.position_beats / self.cycle_beats + i as f64 * cycles_per_sample } else { free };
+                free += cycles_per_sample;
+                phase = (cycles + offset).rem_euclid(1.0) as f32;
+            }
+
+            let raw = level_at(&points, tension, phase);
+            let target = if mode == 2 {
+                // Pan curves swing around 0.5 center (0 -> full L, 1 -> full R).
+                0.5 + (raw - 0.5) * depth
+            } else {
+                1.0 - depth * (1.0 - raw)
+            };
             if first {
                 gain = target;
                 first = false;
             } else {
                 gain += (target - gain) * smooth;
             }
-            (sanitize(l * gain), sanitize(r * gain))
+            match mode {
+                1 => {
+                    let fc = (base_cut * (19_000.0 / base_cut.max(20.0)).powf(gain.clamp(0.0, 1.0))).clamp(30.0, (0.45 * sr as f32).min(20_000.0));
+                    let coeffs = SvfCoeffs::new(SvfMode::Lowpass, fc, res_q, 0.0, sr);
+                    (sanitize(filt[0].process(&coeffs, l)), sanitize(filt[1].process(&coeffs, r)))
+                }
+                2 => {
+                    let pan = (gain * 2.0 - 1.0).clamp(-1.0, 1.0);
+                    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                    let gl = angle.cos() * std::f32::consts::SQRT_2;
+                    let gr = angle.sin() * std::f32::consts::SQRT_2;
+                    (sanitize(l * gl), sanitize(r * gr))
+                }
+                _ => (sanitize(l * gain), sanitize(r * gain)),
+            }
         });
         // Stopped, keep the free-running clock small and in step.
         self.free = if playing { (tr.position_beats / self.cycle_beats + end as f64 * cycles_per_sample).rem_euclid(1.0) } else { free.rem_euclid(1.0) };
         self.gain = gain;
+        self.trig_phase = trig_phase;
+        self.trig_holdoff = trig_holdoff;
+        self.prev_over = prev_over;
+        self.filt = filt;
         self.phase = phase;
         self.first = first;
     }
@@ -216,6 +295,10 @@ impl Processor for Shaper {
 
     fn reset(&mut self) {
         self.free = 0.0;
+        self.trig_phase = 1.0;
+        self.trig_holdoff = 0;
+        self.prev_over = false;
+        self.filt = [SvfState::default(); 2];
         self.gain = 1.0;
         self.phase = 0.0;
         self.first = true;
@@ -326,5 +409,63 @@ mod tests {
         let out: Vec<f32> = (0..4).flat_map(|_| run(&mut s, 12_000, &tr)).collect();
         assert!(out[100] < 0.01 && out[24_100] < 0.01, "a new cycle every beat");
         assert!(out[20_000] > 0.99 && out[44_000] > 0.99);
+    }
+
+    #[test]
+    fn filter_mode_attenuates_high_frequencies_when_curve_is_low() {
+        let mut s = Shaper::new();
+        crate::test_util::set_plain(&mut s, p::MODE, 1.0); // Filter LP
+        crate::test_util::set_plain(&mut s, p::CUTOFF, 100.0);
+        s.set_param(p::SMOOTH, 0.0);
+        let tr = Transport { playing: true, bpm: 120.0, position_beats: 0.0, ..Transport::default() };
+        let mut buf = AudioBuffer::new(2, 4_096);
+        for i in 0..4_096 {
+            let hi = (std::f32::consts::TAU * 6_000.0 * i as f32 / 48_000.0).sin();
+            buf.channel_mut(0)[i] = hi;
+            buf.channel_mut(1)[i] = hi;
+        }
+        let mut ctx = ProcessContext { sample_rate: 48_000.0, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+        s.process(&mut ctx);
+        let early_rms = crate::test_util::rms(&buf.channel(0)[256..1_024]);
+        assert!(early_rms < 0.15, "6kHz should be attenuated when LP curve starts near 100 Hz (rms={early_rms})");
+    }
+
+    #[test]
+    fn pan_mode_steers_left_and_right_across_curve() {
+        let mut s = Shaper::new();
+        crate::test_util::set_plain(&mut s, p::MODE, 2.0); // Pan
+        s.set_param(p::SMOOTH, 0.0);
+        let tr = Transport { playing: true, bpm: 120.0, position_beats: 0.0, ..Transport::default() };
+        let mut buf = AudioBuffer::new(2, 24_000);
+        for ch in 0..2 {
+            buf.channel_mut(ch).fill(0.5);
+        }
+        let mut ctx = ProcessContext { sample_rate: 48_000.0, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+        s.process(&mut ctx);
+        // At start (curve ~0.0 -> full left), L > R; at end (curve ~1.0 -> full right), R > L.
+        assert!(buf.channel(0)[10] > buf.channel(1)[10] + 0.3);
+        assert!(buf.channel(1)[20_000] > buf.channel(0)[20_000] + 0.3);
+    }
+
+    #[test]
+    fn audio_trigger_mode_fires_one_cycle_on_transient() {
+        let mut s = Shaper::new();
+        crate::test_util::set_plain(&mut s, p::TRIGGER, 1.0); // Audio
+        crate::test_util::set_plain(&mut s, p::THRESHOLD, -12.0);
+        s.set_param(p::SMOOTH, 0.0);
+        let tr = Transport { playing: false, bpm: 120.0, ..Transport::default() };
+        let mut buf = AudioBuffer::new(2, 24_000);
+        // Quiet bed for first 4000 samples (must NOT trigger -> stays at end-of-cycle level 1.0).
+        for ch in 0..2 {
+            buf.channel_mut(ch)[0..4_000].fill(0.05);
+            // Loud kick transient at sample 4000, followed by constant 0.5 signal to see ducking.
+            buf.channel_mut(ch)[4_000..4_100].fill(0.9);
+            buf.channel_mut(ch)[4_100..24_000].fill(0.5);
+        }
+        let mut ctx = ProcessContext { sample_rate: 48_000.0, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+        s.process(&mut ctx);
+        assert!((buf.channel(0)[1_000] - 0.05).abs() < 1e-3, "idle before transient");
+        assert!(buf.channel(0)[4_120].abs() < 0.02, "ducked right after transient: {}", buf.channel(0)[4_120]);
+        assert!((buf.channel(0)[22_000] - 0.5).abs() < 0.02, "recovered to unity after cycle");
     }
 }

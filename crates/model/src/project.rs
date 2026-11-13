@@ -280,6 +280,12 @@ pub struct Track {
     /// Plugin delay compensation the engine reports back (samples, read-only).
     #[serde(default)]
     pub reported_latency: u32,
+    /// Optional per-track key/scale override (used by the Piano Roll when the clip has no scale).
+    #[serde(default)]
+    pub scale: Option<Scale>,
+    /// Whether this Instrument track receives notes from the computer MIDI keyboard.
+    #[serde(default)]
+    pub keyboard_input: bool,
 }
 
 impl Track {
@@ -306,6 +312,8 @@ impl Track {
             arrangement: Vec::new(),
             automation: Vec::new(),
             reported_latency: 0,
+            scale: None,
+            keyboard_input: false,
         }
     }
 }
@@ -596,9 +604,16 @@ impl Warp {
         self.transpose + self.detune / 100.0
     }
 
-    /// Playback speed of the source that the pitch asks for (1 = as recorded).
+    /// Playback speed requested by transpose and detune (1 = as recorded).
     pub fn pitch_ratio(&self) -> f64 {
         2f64.powf(f64::from(self.pitch()) / 12.0)
+    }
+
+    /// Source speed factor per clip tick from transpose and detune: `1.0` for
+    /// pitch-preserving warp modes, or [`pitch_ratio`](Self::pitch_ratio) when
+    /// Warp is off or set to `Re-Pitch`.
+    pub fn speed_ratio(&self) -> f64 {
+        if !self.enabled || self.mode == WarpMode::Repitch { self.pitch_ratio() } else { 1.0 }
     }
 }
 
@@ -608,17 +623,45 @@ impl Default for Warp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarpMode {
-    /// Slice at transients (drums).
+    /// Slice at transients (drums & percussion loops).
     Beats,
-    /// Monophonic pitch-preserving stretch.
+    /// Monophonic pitch-period stretch (vocals, bass, solo lines).
     Tones,
-    /// Polyphonic stretch (full mixes).
+    /// Granular stretch with smooth grain scatter (pads & ambiences).
+    Texture,
+    /// Phase-locked polyphonic stretch (full mixes & chords).
     Complex,
+    /// Formant-preserving polyphonic stretch (vocals & harmonic mixes).
+    ComplexPro,
     /// Speed changes pitch (vinyl).
     Repitch,
+}
+
+impl WarpMode {
+    pub const ALL: [Self; 6] = [Self::Beats, Self::Tones, Self::Texture, Self::Complex, Self::ComplexPro, Self::Repitch];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Beats => "Beats",
+            Self::Tones => "Tones",
+            Self::Texture => "Texture",
+            Self::Complex => "Complex",
+            Self::ComplexPro => "Complex Pro",
+            Self::Repitch => "Re-Pitch",
+        }
+    }
+
+    pub fn preserves_pitch(self) -> bool {
+        self != Self::Repitch
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
 }
 
 // ───────────────────────────── Devices & racks ─────────────────────────────
@@ -1040,5 +1083,16 @@ mod tests {
         assert_eq!(a.length_ticks(120.0), 2 * PPQ);
         a.frames = 0;
         assert_eq!(a.length_ticks(120.0), 0);
+    }
+
+    #[test]
+    fn track_defaults_scale_and_keyboard_input_when_missing() {
+        let track = Track::new(TrackId(7), TrackKind::Instrument, "Keys", Color(2));
+        let mut val = serde_json::to_value(&track).unwrap();
+        val.as_object_mut().unwrap().remove("scale");
+        val.as_object_mut().unwrap().remove("keyboard_input");
+        let parsed: Track = serde_json::from_value(val).unwrap();
+        assert_eq!(parsed.scale, None);
+        assert!(!parsed.keyboard_input);
     }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "Techno 303 Line",
+  "plugin": "instrument.acid303",
+  "author": "AI-Track",
+  "tags": ["acid", "techno", "sequencer", "pattern"],
+  "params": {
+    "0": 0.0,
+    "1": 0.5,
+    "2": 0.4,
+    "3": 0.76,
+    "4": 0.72,
+    "5": 0.45,
+    "6": 0.8,
+    "7": 0.55,
+    "8": 0.4,
+    "9": 0.1,
+    "10": 1.0,
+    "11": 0.83
+  }
+}

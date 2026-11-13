@@ -36,9 +36,10 @@ impl Default for Usage {
 }
 
 impl Usage {
-    /// Refresh if the last sample is older than a second. Cheap: one process.
-    pub fn tick(&mut self) {
-        if self.at.elapsed() >= EVERY {
+    /// Refresh if the last sample is older than the sampling interval (1s, or 3s in low-power mode).
+    pub fn tick(&mut self, low_power: bool) {
+        let interval = if low_power { EVERY * 3 } else { EVERY };
+        if self.at.elapsed() >= interval {
             self.sample();
         }
     }

@@ -57,6 +57,8 @@ actions!(
         TogglePalette,
         AddLibraryFolder,
         ToggleGroupFold,
+        ToggleAutomationMode,
+        ToggleAutomationArm,
         Quit,
     ]
 );
@@ -109,6 +111,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-up"), VelocityUp, Some(CTX)),
         KeyBinding::new(&format!("{m}-down"), VelocityDown, Some(CTX)),
         KeyBinding::new("0", ToggleActive, Some(CTX)),
+        KeyBinding::new("a", ToggleAutomationMode, Some(CTX)),
         KeyBinding::new(&format!("{m}-d"), Duplicate, Some(CTX)),
         // Clips and tracks.
         KeyBinding::new(&format!("{m}-e"), SplitClip, Some(CTX)),

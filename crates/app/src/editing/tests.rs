@@ -1094,16 +1094,16 @@ fn plugin_window_edits_become_one_undo_step_per_gesture_and_states_are_stored() 
     let base = steps(&s);
     let edit = |kind, value| PluginEdit { device, param: 3, value, kind };
     let gesture = [edit(K::Begin, 0.), edit(K::Value, 0.2), edit(K::Value, 0.4), edit(K::Value, 0.6)];
-    assert!(s.apply_plugin_edits(&gesture));
-    assert!(s.apply_plugin_edits(&[edit(K::Value, 0.7), edit(K::End, 0.)]), "a gesture spread over frames");
+    assert!(s.apply_plugin_edits(&gesture, None));
+    assert!(s.apply_plugin_edits(&[edit(K::Value, 0.7), edit(K::End, 0.)], None), "a gesture spread over frames");
     assert_eq!(steps(&s), base + 1);
     assert_eq!(s.project.device(device).unwrap().params.get(&3), Some(&0.7));
     assert_eq!(s.history.undo_label(), Some("Plugin parameter"));
     // The value the project already holds (the plugin echoing it) is no edit.
-    assert!(!s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.7), edit(K::End, 0.)]));
+    assert!(!s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.7), edit(K::End, 0.)], None));
     assert_eq!(steps(&s), base + 1);
     // An edit for a device that is gone is ignored.
-    assert!(!s.apply_plugin_edits(&[PluginEdit { device: DeviceId(9999), param: 1, value: 0.5, kind: K::Value }]));
+    assert!(!s.apply_plugin_edits(&[PluginEdit { device: DeviceId(9999), param: 1, value: 0.5, kind: K::Value }], None));
     s.undo();
     assert_eq!(s.project.device(device).unwrap().params.get(&3), None);
     // States: only what differs, in one step, unknown devices left out.
@@ -1113,4 +1113,141 @@ fn plugin_window_edits_become_one_undo_step_per_gesture_and_states_are_stored() 
     let n = steps(&s);
     assert!(!s.store_plugin_states(vec![(device, vec![1, 2, 3])]), "unchanged: no undo step");
     assert_eq!(steps(&s), n);
+}
+
+// ── Automation lanes made from the UI ──
+
+fn lane_of(s: &AppState, track: TrackId, target: AutomationTarget) -> Option<AutomationLane> {
+    s.project.track(track).and_then(|t| t.automation.iter().find(|l| l.target == target).cloned())
+}
+
+#[test]
+fn the_automation_toggle_opens_a_volume_lane_that_drawing_creates() {
+    let Song { mut s, audio, .. } = song();
+    assert!(s.shown_lanes(audio).is_empty(), "hidden until toggled");
+    s.toggle_automation(audio);
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Volume], "a track without automation offers Volume");
+    assert!(lane_of(&s, audio, AutomationTarget::Volume).is_none(), "showing a lane edits nothing");
+    let base = steps(&s);
+    // A click in the lane: the lane is created with that breakpoint, one undo step.
+    assert!(s.set_automation_point(audio, AutomationTarget::Volume, 4 * BEAT, 0.5, false));
+    assert_eq!(lane_of(&s, audio, AutomationTarget::Volume).unwrap().points.len(), 1);
+    assert_eq!(steps(&s), base + 1);
+    s.undo();
+    assert!(lane_of(&s, audio, AutomationTarget::Volume).is_none(), "undo removes the new lane");
+    s.redo();
+    // Hidden and shown again: the lane comes back as it was.
+    s.toggle_automation(audio);
+    assert!(s.shown_lanes(audio).is_empty());
+    s.toggle_automation(audio);
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Volume]);
+}
+
+#[test]
+fn plus_adds_lanes_the_chooser_retargets_and_minus_hides() {
+    let Song { mut s, audio, .. } = song();
+    s.toggle_automation(audio);
+    assert_eq!(s.add_auto_lane(audio), Some(AutomationTarget::Pan));
+    assert_eq!(s.add_auto_lane(audio), Some(AutomationTarget::Mute));
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Volume, AutomationTarget::Pan, AutomationTarget::Mute]);
+    // The chooser of the second lane picks a device parameter.
+    let eq = s.add_stock_device(audio, "fx.eq", "EQ").unwrap();
+    let gain = AutomationTarget::DeviceParam { device: eq, param: 1 };
+    s.set_lane_target(audio, 1, gain);
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Volume, gain, AutomationTarget::Mute]);
+    // Choosing what another lane shows closes that other lane.
+    s.set_lane_target(audio, 2, AutomationTarget::Volume);
+    assert_eq!(s.shown_lanes(audio), vec![gain, AutomationTarget::Volume]);
+    s.hide_auto_lane(audio, gain);
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Volume]);
+    s.hide_auto_lane(audio, AutomationTarget::Volume);
+    assert!(s.shown_lanes(audio).is_empty() && !s.automation_shown.contains(&audio), "the last lane hides the automation");
+}
+
+#[test]
+fn show_automation_reuses_an_empty_lane_and_deleting_is_undoable() {
+    let Song { mut s, audio, .. } = song();
+    let eq = s.add_stock_device(audio, "fx.eq", "EQ").unwrap();
+    let gain = AutomationTarget::DeviceParam { device: eq, param: 1 };
+    // From the mixer (or the device view): the lane opens with the track's automation.
+    s.show_automation(audio, AutomationTarget::Pan);
+    assert_eq!(s.shown_lanes(audio), vec![AutomationTarget::Pan]);
+    // Nothing drawn in Pan yet: the next one takes its place.
+    s.show_automation(audio, gain);
+    assert_eq!(s.shown_lanes(audio), vec![gain]);
+    s.set_automation_point(audio, gain, 0, 0.3, false);
+    s.set_automation_point(audio, gain, 4 * BEAT, 0.9, false);
+    // A drawn lane stays; the next one goes under it.
+    s.show_automation(audio, AutomationTarget::Volume);
+    assert_eq!(s.shown_lanes(audio), vec![gain, AutomationTarget::Volume]);
+    s.show_automation(audio, gain);
+    assert_eq!(s.shown_lanes(audio).len(), 2, "already shown: nothing added");
+    let base = steps(&s);
+    assert!(s.delete_automation(audio, gain));
+    assert!(lane_of(&s, audio, gain).is_none());
+    assert_eq!(steps(&s), base + 1);
+    assert_eq!(s.history.undo_label(), Some("Delete automation"));
+    assert!(s.shown_lanes(audio).contains(&gain), "the lane stays shown, empty");
+    assert!(!s.delete_automation(audio, AutomationTarget::Pan), "nothing to delete");
+    s.undo();
+    assert_eq!(lane_of(&s, audio, gain).unwrap().points.len(), 2, "undo brings the breakpoints back");
+}
+
+#[test]
+fn a_plugin_gesture_shows_its_lane_and_is_written_while_recording_with_automation_arm() {
+    use crate::bridge::{PluginEdit, PluginEditKind as K};
+    let Song { mut s, audio, .. } = song();
+    let device = s.add_stock_device(audio, "fx.eq", "EQ").unwrap();
+    let target = AutomationTarget::DeviceParam { device, param: 3 };
+    let edit = |kind, value| PluginEdit { device, param: 3, value, kind };
+    // Automation hidden, not recording: just the parameter.
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.2), edit(K::End, 0.)], None);
+    assert!(s.shown_lanes(audio).is_empty());
+    // Automation shown: touching the control shows its lane.
+    s.toggle_automation(audio);
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::End, 0.)], None);
+    assert_eq!(s.shown_lanes(audio), vec![target], "the empty Volume lane gave its place");
+    assert!(lane_of(&s, audio, target).is_none(), "touching writes nothing");
+    // Recording without Automation Arm: no automation.
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.5), edit(K::End, 0.)], Some(0));
+    assert!(lane_of(&s, audio, target).is_none());
+    // With it: the move is written as the playhead runs, in one undo step with the value.
+    s.automation_arm = true;
+    let base = steps(&s);
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.1)], Some(BEAT));
+    s.apply_plugin_edits(&[edit(K::Value, 0.6)], Some(2 * BEAT));
+    s.apply_plugin_edits(&[edit(K::Value, 0.9), edit(K::End, 0.)], Some(3 * BEAT));
+    let pts: Vec<(Tick, f32)> = lane_of(&s, audio, target).unwrap().points.iter().map(|p| (p.tick, p.value)).collect();
+    assert_eq!(pts, vec![(BEAT, 0.1), (2 * BEAT, 0.6), (3 * BEAT, 0.9)]);
+    assert_eq!(steps(&s), base + 1);
+    assert_eq!(s.project.device(device).unwrap().params.get(&3), Some(&0.9));
+    // A second pass over the same time overwrites what it passes over.
+    s.apply_plugin_edits(&[edit(K::Begin, 0.), edit(K::Value, 0.3)], Some(BEAT + BEAT / 2));
+    s.apply_plugin_edits(&[edit(K::Value, 0.4), edit(K::End, 0.)], Some(3 * BEAT));
+    let pts: Vec<Tick> = lane_of(&s, audio, target).unwrap().points.iter().map(|p| p.tick).collect();
+    assert_eq!(pts, vec![BEAT, BEAT + BEAT / 2, 3 * BEAT]);
+    s.undo();
+    s.undo();
+    assert!(lane_of(&s, audio, target).is_none(), "each pass is one undo step");
+}
+
+#[test]
+fn the_header_volume_box_and_pan_use_the_mixer_commands() {
+    let Song { mut s, audio, .. } = song();
+    let base = steps(&s);
+    // A drag is one coalesced step, as the mixer's fader.
+    for db in [-1., -2., -3.] {
+        s.set_track_coalesced(&format!("fader-{}", audio.0), audio, TrackProp::VolumeDb(db));
+    }
+    s.seal();
+    assert_eq!(steps(&s), base + 1);
+    assert_eq!(s.project.track(audio).unwrap().volume_db, -3.);
+    s.set_track_coalesced(&format!("pan-{}", audio.0), audio, TrackProp::Pan(-0.5));
+    s.seal();
+    assert_eq!(s.project.track(audio).unwrap().pan, -0.5);
+    assert_eq!(crate::views::arrangement::pan_text(-0.5), "25L");
+    assert_eq!(crate::views::arrangement::value_text(AutomationTarget::Volume, 70. / 76.), "+0.0 dB");
+    let t = s.project.track(audio).unwrap().clone();
+    let v = crate::views::arrangement::current_value(&s.project, &t, AutomationTarget::Pan).unwrap();
+    assert!((v - 0.25).abs() < 1e-6, "a lane with nothing drawn shows the knob's value");
 }

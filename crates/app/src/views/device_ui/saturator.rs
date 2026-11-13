@@ -1,29 +1,34 @@
 //! `fx.saturator`: each band's transfer shape (drag a curve's handle =
 //! drive) next to the bands laid out over frequency, where the crossovers
 //! are draggable lines and each band shows its level.
+//!
+//! The rest of the saturation family's editors live in the submodules:
+//! [`tape`] (`fx.tape`), [`amp`] (`fx.amp`) and [`console`] (`fx.console`).
+
+// Editors of fx.tape / fx.amp / fx.console, dispatched from `device_ui::editor`.
+pub mod amp;
+pub mod console;
+pub mod tape;
 
 use super::kit::{self, Handle, PlotCfg, ax, freq_frac};
 use super::{Dev, caption};
 use crate::theme::*;
 use crate::workspace::Workspace;
-use aitrack_stock::fx::saturator::{STYLES, p};
+use aitrack_stock::fx::saturator::{STYLES, p, style, style_curve};
 use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, TextAlign, div, px};
 
 /// Handle indices of the two crossovers (bands are 0..3).
 const XOVER: usize = 8;
 
-/// The curve of a style at drive-scaled input `u` (unity small-signal gain).
-pub fn shape(style: usize, u: f32, bias: f32, bits: f32) -> f32 {
-    match style {
-        0 => u.tanh(),
-        1 => ((u + bias).tanh() - bias.tanh()) / (1. - bias.tanh().powi(2)),
-        2 => u.clamp(-1., 1.),
-        3 => u.sin(),
-        _ => {
-            let steps = 2f32.powf(bits.clamp(1., 16.) - 1.);
-            (u.clamp(-1., 1.) * steps).round() / steps
-        }
+/// The curve of a style at drive-scaled input `u` (unity small-signal
+/// gain), as the plugin shapes it; `bias` is the Bias control (0..1).
+pub fn shape(st: usize, u: f32, bias: f32, bits: f32) -> f32 {
+    if st == style::BITCRUSH {
+        let steps = 2f32.powf(bits.clamp(1., 16.) - 1.);
+        return (u.clamp(-1., 1.) * steps).round() / steps;
     }
+    let (curve, k, norm) = style_curve(st, bias);
+    curve.f(u as f64, k) as f32 * norm
 }
 
 /// Band edges in Hz for `bands` active bands (the plugin sorts the crossovers).
@@ -43,7 +48,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
     // (style, linear drive, bias, bits) per band.
     let shapes: Vec<(usize, f32, f32, f32)> = (0..nb)
-        .map(|b| (dev.choice(band(b, p::STYLE)), 10f32.powf(dev.plain(band(b, p::DRIVE)) / 20.), dev.plain(band(b, p::BIAS)) / 100. * 0.6, dev.plain(band(b, p::BITS))))
+        .map(|b| (dev.choice(band(b, p::STYLE)), 10f32.powf(dev.plain(band(b, p::DRIVE)) / 20.), dev.plain(band(b, p::BIAS)) / 100., dev.plain(band(b, p::BITS))))
         .collect();
     let at = 0.35f32;
     let curve_y = |s: &(usize, f32, f32, f32), x: f32| 0.5 - shape(s.0, s.1 * x, s.2, s.3).clamp(-1.15, 1.15) / 2.4;
@@ -96,12 +101,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     });
 
     let b = selected;
-    let style = dev.choice(band(b, p::STYLE));
+    let st = dev.choice(band(b, p::STYLE));
     let mut band_ids = vec![band(b, p::STYLE), band(b, p::DRIVE), band(b, p::LEVEL)];
-    match style {
-        1 => band_ids.push(band(b, p::BIAS)),
-        4 => band_ids.extend([band(b, p::BITS), band(b, p::CRUSH_RATE)]),
-        _ => {}
+    if style::uses_bias(st) {
+        band_ids.push(band(b, p::BIAS));
+    }
+    if st == style::BITCRUSH {
+        band_ids.extend([band(b, p::BITS), band(b, p::CRUSH_RATE)]);
     }
     kit::panel(if dev.big { 760. } else { 520. })
         .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 168. })).h_full().child(transfer)).child(div().flex_1().min_w(px(0.)).h_full().child(spectrum)))
@@ -133,16 +139,21 @@ mod tests {
 
     #[test]
     fn shapes_are_unity_for_small_signals_and_bounded() {
-        for style in 0..4 {
-            let small = shape(style, 0.01, 0.2, 8.);
-            assert!((small / 0.01 - 1.).abs() < 0.03, "style {style}: {small}");
+        for (st, name) in STYLES.iter().enumerate().take(style::BITCRUSH) {
+            if st == style::RECTIFY {
+                continue;
+            }
+            let small = shape(st, 0.01, 0.3, 8.);
+            assert!((small / 0.01 - 1.).abs() < 0.03, "{name}: {small}");
             for u in [-40., -2., 0.5, 3., 40.] {
-                assert!(shape(style, u, 0.2, 8.).abs() <= 1.5);
+                assert!(shape(st, u, 0.3, 8.).abs() <= 1.6, "{name} at {u}");
             }
         }
+        // Full-wave rectifier: |u| (clipped).
+        assert!((shape(style::RECTIFY, -0.4, 1., 8.) - 0.4).abs() < 1e-6);
         // The crusher quantises to 2^(bits-1) steps per side.
-        assert_eq!(shape(4, 0.3, 0., 2.), 0.5);
-        assert_eq!(shape(4, 5., 0., 8.), 1.);
+        assert_eq!(shape(style::BITCRUSH, 0.3, 0., 2.), 0.5);
+        assert_eq!(shape(style::BITCRUSH, 5., 0., 8.), 1.);
     }
 
     #[test]

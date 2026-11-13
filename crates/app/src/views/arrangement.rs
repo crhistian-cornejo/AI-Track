@@ -11,8 +11,8 @@ use crate::theme::*;
 use crate::views::arrange_clips::{self, ClipBox, Zone, draw::Wave};
 use crate::views::browser::kind_icon;
 use crate::views::sample_editor::geom::TimeBase;
-use crate::widgets::{self, chip, icon_chip, label, mono};
-use crate::workspace::{Drag, MenuKind, Workspace};
+use crate::widgets::{self, chip, icon_chip, label, menu_header, menu_item, mono};
+use crate::workspace::{Drag, MenuKind, NumTarget, Workspace};
 use aitrack_model::*;
 use gpui::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -22,7 +22,8 @@ use gpui::{
 use gpui::{DispatchPhase, HitboxBehavior, MouseMoveEvent};
 use std::rc::Rc;
 
-const AUTO_H: f32 = 56.;
+/// Height of one automation lane.
+pub const AUTO_H: f32 = 56.;
 
 /// Pixels between the bottom (0) and top (1) of an automation lane's values.
 pub fn auto_value_px() -> f32 {
@@ -36,14 +37,25 @@ pub struct LaneRow {
     pub kind: TrackKind,
     pub top: f32,
     pub h: f32,
-    pub auto: Option<AutomationTarget>,
+    /// The automation lanes shown under the track, top to bottom.
+    pub autos: Vec<AutomationTarget>,
     /// How many groups the track sits inside: the header indents by it.
     pub depth: usize,
 }
 
 impl LaneRow {
     pub fn total(&self) -> f32 {
-        self.h + if self.auto.is_some() { AUTO_H } else { 0. }
+        self.h + AUTO_H * self.autos.len() as f32
+    }
+
+    /// The automation lane `ly` px below the row's top, and `ly` inside it.
+    pub fn lane_at(&self, ly: f32) -> Option<(usize, AutomationTarget, f32)> {
+        let k = ((ly - self.h) / AUTO_H).floor();
+        if k < 0. {
+            return None;
+        }
+        let k = k as usize;
+        self.autos.get(k).map(|t| (k, *t, ly - self.h - k as f32 * AUTO_H))
     }
 }
 
@@ -60,9 +72,9 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
         if groups::hidden(&s.project, t.id) {
             continue;
         }
-        let auto = s.automation_shown.contains(&t.id).then(|| t.automation.first().map(|l| l.target)).flatten();
+        let autos = s.shown_lanes(t.id);
         let h = crate::theme::density(t.height.max(40.).round());
-        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, auto, depth: groups::depth(&s.project, t.id) });
+        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, autos, depth: groups::depth(&s.project, t.id) });
         y += out.last().map_or(0., LaneRow::total);
     }
     out
@@ -92,36 +104,110 @@ fn automation_line(lane: &aitrack_model::AutomationLane, px_per_tick: f32, scrol
     out
 }
 
-/// Normalised automation value under a window position in `track`'s lane.
-pub fn automation_value_at(ws: &Workspace, track: TrackId, pos: Point<Pixels>) -> Option<f32> {
+/// Normalised automation value under a window position in `track`'s lane for `target`.
+pub fn automation_value_at(ws: &Workspace, track: TrackId, target: AutomationTarget, pos: Point<Pixels>) -> Option<f32> {
     let row = rows(&ws.s).into_iter().find(|r| r.track == track)?;
+    let k = row.autos.iter().position(|t| *t == target)?;
     let b = ws.regions.arrange.get();
-    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.h;
+    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.h - k as f32 * AUTO_H;
     Some((1. - (y - 6.) / (AUTO_H - 12.)).clamp(0., 1.))
 }
 
-fn target_name(ws: &Workspace, t: AutomationTarget) -> String {
+/// A device's automatable parameters as (id, name): a stock device's from
+/// the catalogue, a hosted plugin's as it reported them once loaded (hidden,
+/// read-only and MIDI-CC proxy parameters left out). Racks have macros instead.
+pub fn device_params(ws: &Workspace, d: &Device) -> Vec<(u32, String)> {
+    match &d.kind {
+        DeviceKind::Stock { plugin_id } => {
+            ws.b.plugins.device(plugin_id).map(|i| i.params.iter().filter(|p| p.automatable).map(|p| (p.id, p.name.to_owned())).collect()).unwrap_or_default()
+        }
+        DeviceKind::Plugin { .. } => ws.b.plugins.device_params(d.id).into_iter().filter(|p| p.automatable && !is_midi_proxy(p.name)).map(|p| (p.id, p.name.to_owned())).collect(),
+        DeviceKind::Rack(_) => Vec::new(),
+    }
+}
+
+/// JUCE-wrapped plugins list 16 × 128 "MIDI CC n|m" parameters for MIDI
+/// learn; they are not something to draw automation for.
+fn is_midi_proxy(name: &str) -> bool {
+    name.starts_with("MIDI CC ")
+}
+
+/// A parameter's name, or `P<id>` when the device does not list it (a
+/// plugin that is not loaded).
+fn param_name(ws: &Workspace, d: &Device, param: u32) -> String {
+    let stock = match &d.kind {
+        DeviceKind::Stock { plugin_id } => ws.b.plugins.device(plugin_id).and_then(|i| i.params.iter().find(|p| p.id == param)).map(|p| p.name.to_owned()),
+        DeviceKind::Plugin { .. } => ws.b.plugins.device_params(d.id).into_iter().find(|p| p.id == param).map(|p| p.name.to_owned()),
+        DeviceKind::Rack(_) => None,
+    };
+    stock.unwrap_or_else(|| format!("P{param}"))
+}
+
+/// The value a lane holds when it has no breakpoints (normalised as the
+/// lane stores it): the fader, the knob, the switch. Drawn as a faint line.
+pub fn current_value(p: &Project, track: &Track, target: AutomationTarget) -> Option<f32> {
+    let db = |db: f32| if db <= -70. { 0. } else { ((db + 70.) / 76.).clamp(0., 1.) };
+    Some(match target {
+        AutomationTarget::Volume => db(track.volume_db),
+        AutomationTarget::Pan => (track.pan + 1.) / 2.,
+        AutomationTarget::Mute => f32::from(u8::from(track.mute)),
+        AutomationTarget::Send { index } => db(track.sends.get(index as usize)?.level_db),
+        AutomationTarget::Tempo => ((p.tempo.initial_bpm() as f32 - 20.) / 280.).clamp(0., 1.),
+        AutomationTarget::DeviceParam { device, param } => *p.device(device)?.params.get(&param)?,
+        AutomationTarget::DeviceEnabled { device } => f32::from(u8::from(p.device(device)?.enabled)),
+        AutomationTarget::Macro { device, index } => match &p.device(device)?.kind {
+            DeviceKind::Rack(r) => r.macros.get(index as usize)?.value,
+            _ => return None,
+        },
+    })
+}
+
+/// A lane's value as text for its header (the mappings of `aitrack_engine::automation`).
+pub fn value_text(target: AutomationTarget, v: f32) -> String {
+    match target {
+        AutomationTarget::Volume | AutomationTarget::Send { .. } => {
+            if v <= 0. { "-inf dB".into() } else { format!("{} dB", crate::state::format_db(v.min(1.) * 76. - 70.)) }
+        }
+        AutomationTarget::Pan => pan_text(v * 2. - 1.),
+        AutomationTarget::Mute => (if v >= 0.5 { "Muted" } else { "On" }).into(),
+        AutomationTarget::DeviceEnabled { .. } => (if v >= 0.5 { "On" } else { "Off" }).into(),
+        AutomationTarget::Tempo => format!("{:.1} BPM", 20. + v.clamp(0., 1.) * 280.),
+        AutomationTarget::DeviceParam { .. } | AutomationTarget::Macro { .. } => format!("{:.0} %", v * 100.),
+    }
+}
+
+/// Pan as Live writes it: C, 25L, 50R.
+pub fn pan_text(pan: f32) -> String {
+    if pan.abs() < 0.01 { "C".to_owned() } else if pan < 0. { format!("{:.0}L", -pan * 50.) } else { format!("{:.0}R", pan * 50.) }
+}
+
+/// A target's name inside its chooser group (no device prefix).
+fn short_name(ws: &Workspace, t: AutomationTarget) -> String {
+    let p = &ws.s.project;
+    match t {
+        AutomationTarget::DeviceParam { device, param } => p.device(device).map_or(format!("P{param}"), |d| param_name(ws, d, param)),
+        AutomationTarget::DeviceEnabled { .. } => "Device On".into(),
+        AutomationTarget::Macro { device, index } => match p.device(device).map(|d| &d.kind) {
+            Some(DeviceKind::Rack(r)) => r.macros.get(index as usize).map_or(format!("Macro {}", index + 1), |m| m.name.clone()),
+            _ => format!("Macro {}", index + 1),
+        },
+        _ => target_name(ws, t),
+    }
+}
+
+/// A lane's full name: "Volume", "Send B", "EQ Eight · Gain 1".
+pub fn target_name(ws: &Workspace, t: AutomationTarget) -> String {
     let p = &ws.s.project;
     match t {
         AutomationTarget::Volume => "Volume".into(),
         AutomationTarget::Pan => "Pan".into(),
         AutomationTarget::Mute => "Mute".into(),
         AutomationTarget::Send { index } => format!("Send {}", (b'A' + index as u8) as char),
-        AutomationTarget::DeviceParam { device, param } => {
-            let d = p.device(device);
-            let name = d.map_or("Device".into(), |d| d.name.clone());
-            let pname = d
-                .and_then(|d| match &d.kind {
-                    DeviceKind::Stock { plugin_id } => ws.b.plugins.device(plugin_id),
-                    _ => None,
-                })
-                .and_then(|i| i.params.iter().find(|p| p.id == param))
-                .map_or(format!("P{param}"), |p| p.name.to_owned());
-            format!("{name} · {pname}")
-        }
-        AutomationTarget::DeviceEnabled { .. } => "Device On".into(),
-        AutomationTarget::Macro { index, .. } => format!("Macro {}", index + 1),
         AutomationTarget::Tempo => "Tempo".into(),
+        AutomationTarget::DeviceParam { device, .. } | AutomationTarget::DeviceEnabled { device } | AutomationTarget::Macro { device, .. } => {
+            let name = p.device(device).map_or("Device".into(), |d| d.name.clone());
+            format!("{name} · {}", short_name(ws, t))
+        }
     }
 }
 
@@ -171,6 +257,9 @@ struct AutoPaint {
     color: Hsla,
     /// The selected range of this lane, left and right in pixels (equal for a caret).
     sel: Option<(f32, f32)>,
+    /// A lane with no breakpoints: the value it holds (the fader, the knob),
+    /// drawn as a faint flat line, as in Live.
+    idle: Option<f32>,
 }
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
@@ -204,7 +293,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     for r in &rows {
         let Some(t) = ws.s.project.track(r.track) else { continue };
         let ry = r.top - view.scroll_y;
-        lanes.push((ry, r.h, t.color, r.auto.is_some(), ws.s.is_track_selected(t.id)));
+        lanes.push((ry, r.h, t.color, r.autos.len(), ws.s.is_track_selected(t.id)));
         if ry > lane_h || ry + r.total() < 0. {
             continue;
         }
@@ -274,16 +363,17 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 repeats,
             });
         }
-        if let Some(target) = r.auto
-            && let Some(lane) = t.automation.iter().find(|l| l.target == target) {
-                autos.push(AutoPaint {
-                    y: ry + r.h,
-                    points: lane.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect(),
-                    line: automation_line(lane, px_per_tick, view.scroll_x),
-                    color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
-                    sel: ws.s.auto_sel.filter(|r| r.track == t.id && r.target == target).map(|r| (r.start as f32 * px_per_tick - view.scroll_x, r.end as f32 * px_per_tick - view.scroll_x)),
-                });
-            }
+        for (k, &target) in r.autos.iter().enumerate() {
+            let lane = t.automation.iter().find(|l| l.target == target && !l.points.is_empty());
+            autos.push(AutoPaint {
+                y: ry + r.h + k as f32 * AUTO_H,
+                points: lane.map(|l| l.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect()).unwrap_or_default(),
+                line: lane.map(|l| automation_line(l, px_per_tick, view.scroll_x)).unwrap_or_default(),
+                color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
+                sel: ws.s.auto_sel.filter(|r| r.track == t.id && r.target == target).map(|r| (r.start as f32 * px_per_tick - view.scroll_x, r.end as f32 * px_per_tick - view.scroll_x)),
+                idle: if lane.is_none() { current_value(&ws.s.project, t, target) } else { None },
+            });
+        }
     }
     // The grid, the insert marker and the time selection.
     let lane_rects: Vec<(TrackId, f32, f32)> = rows.iter().map(|r| (r.track, r.top - view.scroll_y, r.h)).collect();
@@ -310,12 +400,13 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let h = f32::from(b.size.height);
             window.paint_quad(paint::fill_rect(b, p().well));
             // Lane backgrounds.
-            for (y, lh, _, auto, sel) in &lanes {
+            for (y, lh, _, autos, sel) in &lanes {
                 window.paint_quad(paint::fill_rect(at(o, 0., *y, w, *lh), if *sel { content(0.025) } else { gpui::transparent_black() }));
                 window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh - 1., w, 1.), border()));
-                if *auto {
-                    window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh, w, AUTO_H), content(0.015)));
-                    window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh + AUTO_H - 1., w, 1.), border()));
+                for k in 0..*autos {
+                    let ay = *y + *lh + k as f32 * AUTO_H;
+                    window.paint_quad(paint::fill_rect(at(o, 0., ay, w, AUTO_H), content(0.015)));
+                    window.paint_quad(paint::fill_rect(at(o, 0., ay + AUTO_H - 1., w, 1.), border()));
                 }
             }
             // Grid: bars, beats and the subdivisions the zoom leaves room for.
@@ -365,6 +456,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     if r > l {
                         window.paint_quad(paint::fill_rect(at(o, r - 1., a.y, 1., AUTO_H - 1.), accent_alpha(0.8)));
                     }
+                }
+                if let Some(v) = a.idle {
+                    let y = lane_top + lane_h * (1. - v);
+                    window.paint_quad(paint::fill_rect(at(o, 0., y, w, 1.), with_alpha(a.color, 0.35)));
+                    continue;
                 }
                 let mut pts: Vec<Point<Pixels>> = Vec::with_capacity(a.points.len() + 2);
                 if let Some(first) = a.points.first() {
@@ -522,6 +618,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .child(label(ws.s.snap_label(crate::editing::GridView::Arrange), TEXT_SM, pal.text)),
         )
         .child(div().flex_1())
+        // Live's Automation Arm: while recording, a control moved in a
+        // plugin's window writes its automation.
+        .child(
+            widgets::sized_icon_button("auto-arm", Icon::Automation, ws.s.automation_arm, 24., 14.)
+                .when(ws.s.automation_arm, |d| d.bg(with_alpha(pal.record, 0.18)))
+                .tooltip(widgets::tip("Automation Arm: record plugin moves as automation", None))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_arm(cx))),
+        )
         .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, 24., 14.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
             let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
             this.s.arrange = crate::nav::zoom_at(this.s.arrange, 0.8, centre);
@@ -723,19 +827,28 @@ fn group_rules(ws: &Workspace, id: TrackId) -> Vec<AnyElement> {
     outer.into_iter().take(4).map(|c| div().w(px(4.)).h_full().border_l_1().border_color(with_alpha(track_color(c), 0.8)).into_any_element()).collect()
 }
 
+/// From this height a track header also shows a volume slider under its
+/// buttons (drag a track's bottom edge to make it taller, as in Live).
+const TALL_HEADER: f32 = 80.;
+/// The track-height handle along the bottom edge of a header.
+const RESIZE_H: f32 = 4.;
+
 fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let Some(t) = ws.s.project.track(r.track).cloned() else { return div().into_any_element() };
     let id = t.id;
     let selected = ws.s.is_track_selected(id);
     let auto_on = ws.s.automation_shown.contains(&id);
-    let has_auto = !t.automation.is_empty();
+    let has_auto = t.automation.iter().any(|l| !l.points.is_empty());
     let is_group = t.kind == TrackKind::Group;
+    let audio = t.kind.carries_audio();
+    let tall = r.h >= TALL_HEADER && audio;
     let (mute, solo, arm, collapsed) = (t.mute, t.solo, t.arm, t.collapsed);
     // One step per group the track is in, capped so deep trees keep their names.
     let indent = SP3 * r.depth.min(4) as f32;
     let main = div()
         .id(("arr-head", id.0 as usize))
+        .relative()
         .h(px(r.h))
         .flex()
         .bg(if selected { pal.raised } else { pal.surface })
@@ -801,8 +914,8 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                             )
                         })
                         .child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted))
-                        .child(label(paint::fit(&t.name, TRACK_HEADER_W - 96. - indent, TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
-                        .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted)),
+                        .child(label(paint::fit(&t.name, TRACK_HEADER_W - 104. - indent, TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
+                        .when(audio, |d| d.child(volume_box(ws, id, t.volume_db, cx))),
                 )
                 .child(
                     div()
@@ -827,40 +940,356 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                             })))
                         })
                         .child(div().flex_1())
-                        .when(has_auto, |d| {
-                            d.child(
-                                icon_chip(("a-auto", id.0 as usize), Icon::Automation, auto_on, pal.accent)
-                                    .tooltip(widgets::tip("Show automation", None))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        if !this.s.automation_shown.remove(&id) {
-                                            this.s.automation_shown.insert(id);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
+                        .when(audio, |d| d.child(pan_knob(id, t.pan, cx)))
+                        // Always there (Live): shows the track's lanes, or a
+                        // Volume lane to draw in when it has none yet.
+                        .child(
+                            icon_chip(("a-auto", id.0 as usize), Icon::Automation, auto_on, if has_auto { pal.automation } else { pal.accent })
+                                .tooltip(widgets::tip(if auto_on { "Hide automation" } else { "Show automation" }, Some("A")))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.s.toggle_automation(id);
+                                    cx.notify();
+                                })),
+                        )
                         .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
-                ),
+                )
+                .when(tall, |d| d.child(volume_slider(id, t.volume_db, cx))),
+        )
+        // Drag the bottom edge to change the track's height.
+        .child(
+            div()
+                .id(("arr-resize", id.0 as usize))
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(RESIZE_H))
+                .cursor_ns_resize()
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let start_h = this.s.project.track(id).map_or(56., |t| t.height);
+                    this.s.seal();
+                    this.begin_drag(Drag::TrackHeight { track: id, start_y: f32::from(e.position.y), start_h }, cx);
+                })),
         );
     let mut col = div().flex().flex_col().child(main);
-    if let Some(target) = r.auto {
-        col = col.child(
-            div()
-                .h(px(AUTO_H))
-                .pl(px(SP2 + 4. + indent))
-                .pr(px(SP2))
-                .flex()
-                .items_center()
-                .gap(px(SP2))
-                .bg(content(0.02))
-                .border_b_1()
-                .border_color(border())
-                .child(icon(Icon::Automation, 12., pal.faint))
-                .child(label(paint::fit(&target_name(ws, target), TRACK_HEADER_W - 48., TEXT_SM), TEXT_SM, pal.muted)),
-        );
+    let lanes = r.autos.clone();
+    for (k, target) in lanes.into_iter().enumerate() {
+        col = col.child(lane_header(ws, &t, k, target, indent, cx));
     }
     col.into_any_element()
+}
+
+/// The header of one automation lane (Live): the chooser of what it
+/// automates, its value, and buttons to delete its automation, hide the
+/// lane and add another lane under it.
+fn lane_header(ws: &mut Workspace, t: &Track, k: usize, target: AutomationTarget, indent: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let id = t.id;
+    let key = (id.0 as usize) << 8 | k.min(255);
+    let lane = t.automation.iter().find(|l| l.target == target && !l.points.is_empty());
+    let value = lane.and_then(|l| l.value_at(ws.b.engine.transport().position)).or_else(|| current_value(&ws.s.project, t, target));
+    let open = ws.auto_chooser.as_ref().is_some_and(|c| c.track == id && c.index == k);
+    div()
+        .id(("lane-head", key))
+        .h(px(AUTO_H))
+        .pl(px(SP2 + 4. + indent))
+        .pr(px(SP2))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(SP1))
+        .bg(content(0.02))
+        .border_b_1()
+        .border_color(border())
+        .child(
+            div()
+                .id(("lane-pick", key))
+                .h(px(20.))
+                .px(px(SP1))
+                .gap(px(SP1))
+                .flex()
+                .items_center()
+                .rounded(px(r_sm()))
+                .cursor_pointer()
+                .bg(if open { hover() } else { content(0.04) })
+                .hover(|s| s.bg(hover()))
+                .tooltip(widgets::tip("Choose what this lane automates", None))
+                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    let at = e.position();
+                    open_chooser(this, id, k, point(at.x - px(24.), at.y + px(12.)), window, cx);
+                }))
+                .child(icon(Icon::Automation, 12., if lane.is_some() { pal.automation } else { pal.faint }))
+                .child(label(paint::fit(&target_name(ws, target), TRACK_HEADER_W - 72. - indent, TEXT_SM), TEXT_SM, pal.text).flex_1())
+                .child(icon(Icon::ChevronDown, 10., pal.muted)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .child(mono(value.map_or("—".into(), |v| value_text(target, v)), TEXT_XS, pal.muted).flex_1())
+                .when(lane.is_some(), |d| {
+                    d.child(
+                        widgets::sized_icon_button(("lane-del", key), Icon::Trash, false, 20., 12.)
+                            .tooltip(widgets::tip("Delete this automation", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.s.delete_automation(id, target);
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(
+                    widgets::sized_icon_button(("lane-hide", key), Icon::Minus, false, 20., 12.)
+                        .tooltip(widgets::tip("Hide this lane", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.s.hide_auto_lane(id, target);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    widgets::sized_icon_button(("lane-add", key), Icon::Add, false, 20., 12.)
+                        .tooltip(widgets::tip("Show another automation lane", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.s.add_auto_lane(id);
+                            cx.notify();
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The track's volume as a value box (Live's arrangement header): drag up
+/// or down, double-click for 0 dB, click to type; right-click shows its
+/// automation. The same command and undo step as the mixer's fader.
+fn volume_box(ws: &Workspace, id: TrackId, db: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let target = NumTarget::Volume { track: id };
+    let editing = ws.num_edit.as_ref().filter(|e| e.target == target).map(|e| e.text.clone());
+    div()
+        .id(("arr-vol", id.0 as usize))
+        .flex_none()
+        .w(px(44.))
+        .h(px(18.))
+        .px(px(SP1))
+        .flex()
+        .items_center()
+        .justify_end()
+        .rounded(px(r_sm()))
+        .bg(content(0.04))
+        .border_1()
+        .border_color(if editing.is_some() { accent_alpha(0.7) } else { border() })
+        .cursor_ns_resize()
+        .tooltip(widgets::tip("Volume — drag, double-click for 0 dB, click to type", None))
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            if e.click_count >= 2 {
+                this.num_edit = None;
+                this.s.seal();
+                this.s.set_track(id, TrackProp::VolumeDb(0.));
+                this.s.seal();
+                cx.notify();
+                return;
+            }
+            let pos = crate::state::db_to_fader(this.s.project.track(id).map_or(0., |t| t.volume_db));
+            this.s.seal();
+            this.begin_drag(Drag::Fader { track: id, last_y: f32::from(e.position.y), pos, travel: 160. }, cx);
+        }))
+        // A click that didn't move opens the box for typing.
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if e.click_count() >= 2 || crate::workspace::click_dragged(e) || this.num_edit.as_ref().is_some_and(|n| n.target == target) {
+                return;
+            }
+            let db = this.s.project.track(id).map_or(0., |t| t.volume_db);
+            this.begin_num_edit(target, crate::workspace::plain_text(f64::from((db * 10.).round() / 10.)), cx);
+        }))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_param_menu(id, AutomationTarget::Volume, e.position, cx);
+        }))
+        .child(match editing {
+            Some(text) => div().flex().items_center().child(mono(text, TEXT_XS, pal.accent)).child(div().w(px(1.)).h(px(10.)).ml(px(1.)).bg(pal.accent)).into_any_element(),
+            None => mono(crate::state::format_db(db), TEXT_XS, pal.text).into_any_element(),
+        })
+        .into_any_element()
+}
+
+/// The track's pan as a small knob (drag, double-click centres it,
+/// right-click shows its automation).
+fn pan_knob(id: TrackId, pan: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let value = (pan + 1.) / 2.;
+    widgets::knob(("arr-pan", id.0 as usize), value, true, 16., accent())
+        .tooltip(widgets::tip_owned(format!("Pan {} — drag, double-click to centre", pan_text(pan))))
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            if e.click_count >= 2 {
+                this.s.seal();
+                this.s.set_track(id, TrackProp::Pan(0.));
+                this.s.seal();
+                cx.notify();
+                return;
+            }
+            this.s.seal();
+            this.begin_drag(Drag::Knob { target: crate::workspace::KnobTarget::Pan { track: id }, last_y: f32::from(e.position.y), value }, cx);
+        }))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_param_menu(id, AutomationTarget::Pan, e.position, cx);
+        }))
+        .into_any_element()
+}
+
+/// Width of the volume slider of a tall header.
+const SLIDER_W: f32 = TRACK_HEADER_W - 44.;
+
+/// A tall header's volume slider: drag sideways (fader law, 0 dB at three
+/// quarters), double-click for 0 dB.
+fn volume_slider(id: TrackId, db: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let pos = crate::state::db_to_fader(db);
+    div()
+        .id(("arr-slider", id.0 as usize))
+        .h(px(12.))
+        .flex()
+        .items_center()
+        .cursor_ew_resize()
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            if e.click_count >= 2 {
+                this.s.seal();
+                this.s.set_track(id, TrackProp::VolumeDb(0.));
+                this.s.seal();
+                cx.notify();
+                return;
+            }
+            this.s.seal();
+            this.begin_drag(Drag::HFader { track: id, last_x: f32::from(e.position.x), pos, travel: SLIDER_W }, cx);
+        }))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_param_menu(id, AutomationTarget::Volume, e.position, cx);
+        }))
+        .child(widgets::hbar(pos, SLIDER_W, 4., accent_alpha(0.8)))
+        .into_any_element()
+}
+
+// ───────────────────────────── Lane chooser ─────────────────────────────
+
+/// The open chooser of an automation lane (which lane, and where it opened).
+#[derive(Clone, Debug)]
+pub struct Chooser {
+    pub track: TrackId,
+    pub index: usize,
+    pub at: Point<Pixels>,
+}
+
+/// More items than this and the list asks for a narrower search (plugins
+/// can have thousands of parameters).
+const CHOOSER_MAX: usize = 400;
+
+fn open_chooser(ws: &mut Workspace, track: TrackId, index: usize, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Workspace>) {
+    if ws.auto_chooser.as_ref().is_some_and(|c| c.track == track && c.index == index) {
+        ws.auto_chooser = None;
+        cx.notify();
+        return;
+    }
+    ws.menu = None;
+    ws.auto_search.update(cx, |i, cx| i.set_text("", cx));
+    ws.auto_chooser = Some(Chooser { track, index, at });
+    let focus = gpui::Focusable::focus_handle(ws.auto_search.read(cx), cx);
+    focus.focus(window, cx);
+    cx.notify();
+}
+
+/// One section of the chooser: title, rack depth, targets with their names.
+pub type ChooserGroup = (String, usize, Vec<(AutomationTarget, String)>);
+
+/// What a lane's chooser lists: (group title, rack depth, targets with
+/// their names), the mixer first and then each device of the chain, at any
+/// rack depth, filtered by `query` (a group's title matching keeps all of it).
+pub fn chooser_items(ws: &Workspace, track: TrackId, query: &str) -> Vec<ChooserGroup> {
+    let Some(t) = ws.s.project.track(track) else { return Vec::new() };
+    let q = query.trim().to_lowercase();
+    let groups = automation::targets(t, |d| device_params(ws, d).into_iter().map(|p| p.0).collect());
+    groups
+        .into_iter()
+        .filter_map(|g| {
+            let title = g.device.and_then(|d| ws.s.project.device(d)).map_or("Mixer".to_owned(), |d| d.name.clone());
+            let all = q.is_empty() || title.to_lowercase().contains(&q);
+            let items: Vec<(AutomationTarget, String)> =
+                g.targets.into_iter().map(|t| (t, short_name(ws, t))).filter(|(_, n)| all || n.to_lowercase().contains(&q)).collect();
+            (!items.is_empty()).then_some((title, g.depth, items))
+        })
+        .collect()
+}
+
+pub fn render_chooser(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let pal = p();
+    let c = ws.auto_chooser.clone()?;
+    let Some(t) = ws.s.project.track(c.track) else {
+        ws.auto_chooser = None;
+        return None;
+    };
+    let drawn: Vec<AutomationTarget> = t.automation.iter().filter(|l| !l.points.is_empty()).map(|l| l.target).collect();
+    let current = ws.s.shown_lanes(c.track).get(c.index).copied();
+    let query = ws.auto_search.read(cx).text().to_owned();
+    let groups = chooser_items(ws, c.track, &query);
+    let (track, index) = (c.track, c.index);
+    let mut list = div().flex().flex_col();
+    let (mut shown, mut more) = (0usize, 0usize);
+    for (title, depth, items) in groups {
+        if shown >= CHOOSER_MAX {
+            more += items.len();
+            continue;
+        }
+        list = list.child(menu_header(title.to_uppercase()).pl(px(SP2 + SP3 * depth.min(4) as f32)));
+        for (target, name) in items {
+            if shown >= CHOOSER_MAX {
+                more += 1;
+                continue;
+            }
+            shown += 1;
+            list = list.child(
+                menu_item(("auto-target", shown), drawn.contains(&target).then_some(Icon::Automation), name, None, Some(target) == current).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.s.set_lane_target(track, index, target);
+                        this.auto_chooser = None;
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+    }
+    if shown == 0 {
+        list = list.child(div().px(px(SP2)).py(px(SP2)).child(label("No parameter matches", TEXT_SM, pal.faint)));
+    }
+    if more > 0 {
+        list = list.child(div().px(px(SP2)).py(px(SP2)).child(label(format!("{more} more — type to narrow the list"), TEXT_XS, pal.faint)));
+    }
+    let card = widgets::menu_card("auto-chooser", 280.)
+        .child(div().px(px(SP1)).pb(px(SP1)).child(ws.auto_search.clone()))
+        .child(div().id("auto-chooser-list").max_h(px(360.)).overflow_y_scroll().child(list));
+    Some(
+        gpui::deferred(
+            gpui::anchored().position(c.at).snap_to_window_with_margin(px(SP2)).child(
+                div()
+                    .id("auto-chooser-layer")
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.auto_chooser = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            ),
+        )
+        .with_priority(2)
+        .into_any_element(),
+    )
 }
 
 fn lane_hit(ws: &Workspace, pos: Point<Pixels>) -> Option<(LaneRow, Tick, f32, f32)> {
@@ -895,8 +1324,8 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &
     ws.s.selected_track = Some(track);
     // Automation lane.
     if ly >= row.h {
-        if let Some(target) = row.auto {
-            auto_lane_down(ws, track, target, tick, x, ly - row.h, e, cx);
+        if let Some((_, target, y)) = row.lane_at(ly) {
+            auto_lane_down(ws, track, target, tick, x, y, e, cx);
         }
         return;
     }
@@ -986,10 +1415,10 @@ fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: 
     let Some((row, tick, x, ly)) = lane_hit(ws, e.position) else { return };
     if ly >= row.h {
         // Right-click a breakpoint to delete it.
-        if let Some(target) = row.auto {
+        if let Some((_, target, y)) = row.lane_at(ly) {
             let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
             let points = ws.s.project.track(row.track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
-            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 7. && ((1. - p.value) * (AUTO_H - 12.) + 6. - (ly - row.h)).abs() < 9.);
+            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 7. && ((1. - p.value) * (AUTO_H - 12.) + 6. - y).abs() < 9.);
             if let Some(i) = hit {
                 ws.s.delete_automation_point(row.track, target, i);
                 cx.notify();

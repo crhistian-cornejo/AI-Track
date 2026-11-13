@@ -1,25 +1,40 @@
-//! `fx.saturator` — multiband saturation: up to 3 bands split by LR4
-//! crossovers, each with its own drive, style and level; ADAA1 shapers run
-//! inside a 1×/2×/4× polyphase IIR oversampler (the crossover runs at the
-//! oversampled rate too). Global tone tilt, mix (dry aligned to the
-//! oversampler's delay), output and optional auto gain.
+//! `fx.saturator` — multi-mode, multiband saturation: up to 3 bands split by
+//! LR4 crossovers, each with its own drive, style and level; ADAA1 shapers
+//! ([`shapes`]) run inside a 1×/2×/4× polyphase IIR oversampler (the
+//! crossover runs at the oversampled rate too). A DC blocker follows the
+//! shapers (the asymmetric styles make DC), then the global tone tilt, mix
+//! (dry aligned to the oversampler's delay), output and optional auto gain.
 //!
 //! Styles: Tape (tanh with HF pre-/de-emphasis, exact inverse in the linear
-//! range), Tube (asymmetric tanh, even harmonics), Clip (hard clip), Fold
-//! (sine wavefolder) and Bitcrush (bit depth + sample-rate reduction —
-//! aliasing is the point, no ADAA).
+//! range), Diode (exponential knee, asymmetric), Tube (biased tanh, even
+//! harmonics), Transistor (biased algebraic sigmoid), Clip (hard clip),
+//! Rectify (half/full-wave), Fold (sine folder), Tri Fold (triangle folder)
+//! and Bitcrush (bit depth + sample-rate reduction — aliasing is the point,
+//! no ADAA). The style list keeps the five original styles at the even
+//! indices of a range twice as wide, so the normalised values stored by old
+//! presets and projects (k/4) still land on the same style (2k/8).
+//!
+//! The family's other devices live in the submodules: [`tape`]
+//! (`fx.tape`), [`amp`] (`fx.amp`) and [`console`] (`fx.console`).
 //!
 //! Meter layout: `[input peak, output peak, band 1 level, band 2 level,
 //! band 3 level]` (linear, decaying peaks).
+
+pub mod amp;
+pub mod console;
+pub mod shapes;
+pub mod tape;
+pub mod wdf;
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::crossover::Crossover3;
 use aitrack_dsp::delay::DelayLine;
 use aitrack_dsp::oversample::Oversampler;
-use aitrack_dsp::shaper::{Adaa1, Bitcrusher, ShaperKind};
+use aitrack_dsp::shaper::Bitcrusher;
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::svf::OnePole;
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
+use shapes::{Adaa, Curve};
 
 pub const ID: &str = "fx.saturator";
 
@@ -48,7 +63,47 @@ pub mod p {
     }
 }
 
-pub const STYLES: &[&str] = &["Tape", "Tube", "Clip", "Fold", "Bitcrush"];
+/// Style names; the originals (Tape, Tube, Clip, Fold, Bitcrush) sit at the
+/// even indices (see the module docs).
+pub const STYLES: &[&str] = &["Tape", "Diode", "Tube", "Transistor", "Clip", "Rectify", "Fold", "Tri Fold", "Bitcrush"];
+
+/// Style indices.
+pub mod style {
+    pub const TAPE: usize = 0;
+    pub const DIODE: usize = 1;
+    pub const TUBE: usize = 2;
+    pub const TRANSISTOR: usize = 3;
+    pub const CLIP: usize = 4;
+    pub const RECTIFY: usize = 5;
+    pub const FOLD: usize = 6;
+    pub const TRI_FOLD: usize = 7;
+    pub const BITCRUSH: usize = 8;
+
+    /// Whether the style uses the band's Bias control.
+    pub fn uses_bias(s: usize) -> bool {
+        matches!(s, DIODE | TUBE | TRANSISTOR | RECTIFY)
+    }
+}
+
+/// The ADAA curve, its shape parameter and the gain that restores unity
+/// small-signal slope for a style at `bias` (0..1).
+pub fn style_curve(s: usize, bias: f32) -> (Curve, f64, f32) {
+    let b = bias.clamp(0.0, 1.0) as f64;
+    let (curve, k) = match s {
+        style::DIODE => (Curve::Diode, 1.0 - 0.6 * b),
+        style::TUBE => (Curve::Tube, 0.6 * b),
+        style::TRANSISTOR => (Curve::Transistor, 0.8 * b),
+        style::CLIP => (Curve::Clip, 0.0),
+        style::RECTIFY => (Curve::Rectify, 1.0 - 2.0 * b),
+        style::FOLD => (Curve::SineFold, 0.0),
+        style::TRI_FOLD => (Curve::TriFold, 0.0),
+        _ => (Curve::Tanh, 0.0),
+    };
+    (curve, k, (1.0 / curve.slope0(k)) as f32)
+}
+
+/// DC blocker corner (after the shapers, at the host rate).
+const DC_CORNER: f32 = 6.0;
 const BAND_COUNTS: &[&str] = &["1", "2", "3"];
 const OS: &[&str] = &["1x", "2x", "4x"];
 const OFF_ON: &[&str] = &["Off", "On"];
@@ -77,7 +132,7 @@ pub fn params() -> Vec<ParamInfo> {
     for b in 0..3u32 {
         let i = b as usize;
         v.push(ParamInfo::new(p::band(b, p::DRIVE), DRIVE_NAMES[i], 0.0, 36.0, 6.0).unit("dB").short("Drive"));
-        v.push(ParamInfo::new(p::band(b, p::STYLE), STYLE_NAMES[i], 0.0, 4.0, 0.0).choices(STYLES).short("Style"));
+        v.push(ParamInfo::new(p::band(b, p::STYLE), STYLE_NAMES[i], 0.0, 8.0, 0.0).choices(STYLES).short("Style"));
         v.push(ParamInfo::new(p::band(b, p::LEVEL), LEVEL_NAMES[i], -24.0, 12.0, 0.0).unit("dB").short("Level"));
         v.push(ParamInfo::new(p::band(b, p::BIAS), BIAS_NAMES[i], 0.0, 100.0, 25.0).unit("%").short("Bias"));
         v.push(ParamInfo::new(p::band(b, p::BITS), BITS_NAMES[i], 1.0, 16.0, 8.0).unit("bit").short("Bits"));
@@ -88,7 +143,7 @@ pub fn params() -> Vec<ParamInfo> {
 
 #[derive(Clone, Copy)]
 struct Band {
-    shaper: Adaa1,
+    shaper: Adaa,
     crush: Bitcrusher,
     pre: OnePole,
     de: OnePole,
@@ -96,7 +151,7 @@ struct Band {
 
 impl Band {
     fn new() -> Self {
-        Self { shaper: Adaa1::new(ShaperKind::Tanh), crush: Bitcrusher::default(), pre: OnePole::default(), de: OnePole::default() }
+        Self { shaper: Adaa::new(Curve::Tanh, 0.0), crush: Bitcrusher::default(), pre: OnePole::default(), de: OnePole::default() }
     }
 
     fn reset(&mut self) {
@@ -111,7 +166,7 @@ impl Band {
 #[derive(Clone, Copy, Default)]
 struct BandSet {
     style: usize,
-    bias_norm: f32,
+    norm: f32,
     bits: f32,
     rate_ratio: f32,
 }
@@ -122,6 +177,7 @@ struct Channel {
     xo: Crossover3,
     bands: [Band; 3],
     tone: OnePole,
+    dc: OnePole,
 }
 
 pub struct Saturator {
@@ -157,14 +213,14 @@ impl Default for Saturator {
 impl Saturator {
     pub fn new() -> Self {
         let params = params();
-        let ch = Channel { os: Oversampler::new(2), xo: Crossover3::default(), bands: [Band::new(); 3], tone: OnePole::default() };
+        let ch = Channel { os: Oversampler::new(2), xo: Crossover3::default(), bands: [Band::new(); 3], tone: OnePole::default(), dc: OnePole::default() };
         let mut s = Self {
             info: PluginInfo {
                 id: ID,
                 name: "Saturator",
                 vendor: "AI-Track",
                 category: Category::Effect,
-                tags: &["distortion", "saturation", "multiband"],
+                tags: &["distortion", "saturation", "multiband", "tube", "diode", "fold"],
                 params: params.clone(),
                 inputs: 2,
                 outputs: 2,
@@ -209,6 +265,7 @@ impl Saturator {
         for c in &mut self.ch {
             c.xo.set(bands, f1, f2.max(f1 * 1.2), osr);
             c.tone.set_freq(1000.0, self.sr);
+            c.dc.set_freq(DC_CORNER, self.sr);
             for b in &mut c.bands {
                 b.pre.set_freq(TAPE_CORNER, osr);
                 b.de.set_freq(de_corner, osr);
@@ -216,22 +273,14 @@ impl Saturator {
         }
         for b in 0..3u32 {
             let i = b as usize;
-            let style = self.params.choice(p::band(b, p::STYLE)).min(4);
-            let bias = self.params.plain(p::band(b, p::BIAS)) / 100.0 * 0.6;
-            let kind = match style {
-                1 => ShaperKind::Asym,
-                2 => ShaperKind::HardClip,
-                3 => ShaperKind::Fold,
-                _ => ShaperKind::Tanh,
-            };
+            let style = self.params.choice(p::band(b, p::STYLE)).min(style::BITCRUSH);
+            let (curve, k, norm) = style_curve(style, self.params.plain(p::band(b, p::BIAS)) / 100.0);
             for c in &mut self.ch {
-                c.bands[i].shaper.set_kind(kind);
-                c.bands[i].shaper.set_bias(bias as f64);
+                c.bands[i].shaper.set(curve, k);
             }
-            let sech2 = 1.0 - bias.tanh().powi(2);
             self.set[i] = BandSet {
                 style,
-                bias_norm: 1.0 / sech2,
+                norm,
                 bits: self.params.plain(p::band(b, p::BITS)),
                 rate_ratio: (self.params.plain(p::band(b, p::CRUSH_RATE)) / osr as f32).min(1.0),
             };
@@ -261,18 +310,15 @@ impl Saturator {
 fn shape(band: &mut Band, set: &BandSet, x: f32, g: f32) -> f32 {
     let u = x * g;
     match set.style {
-        0 => {
+        style::TAPE => {
             let (_, hp) = band.pre.tick(u);
             let e = u + TAPE_EMPHASIS * hp;
             let s = band.shaper.process(e);
             let (lp, hp) = band.de.tick(s);
             lp + hp / (1.0 + TAPE_EMPHASIS)
         }
-        1 => band.shaper.process(u) * set.bias_norm,
-        2 => band.shaper.process(u),
-        // sin(π/2 · 2u/π) = sin(u): unity small-signal gain.
-        3 => band.shaper.process(u * std::f32::consts::FRAC_2_PI),
-        _ => band.crush.process(u.clamp(-1.0, 1.0), set.bits, set.rate_ratio),
+        style::BITCRUSH => band.crush.process(u.clamp(-1.0, 1.0), set.bits, set.rate_ratio),
+        _ => band.shaper.process(u) * set.norm,
     }
 }
 
@@ -297,6 +343,7 @@ impl Segmented for Saturator {
         let Self { ch, dry_delay, drive: drv, level, wet, dry, peaks, .. } = self;
         let mut pk = *peaks;
         for_frames(ctx.buffer, start, end, |_, l, r| {
+            let (l, r) = (sanitize(l), sanitize(r));
             let mut g = [0.0f32; 3];
             let mut comp = [1.0f32; 3];
             let mut lv = [0.0f32; 3];
@@ -326,7 +373,7 @@ impl Segmented for Saturator {
                     }
                     *s = acc;
                 }
-                let y = chn.os.downsample(&up);
+                let y = chn.dc.highpass(chn.os.downsample(&up));
                 let (lo, hi) = chn.tone.tick(y);
                 let y = lo * tlo + hi * thi;
                 dry_delay[c].push(*x);
@@ -368,6 +415,7 @@ impl Processor for Saturator {
             c.os.reset();
             c.xo.reset();
             c.tone.reset();
+            c.dc.reset();
             for b in &mut c.bands {
                 b.reset();
             }
@@ -411,56 +459,71 @@ impl Processor for Saturator {
 mod tests {
     use super::*;
     use crate::test_util::{SR, process_stereo, rms, set_plain, sine};
+    use shapes::alias_db;
 
     /// Power of `x` at `freq` (Goertzel over a whole number of cycles).
     fn power(x: &[f32], freq: f64) -> f64 {
-        let w = std::f64::consts::TAU * freq / SR;
-        let c = 2.0 * w.cos();
-        let (mut s1, mut s2) = (0.0f64, 0.0f64);
-        for &v in x {
-            let s = v as f64 + c * s1 - s2;
-            s2 = s1;
-            s1 = s;
-        }
-        (s1 * s1 + s2 * s2 - c * s1 * s2) / (x.len() as f64).powi(2)
+        shapes::power(x, freq, SR)
     }
 
-    fn one_band(s: &mut Saturator, style: f32, drive_db: f32) {
+    fn one_band(s: &mut Saturator, style: usize, drive_db: f32) {
         set_plain(s, p::BANDS, 1.0);
-        set_plain(s, p::band(0, p::STYLE), style);
+        set_plain(s, p::band(0, p::STYLE), style as f32);
         set_plain(s, p::band(0, p::DRIVE), drive_db);
         set_plain(s, p::AUTO_GAIN, 0.0);
     }
 
     #[test]
     fn zero_drive_is_nearly_transparent() {
-        for style in 0..4 {
+        for st in 0..style::BITCRUSH {
+            if st == style::RECTIFY {
+                continue; // folds the negative half by design
+            }
             let mut s = Saturator::new();
-            one_band(&mut s, style as f32, 0.0);
+            one_band(&mut s, st, 0.0);
             let (l, _) = process_stereo(&mut s, sine(1000.0, 0.03), 48_000);
             let x = &l[24_000..48_000];
             let gain = 20.0 * (rms(x) / (0.03 / std::f32::consts::SQRT_2)).log10();
-            assert!(gain.abs() < 0.3, "style {style}: {gain} dB");
-            let thd = (power(x, 2000.0) + power(x, 3000.0)) / power(x, 1000.0);
-            assert!(10.0 * thd.log10() < -50.0, "style {style}: THD {} dB", 10.0 * thd.log10());
+            assert!(gain.abs() < 0.3, "{}: {gain} dB", STYLES[st]);
+            let thd = 10.0 * ((power(x, 2000.0) + power(x, 3000.0)) / power(x, 1000.0)).log10();
+            // A diode's knee is curved right from zero: it is never clean.
+            // Diode and transistor knees are curved (and biased) right from
+            // zero: they are never fully clean.
+            let max = if matches!(st, style::DIODE | style::TRANSISTOR) { -35.0 } else { -50.0 };
+            assert!(thd < max, "{}: THD {thd} dB", STYLES[st]);
         }
     }
 
     #[test]
     fn drive_adds_harmonics() {
+        for st in [style::TUBE, style::DIODE, style::TRANSISTOR] {
+            let mut s = Saturator::new();
+            one_band(&mut s, st, 24.0);
+            let (l, _) = process_stereo(&mut s, sine(1000.0, 0.3), 48_000);
+            let x = &l[24_000..48_000];
+            let h2 = 10.0 * (power(x, 2000.0) / power(x, 1000.0)).log10();
+            let h3 = 10.0 * (power(x, 3000.0) / power(x, 1000.0)).log10();
+            assert!(h2 > -40.0, "{}: 2nd harmonic {h2} dB", STYLES[st]);
+            assert!(h3 > -40.0, "{}: 3rd harmonic {h3} dB", STYLES[st]);
+        }
+        // Symmetric curves: odd harmonics only.
         let mut s = Saturator::new();
-        one_band(&mut s, 1.0, 24.0); // tube: even harmonics
+        one_band(&mut s, style::CLIP, 18.0);
         let (l, _) = process_stereo(&mut s, sine(1000.0, 0.3), 48_000);
         let x = &l[24_000..48_000];
-        let h2 = 10.0 * (power(x, 2000.0) / power(x, 1000.0)).log10();
-        let h3 = 10.0 * (power(x, 3000.0) / power(x, 1000.0)).log10();
-        assert!(h2 > -40.0, "2nd harmonic {h2} dB");
-        assert!(h3 > -40.0, "3rd harmonic {h3} dB");
+        assert!(10.0 * (power(x, 2000.0) / power(x, 1000.0)).log10() < -60.0);
+        // The rectifier doubles the frequency.
+        let mut s = Saturator::new();
+        one_band(&mut s, style::RECTIFY, 0.0);
+        set_plain(&mut s, p::band(0, p::BIAS), 100.0);
+        let (l, _) = process_stereo(&mut s, sine(1000.0, 0.5), 48_000);
+        let x = &l[24_000..48_000];
+        assert!(power(x, 2000.0) > 10.0 * power(x, 1000.0));
     }
 
-    fn alias_ratio_db(os: f32) -> f64 {
+    fn alias_ratio_db(st: usize, os: f32) -> f64 {
         let mut s = Saturator::new();
-        one_band(&mut s, 2.0, 24.0); // hard clip
+        one_band(&mut s, st, 24.0);
         set_plain(&mut s, p::OVERSAMPLING, os);
         let (l, _) = process_stereo(&mut s, sine(5000.0, 0.5), 96_000);
         let x = &l[48_000..96_000];
@@ -479,9 +542,55 @@ mod tests {
 
     #[test]
     fn oversampling_reduces_aliasing() {
-        let a1 = alias_ratio_db(0.0);
-        let a4 = alias_ratio_db(2.0);
+        let a1 = alias_ratio_db(style::CLIP, 0.0);
+        let a4 = alias_ratio_db(style::CLIP, 2.0);
         assert!(a4 < a1 - 10.0, "1x {a1} dB, 4x {a4} dB");
+    }
+
+    /// With ADAA and 2× oversampling every analogue style keeps the aliases
+    /// of a hard-driven 5 kHz tone far under its harmonics.
+    #[test]
+    fn every_style_is_clean_at_2x() {
+        for st in 0..style::BITCRUSH {
+            let mut s = Saturator::new();
+            one_band(&mut s, st, 18.0);
+            set_plain(&mut s, p::OVERSAMPLING, 1.0);
+            set_plain(&mut s, p::band(0, p::BIAS), 50.0);
+            let (l, _) = process_stereo(&mut s, sine(4987.0, 0.5), 3 << 14);
+            let a = alias_db(&l[1 << 15..], 4987.0, SR);
+            // Corners (clip edges, fold peaks) keep 1/n² harmonics; the
+            // triangle folder at 18 dB folds four times per cycle.
+            let max = match st {
+                style::TRI_FOLD => -25.0,
+                style::TAPE | style::CLIP | style::RECTIFY => -42.0,
+                _ => -50.0,
+            };
+            assert!(a < max, "{}: aliases {a:.1} dB", STYLES[st]);
+        }
+    }
+
+    #[test]
+    fn old_style_values_keep_their_style() {
+        // Before the upgrade: 5 styles over 0..4, stored as k / 4.
+        let old = ["Tape", "Tube", "Clip", "Fold", "Bitcrush"];
+        let mut s = Saturator::new();
+        for (k, name) in old.iter().enumerate() {
+            s.set_param(p::band(0, p::STYLE), k as f32 / 4.0);
+            assert_eq!(STYLES[s.params.choice(p::band(0, p::STYLE))], *name);
+        }
+    }
+
+    #[test]
+    fn asymmetric_styles_leave_no_dc() {
+        for st in [style::DIODE, style::TUBE, style::TRANSISTOR, style::RECTIFY] {
+            let mut s = Saturator::new();
+            one_band(&mut s, st, 18.0);
+            set_plain(&mut s, p::band(0, p::BIAS), 80.0);
+            let (l, _) = process_stereo(&mut s, sine(200.0, 0.5), 96_000);
+            let x = &l[48_000..96_000];
+            let mean = x.iter().map(|v| *v as f64).sum::<f64>() / x.len() as f64;
+            assert!(mean.abs() < 1e-3, "{}: DC {mean}", STYLES[st]);
+        }
     }
 
     #[test]
@@ -501,5 +610,17 @@ mod tests {
         set_plain(&mut s, p::OVERSAMPLING, 0.0);
         process_stereo(&mut s, sine(440.0, 0.05), 128);
         assert_eq!(s.latency(), 0);
+    }
+
+    #[test]
+    fn cpu_budget() {
+        // Worst case: 3 bands at 4×. Under 3 % of a core in release.
+        let mut s = Saturator::new();
+        set_plain(&mut s, p::BANDS, 3.0);
+        set_plain(&mut s, p::OVERSAMPLING, 2.0);
+        for b in 0..3 {
+            set_plain(&mut s, p::band(b, p::STYLE), [style::TUBE, style::DIODE, style::TRANSISTOR][b as usize] as f32);
+        }
+        shapes::assert_cpu(&mut s, 3.0);
     }
 }

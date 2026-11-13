@@ -5,9 +5,14 @@
 //! step through the bands.
 //!
 //! The curves are computed here with `aitrack_dsp::response`, the same
-//! designs the plugin runs, so the picture matches the sound; the spectrum
-//! behind them is the plugin's own post-EQ analysis (and, with the curve
-//! taken off, what went in).
+//! designs the plugin runs (in the Natural / Linear phase modes the
+//! analogue prototypes the FIR is designed from), so the picture matches
+//! the sound; the spectrum behind them is the plugin's own post-EQ analysis
+//! (and, with the curve taken off, what went in). With a sidechain feeding
+//! the EQ its spectrum is drawn too, and where the two collide (both loud,
+//! close in level) a red band marks the place to carve.
+
+mod collision;
 
 use super::kit::{self, ContextFn, EmptyFn, Handle, PlotCfg, Rect, ax, frac_freq, freq_frac};
 use super::{Dev, PopKind, caption, current, set_many, set_now};
@@ -16,7 +21,7 @@ use crate::widgets::{self, label, menu_item, mono};
 use crate::workspace::Workspace;
 use aitrack_dsp::response::{BandKind, BandResponse};
 use aitrack_model::DeviceId;
-use aitrack_stock::fx::eq::{BANDS, CURVE_POINTS, p};
+use aitrack_stock::fx::eq::{BANDS, CURVE_POINTS, SC_POINTS, analog, dynx, meter, p};
 use gpui::{
     AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     StatefulInteractiveElement, Styled, TextAlign, Window, div, prelude::FluentBuilder, px,
@@ -30,6 +35,8 @@ const SLOPE_ORDER: [usize; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 const TYPE_SHORT: [&str; 8] = ["Bell", "Lo Shelf", "Hi Shelf", "Lo Cut", "Hi Cut", "Notch", "Band", "Tilt"];
 const SLOPE_SHORT: [&str; 8] = ["6", "12", "18", "24", "36", "48", "72", "96"];
 const CHANNEL_SHORT: [&str; 5] = ["Stereo", "Mid", "Side", "Left", "Right"];
+const DIRECTION_SHORT: [&str; 4] = ["Cut Above", "Boost Above", "Cut Below", "Boost Below"];
+const SOURCE_SHORT: [&str; 2] = ["Own input", "Sidechain"];
 
 /// One band's settings in plain units.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,6 +52,29 @@ pub struct BandSpec {
     pub dynamic: bool,
     pub threshold: f32,
     pub ratio: f32,
+    /// Cut Above / Boost Above / Cut Below / Boost Below.
+    pub direction: usize,
+    pub range: f32,
+    /// Detects the external sidechain.
+    pub external: bool,
+}
+
+/// One band's curve as the plugin runs it in the current phase mode.
+pub enum BandCurve {
+    Iir(BandResponse, f64),
+    Analog(analog::Proto),
+}
+
+impl BandCurve {
+    pub fn magnitude_at(&self, freq: f64) -> f64 {
+        match self {
+            BandCurve::Iir(r, offset) => r.magnitude_at(freq) + offset,
+            BandCurve::Analog(pr) => {
+                let h = pr.at(freq);
+                10. * (h.0 * h.0 + h.1 * h.1).max(1e-30).log10()
+            }
+        }
+    }
 }
 
 impl BandSpec {
@@ -54,11 +84,23 @@ impl BandSpec {
     }
 
     /// The band as the plugin designs it; `dynamic_db` is the gain change
-    /// its dynamics apply right now (≤ 0).
+    /// its dynamics apply right now (signed).
     pub fn response(&self, matched: bool, dynamic_db: f32, sample_rate: f64) -> BandResponse {
         let dynamic = self.dynamic && self.can_be_dynamic();
         let gain = if dynamic { self.gain + dynamic_db } else { self.gain };
         BandResponse::design(self.kind, self.freq, gain, self.q, self.order, matched && !dynamic, sample_rate)
+    }
+
+    /// The band's curve in phase mode `phase` (0 minimum, 1 natural, 2 linear).
+    pub fn curve(&self, phase: usize, matched: bool, dynamic_db: f32, sample_rate: f64) -> BandCurve {
+        let dynamic = self.dynamic && self.can_be_dynamic();
+        if phase > 0 {
+            let gain = if dynamic && self.kind != BandKind::BandPass { self.gain + dynamic_db } else { self.gain };
+            return BandCurve::Analog(analog::Proto::new(self.kind.index(), self.freq as f64, gain as f64, self.q as f64, self.order));
+        }
+        // A dynamic band-pass turns its whole output up or down.
+        let offset = if dynamic && self.kind == BandKind::BandPass { dynamic_db as f64 } else { 0. };
+        BandCurve::Iir(self.response(matched, dynamic_db, sample_rate), offset)
     }
 }
 
@@ -75,6 +117,9 @@ pub fn band(dev: &Dev, b: usize) -> BandSpec {
         dynamic: dev.on(id(p::DYNAMIC)),
         threshold: dev.plain(id(p::THRESHOLD)),
         ratio: dev.plain(id(p::RATIO)),
+        direction: dev.choice(dynx::band(b, dynx::MODE)),
+        range: dev.plain(dynx::band(b, dynx::RANGE)),
+        external: dev.choice(dynx::band(b, dynx::SOURCE)) == 1,
     }
 }
 
@@ -82,9 +127,8 @@ pub fn band(dev: &Dev, b: usize) -> BandSpec {
 #[cfg(test)]
 pub fn curve_db(dev: &Dev, freq: f32) -> f32 {
     let matched = dev.choice(p::MODE) == 0;
-    let bands: Vec<BandResponse> =
-        (0..BANDS).map(|b| band(dev, b)).filter(|s| s.on).map(|s| s.response(matched, 0., dev.sample_rate)).collect();
-    aitrack_dsp::response::magnitude_at(&bands, freq as f64) as f32
+    let phase = dev.choice(p::PHASE);
+    (0..BANDS).map(|b| band(dev, b)).filter(|s| s.on).map(|s| s.curve(phase, matched, 0., dev.sample_rate).magnitude_at(freq as f64)).sum::<f64>() as f32
 }
 
 /// Where a band's node sits in the plot, as fractions of its rect.
@@ -150,9 +194,12 @@ struct View {
     bands: Vec<BandSpec>,
     dynamic_db: [f32; BANDS],
     spectrum: Vec<f32>,
+    /// The sidechain's spectrum (empty when nothing feeds the EQ).
+    sidechain: Vec<f32>,
     selected: usize,
     range: f32,
     matched: bool,
+    phase: usize,
     sample_rate: f64,
     enabled: bool,
 }
@@ -163,8 +210,8 @@ fn paint(v: &View, r: Rect, window: &mut Window, cx: &mut App) {
     kit::freq_grid(window, cx, r, true);
     let y_of = |db: f32| r.py((0.5 - db / (2. * v.range)).clamp(0., 1.));
     let zero = y_of(0.);
-    let designed: Vec<(usize, BandResponse)> =
-        v.bands.iter().enumerate().filter(|(_, s)| s.on).map(|(b, s)| (b, s.response(v.matched, v.dynamic_db[b], v.sample_rate))).collect();
+    let designed: Vec<(usize, BandCurve)> =
+        v.bands.iter().enumerate().filter(|(_, s)| s.on).map(|(b, s)| (b, s.curve(v.phase, v.matched, v.dynamic_db[b], v.sample_rate))).collect();
 
     // The signal: post-EQ filled, pre-EQ (post minus the curve) as an outline.
     if v.spectrum.len() == CURVE_POINTS && v.spectrum.iter().any(|d| *d > -100.) {
@@ -185,6 +232,19 @@ fn paint(v: &View, r: Rect, window: &mut Window, cx: &mut App) {
                 })
                 .collect();
             kit::line(window, &pre, 1., with_alpha(pal.accent2, 0.35));
+        }
+        // The sidechain's spectrum, and where it collides with the track.
+        if v.sidechain.len() == SC_POINTS {
+            let at = |i: usize| i as f32 / (SC_POINTS - 1) as f32;
+            let sc: Vec<Point<Pixels>> = v.sidechain.iter().enumerate().map(|(i, d)| gpui::point(px(r.px(at(i))), px(level(*d)))).collect();
+            kit::line(window, &sc, 1., with_alpha(pal.meter_mid, 0.55));
+            let hit = collision::collision(&v.spectrum, &v.sidechain);
+            let w = r.w / (SC_POINTS - 1) as f32;
+            for (i, c) in hit.iter().enumerate().filter(|(_, c)| **c > 0.15) {
+                let x = r.px(at(i)) - w / 2.;
+                kit::bar(window, x, r.y, w, r.h, 0., with_alpha(pal.record, 0.1 * c));
+                kit::bar(window, x, r.bottom() - 4., w, 4., 0., with_alpha(pal.record, 0.35 + 0.5 * c));
+            }
         }
     }
 
@@ -213,7 +273,7 @@ fn paint(v: &View, r: Rect, window: &mut Window, cx: &mut App) {
         let color = series(b);
         let (fx, fy) = node_pos(s.kind, s.freq, s.gain, v.range);
         let c = r.pt(fx, fy.clamp(0.03, 0.97));
-        if s.dynamic && s.can_be_dynamic() && v.dynamic_db[b] < -0.1 {
+        if s.dynamic && s.can_be_dynamic() && v.dynamic_db[b].abs() > 0.1 {
             // How far the dynamics are pulling the band right now.
             let to = y_of(s.gain + v.dynamic_db[b]);
             let (top, h) = (f32::from(c.y).min(to), (f32::from(c.y) - to).abs());
@@ -240,7 +300,8 @@ fn info_panel(ws: &mut Workspace, dev: &Dev, b: usize, s: &BandSpec, range: f32,
     let (fx, fy) = node_pos(s.kind, s.freq, s.gain, range);
     let width = 204.;
     let dynamic_row = s.can_be_dynamic();
-    let height = if dynamic_row { 104. } else { 72. };
+    let dyn_on = dynamic_row && s.dynamic;
+    let height = 72. + if dynamic_row { 32. } else { 0. } + if dyn_on { 36. + if dev.big { 36. } else { 0. } } else { 0. };
     let x = r.w * fx;
     let left = if x + 18. + width > r.w { x - 18. - width } else { x + 18. };
     let top = (r.h * fy.clamp(0., 1.) - 28.).clamp(4., (r.h - height - 4.).max(4.));
@@ -286,13 +347,32 @@ fn info_panel(ws: &mut Workspace, dev: &Dev, b: usize, s: &BandSpec, range: f32,
         )
         .child(values);
     if dynamic_row {
+        let xid = |x: u32| dynx::band(b, x);
         let mut row = div().h(px(32.)).flex().items_center().gap(px(SP1)).child(kit::pick(dev, id(p::DYNAMIC), cx));
         if s.dynamic {
-            row = row
-                .child(kit::num(ws, dev, id(p::THRESHOLD), cx))
-                .child(kit::num(ws, dev, id(p::RATIO), cx));
+            row = row.child(kit::pick(dev, xid(dynx::MODE), cx)).child(kit::pick(dev, xid(dynx::SOURCE), cx));
         }
         card = card.child(row);
+        if s.dynamic {
+            card = card.child(
+                div()
+                    .flex()
+                    .gap(px(SP1))
+                    .child(kit::num(ws, dev, id(p::THRESHOLD), cx))
+                    .child(kit::num(ws, dev, id(p::RATIO), cx))
+                    .child(kit::num(ws, dev, xid(dynx::RANGE), cx)),
+            );
+            if dev.big {
+                card = card.child(
+                    div()
+                        .flex()
+                        .gap(px(SP1))
+                        .child(kit::num(ws, dev, id(p::ATTACK), cx))
+                        .child(kit::num(ws, dev, id(p::RELEASE), cx))
+                        .child(kit::num(ws, dev, xid(dynx::KNEE), cx)),
+                );
+            }
+        }
     }
     Some(card.into_any_element())
 }
@@ -309,15 +389,19 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let on_context: ContextFn = Rc::new(move |this, band, at, _| this.fx.open_pop(PopKind::EqBand { device, band }, at));
     let mut dynamic_db = [0.0f32; BANDS];
     for (b, d) in dynamic_db.iter_mut().enumerate() {
-        *d = dev.m(2 * CURVE_POINTS + b).clamp(-48., 0.);
+        *d = dev.m(meter::DYNAMIC + b).clamp(-48., 48.);
     }
+    let phase = dev.choice(p::PHASE);
+    let sc_active = dev.m(meter::SC_ACTIVE) > 0.5;
     let view = View {
         bands: bands.clone(),
         dynamic_db,
-        spectrum: dev.meter.get(CURVE_POINTS..2 * CURVE_POINTS).map(<[f32]>::to_vec).unwrap_or_default(),
+        spectrum: dev.meter.get(meter::SPECTRUM..meter::SPECTRUM + CURVE_POINTS).map(<[f32]>::to_vec).unwrap_or_default(),
+        sidechain: if sc_active { dev.meter.get(meter::SC_SPECTRUM..meter::LEN).map(<[f32]>::to_vec).unwrap_or_default() } else { Vec::new() },
         selected,
         range,
         matched: dev.choice(p::MODE) == 0,
+        phase,
         sample_rate: dev.sample_rate,
         enabled: dev.enabled,
     };
@@ -399,7 +483,22 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             cx.notify();
         }));
 
-    kit::panel(if dev.big { 920. } else { 580. })
+    // Phase mode, with its latency; the minimum-phase flavour only matters there.
+    let latency = aitrack_stock::fx::eq::mode_latency(phase, dev.sample_rate);
+    let latency_ms = latency as f64 * 1000. / dev.sample_rate.max(1.);
+    let phase_group = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .child(kit::pick(dev, p::PHASE, cx))
+        .when(dev.big && phase == 0, |d| d.child(kit::pick(dev, p::MODE, cx)))
+        .when(latency > 0, |d| d.child(mono(format!("{latency_ms:.1} ms"), TEXT_XS, pal.faint)));
+    // The sidechain chip: always in the window, in the dock once it is in use.
+    let sidechain_used = dev.choice(p::SIDECHAIN) == 1 || bands.iter().any(|s| s.on && s.dynamic && s.external);
+    let sidechain = (dev.big || sidechain_used).then(|| super::sidechain_chip(ws, dev, p::SIDECHAIN, cx));
+
+    kit::panel(if dev.big { 920. } else { 600. })
         .child(div().flex_1().min_h(px(0.)).relative().child(plot).children(info))
         .child(
             div()
@@ -411,8 +510,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .child(chips)
                 .child(div().flex_1())
                 .child(range_chip)
+                .child(phase_group)
+                .children(sidechain)
                 .child(kit::pick(dev, p::AUTO_GAIN, cx))
-                .child(kit::pick(dev, p::MODE, cx))
                 .child(kit::num(ws, dev, p::OUTPUT, cx)),
         )
         .into_any_element()
@@ -477,6 +577,20 @@ pub fn band_menu(ws: &mut Workspace, device: DeviceId, band_index: usize, cx: &m
             set_now(this, device, id(p::DYNAMIC), next);
             cx.notify();
         })));
+        if s.dynamic {
+            let xid = move |x: u32| dynx::band(band_index, x);
+            card = card
+                .child(grid("DYNAMICS", &DIRECTION_SHORT, xid(dynx::MODE), s.direction, 112., cx))
+                .child(grid("DETECTOR", &SOURCE_SHORT, xid(dynx::SOURCE), usize::from(s.external), 112., cx));
+            if s.external {
+                // Pick the track that keys it (and switch the EQ's sidechain on).
+                card = card.child(menu_item("eq-sc", None, "Listen to track…", None, false).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                    let at = e.position();
+                    this.fx.open_pop(PopKind::Sidechain { device, param: p::SIDECHAIN }, gpui::point(at.x - px(8.), at.y + px(12.)));
+                    cx.notify();
+                })));
+            }
+        }
     }
     let reset = [id(p::GAIN), id(p::Q), id(p::SLOPE)].map(|x| (x, dev.info(x).map_or(0.5, |i| i.default_normalized())));
     let on_next = if s.on { 0. } else { 1. };
@@ -533,7 +647,7 @@ mod tests {
             }
             process_stereo(eq.as_mut(), |_| (0., 0.), 4096);
             let mut meter = [0.0f32; 320];
-            assert_eq!(eq.meter(&mut meter), 265);
+            assert_eq!(eq.meter(&mut meter), meter::LEN);
             // The editor's maths.
             let d = dev(ID, &plain);
             let mut worst = 0.0f32;
@@ -550,6 +664,42 @@ mod tests {
                 assert!((curve_db(&d, f) - sum as f32).abs() < 1e-3);
             }
         }
+    }
+
+    #[test]
+    fn the_fir_modes_draw_the_analogue_curve_the_plugin_reports() {
+        for phase in [1., 2.] {
+            let mut plain = settings();
+            plain.push((p::PHASE, phase));
+            let mut eq = aitrack_stock::create(ID).unwrap();
+            for (id, v) in &plain {
+                set_plain(eq.as_mut(), *id, *v);
+            }
+            process_stereo(eq.as_mut(), |_| (0., 0.), 4096);
+            let mut m = [0.0f32; 320];
+            assert_eq!(eq.meter(&mut m), meter::LEN);
+            assert!(m[meter::LATENCY] > 0.);
+            let d = dev(ID, &plain);
+            for (i, plugin_db) in m[..CURVE_POINTS].iter().enumerate() {
+                let f = aitrack_stock::fx::eq::Eq::curve_frequency(i);
+                let ui = curve_db(&d, f).max(-120.);
+                assert!((ui - plugin_db).abs() < 0.05, "phase {phase}, {f:.0} Hz: drawn {ui:.3} dB, plugin {plugin_db:.3} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn the_band_reads_its_dynamics_settings() {
+        let d = dev(ID, &[(p::band(3, p::DYNAMIC), 1.), (dynx::band(3, dynx::MODE), 3.), (dynx::band(3, dynx::RANGE), 7.5), (dynx::band(3, dynx::SOURCE), 1.)]);
+        let s = band(&d, 3);
+        assert_eq!(s.direction, 3);
+        assert!((s.range - 7.5).abs() < 1e-3);
+        assert!(s.external);
+        assert_eq!(DIRECTION_SHORT.len(), aitrack_stock::fx::eq::DIRECTIONS.len());
+        // A boosting band's curve rises with its dynamic gain.
+        let bell = BandSpec { on: true, kind: BandKind::Bell, freq: 1000., gain: 0., q: 1., order: 2, channel: 0, dynamic: true, threshold: -20., ratio: 2., direction: 1, range: 6., external: false };
+        assert!((bell.curve(0, true, 4., 48_000.).magnitude_at(1000.) - 4.).abs() < 0.05);
+        assert!((bell.curve(2, true, 4., 48_000.).magnitude_at(1000.) - 4.).abs() < 0.01);
     }
 
     #[test]

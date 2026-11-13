@@ -193,6 +193,10 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                             cx.stop_propagation();
                             this.begin_drag(Drag::Knob { target: KnobTarget::Send { track: id, index }, last_y: f32::from(e.position.y), value: pos }, cx);
                         }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_param_menu(id, AutomationTarget::Send { index: index as u16 }, e.position, cx);
+                        }))
                 })
                 .child(mono(letter, TEXT_XS, if has { pal.text } else { pal.faint }).w(px(10.)))
                 .child(widgets::hbar(if has { pos } else { 0. }, STRIP_W - 28. - SP2, 4., accent_alpha(0.8))),
@@ -216,6 +220,10 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 return;
             }
             this.begin_drag(Drag::Fader { track: id, last_y: f32::from(e.position.y), pos: fpos, travel: fader_h - 12. }, cx);
+        }))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_param_menu(id, AutomationTarget::Volume, e.position, cx);
         }));
     let (mute, solo, arm) = (t.mute, t.solo, t.arm);
     let vca_name = t.vca.and_then(|v| ws.s.project.track(v)).map(|v| v.name.clone());
@@ -248,7 +256,15 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .items_center()
                 .justify_center()
                 .gap(px(SP2))
-                .when(!is_vca, |d| d.child(knob_control(("pan", id.0 as usize), (pan + 1.) / 2., true, true, KnobTarget::Pan { track: id }, cx)))
+                .when(!is_vca, |d| {
+                    d.child(knob_control(("pan", id.0 as usize), (pan + 1.) / 2., true, true, KnobTarget::Pan { track: id }, cx).on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_param_menu(id, AutomationTarget::Pan, e.position, cx);
+                        }),
+                    ))
+                })
                 .child(mono(if is_vca { "—".into() } else { pan_text }, TEXT_XS, pal.muted).w(px(24.))),
         ))
         .child(mono(format_db(t.volume_db), TEXT_SM, pal.text).h(px(DB_H)).flex().justify_center())
@@ -300,6 +316,48 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .child(label(vca_name.map_or_else(|| kind_name(t.kind).to_owned(), |v| format!("→ {v}")), TEXT_XS, pal.muted)),
         )
         .into_any_element()
+}
+
+/// Right-click on a fader, a pan knob or a send (here or in a track
+/// header): show that control's automation lane in the arrangement, or
+/// delete the automation it has.
+pub fn render_param_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+    let (track, target, at) = ws.param_menu?;
+    let Some(t) = ws.s.project.track(track) else {
+        ws.param_menu = None;
+        return None;
+    };
+    let has = t.automation.iter().any(|l| l.target == target && !l.points.is_empty());
+    let shown = ws.s.shown_lanes(track).contains(&target);
+    let name = crate::views::arrangement::target_name(ws, target);
+    let card = widgets::menu_card("param-menu", 220.)
+        .child(widgets::menu_header(name.to_uppercase()))
+        .child(widgets::menu_item("param-show", Some(Icon::Automation), if shown { "Go to automation" } else { "Show automation" }, None, false).on_click(cx.listener(
+            move |this, _, _, cx| this.show_automation(track, target, cx),
+        )))
+        .when(has, |d| {
+            d.child(widgets::menu_item("param-delete", Some(Icon::Trash), "Delete automation", None, false).on_click(cx.listener(move |this, _, _, cx| {
+                this.param_menu = None;
+                this.s.delete_automation(track, target);
+                cx.notify();
+            })))
+        });
+    Some(
+        gpui::deferred(
+            gpui::anchored().position(at).snap_to_window_with_margin(px(SP2)).child(
+                div()
+                    .id("param-menu-layer")
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.param_menu = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            ),
+        )
+        .with_priority(2)
+        .into_any_element(),
+    )
 }
 
 fn kind_name(k: TrackKind) -> &'static str {

@@ -129,9 +129,9 @@ mod tests {
         let s = sections(&eq.params);
         assert_eq!(s.len(), 9);
         assert_eq!(s[0].0, "Main");
-        assert_eq!(s[0].1.iter().map(|p| p.name).collect::<Vec<_>>(), vec!["Output", "Auto Gain", "Processing"]);
+        assert_eq!(s[0].1.iter().map(|p| p.name).collect::<Vec<_>>(), vec!["Output", "Auto Gain", "Processing", "Phase", "Sidechain"]);
         assert_eq!(s[1].0, "Band 1");
-        assert_eq!(s[1].1.len(), 12);
+        assert_eq!(s[1].1.len(), 16);
         assert_eq!(s.iter().map(|(_, l)| l.len()).sum::<usize>(), eq.params.len());
         // A plugin without numbered parameters is one section in its own order.
         let comp = catalog.device("fx.compressor").unwrap();

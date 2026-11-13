@@ -1,0 +1,21 @@
+{
+  "name": "Hot Buss",
+  "plugin": "fx.console",
+  "author": "AI-Track",
+  "tags": [
+    "console",
+    "summing",
+    "bus",
+    "drive",
+    "warm"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.6,
+    "2": 0.3,
+    "3": 0.3,
+    "4": 0.6666667,
+    "5": 1.0,
+    "6": 0.5
+  }
+}

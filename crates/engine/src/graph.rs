@@ -44,6 +44,12 @@ pub(crate) struct ProcNode {
     pub meter: Arc<DeviceMeter>,
     /// Which sidechain buffer (see [`CompiledGraph::side`]) this device listens to.
     pub sidechain: Option<usize>,
+    /// Automation of a hosted plugin's parameters for the current block, as
+    /// timed `Param` events (offsets in the whole block); see [`ParamTarget::Timed`].
+    /// Capacity is set at compile time, only for devices that need it.
+    pub auto_events: EventList,
+    /// The block's events merged with `auto_events` for one process call.
+    pub merged: EventList,
 }
 
 /// The sidechain signals available to the devices of one track.
@@ -108,7 +114,10 @@ impl DeviceNode {
     }
 }
 
-fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>) {
+/// Run a chain over `buf`, the frames `win.0..win.1` of the block: `events`
+/// are already relative to the window; a device's own timed automation
+/// (block offsets) is cut to the window and merged in, in offset order.
+fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize)) {
     for d in devs {
         match d {
             DeviceNode::Proc(p) => {
@@ -123,18 +132,60 @@ fn process_devices(devs: &mut [DeviceNode], buf: &mut AudioBuffer, events: &[Eve
                 }
                 let frames = buf.frames();
                 let sidechain = p.sidechain.and_then(|slot| side.chunk(slot, frames));
+                let events = if p.auto_events.events.is_empty() {
+                    events
+                } else {
+                    merge_window(&mut p.merged, events, &p.auto_events.events, win);
+                    &p.merged.events
+                };
                 let mut ctx = ProcessContext { sample_rate: sr, buffer: buf, sidechain, events, transport: tr };
                 proc.process(&mut ctx);
                 p.proc.publish_latency(proc.latency());
             }
             DeviceNode::Rack(r) => {
                 if r.enabled.load(Ordering::Relaxed) {
-                    r.process(buf, events, tr, sr, side);
+                    r.process(buf, events, tr, sr, side, win);
                 }
             }
             DeviceNode::Missing(_) => {}
         }
     }
+}
+
+/// `out` = `events` (window offsets) and the part of `timed` (block offsets)
+/// inside `win`, rebased, both kept in offset order (at equal offsets the
+/// block's own events come first). Real-time safe: `out` has fixed capacity.
+fn merge_window(out: &mut EventList, events: &[Event], timed: &[Event], win: (usize, usize)) {
+    out.clear();
+    let (a, b) = (win.0 as u32, win.1 as u32);
+    let mut timed = timed.iter().filter(|e| e.offset >= a && e.offset < b).map(|e| Event { offset: e.offset - a, kind: e.kind }).peekable();
+    for e in events {
+        while let Some(t) = timed.next_if(|t| t.offset < e.offset) {
+            out.push(t.offset, t.kind);
+        }
+        out.push(e.offset, e.kind);
+    }
+    for t in timed {
+        out.push(t.offset, t.kind);
+    }
+}
+
+/// The processor node of `id` in a chain, at any rack depth.
+pub(crate) fn find_proc_mut(devs: &mut [DeviceNode], id: DeviceId) -> Option<&mut ProcNode> {
+    for d in devs {
+        match d {
+            DeviceNode::Proc(p) if p.id == id => return Some(p),
+            DeviceNode::Rack(r) => {
+                for c in &mut r.chains {
+                    if let Some(p) = find_proc_mut(&mut c.devices, id) {
+                        return Some(p);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn in_range(v: u8, r: (u8, u8)) -> bool {
@@ -156,7 +207,7 @@ impl RackNode {
         }
     }
 
-    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>) {
+    fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize)) {
         let n = buf.frames();
         self.input.set_frames(n);
         self.input.copy_from(buf);
@@ -171,7 +222,7 @@ impl RackNode {
             }
             c.buf.set_frames(n);
             c.buf.copy_from(&self.input);
-            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side);
+            process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side, win);
             c.delay.process(&mut c.buf);
             let (gl, gr) = c.gain;
             if buf.channels() >= 2 && c.buf.channels() >= 2 {
@@ -219,6 +270,11 @@ fn adopt_devices(new: &mut [DeviceNode], old: &mut [DeviceNode]) {
 
 pub(crate) enum ParamTarget {
     Param(Arc<SharedProcessor>, u32),
+    /// A hosted plugin's parameter: sent as `Param` events at sample offsets
+    /// inside the block (VST3 `IParameterChanges` points, CLAP param-value
+    /// events with their time) rather than by cutting the chain into
+    /// control blocks. Written into the device node's `auto_events`.
+    Timed(DeviceId, u32),
     Enabled(Arc<AtomicBool>),
     /// Macro: `(processor, param, min, max)` for every mapping.
     Macro(Vec<(Arc<SharedProcessor>, u32, f32, f32)>),
@@ -231,6 +287,63 @@ pub(crate) struct ParamAuto {
 }
 
 impl ParamAuto {
+    pub(crate) fn is_timed(&self) -> bool {
+        matches!(self.target, ParamTarget::Timed(..))
+    }
+
+    /// Timed targets: this block's values as events at block offsets, one
+    /// every [`CONTROL_BLOCK`] frames where the value moved plus one on the
+    /// exact sample of every breakpoint inside the block (so a jump lands
+    /// where it is drawn). `start` is the block's first sample on the
+    /// timeline the lane is read on. Real-time safe.
+    fn emit(&mut self, out: &mut EventList, ctx: &TimeCtx<'_>, start: i64, n: usize) {
+        let ParamTarget::Timed(_, id) = self.target else { return };
+        if !self.lane.enabled || self.lane.points.is_empty() || n == 0 {
+            return;
+        }
+        let (t0, t1) = (ctx.tick_of(start), ctx.tick_of(start + n as i64));
+        // Breakpoints inside the block, as block offsets (ascending).
+        let pts = &self.lane.points;
+        let mut k = pts.partition_point(|p| (p.tick as f64) <= t0);
+        let next_break = |k: &mut usize| -> Option<(usize, Tick)> {
+            while let Some(p) = pts.get(*k) {
+                if p.tick as f64 >= t1 {
+                    return None;
+                }
+                *k += 1;
+                let off = ctx.sample_of(p.tick) - start;
+                if off > 0 && (off as usize) < n {
+                    return Some((off as usize, p.tick));
+                }
+            }
+            None
+        };
+        let mut brk = next_break(&mut k);
+        let mut a = 0;
+        loop {
+            // The next point in time: a control step or a breakpoint, whichever
+            // comes first (the control step on a tie).
+            let (off, value) = match brk {
+                Some((b, tick)) if a >= n || b < a => {
+                    brk = next_break(&mut k);
+                    (b, self.lane.value_at(tick))
+                }
+                _ if a < n => {
+                    let v = lane_value(&self.lane, ctx.tick_of(start + a as i64));
+                    a += CONTROL_BLOCK;
+                    (a - CONTROL_BLOCK, v)
+                }
+                _ => break,
+            };
+            let Some(v) = value else { continue };
+            if (v - self.last).abs() < 1e-6 {
+                continue;
+            }
+            self.last = v;
+            out.push(off as u32, EventKind::Param { id, value: v });
+        }
+    }
+
     fn apply(&mut self, tick: f64) {
         let Some(v) = lane_value(&self.lane, tick) else { return };
         if (v - self.last).abs() < 1e-6 {
@@ -240,6 +353,7 @@ impl ParamAuto {
         match &self.target {
             // SAFETY: audio thread, see `SharedProcessor`.
             ParamTarget::Param(p, id) => unsafe { p.get_mut().set_param(*id, v) },
+            ParamTarget::Timed(..) => {}
             ParamTarget::Enabled(flag) => flag.store(v >= 0.5, Ordering::Relaxed),
             ParamTarget::Macro(maps) => {
                 for (p, id, min, max) in maps {
@@ -792,15 +906,31 @@ fn process_track(
     }
     t.events.sort();
 
-    // Device chain.
-    if t.param_autos.is_empty() {
+    // Device chain. Hosted plugins get their automation as timed events in
+    // one call; other automation cuts the chain into control blocks.
+    let auto_start = lo - t.chain_latency_in as i64;
+    for pa in t.param_autos.iter() {
+        if let ParamTarget::Timed(device, _) = pa.target
+            && let Some(node) = find_proc_mut(&mut t.devices, device)
+        {
+            node.auto_events.clear();
+        }
+    }
+    for pa in t.param_autos.iter_mut() {
+        if let ParamTarget::Timed(device, _) = pa.target
+            && let Some(node) = find_proc_mut(&mut t.devices, device)
+        {
+            pa.emit(&mut node.auto_events, ctx, auto_start, n);
+        }
+    }
+    if t.param_autos.iter().all(ParamAuto::is_timed) {
         let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: 0 };
-        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si);
+        process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si, (0, n));
     } else {
         let mut a = 0;
         while a < n {
             let b = (a + CONTROL_BLOCK).min(n);
-            let tick = ctx.tick_of(lo + a as i64 - t.chain_latency_in as i64);
+            let tick = ctx.tick_of(auto_start + a as i64);
             for pa in &mut t.param_autos {
                 pa.apply(tick);
             }
@@ -816,7 +946,7 @@ fn process_track(
             tr.position_samples = lo + a as i64;
             tr.position_beats = ctx.tick_of(lo + a as i64) / PPQ as f64;
             let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: a };
-            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr, &mut si);
+            process_devices(&mut t.devices, &mut t.chunk_buf, &t.chunk_events.events, &tr, sr, &mut si, (a, b));
             for ch in 0..t.buf.channels().min(t.chunk_buf.channels()) {
                 t.buf.channel_mut(ch)[a..b].copy_from_slice(t.chunk_buf.channel(ch));
             }
@@ -986,3 +1116,7 @@ fn follow_target(f: FollowAction, scene: usize, slots: &[Option<usize>], scene_c
         FollowAction::Stop { after_bars } => (after_bars.max(1), None),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/plugin_automation.rs"]
+mod plugin_automation;

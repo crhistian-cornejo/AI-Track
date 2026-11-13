@@ -1,31 +1,44 @@
-//! `fx.reverb` — algorithmic reverb with three modes:
+//! `fx.reverb` — algorithmic reverb on two tank engines, voiced as a set
+//! of named algorithms and vintage colours:
 //!
-//! * **Hall / Room**: feedback delay network of 8 or 16 lines mixed by an
-//!   orthonormal fast Walsh–Hadamard transform. Each line has slowly
+//! * **FDN** (halls, rooms, chamber, ambience, shimmer, cloud): feedback
+//!   delay network of 8 or 16 lines mixed by an orthonormal fast
+//!   Walsh–Hadamard transform (Jot & Chaigne 1991). Each line has slowly
 //!   modulated reads and an absorption filter (gain × low shelf × high
 //!   shelf on bilinear one-poles) designed from its own loop length, so the
 //!   low / mid / high decay times are exactly the requested RT60s. The tank
 //!   input is normalised by the loop energy so longer decays ring longer,
 //!   not louder. Input diffusion all-passes and an early-reflection pattern
-//!   (taps on the pre-delay line) sit in front. Room uses shorter lines and
-//!   a tighter early pattern than Hall.
+//!   (taps on the pre-delay line) sit in front.
 //! * **Plate**: the figure-eight tank of J. Dattorro, *Effect Design Part 1*
 //!   (JAES 1997): four input diffusers, two cross-coupled halves with a
 //!   modulated all-pass, delays, damping and a second all-pass each, and the
 //!   published output taps. Its decay coefficient is solved from the tank's
 //!   loop length for the requested RT60.
 //!
+//! The Algorithm picks a [`voicing`] (line lengths, early pattern, diffusion,
+//! modulation); "Classic" keeps the original Hall / Room / Plate of Mode.
+//! The Colour band-limits, thins and quantises the tank like 70s / 80s
+//! digital units. Shimmer feeds the late field back through a
+//! [`shimmer`] pitch shifter; Ducking lowers the wet while the input plays.
+//!
 //! All buffers are sized in `prepare` for the largest size; parameter edits
 //! only move targets (line lengths glide). Zero latency.
 //!
-//! Meter layout: `[wet peak L, wet peak R, mid-band RT60 (s)]`.
+//! Meter layout: `[wet peak L, wet peak R, mid-band RT60 (s), duck gain]`.
+
+pub mod shimmer;
+pub mod voicing;
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::delay::{AllpassDiffuser, AllpassReader, DelayLine};
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::svf::{OnePole, SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
+use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower};
+use shimmer::{INTERVAL_NAMES, INTERVALS, PitchShifter};
 use std::f32::consts::TAU;
+use voicing::{ALGORITHMS, COLOR_TABLE, COLORS, Engine, VOICES, quantise, voice_index};
 
 pub const ID: &str = "fx.reverb";
 
@@ -49,6 +62,11 @@ pub mod p {
     pub const MIX: u32 = 16;
     pub const FREEZE: u32 = 17;
     pub const OUTPUT: u32 = 18;
+    pub const ALGORITHM: u32 = 19;
+    pub const COLOR: u32 = 20;
+    pub const SHIMMER: u32 = 21;
+    pub const SHIFT: u32 = 22;
+    pub const DUCK: u32 = 23;
 }
 
 const MODES: &[&str] = &["Hall", "Room", "Plate"];
@@ -66,6 +84,8 @@ const FREEZE_GAIN: f32 = 0.99995;
 /// Overall wet trim so a steady input plays back at about its own level.
 const FDN_WET: f32 = 2.1;
 const PLATE_WET: f32 = 0.6;
+/// Shimmer loop gain at 100 % (the tank's own gain is about one).
+const SHIMMER_MAX: f32 = 0.72;
 
 pub fn params() -> Vec<ParamInfo> {
     vec![
@@ -88,6 +108,11 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::MIX, "Mix", 0.0, 100.0, 25.0).unit("%"),
         ParamInfo::new(p::FREEZE, "Freeze", 0.0, 1.0, 0.0).choices(OFF_ON),
         ParamInfo::new(p::OUTPUT, "Output", -24.0, 12.0, 0.0).unit("dB").short("Out"),
+        ParamInfo::new(p::ALGORITHM, "Algorithm", 0.0, (ALGORITHMS.len() - 1) as f32, 0.0).choices(ALGORITHMS).short("Algo"),
+        ParamInfo::new(p::COLOR, "Colour", 0.0, (COLORS.len() - 1) as f32, 0.0).choices(COLORS).short("Colour"),
+        ParamInfo::new(p::SHIMMER, "Shimmer", 0.0, 100.0, 0.0).unit("%").short("Shim"),
+        ParamInfo::new(p::SHIFT, "Shimmer Pitch", 0.0, (INTERVAL_NAMES.len() - 1) as f32, 6.0).choices(INTERVAL_NAMES).short("Pitch"),
+        ParamInfo::new(p::DUCK, "Ducking", 0.0, 100.0, 0.0).unit("%").short("Duck"),
     ]
 }
 
@@ -192,7 +217,7 @@ struct Fdn {
 
 impl Fdn {
     fn new(sr: f64) -> Self {
-        let max = ((MAX_LINE_MS + 2.0 * MAX_MOD_MS) * 0.001 * sr as f32) as usize + 8;
+        let max = ((MAX_LINE_MS + 4.0 * MAX_MOD_MS) * 0.001 * sr as f32) as usize + 8;
         let lines = (0..MAX_LINES)
             .map(|_| Line {
                 buf: DelayLine::new(max),
@@ -446,6 +471,13 @@ impl Plate {
 
 // ── Plugin ───────────────────────────────────────────────────────────────
 
+/// Smooth saturation for the shimmer return (rational tanh, |y| ≤ 1).
+#[inline]
+fn soft(x: f32) -> f32 {
+    let x = x.clamp(-3.0, 3.0);
+    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+}
+
 pub struct Reverb {
     info: PluginInfo,
     params: ParamStore,
@@ -460,12 +492,30 @@ pub struct Reverb {
     wet: Smoother,
     dry: Smoother,
     width: Smoother,
+    shimmer_gain: Smoother,
     hp: SvfCoeffs,
     lp: SvfCoeffs,
     hp_st: [SvfState; 2],
     lp_st: [SvfState; 2],
+    shifter: PitchShifter,
+    shim_hp: OnePole,
+    shim_src: f32,
+    /// Colour band limit: coefficients, tank-input and output states.
+    color_lp: SvfCoeffs,
+    color_in: [SvfState; 2],
+    color_out: [SvfState; 2],
+    color_on: bool,
+    /// Wet word scale (`2^(bits−1)`), 0 = float.
+    quant: f32,
+    late_trim: f32,
+    duck_env: EnvelopeFollower,
+    duck_amount: f32,
+    duck_gain: f32,
     diffusion: f32,
+    /// Engine the frame loop runs: 2 = plate, otherwise the FDN.
     mode: usize,
+    /// Voicing × colour the tank was last cleared for.
+    voice: usize,
     rt: [f32; 3],
     peak: [f32; 2],
     first: bool,
@@ -509,12 +559,26 @@ impl Reverb {
             wet: Smoother::new(0.25),
             dry: Smoother::new(1.0),
             width: Smoother::new(1.0),
+            shimmer_gain: Smoother::new(0.0),
             hp: SvfCoeffs::default(),
             lp: SvfCoeffs::default(),
             hp_st: [SvfState::default(); 2],
             lp_st: [SvfState::default(); 2],
+            shifter: PitchShifter::new(sr),
+            shim_hp: OnePole::default(),
+            shim_src: 0.0,
+            color_lp: SvfCoeffs::default(),
+            color_in: [SvfState::default(); 2],
+            color_out: [SvfState::default(); 2],
+            color_on: false,
+            quant: 0.0,
+            late_trim: 1.0,
+            duck_env: EnvelopeFollower::new(DetectorMode::Peak),
+            duck_amount: 0.0,
+            duck_gain: 1.0,
             diffusion: 0.5,
-            mode: usize::MAX,
+            mode: 0,
+            voice: usize::MAX,
             rt: [2.0; 3],
             peak: [0.0; 2],
             first: true,
@@ -523,40 +587,57 @@ impl Reverb {
         r
     }
 
+    /// The voicing and colour the current Algorithm / Mode / Colour select.
+    pub fn voicing(&self) -> (voicing::Voicing, voicing::Color) {
+        let algo = self.params.choice(p::ALGORITHM).min(ALGORITHMS.len() - 1);
+        let color = self.params.choice(p::COLOR).min(COLORS.len() - 1);
+        (VOICES[voice_index(algo, self.params.choice(p::MODE))], COLOR_TABLE[color])
+    }
+
     /// RT60s `[low, mid, high]` in seconds for the current params.
     pub fn decay_times(&self) -> [f32; 3] {
         let mid = self.params.plain(p::DECAY);
         let low = (mid * self.params.plain(p::BASS_MULT)).clamp(0.05, 80.0);
-        let ratio = 0.1f32.powf(self.params.plain(p::DAMPING) / 100.0);
+        let damping = (self.params.plain(p::DAMPING) / 100.0 * self.voicing().0.damping).min(1.2);
+        let ratio = 0.1f32.powf(damping);
         [low, mid, (mid * ratio).max(0.05)]
+    }
+
+    /// Loop gain of the shimmer feedback for the current params.
+    pub fn shimmer_amount(&self) -> f32 {
+        let floor = self.voicing().0.shimmer_floor;
+        (floor + (1.0 - floor) * self.params.plain(p::SHIMMER) / 100.0) * SHIMMER_MAX
     }
 
     fn update(&mut self) {
         let sr = self.sr as f32;
-        let mode = self.params.choice(p::MODE).min(2);
-        if mode != self.mode {
-            if self.mode != usize::MAX {
+        let (v, c) = self.voicing();
+        let algo = self.params.choice(p::ALGORITHM).min(ALGORITHMS.len() - 1);
+        let key = voice_index(algo, self.params.choice(p::MODE)) * COLORS.len() + self.params.choice(p::COLOR).min(COLORS.len() - 1);
+        if key != self.voice {
+            if self.voice != usize::MAX {
                 self.fdn.clear();
                 self.plate.clear();
+                self.shifter.clear();
+                self.shim_src = 0.0;
             }
-            self.mode = mode;
+            self.voice = key;
         }
+        self.mode = if v.engine == Engine::Plate { 2 } else { 0 };
         let size = self.params.plain(p::SIZE) / 100.0;
         let freeze = self.params.on(p::FREEZE);
         self.rt = self.decay_times();
         let ms = |m: f32| m * 0.001 * sr;
         let mod_amt = self.params.plain(p::MOD_DEPTH) / 100.0;
+        let mod_scale = v.mod_scale * c.mod_scale;
         let rate = self.params.plain(p::MOD_RATE);
-        self.diffusion = self.params.plain(p::DIFFUSION) / 100.0;
+        self.diffusion = (self.params.plain(p::DIFFUSION) / 100.0 * v.diffusion * c.diffusion).min(1.07);
 
         // FDN.
-        let n = if self.params.choice(p::LINES) == 0 { 8 } else { 16 };
-        let (longest, early_span, mod_scale) = if mode == 1 {
-            (sweep(12.0, 70.0, size), sweep(4.0, 40.0, size), 0.5)
-        } else {
-            (sweep(45.0, MAX_LINE_MS - 5.0, size), sweep(10.0, MAX_EARLY_MS - 5.0, size), 1.0)
-        };
-        let shortest = longest * 0.3;
+        let n = c.lines.or(v.lines).unwrap_or(if self.params.choice(p::LINES) == 0 { 8 } else { 16 });
+        let longest = sweep(v.longest.0, v.longest.1, size);
+        let early_span = sweep(v.early_span.0, v.early_span.1, size);
+        let shortest = longest * v.spread;
         let fdn = &mut self.fdn;
         if fdn.n != n {
             fdn.n = n;
@@ -594,17 +675,29 @@ impl Reverb {
         let loop_len = self.plate.set_scale(sr, 0.5 + size);
         // Four decay multiplications per trip round the figure eight.
         self.plate.decay = if freeze { 0.99999 } else { 10f32.powf(-3.0 * loop_len / (4.0 * sr * self.rt[1])).min(0.9995) };
-        let damp_hz = (self.params.plain(p::DAMP_FREQ) * 2f32.powf(2.0 * (0.5 - self.params.plain(p::DAMPING) / 100.0))).min(sr * 0.45);
+        let damping = (self.params.plain(p::DAMPING) / 100.0 * v.damping).min(1.0);
+        let damp_hz = (self.params.plain(p::DAMP_FREQ) * 2f32.powf(2.0 * (0.5 - damping))).min(sr * 0.45);
         self.plate.damp = (-TAU * damp_hz / sr).exp();
-        self.plate.in_g = 0.4 + 0.6 * self.diffusion;
-        self.plate.exc = PLATE_EXCURSION * sr / PLATE_SR * (mod_amt / 0.3).min(3.0);
+        self.plate.in_g = 0.4 + 0.6 * self.diffusion.min(1.0);
+        self.plate.exc = PLATE_EXCURSION * sr / PLATE_SR * (mod_amt / 0.3).min(3.0) * mod_scale.min(1.5);
         self.plate.inc = rate / sr;
+
+        // Colour.
+        self.color_on = c.bandwidth.is_some();
+        self.color_lp = SvfCoeffs::new(SvfMode::Lowpass, c.bandwidth.unwrap_or(20_000.0).min(sr * 0.45), 0.707, 0.0, self.sr);
+        self.quant = c.bits.map_or(0.0, |b| 2f32.powi(b as i32 - 1));
+        self.late_trim = v.late;
+
+        // Shimmer and ducking.
+        self.shifter.set_semitones(INTERVALS[self.params.choice(p::SHIFT).min(INTERVALS.len() - 1)]);
+        self.shim_hp.set_freq(250.0, self.sr);
+        self.shimmer_gain.set_target(self.shimmer_amount());
+        self.duck_amount = self.params.plain(p::DUCK) / 100.0;
 
         self.predelay.set_target(ms(self.params.plain(p::PREDELAY)));
         self.early_span.set_target(ms(early_span));
         self.input_gain.set_target(if freeze { 0.0 } else { 1.0 });
-        let early = self.params.plain(p::EARLY) / 100.0 * if mode == 1 { 1.4 } else { 0.8 };
-        self.early_gain.set_target(if mode == 2 { 0.0 } else { early });
+        self.early_gain.set_target(self.params.plain(p::EARLY) / 100.0 * v.early_gain);
         let mix = self.params.plain(p::MIX) / 100.0;
         let out = db_to_gain(self.params.plain(p::OUTPUT));
         self.wet.set_target((2.0 * mix).min(1.0) * out);
@@ -616,7 +709,16 @@ impl Reverb {
             for l in &mut self.fdn.lines {
                 l.len = l.target;
             }
-            for s in [&mut self.predelay, &mut self.early_span, &mut self.input_gain, &mut self.early_gain, &mut self.wet, &mut self.dry, &mut self.width] {
+            for s in [
+                &mut self.predelay,
+                &mut self.early_span,
+                &mut self.input_gain,
+                &mut self.early_gain,
+                &mut self.wet,
+                &mut self.dry,
+                &mut self.width,
+                &mut self.shimmer_gain,
+            ] {
                 s.snap_to_target();
             }
             self.first = false;
@@ -638,18 +740,53 @@ impl Segmented for Reverb {
         let mode = self.mode;
         let g_diff = self.diffusion * 0.7;
         let decay = (-1.0 / (0.3 * self.sr as f32)).exp();
-        let (hp, lp) = (self.hp, self.lp);
+        let (hp, lp, clp) = (self.hp, self.lp, self.color_lp);
+        let (color_on, quant, late, duck_amount) = (self.color_on, self.quant, self.late_trim, self.duck_amount);
         let max_pre = self.pre[0].max_delay() as f32 - 2.0;
         let mut peak = self.peak;
-        let Self { fdn, plate, pre, predelay, early_span, input_gain, early_gain, wet, dry, width, hp_st, lp_st, .. } = self;
+        let mut duck_gain = self.duck_gain;
+        let Self {
+            fdn,
+            plate,
+            pre,
+            predelay,
+            early_span,
+            input_gain,
+            early_gain,
+            wet,
+            dry,
+            width,
+            shimmer_gain,
+            hp_st,
+            lp_st,
+            shifter,
+            shim_hp,
+            shim_src,
+            color_in,
+            color_out,
+            duck_env,
+            ..
+        } = self;
         for_frames(ctx.buffer, start, end, |_, l, r| {
             let ig = input_gain.next();
             pre[0].push(l * ig);
             pre[1].push(r * ig);
             let pd = predelay.next();
-            let (pl, pr) = if pd < 0.5 { (l * ig, r * ig) } else { (pre[0].read_linear(pd), pre[1].read_linear(pd)) };
+            let (mut pl, mut pr) = if pd < 0.5 { (l * ig, r * ig) } else { (pre[0].read_linear(pd), pre[1].read_linear(pd)) };
+            // Shimmer: last frame's late field, pitch-shifted, back in.
+            let sg = shimmer_gain.next();
+            if sg > 1e-4 {
+                let back = soft(shifter.process(shim_hp.highpass(*shim_src)) * sg) * ig;
+                pl += back;
+                pr += back;
+            }
+            if color_on {
+                pl = color_in[0].process(&clp, pl);
+                pr = color_in[1].process(&clp, pr);
+            }
             let (mut wl, mut wr) = if mode == 2 {
                 let (a, b) = plate.tick(0.5 * (pl + pr));
+                *shim_src = 0.5 * (a + b) * PLATE_WET;
                 (a * PLATE_WET, b * PLATE_WET)
             } else {
                 let mut dl = pl;
@@ -661,6 +798,8 @@ impl Segmented for Reverb {
                     dr = d.process(dr, g_diff);
                 }
                 let (a, b) = fdn.tick(dl, dr);
+                let k = FDN_WET * late;
+                *shim_src = 0.5 * (a + b) * k;
                 // Early reflections: taps after the pre-delay, crossing
                 // sides on odd taps.
                 let eg = early_gain.next();
@@ -673,14 +812,25 @@ impl Segmented for Reverb {
                         er += own_r.read_linear((pd + EARLY_AT_R[k] * span).min(max_pre)) * fdn.early_gain_r[k];
                     }
                 }
-                (a * FDN_WET + el * eg, b * FDN_WET + er * eg)
+                (a * k + el * eg, b * k + er * eg)
             };
+            if color_on {
+                wl = color_out[0].process(&clp, wl);
+                wr = color_out[1].process(&clp, wr);
+            }
+            if quant > 0.0 {
+                wl = quantise(wl, quant);
+                wr = quantise(wr, quant);
+            }
             wl = lp_st[0].process(&lp, hp_st[0].process(&hp, wl));
             wr = lp_st[1].process(&lp, hp_st[1].process(&hp, wr));
             let w = width.next();
             let m = 0.5 * (wl + wr);
             let s = 0.5 * (wl - wr) * w;
-            let g = wet.next();
+            // Ducking: the dry input's envelope pushes the tail down.
+            let env = duck_env.process(0.5 * (l + r));
+            duck_gain = 1.0 - duck_amount * (env * 4.0).min(1.0);
+            let g = wet.next() * duck_gain;
             wl = (m + s) * g;
             wr = (m - s) * g;
             peak[0] = (peak[0] * decay).max(wl.abs());
@@ -688,7 +838,11 @@ impl Segmented for Reverb {
             let d = dry.next();
             (sanitize(l * d + wl), sanitize(r * d + wr))
         });
+        if !self.shim_src.is_finite() {
+            self.shim_src = 0.0;
+        }
         self.peak = peak.map(|v| if v.is_finite() { v } else { 0.0 });
+        self.duck_gain = duck_gain;
     }
 }
 
@@ -704,6 +858,7 @@ impl Processor for Reverb {
             self.plate = Plate::new(sample_rate);
             let n = ((MAX_PREDELAY_MS + MAX_EARLY_MS + 10.0) * 0.001 * sample_rate as f32) as usize;
             self.pre = [DelayLine::new(n), DelayLine::new(n)];
+            self.shifter = PitchShifter::new(sample_rate);
         }
         self.fdn.glide = 1.0 - (-1.0 / (0.08 * sample_rate as f32)).exp();
         for s in [&mut self.predelay, &mut self.early_span] {
@@ -712,6 +867,8 @@ impl Processor for Reverb {
         for s in [&mut self.input_gain, &mut self.early_gain, &mut self.wet, &mut self.dry, &mut self.width] {
             s.set_time(20.0, sample_rate);
         }
+        self.shimmer_gain.set_time(80.0, sample_rate);
+        self.duck_env.set_times(5.0, 250.0, sample_rate);
         self.first = true;
         self.params.mark_dirty();
         self.update();
@@ -726,6 +883,13 @@ impl Processor for Reverb {
         }
         self.hp_st = [SvfState::default(); 2];
         self.lp_st = [SvfState::default(); 2];
+        self.color_in = [SvfState::default(); 2];
+        self.color_out = [SvfState::default(); 2];
+        self.shifter.clear();
+        self.shim_hp.reset();
+        self.shim_src = 0.0;
+        self.duck_env.reset();
+        self.duck_gain = 1.0;
         self.peak = [0.0; 2];
     }
 
@@ -746,7 +910,9 @@ impl Processor for Reverb {
             60.0
         } else {
             let rt = self.decay_times();
-            1.5 * rt[0].max(rt[1]).max(rt[2]) + self.params.plain(p::PREDELAY) * 0.001 + 0.2
+            // Each trip through the shimmer adds another tank decay.
+            let shimmer = 1.0 / (1.0 - self.shimmer_amount().min(0.95));
+            1.5 * rt[0].max(rt[1]).max(rt[2]) * shimmer + self.params.plain(p::PREDELAY) * 0.001 + 0.2
         };
         (secs.min(100.0) * self.sr as f32) as u32
     }
@@ -760,7 +926,7 @@ impl Processor for Reverb {
     }
 
     fn meter(&self, out: &mut [f32]) -> usize {
-        write_meter(out, 0, &[self.peak[0], self.peak[1], self.rt[1]])
+        write_meter(out, 0, &[self.peak[0], self.peak[1], self.rt[1], self.duck_gain])
     }
 }
 
@@ -909,5 +1075,170 @@ mod tests {
         set_plain(&mut r, p::MODE, 0.0);
         let (l, _) = process_stereo(&mut r, sine(200.0, 1.0), 48_000 * 3);
         assert!(l.iter().all(|v| v.is_finite()) && peak(&l) < 20.0);
+    }
+
+    fn noise(seed: u32) -> impl FnMut(usize) -> (f32, f32) {
+        let mut n = seed.max(1);
+        move |_| {
+            n ^= n << 13;
+            n ^= n >> 17;
+            n ^= n << 5;
+            let v = (n >> 8) as f32 / 8_388_608.0 - 1.0;
+            (v * 0.3, v * 0.3)
+        }
+    }
+
+    /// Energy of `x` at `freq` (Goertzel).
+    fn tone(x: &[f32], freq: f32) -> f32 {
+        let w = TAU * freq / SR as f32;
+        let c = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &v in x {
+            let s = v + c * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        (s1 * s1 + s2 * s2 - c * s1 * s2).max(0.0).sqrt() / x.len() as f32
+    }
+
+    #[test]
+    fn every_algorithm_and_colour_keeps_its_decay_and_level() {
+        for algo in 1..ALGORITHMS.len() {
+            for color in 0..COLORS.len() {
+                let mut r = Reverb::new();
+                wet_only(&mut r);
+                set_plain(&mut r, p::ALGORITHM, algo as f32);
+                set_plain(&mut r, p::COLOR, color as f32);
+                set_plain(&mut r, p::DECAY, 2.0);
+                set_plain(&mut r, p::DAMPING, 0.0);
+                set_plain(&mut r, p::SHIMMER, 0.0);
+                let name = format!("{} / {}", ALGORITHMS[algo], COLORS[color]);
+                let ir = impulse_response(&mut r, 3.0);
+                assert!(ir.iter().all(|v| v.is_finite()), "{name}");
+                // The shimmer voicing always feeds back, which lengthens it.
+                if algo != 7 && color == 0 {
+                    let t = rt60(&ir);
+                    let tol = if VOICES[voice_index(algo, 0)].engine == Engine::Plate { 0.25 } else { 0.15 };
+                    assert!((t / 2.0 - 1.0).abs() < tol, "{name}: measured {t} s");
+                }
+                let (l, _) = process_stereo(&mut r, noise(7), 96_000);
+                let db = 20.0 * (rms(&l[48_000..]) / (0.3 / 3f32.sqrt())).log10();
+                assert!(db.abs() < 9.0, "{name}: wet level {db} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn classic_mode_still_picks_the_engine() {
+        let mut r = Reverb::new();
+        set_plain(&mut r, p::MODE, 2.0);
+        assert_eq!(r.voicing().0.engine, Engine::Plate);
+        set_plain(&mut r, p::ALGORITHM, 1.0);
+        assert_eq!(r.voicing().0.engine, Engine::Fdn, "an algorithm overrides Mode");
+    }
+
+    #[test]
+    fn shimmer_adds_the_octave_above() {
+        let burst = |i: usize| {
+            let v = if i < 24_000 { 0.4 * (TAU * 440.0 * i as f32 / SR as f32).sin() } else { 0.0 };
+            (v, v)
+        };
+        let octave = |shimmer: f32| {
+            let mut r = Reverb::new();
+            wet_only(&mut r);
+            set_plain(&mut r, p::ALGORITHM, 1.0);
+            set_plain(&mut r, p::DECAY, 4.0);
+            set_plain(&mut r, p::SHIMMER, shimmer);
+            let (l, _) = process_stereo(&mut r, burst, 96_000);
+            let tail = &l[36_000..84_000];
+            (tone(tail, 880.0), tone(tail, 1760.0))
+        };
+        let (dry8, dry16) = octave(0.0);
+        let (wet8, wet16) = octave(100.0);
+        assert!(wet8 > 4.0 * dry8, "+12 st: 880 Hz {wet8} vs {dry8}");
+        assert!(wet16 > 4.0 * dry16, "it keeps climbing: 1760 Hz {wet16} vs {dry16}");
+    }
+
+    #[test]
+    fn full_shimmer_on_a_long_decay_still_dies_away() {
+        for algo in [1.0, 3.0, 7.0, 8.0] {
+            let mut r = Reverb::new();
+            wet_only(&mut r);
+            set_plain(&mut r, p::ALGORITHM, algo);
+            set_plain(&mut r, p::DECAY, 20.0);
+            set_plain(&mut r, p::DAMPING, 0.0);
+            set_plain(&mut r, p::SHIMMER, 100.0);
+            let mut src = noise(3);
+            let (l, _) = process_stereo(&mut r, |i| if i < 48_000 { src(i) } else { (0.0, 0.0) }, 48_000 * 40);
+            let early = rms(&l[48_000 * 2..48_000 * 4]);
+            let late = rms(&l[48_000 * 38..]);
+            assert!(late.is_finite() && late < 0.3 * early, "algo {algo}: {early} → {late}");
+            assert!(peak(&l) < 4.0, "algo {algo}: bounded {}", peak(&l));
+        }
+    }
+
+    #[test]
+    fn the_70s_colour_is_band_limited_and_grainy() {
+        let hf = |color: f32| {
+            let mut r = Reverb::new();
+            wet_only(&mut r);
+            set_plain(&mut r, p::ALGORITHM, 1.0);
+            set_plain(&mut r, p::COLOR, color);
+            set_plain(&mut r, p::DAMPING, 0.0);
+            let (l, _) = process_stereo(&mut r, noise(11), 48_000);
+            let c = SvfCoeffs::new(SvfMode::Highpass, 12_000.0, 0.707, 0.0, SR);
+            let mut st = SvfState::default();
+            let hi: Vec<f32> = l[24_000..].iter().map(|&x| st.process(&c, x)).collect();
+            rms(&hi) / rms(&l[24_000..])
+        };
+        let (now, s80, s70) = (hf(0.0), hf(1.0), hf(2.0));
+        assert!(s80 < 0.5 * now && s70 < 0.5 * s80, "now {now} 80s {s80} 70s {s70}");
+        // A 12-bit tank rounds the quiet end of the tail to silence.
+        let tail = |color: f32| {
+            let mut r = Reverb::new();
+            wet_only(&mut r);
+            set_plain(&mut r, p::COLOR, color);
+            set_plain(&mut r, p::DECAY, 1.0);
+            let ir = impulse_response(&mut r, 2.0);
+            rms(&ir[67_000..96_000])
+        };
+        let (float, word) = (tail(0.0), tail(2.0));
+        assert!(float > 0.0 && word < 0.01 * float, "the tail truncates: {word} vs {float}");
+    }
+
+    #[test]
+    fn ducking_lowers_the_tail_while_the_input_plays() {
+        let level = |duck: f32| {
+            let mut r = Reverb::new();
+            wet_only(&mut r);
+            set_plain(&mut r, p::DUCK, duck);
+            let mut src = noise(5);
+            let (l, _) = process_stereo(&mut r, |i| if i < 48_000 { src(i) } else { (0.0, 0.0) }, 72_000);
+            (rms(&l[24_000..48_000]), rms(&l[60_000..72_000]))
+        };
+        let (open_during, open_after) = level(0.0);
+        let (duck_during, duck_after) = level(100.0);
+        assert!(duck_during < 0.3 * open_during, "ducked {duck_during} vs {open_during}");
+        assert!(duck_after > 0.6 * open_after, "the tail comes back: {duck_after} vs {open_after}");
+    }
+
+    #[test]
+    fn cpu_budget_per_instance() {
+        // Worst case: 16 lines, max modulation, shimmer, 80s colour, ducking.
+        let mut r = Reverb::new();
+        set_plain(&mut r, p::ALGORITHM, 8.0);
+        set_plain(&mut r, p::COLOR, 1.0);
+        set_plain(&mut r, p::MOD_DEPTH, 100.0);
+        set_plain(&mut r, p::SHIMMER, 50.0);
+        set_plain(&mut r, p::DUCK, 50.0);
+        set_plain(&mut r, p::EARLY, 100.0);
+        let secs = 2.0;
+        let t = std::time::Instant::now();
+        let (l, _) = process_stereo(&mut r, noise(9), (secs * SR) as usize);
+        let share = t.elapsed().as_secs_f64() / secs;
+        assert!(l.iter().all(|v| v.is_finite()));
+        // The test profile is optimised; leave room for a loaded CI machine.
+        let budget = if cfg!(debug_assertions) { 0.25 } else { 0.06 };
+        assert!(share < budget, "reverb uses {:.2} % of a core", share * 100.0);
     }
 }

@@ -610,6 +610,9 @@ pub fn has_editor(plugin: &str) -> bool {
     matches!(
         plugin,
         "fx.eq"
+            | "fx.tape"
+            | "fx.amp"
+            | "fx.console"
             | "fx.filter"
             | "fx.compressor"
             | "fx.gate"
@@ -643,6 +646,9 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.multiband" => multiband::render(ws, dev, cx),
         "fx.midside" => midside::render(ws, dev, cx),
         "fx.saturator" => saturator::render(ws, dev, cx),
+        "fx.tape" => saturator::tape::render(ws, dev, cx),
+        "fx.amp" => saturator::amp::render(ws, dev, cx),
+        "fx.console" => saturator::console::render(ws, dev, cx),
         "fx.shaper" => shaper::render(ws, dev, cx),
         "fx.reverb" => reverb::render(ws, dev, cx),
         "fx.delay" => delay::render(ws, dev, cx),

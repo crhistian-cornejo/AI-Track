@@ -1,0 +1,21 @@
+{
+  "name": "Drum Bus Glue",
+  "plugin": "fx.console",
+  "author": "AI-Track",
+  "tags": [
+    "console",
+    "glue",
+    "drums",
+    "punchy",
+    "bus"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.53333336,
+    "2": 0.65,
+    "3": 0.4,
+    "4": 0.6666667,
+    "5": 1.0,
+    "6": 0.5
+  }
+}

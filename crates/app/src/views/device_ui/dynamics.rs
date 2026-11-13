@@ -2,14 +2,22 @@
 //! draggable threshold and ratio / range handles (Alt or scroll on the
 //! threshold = knee / hysteresis), a scrolling history of level and gain
 //! change, a gain-reduction meter, and the remaining controls in a row.
+//!
+//! The compressor adds a six-way style selector (Clean, Punch, Glue, Opto,
+//! VCA, Vari-Mu: one click writes both the plugin's `Style` and `Model`), the
+//! feed-forward / feedback switch and, in the device window, a sidechain
+//! column (high-pass, bell, low-pass, listen) next to the history.
 
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
-use super::{Dev, HISTORY};
+use super::{Dev, HISTORY, caption, set_many};
 use crate::theme::*;
 use crate::workspace::Workspace;
 use aitrack_dsp::envelope::gain_computer;
 use aitrack_stock::fx::{compressor, gate, transient};
-use gpui::{AnyElement, App, Context, IntoElement, ParentElement, Pixels, Point, Styled, TextAlign, Window, div, px};
+use gpui::{
+    AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, StatefulInteractiveElement, Styled,
+    TextAlign, Window, div, prelude::FluentBuilder, px,
+};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,9 +47,8 @@ pub struct Transfer {
 impl Transfer {
     pub fn compressor(dev: &Dev) -> Self {
         use compressor::p;
-        let knee = dev.plain(p::KNEE);
-        // The Opto style never runs a hard knee.
-        let knee = if dev.choice(p::STYLE) == 3 { knee.max(6.) } else { knee };
+        // Opto never runs a hard knee, Vari-Mu's ratio grows over 18 dB.
+        let knee = compressor::effective_knee(style_now(dev), dev.plain(p::KNEE));
         let (threshold, ratio, range) = (dev.plain(p::THRESHOLD), dev.plain(p::RATIO), dev.plain(p::RANGE));
         let mut makeup = dev.plain(p::MAKEUP) + dev.plain(p::OUTPUT);
         if dev.on(p::AUTO_MAKEUP) {
@@ -85,6 +92,81 @@ impl Transfer {
     pub fn frac(&self, db: f32) -> f32 {
         ((db - self.floor) / -self.floor).clamp(0., 1.)
     }
+}
+
+/// The compressor style in effect (index into `compressor::STYLE_NAMES`).
+pub fn style_now(dev: &Dev) -> usize {
+    use compressor::p;
+    compressor::resolved_style(dev.choice(p::STYLE), dev.choice(p::MODEL))
+}
+
+/// The `(Style, Model)` plain values that select style `i` (0 Clean … 5 Vari-Mu).
+/// VCA and Vari-Mu keep the classic style underneath as it was.
+pub fn style_values(i: usize, classic_now: usize) -> (f32, f32) {
+    match i {
+        4 => (classic_now as f32, compressor::model::VCA),
+        5 => (classic_now as f32, compressor::model::VARI_MU),
+        _ => (i.min(3) as f32, compressor::model::CLASSIC),
+    }
+}
+
+/// The six styles as one segmented control.
+fn style_bar(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+    use compressor::p;
+    let pal = p();
+    let now = style_now(dev);
+    let device = dev.id;
+    let classic = dev.choice(p::STYLE);
+    let mut row = div().flex_none().h(px(20.)).flex().items_center().gap(px(2.)).p(px(2.)).rounded(px(r_sm())).bg(pal.well);
+    for (i, name) in compressor::STYLE_NAMES.iter().enumerate() {
+        let (st, model) = style_values(i, classic);
+        let values = [(p::STYLE, dev.to_norm(p::STYLE, st)), (p::MODEL, dev.to_norm(p::MODEL, model))];
+        let on = i == now;
+        row = row.child(
+            div()
+                .id(("comp-style", dev.key(i)))
+                .h(px(16.))
+                .px(px(SP1 + 2.))
+                .flex()
+                .items_center()
+                .rounded(px(r_sm()))
+                .cursor_pointer()
+                .bg(if on { accent_alpha(0.24) } else { gpui::transparent_black() })
+                .hover(|d| d.bg(if on { accent_alpha(0.3) } else { content(0.08) }))
+                .child(crate::widgets::label(*name, TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    set_many(this, "Compressor style", device, &values);
+                    cx.notify();
+                })),
+        );
+    }
+    row.into_any_element()
+}
+
+/// The device window's sidechain column of the compressor.
+fn sidechain_column(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+    use compressor::p;
+    let pal = p();
+    let grid = |ws: &mut Workspace, ids: [u32; 2], cx: &mut Context<Workspace>| div().flex().gap(px(SP1)).child(kit::ctl(ws, dev, ids[0], cx)).child(kit::ctl(ws, dev, ids[1], cx));
+    div()
+        .flex_none()
+        .w(px(132.))
+        .h_full()
+        .p(px(SP2))
+        .gap(px(SP1))
+        .flex()
+        .flex_col()
+        .rounded(px(r_md()))
+        .bg(pal.well)
+        .border_1()
+        .border_color(border())
+        .child(caption("SIDECHAIN"))
+        .child(super::sidechain_chip(ws, dev, p::SIDECHAIN, cx))
+        .child(grid(ws, [p::SC_HPF, p::SC_LPF], cx))
+        .child(grid(ws, [p::SC_EQ_FREQ, p::SC_EQ_GAIN], cx))
+        .child(div().flex().gap(px(SP1)).child(kit::pick(dev, p::SC_LISTEN, cx)).child(kit::pick(dev, p::TOPOLOGY, cx)))
+        .into_any_element()
 }
 
 /// A history trace as points across `r`, newest at the right edge.
@@ -173,8 +255,9 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
             (
                 Some(t),
                 handles,
-                vec![p::ATTACK, p::RELEASE, p::KNEE, p::MAKEUP, p::MIX, p::STYLE],
-                vec![p::THRESHOLD, p::RATIO, p::RMS, p::LINK, p::LOOKAHEAD, p::SC_HPF, p::RANGE, p::OUTPUT, p::AUTO_RELEASE, p::AUTO_MAKEUP, p::SIDECHAIN, p::SC_LISTEN],
+                if dev.big { vec![p::ATTACK, p::RELEASE, p::KNEE, p::MAKEUP, p::MIX] } else { vec![p::ATTACK, p::RELEASE, p::KNEE, p::MAKEUP, p::MIX, p::TOPOLOGY] },
+                // In the window the sidechain controls live in their own column.
+                vec![p::THRESHOLD, p::RATIO, p::RANGE, p::RMS, p::LINK, p::LOOKAHEAD, p::OUTPUT, p::AUTO_RELEASE, p::AUTO_MAKEUP],
             )
         }
         Kind::Gate => {
@@ -236,7 +319,7 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
     // Middle: level and gain change over the last four seconds.
     let hist = dev.hist.clone();
     let region = ws.fx.region(dev.id, 1);
-    let history = div().flex_1().min_w(px(0.)).h_full().rounded(px(r_md())).bg(pal.well).border_1().border_color(border()).overflow_hidden().child(
+    let history = div().flex_1().min_w(px(0.)).min_h(px(0.)).rounded(px(r_md())).bg(pal.well).border_1().border_color(border()).overflow_hidden().child(
         gpui::canvas(
             move |b, _, _| region.set(b),
             move |b, _, window, cx| {
@@ -305,8 +388,44 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
         "fx.gate" => Some(super::sidechain_chip(ws, dev, aitrack_stock::fx::gate::p::SIDECHAIN, cx)),
         _ => None,
     };
-    kit::panel(if dev.big { 760. } else { 520. })
-        .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(curve)).child(history).child(meter))
+    // The compressor's middle column: style above the history, with what the
+    // detector is doing (feedback, lookahead) as a badge.
+    let middle = if kind == Kind::Compressor {
+        use compressor::p;
+        let fb = dev.m(69) > 0.5 || (dev.meter.len() < 70 && dev.choice(p::TOPOLOGY) == 1 && dev.choice(p::SIDECHAIN) == 0);
+        let look = dev.plain(p::LOOKAHEAD);
+        let badge = match (fb, look > 0.05) {
+            (true, _) => Some("feedback".to_owned()),
+            (false, true) => Some(format!("lookahead {look:.1} ms")),
+            _ => None,
+        };
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(SP1))
+            .child(div().flex_none().flex().items_center().gap(px(SP2)).child(style_bar(dev, cx)).child(div().flex_1()).when_some(badge, |d, b| d.child(crate::widgets::mono(b, TEXT_XS, pal.faint))))
+            .child(history)
+            .into_any_element()
+    } else {
+        history.h_full().into_any_element()
+    };
+    let side = (kind == Kind::Compressor && dev.big).then(|| sidechain_column(ws, dev, cx));
+    let sidechain = if side.is_some() { None } else { sidechain };
+    kit::panel(if dev.big { 860. } else { 540. })
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .gap(px(SP2))
+                .child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(curve))
+                .child(middle)
+                .child(meter)
+                .children(side),
+        )
         .child(
             div()
                 .flex_none()
@@ -335,7 +454,7 @@ mod tests {
         }
         aitrack_stock::test_util::process_stereo(plugin.as_mut(), |_| (0., 0.), 2048);
         let mut m = [0.0f32; 80];
-        assert_eq!(plugin.meter(&mut m), 67);
+        assert_eq!(plugin.meter(&mut m), 70);
         let t = Transfer::compressor(&dev("fx.compressor", &plain));
         for (i, plugin_db) in m[3..67].iter().enumerate() {
             let level = -60. + 60. * i as f32 / 63.;
@@ -345,6 +464,33 @@ mod tests {
         assert!((t.out(-6.) - t.out(-12.) - 1.).abs() < 0.01);
         let capped = Transfer { range: 4., ..t };
         assert!((capped.out(0.) - (0. - 4. + capped.makeup)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_style_selector_writes_style_and_model() {
+        use compressor::p;
+        assert_eq!(style_values(2, 0), (2., compressor::model::CLASSIC));
+        assert_eq!(style_values(4, 3), (3., compressor::model::VCA));
+        assert_eq!(style_values(5, 1), (1., compressor::model::VARI_MU));
+        for i in 0..6 {
+            let (st, model) = style_values(i, 2);
+            assert_eq!(style_now(&dev("fx.compressor", &[(p::STYLE, st), (p::MODEL, model)])), i);
+        }
+        // The Vari-Mu knee is the plugin's.
+        let plain = [(p::MODEL, compressor::model::VARI_MU), (p::KNEE, 3.), (p::THRESHOLD, -20.)];
+        let mut plugin = aitrack_stock::create("fx.compressor").unwrap();
+        for (id, v) in plain {
+            set_plain(plugin.as_mut(), id, v);
+        }
+        aitrack_stock::test_util::process_stereo(plugin.as_mut(), |_| (0., 0.), 1024);
+        let mut m = [0.0f32; 80];
+        plugin.meter(&mut m);
+        let t = Transfer::compressor(&dev("fx.compressor", &plain));
+        assert_eq!(t.knee, 18.);
+        for (i, plugin_db) in m[3..67].iter().enumerate() {
+            let level = -60. + 60. * i as f32 / 63.;
+            assert!((t.out(level) - plugin_db).abs() < 0.05);
+        }
     }
 
     #[test]

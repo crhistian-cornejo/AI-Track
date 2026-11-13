@@ -116,7 +116,8 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
             if p.flags.contains(ParamInfoFlags::IS_STEPPED) {
                 info.scale = ParamScale::Stepped;
             }
-            info.automatable = p.flags.contains(ParamInfoFlags::IS_AUTOMATABLE) && !p.flags.contains(ParamInfoFlags::IS_READONLY);
+            // Hidden and read-only parameters are not offered for automation.
+            info.automatable = p.flags.contains(ParamInfoFlags::IS_AUTOMATABLE) && !p.flags.intersects(ParamInfoFlags::IS_READONLY | ParamInfoFlags::IS_HIDDEN);
             let plain = pe.get_value(&handle, p.id).unwrap_or(p.default_value);
             let range = (p.max_value - p.min_value).abs();
             let n = if range < f64::EPSILON { 0.0 } else { ((plain - p.min_value) / (p.max_value - p.min_value)).clamp(0.0, 1.0) };

@@ -197,6 +197,26 @@ fn check(info: &HostedPluginInfo, editor_secs: Option<f64>) -> Outcome {
         ctl.idle();
         o.lines.push(format!("set_param {} {before:.3} -> {:.3} (\"{}\")", par.name, p.get_param(par.id), ctl.param_text(par.id, target).unwrap_or_default()));
         p.set_param(par.id, before);
+        // Automation as the engine sends it to hosted plugins: timed Param
+        // events at sample offsets inside one block (several per parameter,
+        // two on one offset for a jump). The plugin must take them all and
+        // end on the last one.
+        let ramp = [(0u32, 0.2f32), (31, 0.35), (64, 0.5), (64, 0.8), (127, 0.65)];
+        render(
+            &mut p,
+            44_100.0,
+            128,
+            3,
+            |b| if b == 0 { ramp.iter().map(|&(offset, value)| Event { offset, kind: EventKind::Param { id: par.id, value } }).collect() } else { Vec::new() },
+            |buf, b| if !info.is_instrument { sine(buf, b, 44_100.0) },
+        );
+        ctl.idle();
+        let (got, text) = (p.get_param(par.id), ctl.param_text(par.id, 0.65).unwrap_or_default());
+        o.lines.push(format!("timed param events {}: ends at {got:.3} (\"{text}\")", par.name));
+        if (got - 0.65).abs() > 0.02 && par.scale != aitrack_dsp::ParamScale::Stepped {
+            o.failures.push(format!("timed param events: {} ended at {got:.3}, not 0.65", par.name));
+        }
+        p.set_param(par.id, before);
     }
 
     match ctl.save_state() {

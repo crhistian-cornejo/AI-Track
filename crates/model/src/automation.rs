@@ -9,7 +9,7 @@
 //! before. Two breakpoints may share a tick: that is a vertical jump (the
 //! later one holds from that tick on, as [`AutomationLane::value_at`] reads it).
 
-use crate::{AutomationLane, AutomationPoint, Tick};
+use crate::{AutomationLane, AutomationPoint, AutomationTarget, Device, DeviceId, DeviceKind, Tick, Track, TrackKind};
 
 fn value_at(points: &[AutomationPoint], tick: Tick) -> Option<f32> {
     AutomationLane { points: points.to_vec(), ..AutomationLane::new(crate::AutomationTarget::Volume) }.value_at(tick)
@@ -143,10 +143,90 @@ fn tidy(points: Vec<AutomationPoint>) -> Vec<AutomationPoint> {
     out
 }
 
+// ───────────────────────────── Targets ─────────────────────────────
+
+/// Every device of a chain in order, at any rack depth (a rack comes before
+/// what its chains hold), with how many racks it sits inside.
+pub fn chain_devices(devices: &[Device]) -> Vec<(&Device, usize)> {
+    fn walk<'a>(devices: &'a [Device], depth: usize, out: &mut Vec<(&'a Device, usize)>) {
+        for d in devices {
+            out.push((d, depth));
+            if let DeviceKind::Rack(r) = &d.kind {
+                for c in &r.chains {
+                    walk(&c.devices, depth + 1, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(devices, 0, &mut out);
+    out
+}
+
+/// One section of a track's automation chooser: the mixer (`device` is
+/// `None`) or one device of its chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetGroup {
+    pub device: Option<DeviceId>,
+    /// How many racks the device sits inside (0 for the mixer).
+    pub depth: usize,
+    pub targets: Vec<AutomationTarget>,
+}
+
+/// What a track's lanes can automate, grouped as in Live's chooser: the
+/// mixer first (Volume, Pan, Mute, one per send; Main adds Tempo), then each
+/// device of the chain at any rack depth with its On switch, a rack's
+/// macros, and the parameters `params` lists for it (the automatable ones,
+/// in display order; the caller knows stock and plugin parameter lists).
+pub fn targets(track: &Track, params: impl Fn(&Device) -> Vec<u32>) -> Vec<TargetGroup> {
+    let mut mixer = Vec::new();
+    if track.kind.carries_audio() {
+        mixer.extend([AutomationTarget::Volume, AutomationTarget::Pan]);
+        if track.kind != TrackKind::Main {
+            mixer.push(AutomationTarget::Mute);
+        }
+        mixer.extend((0..track.sends.len()).map(|i| AutomationTarget::Send { index: i as u16 }));
+    }
+    if track.kind == TrackKind::Main {
+        mixer.push(AutomationTarget::Tempo);
+    }
+    let mut out = vec![TargetGroup { device: None, depth: 0, targets: mixer }];
+    for (d, depth) in chain_devices(&track.devices) {
+        let mut targets = vec![AutomationTarget::DeviceEnabled { device: d.id }];
+        if let DeviceKind::Rack(r) = &d.kind {
+            targets.extend((0..r.macros.len()).map(|i| AutomationTarget::Macro { device: d.id, index: i as u8 }));
+        } else {
+            targets.extend(params(d).into_iter().map(|param| AutomationTarget::DeviceParam { device: d.id, param }));
+        }
+        out.push(TargetGroup { device: Some(d.id), depth, targets });
+    }
+    out
+}
+
+/// The device a target belongs to, if any.
+pub fn target_device(target: AutomationTarget) -> Option<DeviceId> {
+    match target {
+        AutomationTarget::DeviceParam { device, .. } | AutomationTarget::DeviceEnabled { device } | AutomationTarget::Macro { device, .. } => Some(device),
+        _ => None,
+    }
+}
+
+/// `points` with a breakpoint written at `tick` (Live's automation
+/// recording): what was between `from` (where this pass started, or the
+/// last tick written) and `tick` is replaced, so a move overwrites the
+/// envelope it passes over. The value is clamped to `0..=1`.
+pub fn write(points: &[AutomationPoint], from: Tick, tick: Tick, value: f32) -> Vec<AutomationPoint> {
+    let (a, b) = (from.min(tick), from.max(tick));
+    let mut out: Vec<AutomationPoint> = points.iter().filter(|p| p.tick < a || p.tick > b || (p.tick == a && a < b)).copied().collect();
+    let i = out.partition_point(|p| p.tick <= tick);
+    out.insert(i, AutomationPoint { tick, value: value.clamp(0.0, 1.0), curve: 0.0 });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AutomationTarget;
+    use crate::{Chain, Color, Rack, RackKind, Send, TrackId};
 
     fn pt(tick: Tick, value: f32) -> AutomationPoint {
         AutomationPoint { tick, value, curve: 0.0 }
@@ -242,5 +322,46 @@ mod tests {
         // Undo-friendly: the lane's command can restore the original.
         let lane = AutomationLane { points: up, ..AutomationLane::new(AutomationTarget::Pan) };
         assert!(lane.points.windows(2).all(|w| w[0].tick <= w[1].tick), "still sorted");
+    }
+
+    fn dev(id: u64) -> Device {
+        Device::stock(DeviceId(id), "fx.eq", format!("D{id}"))
+    }
+
+    #[test]
+    fn targets_list_the_mixer_then_every_device_inside_racks() {
+        let mut t = Track::new(TrackId(1), TrackKind::Audio, "a", Color(0));
+        t.sends.push(Send { target: TrackId(9), level_db: 0.0, pre_fader: false });
+        let mut inner = Rack::new(RackKind::Audio);
+        let mut chain = Chain::new("c", Color(0));
+        chain.devices.push(dev(12));
+        inner.chains.push(chain);
+        let mut rack = dev(11);
+        rack.kind = DeviceKind::Rack(inner);
+        t.devices = vec![dev(10), rack];
+        let groups = targets(&t, |d| if d.id == DeviceId(12) { vec![3, 4] } else { vec![0] });
+        assert_eq!(groups[0].targets, vec![AutomationTarget::Volume, AutomationTarget::Pan, AutomationTarget::Mute, AutomationTarget::Send { index: 0 }]);
+        let devices: Vec<(Option<DeviceId>, usize)> = groups.iter().map(|g| (g.device, g.depth)).collect();
+        assert_eq!(devices, vec![(None, 0), (Some(DeviceId(10)), 0), (Some(DeviceId(11)), 0), (Some(DeviceId(12)), 1)]);
+        let rack = &groups[2].targets;
+        assert_eq!(rack[0], AutomationTarget::DeviceEnabled { device: DeviceId(11) });
+        assert_eq!(rack.len(), 1 + crate::MACRO_COUNT, "a rack offers its macros");
+        assert_eq!(groups[3].targets[1..], [AutomationTarget::DeviceParam { device: DeviceId(12), param: 3 }, AutomationTarget::DeviceParam { device: DeviceId(12), param: 4 }]);
+        assert_eq!(target_device(groups[3].targets[2]), Some(DeviceId(12)));
+        // Main: no Mute, but the tempo lane.
+        let main = Track::new(TrackId(2), TrackKind::Main, "Main", Color(0));
+        assert_eq!(targets(&main, |_| Vec::new())[0].targets, vec![AutomationTarget::Volume, AutomationTarget::Pan, AutomationTarget::Tempo]);
+    }
+
+    #[test]
+    fn writing_overwrites_what_the_move_passes_over() {
+        let p = write(&ramp(), 0, 0, 0.3);
+        assert_eq!(p[0], pt(0, 0.3), "replaces the breakpoint it lands on");
+        // A pass from 500 to 1500: the breakpoint at 1000 goes.
+        let mut pts = write(&ramp(), 500, 500, 0.2);
+        pts = write(&pts, 500, 1500, 0.4);
+        assert_eq!(pts, vec![pt(0, 0.0), pt(500, 0.2), pt(1500, 0.4), pt(2000, 0.5)]);
+        // Into an empty lane.
+        assert_eq!(write(&[], 0, 100, 1.5), vec![pt(100, 1.0)]);
     }
 }

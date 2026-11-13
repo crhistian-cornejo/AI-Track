@@ -50,6 +50,8 @@ pub enum NumTarget {
     /// An audio clip's transpose (st) and detune (ct), as the knobs edit them.
     Transpose { clip: ClipId },
     Detune { clip: ClipId },
+    /// A track's volume in dB (the arrangement header's value box).
+    Volume { track: TrackId },
 }
 
 /// A value box being typed into. Clicking a draggable number opens it with
@@ -109,6 +111,10 @@ pub fn click_dragged(e: &ClickEvent) -> bool {
 pub enum Drag {
     Knob { target: KnobTarget, last_y: f32, value: f32 },
     Fader { track: TrackId, last_y: f32, pos: f32, travel: f32 },
+    /// A sideways volume slider (a tall track header).
+    HFader { track: TrackId, last_x: f32, pos: f32, travel: f32 },
+    /// A track header's bottom edge: the track's height.
+    TrackHeight { track: TrackId, start_y: f32, start_h: f32 },
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
     MixerResize { start_y: f32, start_h: f32 },
@@ -209,6 +215,14 @@ pub struct Workspace {
     /// against drags).
     pub num_edit: Option<NumEdit>,
     pub menu: Option<Menu>,
+    /// An automation lane's target chooser, while open.
+    pub auto_chooser: Option<views::arrangement::Chooser>,
+    /// The chooser's search field.
+    pub auto_search: Entity<TextInput>,
+    /// Right-click on a fader, knob or send: "Show automation" for it.
+    pub param_menu: Option<(TrackId, AutomationTarget, Point<Pixels>)>,
+    /// Dev view: text to type into the chooser's search on the first frame.
+    auto_search_pending: Option<String>,
     /// View state of the visual device editors.
     pub fx: views::device_ui::UiState,
     /// View state of the sample editor (the Clip tab for an audio clip).
@@ -317,6 +331,7 @@ impl Workspace {
     pub fn new(project: Project, bridges: Bridges, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextInput::new(cx, "Search samples, devices, presets and commands", Some(Icon::Search)));
         let export_name = cx.new(|cx| TextInput::new(cx, "File name", Some(Icon::File)));
+        let auto_search = cx.new(|cx| TextInput::new(cx, "Search parameters", Some(Icon::Search)));
         let look = views::prefs::Look::load(cx);
         let subs = vec![
             cx.subscribe(&search, |this, _, e: &InputEvent, cx| {
@@ -324,6 +339,7 @@ impl Workspace {
                 views::palette::set_query(this, q);
                 cx.notify();
             }),
+            cx.subscribe(&auto_search, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
         // Main-thread plugin work, background scan results and engine
         // messages, on a short timer that runs even while nothing animates.
@@ -347,6 +363,10 @@ impl Workspace {
             drag: None,
             num_edit: None,
             menu: None,
+            auto_chooser: None,
+            auto_search,
+            param_menu: None,
+            auto_search_pending: None,
             fx: views::device_ui::UiState::default(),
             sample: Default::default(),
             waves: Default::default(),
@@ -557,6 +577,49 @@ impl Workspace {
                     self.s.group_devices();
                 }
                 // Open the right-click menu of the selected track / of the picked device.
+                // Automation lanes on the selected track (`track=Name` first):
+                // a drawn Volume lane and an empty Pan lane under it.
+                "lanes" => {
+                    if let Some(t) = self.s.selected_track {
+                        self.s.show_automation(t, AutomationTarget::Volume);
+                        for (tick, v) in [(0, 0.92), (4 * PPQ, 0.92), (8 * PPQ, 0.4), (12 * PPQ, 0.8), (16 * PPQ, 0.6)] {
+                            self.s.set_automation_point(t, AutomationTarget::Volume, tick, v, false);
+                        }
+                        self.s.add_auto_lane(t);
+                    }
+                }
+                // A lane for the first parameter of the selected track's first device.
+                "devlane" => {
+                    if let Some(t) = self.s.selected_track
+                        && let Some(d) = self.s.project.track(t).and_then(|t| t.devices.first()).cloned()
+                        && let Some((param, _)) = views::arrangement::device_params(self, &d).first().cloned()
+                    {
+                        self.s.show_automation(t, AutomationTarget::DeviceParam { device: d.id, param });
+                    }
+                }
+                // The selected track made tall enough for the header's volume slider.
+                "talltrack" => {
+                    if let Some(t) = self.s.selected_track {
+                        self.s.set_track(t, TrackProp::Height(88.));
+                    }
+                }
+                // The chooser of the selected track's first lane, open (`lanes` first).
+                "chooser" => {
+                    if let Some(t) = self.s.selected_track {
+                        self.auto_chooser = Some(views::arrangement::Chooser { track: t, index: 0, at: gpui::point(gpui::px(80.), gpui::px(240.)) });
+                    }
+                }
+                // Search the open chooser: `autosearch=gain`.
+                _ if word.starts_with("autosearch=") => {
+                    self.auto_search_pending = word.split('=').nth(1).map(str::to_owned);
+                }
+                // The "Show automation" menu of the selected track's fader.
+                "parammenu" => {
+                    if let Some(t) = self.s.selected_track {
+                        self.param_menu = Some((t, AutomationTarget::Volume, gpui::point(gpui::px(420.), gpui::px(240.))));
+                    }
+                }
+                "autoarm" => self.s.automation_arm = true,
                 "menu=track" => {
                     if let Some(t) = self.s.selected_track {
                         self.menu = Some(Menu {
@@ -719,7 +782,9 @@ impl Workspace {
         let mut changed = self.b.engine.idle();
         // Knobs turned in a plugin's own window become undoable SetParam edits.
         let edits = self.b.engine.take_plugin_edits();
-        changed |= self.s.apply_plugin_edits(&edits);
+        // While recording with Automation Arm on, they are written into their lanes too.
+        let t = self.b.engine.transport();
+        changed |= self.s.apply_plugin_edits(&edits, (t.recording && t.playing).then_some(t.position));
         // The usage read-out moves about once a second even when nothing else does.
         let (cpu, mem) = (self.usage.cpu, self.usage.memory);
         self.usage.tick();
@@ -784,6 +849,39 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Right-click on a mixer control: a menu to show its automation lane.
+    pub fn open_param_menu(&mut self, track: TrackId, target: AutomationTarget, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.auto_chooser = None;
+        self.menu_counter += 1;
+        self.param_menu = Some((track, target, at));
+        cx.notify();
+    }
+
+    /// Show `track`'s automation lane for `target` in the arrangement (the
+    /// mixer's and the device view's "Show automation"): switches to the
+    /// Arrangement and scrolls the lane into view. The state part is
+    /// [`AppState::show_automation`].
+    pub fn show_automation(&mut self, track: TrackId, target: AutomationTarget, cx: &mut Context<Self>) {
+        self.s.show_automation(track, target);
+        self.param_menu = None;
+        self.set_view(MainView::Arrangement, cx);
+        let rows = views::arrangement::rows(&self.s);
+        if let Some(r) = rows.iter().find(|r| r.track == track)
+            && let Some(k) = r.autos.iter().position(|t| *t == target)
+        {
+            let view_h = f32::from(self.regions.arrange.get().size.height).max(200.);
+            let (top, bottom) = (r.top, r.top + r.h + (k + 1) as f32 * views::arrangement::AUTO_H);
+            let v = &mut self.s.arrange;
+            if top < v.scroll_y {
+                v.scroll_y = top;
+            } else if bottom > v.scroll_y + view_h {
+                v.scroll_y = (bottom - view_h).max(0.);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -814,6 +912,34 @@ impl Workspace {
             0 => self.toast("Nothing to split at the marker", cx),
             _ => cx.notify(),
         }
+    }
+
+    /// A (Live): show or hide the automation of the selected tracks (all
+    /// shown when any is hidden). While musical typing is on, A is a note.
+    fn toggle_automation_mode(&mut self, _: &ToggleAutomationMode, _: &mut Window, cx: &mut Context<Self>) {
+        if self.piano_keyboard && self.bottom_open && self.s.bottom_tab == BottomTab::PianoRoll && self.modal.is_none() {
+            cx.propagate();
+            return;
+        }
+        let tracks: Vec<TrackId> = self.s.project.content_tracks().map(|t| t.id).filter(|t| self.s.is_track_selected(*t)).collect();
+        let show = tracks.iter().any(|t| !self.s.automation_shown.contains(t));
+        for t in tracks {
+            if self.s.automation_shown.contains(&t) != show {
+                self.s.toggle_automation(t);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_automation_arm(&mut self, _: &ToggleAutomationArm, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_arm(cx);
+    }
+
+    /// Automation Arm on or off (the arrangement toolbar's button).
+    pub fn toggle_arm(&mut self, cx: &mut Context<Self>) {
+        self.s.automation_arm = !self.s.automation_arm;
+        self.toast(if self.s.automation_arm { "Automation Arm on: moving a plugin control while recording writes its automation" } else { "Automation Arm off" }, cx);
+        cx.notify();
     }
 
     fn toggle_view(&mut self, _: &ToggleView, _: &mut Window, cx: &mut Context<Self>) {
@@ -1078,6 +1204,15 @@ impl Workspace {
                     self.s.seal();
                 }
             }
+            NumTarget::Volume { track } => {
+                let text = edit.text.trim().to_lowercase();
+                let db = if text == "-inf" || text == "-" { Some(-70.) } else { parse_plain(&text) };
+                if let Some(db) = db {
+                    self.s.seal();
+                    self.s.set_track(track, TrackProp::VolumeDb(if db <= -70. { -150. } else { db.min(6.) }));
+                    self.s.seal();
+                }
+            }
             NumTarget::Tempo => {
                 if let Some(v) = parse_plain(&edit.text) {
                     self.s.set_tempo((v as f64).clamp(20., 999.));
@@ -1161,6 +1296,20 @@ impl Workspace {
                 let id = *track;
                 self.s.set_track_coalesced(&format!("fader-{}", id.0), id, TrackProp::VolumeDb(db));
             }
+            Drag::HFader { track, last_x, pos, travel } => {
+                let x = f32::from(e.position.x);
+                let dx = x - *last_x;
+                *last_x = x;
+                *pos = (*pos + dx / *travel * fine).clamp(0., 1.);
+                let id = *track;
+                self.s.set_track_coalesced(&format!("fader-{}", id.0), id, TrackProp::VolumeDb(fader_to_db(*pos)));
+            }
+            Drag::TrackHeight { track, start_y, start_h } => {
+                // Whole multiples of 4 px, as every size in the interface.
+                let h = ((*start_h + y - *start_y) / 4.).round() * 4.;
+                let id = *track;
+                self.s.set_track_coalesced(&format!("height-{}", id.0), id, TrackProp::Height(h.clamp(40., 400.)));
+            }
             Drag::Tempo { last_y, bpm } => {
                 let dy = (*last_y - y) as f64;
                 *last_y = y;
@@ -1239,7 +1388,7 @@ impl Workspace {
             Drag::AutoPoint { track, target, original, index } => {
                 let (tick, _) = self.arrange_pos(e.position);
                 let tick = self.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt);
-                if let Some(value) = views::arrangement::automation_value_at(self, *track, e.position) {
+                if let Some(value) = views::arrangement::automation_value_at(self, *track, *target, e.position) {
                     self.s.move_automation_point(*track, *target, original.clone(), *index, tick, value);
                 }
             }
@@ -2138,6 +2287,11 @@ impl Render for Workspace {
         let bottom = views::bottom::render(self, window, cx);
         let mixer = self.render_mixer_section(window, cx);
         let menu = self.render_menu(window, cx);
+        if let Some(q) = self.auto_search_pending.take() {
+            self.auto_search.update(cx, |i, cx| i.set_text(&q, cx));
+        }
+        let chooser = views::arrangement::render_chooser(self, cx);
+        let param_menu = views::mixer::render_param_menu(self, cx);
         let modal = views::prefs::render_modal(self, window, cx);
         let backdrop = views::prefs::backdrop(self);
         let capture = self.drag_capture(cx);
@@ -2171,6 +2325,8 @@ impl Render for Workspace {
             .map(|d| crate::keys::register(d, cx))
             .on_action(cx.listener(Self::play_stop))
             .on_action(cx.listener(Self::toggle_view))
+            .on_action(cx.listener(Self::toggle_automation_mode))
+            .on_action(cx.listener(Self::toggle_automation_arm))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::delete))
@@ -2317,6 +2473,8 @@ impl Render for Workspace {
             .children(fx_overlay)
             .children(meter_layers)
             .children(menu)
+            .children(chooser)
+            .children(param_menu)
             .children(palette)
     }
 }

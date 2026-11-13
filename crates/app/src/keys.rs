@@ -216,6 +216,8 @@ pub static TABLE: &[Entry] = &[
     ),
     cmd(Cmd::FoldTrack, "Fold / Unfold Group", "Fold the selected group, or the group the selected track is in.", C::Tracks, &["s"]),
     cmd(Cmd::ArmTrack, "Arm", "Arm the selected track for recording.", C::Tracks, &["c"]),
+    main("ToggleAutomationMode", "Show Automation", "Show or hide the automation lanes of the selected tracks.", C::Tracks, K, &["a"]),
+    main("ToggleAutomationArm", "Automation Arm", "While recording, moving a control in a plugin's window writes its automation.", C::Transport, W, &[]),
     cmd(Cmd::Track1, "Track 1 Activator", "Switch the first track on or off.", C::Tracks, &["f1"]),
     cmd(Cmd::Track2, "Track 2 Activator", "Switch the second track on or off.", C::Tracks, &["f2"]),
     cmd(Cmd::Track3, "Track 3 Activator", "Switch the third track on or off.", C::Tracks, &["f3"]),
@@ -421,7 +423,7 @@ mod tests {
         }
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
-        const KEYLESS: &[Bound] = &[Bound::Action("AddLibraryFolder")];
+        const KEYLESS: &[Bound] = &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm")];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

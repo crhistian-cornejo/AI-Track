@@ -16,7 +16,7 @@
 
 use super::main_thread::MainThread;
 use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PresetInfo, ScanStatus};
-use aitrack_dsp::{Category, PluginInfo, ProcessContext, Processor};
+use aitrack_dsp::{Category, ParamInfo, PluginInfo, ProcessContext, Processor};
 use aitrack_engine::ProcessorFactory;
 use aitrack_host::sandbox::{SandboxEditor, SandboxedPlugin};
 use aitrack_host::scan::Scanner;
@@ -52,7 +52,7 @@ fn category_for(id: &str, category: Category) -> DeviceCategory {
     match id {
         "fx.eq" => DeviceCategory::Eq,
         "fx.compressor" | "fx.limiter" | "fx.gate" | "fx.transient" => DeviceCategory::Dynamics,
-        "fx.saturator" => DeviceCategory::Distortion,
+        "fx.saturator" | "fx.tape" | "fx.amp" | "fx.console" => DeviceCategory::Distortion,
         "fx.clipper" => DeviceCategory::Distortion,
         "fx.multiband" | "fx.midside" => DeviceCategory::Utility,
         "fx.reverb" | "fx.delay" => DeviceCategory::Space,
@@ -97,6 +97,8 @@ struct Instances {
     /// Edits made in each plugin's own GUI (lock-free queues filled on the
     /// audio thread), drained on the UI tick.
     edits: HashMap<DeviceId, (u64, rtrb::Consumer<ParamEdit>)>,
+    /// Each live instance's parameter list, for the automation chooser.
+    params: HashMap<DeviceId, (u64, Vec<ParamInfo>)>,
 }
 
 /// State shared by the hosted plugin factories, the catalogue and the UI.
@@ -201,6 +203,11 @@ impl PluginRuntime {
         ran > 0 || got || !hung.is_empty()
     }
 
+    /// The parameters of a live hosted device (empty when it is not loaded).
+    pub fn device_params(&self, device: DeviceId) -> Vec<ParamInfo> {
+        self.instances.lock().params.get(&device).map(|(_, p)| p.clone()).unwrap_or_default()
+    }
+
     /// Edits made in plugin editors since the last call, oldest first.
     pub fn take_edits(&self) -> Vec<PluginEdit> {
         std::mem::take(&mut *self.edits.lock())
@@ -256,6 +263,9 @@ impl PluginRuntime {
         if i.edits.get(&device).is_some_and(|(t, _)| *t == token) {
             i.edits.remove(&device);
         }
+        if i.params.get(&device).is_some_and(|(t, _)| *t == token) {
+            i.params.remove(&device);
+        }
     }
 }
 
@@ -283,6 +293,7 @@ impl ProcessorFactory for HostedFactory {
                     if self.live {
                         let mut i = self.rt.instances.lock();
                         i.sandboxed.insert(device.id, (token, p.editor_handle()));
+                        i.params.insert(device.id, (token, p.info().params.clone()));
                         if let Some(q) = p.take_param_edits() {
                             i.edits.insert(device.id, (token, q));
                         }
@@ -302,6 +313,7 @@ impl ProcessorFactory for HostedFactory {
                 if self.live {
                     let mut i = self.rt.instances.lock();
                     i.controllers.insert(device.id, (token, controller.clone()));
+                    i.params.insert(device.id, (token, plugin.info().params.clone()));
                     if let Some(q) = plugin.take_param_edits() {
                         i.edits.insert(device.id, (token, q));
                     }
@@ -516,6 +528,10 @@ impl PluginCatalog for RealCatalog {
 
     fn external_plugins(&self) -> &[ExternalPlugin] {
         &self.external
+    }
+
+    fn device_params(&self, device: DeviceId) -> Vec<ParamInfo> {
+        self.rt.device_params(device)
     }
 
     fn presets(&self, plugin_id: &str) -> Vec<PresetInfo> {

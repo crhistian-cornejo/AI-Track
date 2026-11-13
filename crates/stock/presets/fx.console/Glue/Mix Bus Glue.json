@@ -1,0 +1,21 @@
+{
+  "name": "Mix Bus Glue",
+  "plugin": "fx.console",
+  "author": "AI-Track",
+  "tags": [
+    "console",
+    "glue",
+    "bus",
+    "mastering",
+    "subtle"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.4,
+    "2": 0.35,
+    "3": 0.2,
+    "4": 0.6666667,
+    "5": 1.0,
+    "6": 0.5
+  }
+}

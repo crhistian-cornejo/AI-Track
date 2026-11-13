@@ -204,6 +204,8 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                             is_instrument: r.is_instrument,
                             meter: r.meter,
                             sidechain: d.sidechain.filter(|s| *s != dc.track).and_then(|s| dc.side_slots.get(&s).copied()),
+                            auto_events: EventList::with_capacity(0),
+                            merged: EventList::with_capacity(0),
                         }));
                     }
                     None => {
@@ -522,7 +524,10 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                     send_lanes.insert(index, lane.clone());
                 }
                 AutomationTarget::DeviceParam { device, param } => {
+                    let hosted = project.device(device).is_some_and(|d| matches!(d.kind, DeviceKind::Plugin { .. }));
                     match handles.get(&device).and_then(|h| h.proc.clone()) {
+                        // Hosted plugins take sample-accurate parameter events.
+                        Some(_) if hosted => param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Timed(device, param), last: f32::NAN }),
                         Some(p) => param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Param(p, param), last: f32::NAN }),
                         None => warnings.push(format!("track '{}': automation targets unknown device {device}", t.name)),
                     }
@@ -547,6 +552,22 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                     }
                 }
                 AutomationTarget::Tempo => {}
+            }
+        }
+
+        // Room for the timed automation events of each hosted plugin it
+        // reaches: one per control block and per breakpoint in a block.
+        if let Some(devices) = chains[i].as_mut() {
+            let per_lane = max / CONTROL_BLOCK + 2;
+            for pa in &param_autos {
+                if let ParamTarget::Timed(device, _) = pa.target
+                    && let Some(node) = crate::graph::find_proc_mut(devices, device)
+                {
+                    let breaks = pa.lane.points.len().min(max);
+                    let cap = node.auto_events.events.capacity() + per_lane + breaks;
+                    node.auto_events = EventList::with_capacity(cap);
+                    node.merged = EventList::with_capacity(cap + EVENT_CAPACITY);
+                }
             }
         }
 

@@ -6,7 +6,7 @@
 
 use aitrack_model::command::DeviceSlot;
 use aitrack_model::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const BAR: Tick = 4 * PPQ;
 
@@ -123,7 +123,16 @@ pub struct AppState {
     pub selected_clip: Option<ClipId>,
     pub selected_placement: Option<(TrackId, PlacementId)>,
     pub selected_notes: BTreeSet<NoteId>,
+    /// Tracks whose automation lanes are shown (the header's automation toggle).
     pub automation_shown: BTreeSet<TrackId>,
+    /// The lanes each track shows, top to bottom, while its automation is
+    /// shown (kept while hidden, as Live remembers them). See [`AppState::shown_lanes`].
+    pub auto_lanes: BTreeMap<TrackId, Vec<AutomationTarget>>,
+    /// Live's Automation Arm: while recording, moving a control in a
+    /// plugin's window writes its automation.
+    pub automation_arm: bool,
+    /// Gestures being written as automation: per (device, param), the last tick written.
+    pub auto_writes: BTreeMap<(DeviceId, u32), Tick>,
     pub arrange: ArrangeView,
     pub piano: PianoView,
     /// Selection, insert marker, clipboard and grid of the editing commands.
@@ -154,6 +163,9 @@ impl AppState {
             selected_placement: None,
             selected_notes: BTreeSet::new(),
             automation_shown: BTreeSet::new(),
+            auto_lanes: BTreeMap::new(),
+            automation_arm: false,
+            auto_writes: BTreeMap::new(),
             arrange: ArrangeView { px_per_beat: 7., scroll_x: 0., scroll_y: 0. },
             piano: PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 0. },
             ed: Default::default(),
@@ -180,6 +192,7 @@ impl AppState {
         for t in &s.project.tracks {
             if !t.automation.is_empty() {
                 s.automation_shown.insert(t.id);
+                s.auto_lanes.insert(t.id, t.automation.iter().map(|l| l.target).collect());
             }
         }
         // Centre the piano roll on the notes (or middle C).
@@ -244,6 +257,9 @@ impl AppState {
         if self.auto_sel.is_some_and(|r| self.project.track(r.track).is_none()) {
             self.auto_sel = None;
         }
+        let p = &self.project;
+        self.automation_shown.retain(|t| p.track(*t).is_some());
+        self.auto_lanes.retain(|t, _| p.track(*t).is_some());
         if let Some(c) = self.selected_clip
             && !self.project.clips.contains_key(&c) {
                 self.selected_clip = None;
@@ -1037,26 +1053,179 @@ impl AppState {
     /// one undo step. A value the project already holds is skipped, so the
     /// engine never sends a plugin back what it just reported; values the
     /// host sets are not reported by plugins as edits, so nothing loops.
+    ///
+    /// As in Live, touching a control shows its lane when the track's
+    /// automation is shown, and while recording with Automation Arm on
+    /// (`record_at` is the playhead then) the gesture is written into that
+    /// lane, overwriting what it passes over, in the same undo step.
     /// Returns whether the project changed.
-    pub fn apply_plugin_edits(&mut self, edits: &[crate::bridge::PluginEdit]) -> bool {
+    pub fn apply_plugin_edits(&mut self, edits: &[crate::bridge::PluginEdit], record_at: Option<Tick>) -> bool {
         use crate::bridge::PluginEditKind;
+        let record_at = record_at.filter(|_| self.automation_arm).map(|t| t.max(0));
         let mut changed = false;
         for e in edits {
+            let target = AutomationTarget::DeviceParam { device: e.device, param: e.param };
+            let track = self.project.device_track(e.device);
             match e.kind {
-                PluginEditKind::Begin => {}
+                PluginEditKind::Begin => {
+                    if let Some(track) = track
+                        && (record_at.is_some() || self.automation_shown.contains(&track))
+                    {
+                        self.show_automation(track, target);
+                        changed = true;
+                    }
+                    if let Some(tick) = record_at {
+                        self.auto_writes.insert((e.device, e.param), tick);
+                    }
+                }
                 PluginEditKind::Value => {
                     let Some(d) = self.project.device(e.device) else { continue };
                     let value = e.value.clamp(0., 1.);
-                    if d.params.get(&e.param).is_some_and(|v| (v - value).abs() < 1e-6) {
-                        continue;
-                    }
+                    let same = d.params.get(&e.param).is_some_and(|v| (v - value).abs() < 1e-6);
                     let key = format!("plugin:{}:{}", e.device, e.param);
-                    changed |= self.edit_coalesced(&key, "Plugin parameter", vec![Command::SetParam { device: e.device, param: e.param, value: Some(value) }]);
+                    let mut cmds = Vec::new();
+                    if !same {
+                        cmds.push(Command::SetParam { device: e.device, param: e.param, value: Some(value) });
+                    }
+                    if let (Some(tick), Some(track)) = (record_at, track) {
+                        let from = *self.auto_writes.get(&(e.device, e.param)).unwrap_or(&tick);
+                        let points = aitrack_model::automation::write(&self.lane_points(track, target), from, tick, value);
+                        self.auto_writes.insert((e.device, e.param), tick);
+                        if !self.shown_lanes(track).contains(&target) {
+                            self.show_automation(track, target);
+                        }
+                        cmds.push(self.lane_command(track, target, points));
+                    }
+                    if !cmds.is_empty() {
+                        changed |= self.edit_coalesced(&key, "Plugin parameter", cmds);
+                    }
                 }
-                PluginEditKind::End => self.seal(),
+                PluginEditKind::End => {
+                    self.auto_writes.remove(&(e.device, e.param));
+                    self.seal();
+                }
             }
         }
         changed
+    }
+
+    // ── Automation lanes (Live: the header's automation toggle, the lane's
+    //    chooser, "+" for another lane and "−" to hide one) ──
+
+    /// The lanes shown under `track`, top to bottom; empty while its
+    /// automation is hidden. Shown without a chosen lane, it is the first
+    /// lane that has breakpoints, else Volume.
+    pub fn shown_lanes(&self, track: TrackId) -> Vec<AutomationTarget> {
+        if !self.automation_shown.contains(&track) {
+            return Vec::new();
+        }
+        match self.auto_lanes.get(&track) {
+            Some(l) if !l.is_empty() => l.clone(),
+            _ => vec![self.default_lane(track)],
+        }
+    }
+
+    fn default_lane(&self, track: TrackId) -> AutomationTarget {
+        let t = self.project.track(track);
+        t.and_then(|t| t.automation.iter().find(|l| !l.points.is_empty()).map(|l| l.target))
+            .unwrap_or(if t.is_some_and(|t| t.kind.carries_audio()) { AutomationTarget::Volume } else { AutomationTarget::Tempo })
+    }
+
+    /// The header's automation button: show or hide the track's lanes.
+    pub fn toggle_automation(&mut self, track: TrackId) {
+        if !self.automation_shown.remove(&track) {
+            self.automation_shown.insert(track);
+            let lanes = self.shown_lanes(track);
+            self.auto_lanes.insert(track, lanes);
+        }
+    }
+
+    /// Show `track`'s lane for `target` (the mixer's and the device view's
+    /// "Show automation", a touched plugin control). A lane with nothing
+    /// drawn in it gives its place to it, as Live's chooser does; otherwise
+    /// it is added under the others. Nothing is edited: the lane exists in
+    /// the project once a breakpoint is drawn.
+    pub fn show_automation(&mut self, track: TrackId, target: AutomationTarget) {
+        if self.project.track(track).is_none() {
+            return;
+        }
+        let mut lanes = if self.automation_shown.contains(&track) { self.shown_lanes(track) } else { self.auto_lanes.get(&track).cloned().unwrap_or_default() };
+        if !lanes.contains(&target) {
+            match lanes.iter().position(|t| self.lane_points(track, *t).is_empty()) {
+                Some(i) => lanes[i] = target,
+                None => lanes.push(target),
+            }
+        }
+        self.auto_lanes.insert(track, lanes);
+        self.automation_shown.insert(track);
+        self.selected_track = Some(track);
+    }
+
+    /// "+": one more lane under the track's others, for the first target
+    /// not shown yet (lanes with breakpoints first, then the mixer's).
+    /// `None` when every one is already shown.
+    pub fn add_auto_lane(&mut self, track: TrackId) -> Option<AutomationTarget> {
+        let t = self.project.track(track)?;
+        let shown = self.shown_lanes(track);
+        let mixer = aitrack_model::automation::targets(t, |_| Vec::new()).swap_remove(0).targets;
+        let next = t.automation.iter().filter(|l| !l.points.is_empty()).map(|l| l.target).chain(mixer).find(|c| !shown.contains(c))?;
+        let mut lanes = shown;
+        lanes.push(next);
+        self.auto_lanes.insert(track, lanes);
+        self.automation_shown.insert(track);
+        Some(next)
+    }
+
+    /// The chooser of the lane at `index`: it shows `target` from now on (a
+    /// lane already showing `target` elsewhere under the track is closed).
+    pub fn set_lane_target(&mut self, track: TrackId, index: usize, target: AutomationTarget) {
+        let mut lanes = self.shown_lanes(track);
+        if index >= lanes.len() {
+            return;
+        }
+        let old = lanes[index];
+        lanes[index] = target;
+        // Keep the lane just chosen; another one showing `target` goes.
+        let mut i = 0;
+        lanes.retain(|t| {
+            i += 1;
+            *t != target || i - 1 == index
+        });
+        if self.auto_sel.is_some_and(|r| r.track == track && r.target == old) {
+            self.auto_sel = None;
+        }
+        self.auto_lanes.insert(track, lanes);
+    }
+
+    /// "−": hide one lane (its breakpoints stay); the last one hides the
+    /// track's automation.
+    pub fn hide_auto_lane(&mut self, track: TrackId, target: AutomationTarget) {
+        let mut lanes = self.shown_lanes(track);
+        lanes.retain(|t| *t != target);
+        if self.auto_sel.is_some_and(|r| r.track == track && r.target == target) {
+            self.auto_sel = None;
+        }
+        if lanes.is_empty() {
+            self.automation_shown.remove(&track);
+            self.auto_lanes.remove(&track);
+        } else {
+            self.auto_lanes.insert(track, lanes);
+        }
+    }
+
+    /// Delete a lane's automation (one undo step); the lane stays shown,
+    /// empty. `false` when it has none.
+    pub fn delete_automation(&mut self, track: TrackId, target: AutomationTarget) -> bool {
+        if !self.project.track(track).is_some_and(|t| t.automation.iter().any(|l| l.target == target)) {
+            return false;
+        }
+        if self.auto_sel.is_some_and(|r| r.track == track && r.target == target) {
+            self.auto_sel = None;
+        }
+        self.seal();
+        let ok = self.edit("Delete automation", vec![Command::SetAutomation { track, target, lane: None }]);
+        self.seal();
+        ok
     }
 
     /// Store the states the plugins report (before saving): one sealed undo

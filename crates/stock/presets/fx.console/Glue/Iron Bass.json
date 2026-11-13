@@ -1,0 +1,21 @@
+{
+  "name": "Iron Bass",
+  "plugin": "fx.console",
+  "author": "AI-Track",
+  "tags": [
+    "console",
+    "bass",
+    "transformer",
+    "warm",
+    "808"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.4,
+    "2": 0.2,
+    "3": 0.9,
+    "4": 0.6666667,
+    "5": 1.0,
+    "6": 0.5
+  }
+}

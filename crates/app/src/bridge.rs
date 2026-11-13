@@ -884,6 +884,13 @@ pub trait PluginCatalog {
     fn load_preset(&self, path: &str) -> Result<(String, BTreeMap<u32, f32>), String> {
         Err(format!("no preset {path}"))
     }
+    /// The parameters of a loaded VST3/CLAP device, as the plugin reported
+    /// them (empty until it is loaded, and for stock devices: see
+    /// [`PluginCatalog::device`]). `automatable` is false for read-only and
+    /// hidden ones; MIDI-CC proxy parameters are not listed at all.
+    fn device_params(&self, _device: DeviceId) -> Vec<ParamInfo> {
+        Vec::new()
+    }
     /// Scan the VST3/CLAP folders again in the background.
     fn rescan(&mut self) {}
     fn scan_status(&self) -> ScanStatus {

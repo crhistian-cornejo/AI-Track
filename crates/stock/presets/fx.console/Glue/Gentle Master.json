@@ -1,0 +1,21 @@
+{
+  "name": "Gentle Master",
+  "plugin": "fx.console",
+  "author": "AI-Track",
+  "tags": [
+    "console",
+    "mastering",
+    "subtle",
+    "glue",
+    "hi-fi"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.4,
+    "2": 0.2,
+    "3": 0.1,
+    "4": 0.6666667,
+    "5": 1.0,
+    "6": 1.0
+  }
+}

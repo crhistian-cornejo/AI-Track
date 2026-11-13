@@ -30,12 +30,33 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::DeviceContext(device) => crate::editing::menus::device_menu(ws, *device, cx),
         MenuKind::PaletteDevice { key, name, instrument } => palette_device_menu(ws, key, name, *instrument, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
-        MenuKind::File => file_menu(ws, cx),
+        MenuKind::File => file_menu(ws, window, cx),
     })
 }
 
+/// Computes the vertical origin GPUI `anchored().snap_to_window_with_margin(px(SP2))`
+/// places a menu card of height `card_h` at inside a viewport of height `vh`.
+fn snapped_menu_y(raw_y: f32, card_h: f32, vh: f32) -> f32 {
+    let mut y = raw_y;
+    if y + card_h > vh {
+        y = vh - card_h - SP2;
+    }
+    if y < 0. {
+        y = SP2;
+    }
+    y
+}
+
+/// Clamps a cascading submenu's `top` offset (relative to its parent menu card)
+/// so the submenu stays fully inside `[SP2, vh - SP2]`.
+fn clamp_submenu_top(desired_top: f32, card_y: f32, sub_h: f32, vh: f32) -> f32 {
+    let min_top = SP2 - card_y;
+    let max_top = (vh - SP2 - card_y - sub_h).max(min_top);
+    desired_top.clamp(min_top, max_top)
+}
+
 /// File: new from a template, open, open recent, save, export.
-fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+fn file_menu(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     use crate::project_io::Template;
     let pal = p();
     let mac = cfg!(target_os = "macos");
@@ -92,13 +113,15 @@ fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         }));
 
     let recent_submenu = ws.file_recent_open.then(|| {
+        let vh = f32::from(window.viewport_size().height);
+        let sub_list_max_h = (vh - 2. * SP2 - 34.).clamp(160., 360.);
         let mut sub_list = div()
             .id("file-recent-list")
-            .max_h(px(360.))
+            .max_h(px(sub_list_max_h))
             .overflow_y_scroll()
             .flex()
             .flex_col();
-        if ws.recent_projects.is_empty() {
+        let sub_content_h = if ws.recent_projects.is_empty() {
             sub_list = sub_list.child(
                 div()
                     .h(px(ROW_H))
@@ -107,6 +130,7 @@ fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     .items_center()
                     .child(label("No recent projects", TEXT_SM, pal.faint)),
             );
+            ROW_H
         } else {
             for (i, path) in ws.recent_projects.iter().enumerate() {
                 let (name, dir) = crate::project_io::recent_project_display(path);
@@ -147,13 +171,20 @@ fn file_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     this.clear_recent_projects(cx);
                 })),
             );
-        }
+            ws.recent_projects.len() as f32 * 36. + 1. + ROW_H
+        };
+        let exact_sub_h = (34. + sub_content_h.min(sub_list_max_h)).min(vh - 2. * SP2);
+        let raw_y = ws.menu.as_ref().map_or(SP2, |m| f32::from(m.at.y));
+        // Template rows (3 * 48) + headers (2 * 24) + 6 action rows (6 * 28) + card chrome (10) ≈ 370 px.
+        let est_card_h = 370.;
+        let card_y = snapped_menu_y(raw_y, est_card_h, vh);
+        let sub_top = clamp_submenu_top(-SP1 - 1., card_y, exact_sub_h, vh);
         div()
             .id("file-recent-submenu")
             .occlude()
             .absolute()
             .left_full()
-            .top(px(-SP1 - 1.))
+            .top(px(sub_top))
             .pl(px(4.))
             .child(widgets::menu_card("file-recent-card", 300.).child(menu_header("RECENT PROJECTS")).child(sub_list))
     });
@@ -690,8 +721,7 @@ fn render_device_entry_row(
                 .child(widgets::badge("Local", pal.faint))
                 .child(star_btn)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.menu = None;
-                    this.device_menu_hover = None;
+                    this.close_menu(cx);
                     if this.s.add_stock_device(track, id, name).is_some() {
                         this.palette.plugin_prefs.note_recent(&stock_key(id));
                         this.toast(format!("Added {name}"), cx);
@@ -727,8 +757,7 @@ fn render_device_entry_row(
                 .child(widgets::badge(fmt, pal.accent))
                 .child(star_btn)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.menu = None;
-                    this.device_menu_hover = None;
+                    this.close_menu(cx);
                     let name = plugin.name.clone();
                     let key = external_key(plugin.format, &plugin.uid);
                     if this.s.add_plugin_device(track, &plugin).is_some() {
@@ -741,20 +770,25 @@ fn render_device_entry_row(
     }
 }
 
+/// Returns `(submenu_card, rendered_card_height)` so the caller can keep the
+/// cascading panel completely inside the viewport.
 fn device_submenu_card(
     grp: DeviceMenuGroup,
     items: Vec<DeviceMenuEntry>,
     track: aitrack_model::TrackId,
     prefs: &crate::plugin_prefs::PluginPrefs,
+    vh: f32,
     cx: &mut Context<Workspace>,
-) -> AnyElement {
+) -> (AnyElement, f32) {
     let pal = p();
+    let list_max_h = (vh - 2. * SP2 - 34.).clamp(160., 380.);
     let mut list = div()
         .id("dev-submenu-scroll")
-        .max_h(px(380.))
+        .max_h(px(list_max_h))
         .overflow_y_scroll()
         .flex()
         .flex_col();
+    let mut content_h = 0.0_f32;
 
     if items.is_empty() {
         list = list
@@ -771,12 +805,12 @@ fn device_submenu_card(
             .child(
                 menu_item("dev-folders", Some(Icon::FolderOpen), "Plugin folders…", None, false).on_click(cx.listener(
                     |this, _, _, cx| {
-                        this.menu = None;
-                        this.device_menu_hover = None;
+                        this.close_menu(cx);
                         this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx);
                     },
                 )),
             );
+        content_h += 32. + 2. * ROW_H;
     } else {
         match grp {
             DeviceMenuGroup::Effect(_) => {
@@ -786,21 +820,25 @@ fn device_submenu_card(
                 if !local.is_empty() {
                     if both {
                         list = list.child(menu_header("LOCAL"));
+                        content_h += 24.;
                     }
                     for entry in local {
                         let fav = prefs.is_favorite(&entry.key());
                         list = list.child(render_device_entry_row("dev-sub", idx, entry, track, fav, cx));
                         idx += 1;
+                        content_h += ROW_H;
                     }
                 }
                 if !ext.is_empty() {
                     if both {
                         list = list.child(div().pt(px(SP1)).child(widgets::divider_h())).child(menu_header("INSTALLED VST / CLAP"));
+                        content_h += SP1 + 1. + 24.;
                     }
                     for entry in ext {
                         let fav = prefs.is_favorite(&entry.key());
                         list = list.child(render_device_entry_row("dev-sub", idx, entry, track, fav, cx));
                         idx += 1;
+                        content_h += ROW_H;
                     }
                 }
             }
@@ -814,13 +852,16 @@ fn device_submenu_card(
                     }
                     if sec > 0 {
                         list = list.child(div().pt(px(SP1)).child(widgets::divider_h()));
+                        content_h += SP1 + 1.;
                     }
                     sec += 1;
                     list = list.child(menu_header(inst_grp.label().to_uppercase()));
+                    content_h += 24.;
                     for entry in group_items {
                         let fav = prefs.is_favorite(&entry.key());
                         list = list.child(render_device_entry_row("dev-sub", idx, entry, track, fav, cx));
                         idx += 1;
+                        content_h += ROW_H;
                     }
                 }
             }
@@ -828,15 +869,18 @@ fn device_submenu_card(
                 for (idx, entry) in items.into_iter().enumerate() {
                     let fav = prefs.is_favorite(&entry.key());
                     list = list.child(render_device_entry_row("dev-sub", idx, entry, track, fav, cx));
+                    content_h += ROW_H;
                 }
             }
         }
     }
 
-    widgets::menu_card("dev-submenu-card", 276.)
+    let exact_h = (34. + content_h.min(list_max_h)).min(vh - 2. * SP2);
+    let el = widgets::menu_card("dev-submenu-card", 276.)
         .child(menu_header(grp.label().to_uppercase()))
         .child(list)
-        .into_any_element()
+        .into_any_element();
+    (el, exact_h)
 }
 
 fn device_menu(
@@ -886,7 +930,7 @@ fn device_menu(
         let matches = search_entries(&all, stock, prefs, &query);
         let mut list = div()
             .id("device-menu-search-scroll")
-            .max_h(px((vh - 120.).clamp(200., 400.)))
+            .max_h(px((vh - 66. - 2. * SP2).clamp(160., 400.)))
             .overflow_y_scroll()
             .flex()
             .flex_col();
@@ -904,13 +948,15 @@ fn device_menu(
     let (fav_group, fx_groups, local_synth_count, vst_synth_count) = build_main_menu_groups(&all, prefs);
     let active_hover = ws.device_menu_hover;
 
-    let mut row_y = 24. + CONTROL_H + SP1 + SP1;
+    let list_max_h = (vh - 66. - 2. * SP2).clamp(160., 500.);
+    let list_top_offset = SP1 + 1. + 24. + CONTROL_H + SP1;
+    let mut list_content_h = 0.0_f32;
     let mut hovered_y: Option<f32> = None;
     let mut group_idx = 0usize;
 
     let mut list = div()
         .id("device-menu-groups")
-        .max_h(px((vh - 100.).clamp(220., 500.)))
+        .max_h(px(list_max_h))
         .overflow_y_scroll()
         .flex()
         .flex_col();
@@ -958,51 +1004,48 @@ fn device_menu(
     };
 
     if let Some(fav_count) = fav_group {
-        list = list.child(make_group_row(DeviceMenuGroup::Favorites, fav_count, row_y));
-        row_y += ROW_H;
+        list = list.child(make_group_row(DeviceMenuGroup::Favorites, fav_count, list_top_offset + list_content_h));
+        list_content_h += ROW_H;
         list = list.child(div().py(px(2.)).child(widgets::divider_h()));
-        row_y += 5.;
+        list_content_h += 5.;
     }
 
     if !fx_groups.is_empty() {
         list = list.child(menu_header("EFFECTS"));
-        row_y += 24.;
+        list_content_h += 24.;
         for (grp, count) in &fx_groups {
-            list = list.child(make_group_row(*grp, *count, row_y));
-            row_y += ROW_H;
+            list = list.child(make_group_row(*grp, *count, list_top_offset + list_content_h));
+            list_content_h += ROW_H;
         }
     }
 
     list = list.child(div().py(px(2.)).child(widgets::divider_h()));
-    row_y += 5.;
+    list_content_h += 5.;
     list = list.child(menu_header("SYNTHS & INSTRUMENTS"));
-    row_y += 24.;
+    list_content_h += 24.;
     if local_synth_count > 0 {
-        list = list.child(make_group_row(DeviceMenuGroup::LocalSynths, local_synth_count, row_y));
-        row_y += ROW_H;
+        list = list.child(make_group_row(DeviceMenuGroup::LocalSynths, local_synth_count, list_top_offset + list_content_h));
+        list_content_h += ROW_H;
     }
-    list = list.child(make_group_row(DeviceMenuGroup::VstSynths, vst_synth_count, row_y));
-    row_y += ROW_H;
+    list = list.child(make_group_row(DeviceMenuGroup::VstSynths, vst_synth_count, list_top_offset + list_content_h));
+    list_content_h += ROW_H;
 
     card = card.child(list);
 
     let submenu = active_hover.map(|grp| {
         let items = entries_for_menu_group(&all, prefs, grp);
-        let sub_rows = items.len().max(3);
-        let est_card_h = (row_y + SP1).min((vh - 2. * SP2).max(240.));
-        let card_y = f32::from(menu_at.y).clamp(SP2, (vh - est_card_h - SP2).max(SP2));
-        let est_sub_h = (24. + sub_rows as f32 * ROW_H + 32.).min(420.);
-        let desired_top = hovered_y.unwrap_or(24.) - SP1;
-        let min_top = SP2 - card_y;
-        let max_top = (vh - SP2 - card_y - est_sub_h).max(min_top);
-        let sub_top = desired_top.clamp(min_top, max_top);
+        let (sub_card, exact_sub_h) = device_submenu_card(grp, items, track, prefs, vh, cx);
+        let est_card_h = (66. + list_content_h.min(list_max_h)).min(vh - 2. * SP2);
+        let card_y = snapped_menu_y(f32::from(menu_at.y), est_card_h, vh);
+        let desired_top = hovered_y.unwrap_or(24.).min(est_card_h - ROW_H) - SP1;
+        let sub_top = clamp_submenu_top(desired_top, card_y, exact_sub_h, vh);
 
         let sub = div()
             .id("dev-submenu")
             .occlude()
             .absolute()
             .top(px(sub_top))
-            .child(device_submenu_card(grp, items, track, prefs, cx));
+            .child(sub_card);
         if open_left { sub.right_full().pr(px(4.)) } else { sub.left_full().pl(px(4.)) }
     });
 
@@ -1218,5 +1261,17 @@ mod tests {
         assert!(q_lim.iter().any(|e| e.name() == "Limiter"));
         let q_vital = search_entries(&all, cat.stock_devices(), &prefs, "vital");
         assert!(q_vital.iter().any(|e| e.name() == "Vital"));
+    }
+
+    #[test]
+    fn cascading_submenu_stays_inside_viewport_vertically() {
+        let vh = 760.0_f32;
+        let card_h = 515.0_f32;
+        let sub_h = 414.0_f32; // e.g. Local Synths with 5 subgroup headers + 8 rows
+        let card_y = snapped_menu_y(500.0, card_h, vh);
+        let sub_top = clamp_submenu_top(450.0, card_y, sub_h, vh);
+        let sub_bottom = card_y + sub_top + sub_h;
+        assert!(card_y + sub_top >= SP2, "submenu top must not clip above window: {}", card_y + sub_top);
+        assert!(sub_bottom <= vh - SP2 + 0.01, "submenu bottom {sub_bottom} must fit inside {}", vh - SP2);
     }
 }

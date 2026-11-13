@@ -2062,16 +2062,11 @@ impl Workspace {
         let body = views::menus::render(self, &menu, window, cx)?;
         let id = gpui::ElementId::Name(format!("menu-{}", menu.opened).into());
         Some(
-            deferred(
-                anchored().position(menu.at).snap_to_window_with_margin(px(SP2)).child(
-                    div()
-                        .id("menu-layer")
-                        .occlude()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
-                        .child(motion::rise_in(id, div().child(body), 6.)),
-                ),
+            menu_overlay(
+                menu.at,
+                motion::rise_in(id, div().child(body), 6.),
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
             )
-            .with_priority(2)
             .into_any_element(),
         )
     }
@@ -2739,6 +2734,43 @@ pub fn mixer_h_fitted(mixer_h: f32, bottom_h: f32, window_h: f32) -> f32 {
     mixer_h.min(room).max(160.)
 }
 
+/// Renders a menu anchored at `at` above a full-window click-outside backdrop.
+///
+/// Using an occluded backdrop instead of `on_mouse_down_out` on `menu-layer`
+/// ensures cascading `.absolute()` submenus (`Open Recent`, `Add Device`)
+/// extending outside the primary card's bounds are not dismissed on mouse-down
+/// before their `on_click` fires.
+fn menu_overlay(
+    at: Point<Pixels>,
+    content: impl IntoElement,
+    on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Deferred {
+    let dismiss = Rc::new(on_dismiss);
+    let backdrop = div()
+        .id("menu-backdrop")
+        .size_full()
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, {
+            let dismiss = dismiss.clone();
+            move |e, window, cx| dismiss(e, window, cx)
+        })
+        .on_mouse_down(gpui::MouseButton::Right, {
+            let dismiss = dismiss.clone();
+            move |e, window, cx| dismiss(e, window, cx)
+        })
+        .on_mouse_down(gpui::MouseButton::Middle, move |e, window, cx| dismiss(e, window, cx));
+
+    deferred(
+        div()
+            .id("menu-overlay")
+            .absolute()
+            .inset_0()
+            .child(backdrop)
+            .child(anchored().position(at).snap_to_window_with_margin(px(SP2)).child(div().id("menu-layer").occlude().child(content))),
+    )
+    .with_priority(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bottom_h_clamped, mixer_h_fitted};
@@ -2799,5 +2831,124 @@ mod tests {
         let pred = gpui::KeyBindingContextPredicate::parse("Workspace && !TextInput").unwrap();
         assert!(pred.eval(&[normal_ctx]));
         assert!(!pred.eval(&[editing_ctx]));
+    }
+
+    #[test]
+    fn menu_overlay_allows_clicking_cascading_submenu_and_dismisses_outside() {
+        use gpui::{
+            AnyWindowHandle, AppContext, Context, InputEvent, InteractiveElement, IntoElement,
+            MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Render,
+            StatefulInteractiveElement, Styled, TestAppContext, Window, div, point, px,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct SubmenuHost {
+            dismisses: Rc<Cell<usize>>,
+            clicks: Rc<Cell<usize>>,
+        }
+
+        impl Render for SubmenuHost {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let dismisses = self.dismisses.clone();
+                let clicks = self.clicks.clone();
+                let submenu = div()
+                    .id("test-submenu")
+                    .occlude()
+                    .absolute()
+                    .left_full()
+                    .top_0()
+                    .w(px(200.))
+                    .h(px(60.))
+                    .child(
+                        div()
+                            .id("test-submenu-item")
+                            .w(px(200.))
+                            .h(px(40.))
+                            .on_click(move |_, _, _| {
+                                clicks.set(clicks.get() + 1);
+                            }),
+                    );
+                let body = div()
+                    .relative()
+                    .w(px(200.))
+                    .h(px(100.))
+                    .child(submenu);
+
+                div().relative().size_full().child(super::menu_overlay(
+                    point(px(20.), px(20.)),
+                    body,
+                    move |_, _, _| {
+                        dismisses.set(dismisses.get() + 1);
+                    },
+                ))
+            }
+        }
+
+        let mut test_app = TestAppContext::single();
+        let dismisses = Rc::new(Cell::new(0));
+        let clicks = Rc::new(Cell::new(0));
+        let window = test_app.add_window({
+            let dismisses = dismisses.clone();
+            let clicks = clicks.clone();
+            move |_, _| SubmenuHost { dismisses, clicks }
+        });
+        let any_window: AnyWindowHandle = window.into();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+
+        // Click inside the cascading submenu (x=250 is outside the 200px primary card at x=20..220).
+        let in_submenu = point(px(250.), px(35.));
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: in_submenu,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position: in_submenu,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(dismisses.get(), 0, "clicking an overflowing submenu must not dismiss the menu");
+        assert_eq!(clicks.get(), 1, "submenu item on_click must fire");
+
+        // Click outside both the primary menu and the submenu.
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(600.), px(500.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(dismisses.get(), 1, "clicking outside the menu and submenu must dismiss");
     }
 }

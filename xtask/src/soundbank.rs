@@ -348,6 +348,57 @@ fn fetch_archive(paths: &Paths, agent: &ureq::Agent, p: &BundledPack) -> Result<
             fs::remove_file(&tar_path)?;
         }
         ArchiveFormat::SevenZ => {
+            // Entry names are cleaned one by one (no `..`, no absolute path) and the expansion is limited.
+            aitrack_library::install::unpack(&archive, ArchiveFormat::SevenZ, &raw, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| anyhow!("7z: {e}"))?;
+        }
+        ArchiveFormat::GithubTree => unreachable!(),
+    };
+    let archive = paths.cache.join(format!("{}.{ext}", p.id));
+    let mut sha = None;
+    if archive.is_file() {
+        let have = sha256_file(&archive)?;
+        if p.sha256.is_empty() || p.sha256 == have {
+            println!("    cached archive ok");
+            sha = Some(have);
+        } else {
+            println!("    cached archive hash mismatch, downloading again");
+            fs::remove_file(&archive)?;
+        }
+    }
+    let sha = match sha {
+        Some(s) => s,
+        None => download(agent, &p.download_url, &archive)?,
+    };
+    if !p.sha256.is_empty() && p.sha256 != sha {
+        fs::remove_file(&archive).ok();
+        bail!("{}: sha256 mismatch (manifest {}, got {sha})", p.id, p.sha256);
+    }
+
+    let raw = paths.cache.join(format!("{}.extract", p.id));
+    if raw.exists() {
+        fs::remove_dir_all(&raw)?;
+    }
+    fs::create_dir_all(&raw)?;
+    println!("    extracting");
+    match p.format {
+        ArchiveFormat::Zip => extract_zip(&archive, &raw)?,
+        ArchiveFormat::TarGz => {
+            let gz = flate2::read::GzDecoder::new(BufReader::new(File::open(&archive)?));
+            extract_tar(gz, &raw)?
+        }
+        ArchiveFormat::TarXz => {
+            // Pure-Rust xz: decompress to a temporary tar, then unpack it.
+            let tar_path = paths.cache.join(format!("{}.tar", p.id));
+            {
+                let mut input = BufReader::new(File::open(&archive)?);
+                let mut out = BufWriter::new(File::create(&tar_path)?);
+                lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| anyhow!("xz: {e:?}"))?;
+                out.flush()?;
+            }
+            extract_tar(BufReader::new(File::open(&tar_path)?), &raw)?;
+            fs::remove_file(&tar_path)?;
+        }
+        ArchiveFormat::SevenZ => {
             sevenz_rust2::decompress_file(&archive, &raw).map_err(|e| anyhow!("7z: {e}"))?;
             // Reject anything that escaped the folder (zip-slip style names).
             for e in walkdir::WalkDir::new(&raw) {

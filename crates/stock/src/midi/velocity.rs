@@ -9,9 +9,11 @@
 //!    three times the distance from the pivot at +100 %).
 //! 3. *Gain* (±64): added in velocity steps.
 //! 4. *Random* (0…100 %): adds a draw in ±(Random / 2) of the full range. The
-//!    draw is a hash of *Seed* and the count of note-ons since the device was
-//!    reset, so the same seed gives the same sequence every time, live or
-//!    exported, whatever the block size.
+//!    draw is a hash of *Seed* and the song position of the note (the shared
+//!    [`PositionHash`]), so a note at a given position always gets the same
+//!    draw: live, exported from the middle of the song, after a stop, a jump or
+//!    a loop wrap, and for any block size. Notes at the very same position are
+//!    told apart by their order of arrival.
 //! 5. *Mode*. **Map** squeezes the result linearly into *Min*…*Max* (with the
 //!    defaults 1…127 it changes nothing); **Clip** keeps it and clamps it to
 //!    *Min*…*Max*; **Fixed** ignores the played velocity (and stages 1–2) and
@@ -21,6 +23,7 @@
 //! other event pass untouched.
 
 use crate::common::ParamStore;
+use crate::midi::kit::{Draw, PositionHash};
 use aitrack_dsp::{Category, EventKind, EventSink, MidiContext, ParamInfo, PluginInfo, ProcessContext, Processor};
 
 pub const ID: &str = "midi.velocity";
@@ -97,8 +100,8 @@ pub struct Velocity {
     info: PluginInfo,
     params: ParamStore,
     shape: Shape,
-    /// Note-ons since the last reset: the position in the random sequence.
-    count: u64,
+    hash: PositionHash,
+    sr: f64,
 }
 
 pub fn create() -> Box<dyn Processor> {
@@ -109,20 +112,6 @@ impl Default for Velocity {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[inline]
-fn mix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// The `n`th draw of a seed: −1…1.
-pub fn draw(seed: u64, n: u64) -> f32 {
-    let h = mix64(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ n);
-    ((h >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
 }
 
 impl Velocity {
@@ -142,7 +131,8 @@ impl Velocity {
             },
             params: ParamStore::new(&ps),
             shape: Shape { mode: 0, fixed: 100.0, gamma: 1.0, factor: 1.0, pivot: 64.0, gain: 0.0, min: 1.0, max: 127.0, random: 0.0, seed: 0 },
-            count: 0,
+            hash: PositionHash::new(0x7665_6C6F),
+            sr: 48_000.0,
         };
         v.refresh();
         v
@@ -177,13 +167,14 @@ impl Processor for Velocity {
         &self.info
     }
 
-    fn prepare(&mut self, _sample_rate: f64, _max_frames: usize) {
+    fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
+        self.sr = if sample_rate > 0.0 { sample_rate } else { 48_000.0 };
         self.reset();
         self.params.mark_dirty();
     }
 
     fn reset(&mut self) {
-        self.count = 0;
+        self.hash.reset();
     }
 
     /// A MIDI effect: the engine never asks for audio.
@@ -212,8 +203,8 @@ impl Processor for Velocity {
         for e in ctx.events {
             match e.kind {
                 EventKind::NoteOn { channel, key, velocity, note_id } if velocity > 0.0 => {
-                    let d = if self.shape.random > 0.0 { draw(self.shape.seed, self.count) } else { 0.0 };
-                    self.count = self.count.wrapping_add(1);
+                    let sr = if ctx.sample_rate > 0.0 { ctx.sample_rate } else { self.sr };
+                    let d = if self.shape.random > 0.0 { Draw::new(self.hash.next(self.shape.seed as u32, ctx.transport, e.offset, sr, 0.0)).signed() } else { 0.0 };
                     let v = self.shape.apply(velocity, d) / 127.0;
                     out.push(e.offset, EventKind::NoteOn { channel, key, velocity: v, note_id });
                 }

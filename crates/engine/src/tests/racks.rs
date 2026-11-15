@@ -516,3 +516,55 @@ fn moving_chain_select_never_compiles() {
     block(&mut proc_);
     assert_eq!(f.calls(ida), calls);
 }
+
+#[test]
+fn a_chain_waking_from_sleep_plays_nothing_from_before() {
+    // Chain A (a DC source) shares the rack with chain B (300 ms of latency),
+    // so A sits behind a delay line of 3 584 samples that is full of A's DC
+    // while it plays.
+    let mut b = B::new(TrackKind::Audio);
+    let (da, lat) = (b.device(DC, &[(0, 0.4)]), {
+        let mut l = b.device(TEST_LATENCY, &[]);
+        l.state = Some(3_584u32.to_le_bytes().to_vec());
+        l
+    });
+    let ida = da.id;
+    let mut rack = Rack::new(RackKind::Audio);
+    let mut a = b.chain("a", vec![da]);
+    a.selector_range = (0, 48);
+    let mut c = b.chain("b", vec![lat]);
+    c.selector_range = (0, 127);
+    rack.chains.push(a);
+    rack.chains.push(c);
+    let rack_id = b.rack(rack);
+    let (h, mut proc_) = start(&b.p, Arc::new(Probes::default()));
+    for _ in 0..30 {
+        block(&mut proc_);
+    }
+    assert!((block(&mut proc_).channel(0)[10] - 0.4).abs() < 1e-3, "A plays");
+    // Out of A's zone: it fades out and sleeps, for a long time.
+    assert!(h.set_rack_selector(rack_id, 127));
+    for _ in 0..200 {
+        block(&mut proc_);
+    }
+    // While it sleeps its source changes to silence...
+    let mut p2 = b.p.clone();
+    p2.tracks[1].devices[0].kind = {
+        let DeviceKind::Rack(r) = &p2.tracks[1].devices[0].kind else { unreachable!() };
+        let mut r = r.clone();
+        r.chains[0].devices[0].params.insert(0, 0.0);
+        r.chain_selector = 127;
+        DeviceKind::Rack(r)
+    };
+    h.update_project(&p2);
+    h.flush();
+    block(&mut proc_);
+    let _ = ida;
+    // ...and A comes back: the old 0.4 in its delay line must not be heard.
+    assert!(h.set_rack_selector(rack_id, 0));
+    let mut heard = 0.0f32;
+    for _ in 0..24 {
+        heard = heard.max(peak(block(&mut proc_).channel(0)));
+    }
+    assert!(heard < 1e-6, "audio from before the sleep came out: peak {heard}");
+}

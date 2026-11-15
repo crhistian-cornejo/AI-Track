@@ -151,7 +151,7 @@ fn output_is_the_same_for_any_block_size() {
     for block in [1usize, 3, 100, 1000] {
         let mut b = rig();
         b.run(&input, 2000, block);
-        assert_eq!(a.log, b.log, "block {block}");
+        assert_eq!(a.log_no_ids(), b.log_no_ids(), "block {block}");
     }
 }
 

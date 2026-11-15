@@ -30,6 +30,8 @@ const GAIN: f32 = 1.0;
 const LOOP_SECONDS: usize = 600;
 /// Rendered previews kept for switching back and forth (a loop is a few MB).
 const RENDER_KEEP: usize = 8;
+/// Most audio the kept renders hold in all (a 30 s stereo render at 48 kHz is 11.5 MB).
+const RENDER_BUDGET_BYTES: usize = 48 << 20;
 /// Longest preview.
 const MAX_SECONDS: usize = 30;
 /// Frames per callback asked of the device (clamped to what it supports).
@@ -325,9 +327,16 @@ pub fn entry_delay(start_in: Option<Duration>, bar: Duration, elapsed: Duration)
 
 /// Renders kept for going back and forth in a list: the same sound at the
 /// same tempo, key and rate is not stretched twice.
-#[derive(Default)]
 struct Renders {
     kept: VecDeque<(RenderKey, Arc<DecodedAudio>)>,
+    /// Most bytes of audio the kept renders may hold together (the newest always stays).
+    budget: usize,
+}
+
+impl Default for Renders {
+    fn default() -> Self {
+        Self { kept: VecDeque::new(), budget: RENDER_BUDGET_BYTES }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -356,10 +365,14 @@ impl Renders {
         }
         let audio = Arc::new(render_synced(req, rate)?);
         self.kept.push_back((key, audio.clone()));
-        while self.kept.len() > RENDER_KEEP {
+        while self.kept.len() > RENDER_KEEP || (self.kept.len() > 1 && self.bytes() > self.budget) {
             self.kept.pop_front();
         }
         Ok(audio)
+    }
+
+    fn bytes(&self) -> usize {
+        self.kept.iter().map(|(_, a)| a.byte_size()).sum()
     }
 }
 
@@ -368,7 +381,13 @@ impl Renders {
 /// for percussion, a plain Re-Pitch for a one-shot that only changes key), then
 /// converted to the stream's rate with the clips' own converter. Slow: on the worker only.
 pub fn render_synced(req: &SyncedPreview, stream_rate: u32) -> Result<DecodedAudio, String> {
-    let (channels, file_rate) = sample_cache::decode_file(&req.path)?;
+    let (mut channels, file_rate) = sample_cache::decode_file(&req.path)?;
+    // Only the first `MAX_SECONDS` are ever heard: do not stretch or convert the rest.
+    let keep = file_rate as usize * MAX_SECONDS;
+    for c in &mut channels {
+        c.truncate(keep);
+        c.shrink_to_fit();
+    }
     let time_scale = match req.original_bpm {
         Some(b) if b > 0. && req.project_bpm > 0. => b / req.project_bpm,
         _ => 1.,
@@ -646,6 +665,45 @@ mod tests {
             renders.get(&SyncedPreview { semitones: -(i as i8) - 1, ..req.clone() }, 48_000).unwrap();
         }
         assert!(renders.kept.len() <= RENDER_KEEP, "bounded");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_long_file_is_cut_to_the_preview_length_before_it_is_stretched() {
+        // 90 s at 8 kHz: only the first MAX_SECONDS can be heard, so only those are rendered.
+        let path = tone("long-90s.wav", 8_000, 90., 300.);
+        let cap = MAX_SECONDS * 48_000;
+        let plain = render_synced(&request(path.clone()), 48_000).unwrap();
+        assert!(plain.frames <= cap + 48, "{} frames", plain.frames);
+        let stretched = render_synced(&SyncedPreview { original_bpm: Some(120.), semitones: 3, ..request(path.clone()) }, 48_000).unwrap();
+        assert!(stretched.frames <= cap + 4_800, "{} frames", stretched.frames);
+        assert!(stretched.byte_size() < 32 << 20, "{} bytes", stretched.byte_size());
+        // A short file is untouched.
+        let short = tone("short-2s.wav", 8_000, 2., 300.);
+        assert_eq!(render_synced(&request(short.clone()), 8_000).unwrap().frames, 16_000);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(short);
+    }
+
+    #[test]
+    fn the_renders_kept_are_bounded_by_size_not_only_by_count() {
+        let path = tone("budget-8k.wav", 8_000, 4., 400.);
+        let req = SyncedPreview { original_bpm: Some(120.), ..request(path.clone()) };
+        let one = render_synced(&req, 48_000).unwrap().byte_size();
+        // Room for two and a half renders: never more than two are held, the newest always is.
+        let mut renders = Renders { budget: one * 5 / 2, ..Renders::default() };
+        let mut last = None;
+        for i in 0..6 {
+            last = Some(renders.get(&SyncedPreview { semitones: i, ..req.clone() }, 48_000).unwrap());
+            assert!(renders.kept.len() <= 2, "{} kept", renders.kept.len());
+            assert!(renders.bytes() <= renders.budget);
+        }
+        let again = renders.get(&SyncedPreview { semitones: 5, ..req.clone() }, 48_000).unwrap();
+        assert!(Arc::ptr_eq(&last.unwrap(), &again), "the newest survives");
+        // One bigger than the whole budget is still served (and kept alone).
+        let mut tiny = Renders { budget: 1, ..Renders::default() };
+        let a = tiny.get(&req, 48_000).unwrap();
+        assert!(a.frames > 0 && tiny.kept.len() <= 1);
         let _ = std::fs::remove_file(path);
     }
 

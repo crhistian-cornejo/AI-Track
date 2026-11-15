@@ -110,27 +110,54 @@ fn random_is_repeatable_with_the_seed_and_bounded_by_its_amount() {
     assert!(run(3.0, 0.0).iter().all(|v| *v == 80));
 }
 
+/// Velocities of the note-ons of a timeline of 100 notes, one every 7000
+/// samples starting at song beat `from_beats`, as a take that starts there
+/// (a fresh device, like an export or a start after any reset).
+fn take(from_beats: f64, skip: usize, block: usize) -> Vec<u32> {
+    let mut r = rig();
+    set(&mut r, p::RANDOM, 80.0);
+    set(&mut r, p::SEED, 11.0);
+    r.start_at(from_beats);
+    let origin = r.pos_samples;
+    // Note i sits at song sample i * 7000 (+ 1000), whatever the take.
+    let input: Vec<_> = (skip..100).map(|i| (i as i64 * 7000 + 1000 - origin, on(60, 0.6))).filter(|(t, _)| *t >= 0).collect();
+    r.run(&input, 100 * 7000 - origin, block);
+    r.notes().iter().map(|n| (n.3 * 127.0).round() as u32).collect()
+}
+
 #[test]
-fn the_random_sequence_restarts_on_reset_and_ignores_block_size() {
-    let input: Vec<_> = (0..100).map(|i| (i * 7, on(60, 0.6))).collect();
-    let mut a = rig();
-    set(&mut a, p::RANDOM, 80.0);
-    set(&mut a, p::SEED, 11.0);
-    a.run(&input, 700, 4096);
-    for block in [1usize, 5, 64] {
-        let mut b = rig();
-        set(&mut b, p::RANDOM, 80.0);
-        set(&mut b, p::SEED, 11.0);
-        b.run(&input, 700, block);
-        assert!(a.log == b.log, "block {block}");
+fn the_random_draw_belongs_to_the_song_position_not_to_the_take() {
+    // Live from the start of the song.
+    let live = take(0.0, 0, 4096);
+    assert_eq!(live.len(), 100);
+    // An export (or a play after a stop or a loop wrap) that begins at beat 8:
+    // 8 beats = 192000 samples, so notes 28 and later are the ones in range.
+    let from_beat_8 = take(8.0, 28, 4096);
+    assert_eq!(from_beat_8, live[28..], "the same velocities at the same positions");
+    // And a different start inside the range, other block sizes.
+    for (beats, skip) in [(0.0, 0), (4.0, 14), (8.0, 28)] {
+        for block in [1usize, 7, 64, 480] {
+            assert_eq!(take(beats, skip, block), live[skip..], "from beat {beats}, block {block}");
+        }
     }
-    let vels = |r: &Rig| -> Vec<u32> { r.notes().iter().map(|n| (n.3 * 127.0).round() as u32).collect() };
-    let first = vels(&a);
-    assert_eq!(first.len(), 100);
-    a.log.clear();
-    a.p.reset();
-    a.run(&input, 700, 100);
-    assert_eq!(vels(&a), first, "reset starts the sequence again");
+    // The draw still varies from note to note.
+    assert!(live.iter().collect::<std::collections::BTreeSet<_>>().len() > 20);
+}
+
+#[test]
+fn reset_does_not_change_what_a_position_draws() {
+    let mut r = rig();
+    set(&mut r, p::RANDOM, 80.0);
+    set(&mut r, p::SEED, 11.0);
+    let input: Vec<_> = (0..20).map(|i| (i * 700 + 5, on(60, 0.6))).collect();
+    r.run(&input, 14_000, 256);
+    let first: Vec<_> = r.notes().iter().map(|n| n.3).collect();
+    r.p.reset();
+    r.log.clear();
+    r.start_at(0.0);
+    r.run(&input, 14_000, 100);
+    let second: Vec<_> = r.notes().iter().map(|n| n.3).collect();
+    assert_eq!(first, second);
 }
 
 #[test]

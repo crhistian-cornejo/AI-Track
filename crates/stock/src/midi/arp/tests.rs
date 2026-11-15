@@ -171,13 +171,13 @@ fn the_pattern_is_the_same_for_any_block_size_and_a_late_start() {
     let reference = {
         let mut r = rig();
         r.run(&input, 200_000, 4096);
-        r.log.clone()
+        r.log_no_ids()
     };
     assert!(reference.len() > 20);
     for block in [1usize, 2, 7, 64, 100, 480, 1023, 4096] {
         let mut r = rig();
         r.run(&input, 200_000, block);
-        assert_eq!(r.log, reference, "block size {block}");
+        assert_eq!(r.log_no_ids(), reference, "block size {block}");
     }
 }
 

@@ -1361,6 +1361,18 @@ pub enum SpliceState {
     Scanning(PathBuf),
 }
 
+/// What a [`SoundSearchFn`] needs to know that only the UI thread has at hand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoundEnv {
+    /// The Splice download folder, when there is one.
+    pub splice_folder: Option<PathBuf>,
+    /// A scan of the library is running.
+    pub scanning: bool,
+}
+
+/// A sound search to run off the UI thread (see `LibraryBridge::sound_searcher`).
+pub type SoundSearchFn = Box<dyn FnMut(&SoundQuery, &SoundEnv) -> SoundPage + Send>;
+
 /// A page of results.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SoundPage {
@@ -1707,6 +1719,11 @@ pub trait LibraryBridge {
     /// Search for the Sounds panel: filters by type, key, tempo, tag, collection and favourites.
     fn search_sounds(&self, _q: &SoundQuery) -> SoundPage {
         SoundPage::default()
+    }
+    /// A search for the Sounds panel that can run on another thread, with connections
+    /// of its own (`None` for bridges whose search is cheap enough for the UI thread).
+    fn sound_searcher(&self) -> Option<SoundSearchFn> {
+        None
     }
     /// The Splice download folder to index as a collection (`None` = none chosen
     /// and none found at Splice's default place). Cheap: call it as often as you like.

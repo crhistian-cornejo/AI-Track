@@ -82,11 +82,20 @@ const RELEASE_NAMES: &[&str] = &["0.1 s", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1
 const HPF_NAMES: &[&str] = &["Off", "30 Hz", "60 Hz", "90 Hz", "120 Hz", "180 Hz", "240 Hz"];
 /// Fall of the gain-reduction meter, dB per second.
 const GR_FALL_DB_S: f32 = 40.0;
+/// Fall of the peak meters, dB per second (per sample, whatever the buffer).
+const PEAK_FALL_DB_S: f32 = 40.0;
 /// Auto release: fast end, slow end (ms) and the reduction depth that
 /// reaches the slow end.
 const AUTO_FAST_MS: f32 = 100.0;
 const AUTO_SLOW_MS: f32 = 1_200.0;
 const AUTO_DEPTH_DB: f32 = 10.0;
+
+/// One sample of a peak meter's fall (flushed before the denormals).
+#[inline]
+fn fall(peak: f32, decay: f32) -> f32 {
+    let v = peak * decay;
+    if v < 1e-9 { 0.0 } else { v }
+}
 
 pub fn params() -> Vec<ParamInfo> {
     vec![
@@ -213,6 +222,8 @@ pub struct BusComp {
     gr_disp: f32,
     in_peak: f32,
     out_peak: f32,
+    /// Per-sample factor of the peak meters' fall.
+    peak_decay: f32,
     clip_hold: f32,
     first: bool,
 }
@@ -267,6 +278,7 @@ impl BusComp {
             gr_disp: 0.0,
             in_peak: 0.0,
             out_peak: 0.0,
+            peak_decay: 1.0,
             clip_hold: 0.0,
             first: true,
         };
@@ -345,8 +357,9 @@ impl Segmented for BusComp {
         let lat = self.clip_latency;
         let ceil = db_to_gain(CEILING_DB);
         let inv_ceil = 1.0 / ceil;
-        let mut in_peak = self.in_peak * 0.5;
-        let mut out_peak = self.out_peak * 0.5;
+        let decay = self.peak_decay;
+        let mut in_peak = self.in_peak;
+        let mut out_peak = self.out_peak;
         let mut gr_max = 0.0f32;
         let mut clip_peak = 0.0f32;
         let this = &mut *self;
@@ -359,7 +372,7 @@ impl Segmented for BusComp {
             let lf = this.listen_fade.next();
             let gr = this.bus.process(dl, dr, thr, ratio, range);
             gr_max = gr_max.max(gr);
-            in_peak = in_peak.max(l.abs()).max(r.abs());
+            in_peak = fall(in_peak, decay).max(l.abs()).max(r.abs());
             let g = db_to_gain(-gr) * this.makeup.next();
             let mut wet = [l * g, r * g];
             let cf = this.clip_fade.next();
@@ -387,7 +400,7 @@ impl Segmented for BusComp {
             let out_g = this.output.next();
             let mut ol = (dry[0] + (wet[0] - dry[0]) * mix) * out_g;
             let mut or = (dry[1] + (wet[1] - dry[1]) * mix) * out_g;
-            out_peak = out_peak.max(ol.abs()).max(or.abs());
+            out_peak = fall(out_peak, decay).max(ol.abs()).max(or.abs());
             if lf > 0.0 {
                 ol += (dl - ol) * lf;
                 or += (dr - or) * lf;
@@ -410,6 +423,7 @@ impl Processor for BusComp {
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
         self.sr = sample_rate;
+        self.peak_decay = db_to_gain(-PEAK_FALL_DB_S / sample_rate as f32);
         self.bus.prepare(sample_rate);
         self.makeup.set_time(20.0, sample_rate);
         self.mix.set_time(20.0, sample_rate);
@@ -899,5 +913,34 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The peak meters fall in dB per second, not per call: after the same
+    /// pulse they read alike with any host buffer size.
+    #[test]
+    fn peak_meters_do_not_depend_on_the_block_size() {
+        use crate::test_util::meter_after_pulse;
+        // 0.5 → −6 dBFS, falling 40 dB/s for the 0.512 s that follow.
+        let want = -6.02 - 40.0 * 24_566.0 / 48_000.0;
+        for block in [64usize, 128, 512, 2048] {
+            let m = meter_after_pulse(create, block);
+            for (name, k) in [("input", 1usize), ("output", 2)] {
+                assert!((m[k] - want).abs() < 1.5, "{name} peak with {block}-frame blocks reads {} dB, want {want}", m[k]);
+            }
+        }
+    }
+
+    #[test]
+    fn detector_state_is_exactly_zero_after_silence() {
+        let mut c = BusComp::new();
+        set_plain(&mut c, p::RELEASE, RELEASE_AUTO as f32);
+        set_plain(&mut c, p::THRESHOLD, -30.0);
+        let input = |i: usize| if i < 24_000 { sine(200.0, 0.9)(i) } else { (0.0, 0.0) };
+        process_stereo(&mut c, input, 24_000 + 20 * 48_000);
+        assert_eq!(c.bus.ms, [0.0, 0.0]);
+        assert_eq!(c.bus.hold.value(), 0.0);
+        assert_eq!(c.bus.smoother.value(), 0.0);
+        assert_eq!(c.bus.smoother.memory(), (0.0, 0.0));
+        assert_eq!((c.in_peak, c.out_peak), (0.0, 0.0));
     }
 }

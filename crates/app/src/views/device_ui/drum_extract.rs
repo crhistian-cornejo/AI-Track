@@ -338,7 +338,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 if let Ok(Ok(Some(paths))) = rx.await
                     && let Some(dest) = paths.into_iter().next()
                 {
-                    let count = export_all_wavs(&res, &dest);
+                    // Copying many stems is disk work: keep it off the UI thread.
+                    let job_dest = dest.clone();
+                    let count = cx.background_executor().spawn(async move { export_all_wavs(&res, &job_dest) }).await;
                     let _ = weak.update(cx, |ws, cx| {
                         let st = ws.fx.drum_extract.entry(device).or_default();
                         match count {

@@ -361,8 +361,10 @@ fn a_link_entry_and_a_missing_platform_are_guided_not_installable() {
     assert!(matches!(nova.state, PluginState::Guided(GuidedWhy::Unpinned) | PluginState::Available), "{:?}", nova.state);
     let vital = cards.iter().find(|c| c.entry.id == "vital").unwrap();
     assert_eq!(vital.state, PluginState::Guided(GuidedWhy::Link));
+    let noisemaker = cards.iter().find(|c| c.entry.id == "tal-noisemaker").unwrap();
+    assert_eq!(noisemaker.state, PluginState::Guided(GuidedWhy::NoBuild), "only a macOS build is offered");
     let sforzando = cards.iter().find(|c| c.entry.id == "sforzando").unwrap();
-    assert_eq!(sforzando.state, PluginState::Guided(GuidedWhy::NoBuild), "only a macOS build is offered");
+    assert_eq!(sforzando.state, PluginState::Guided(GuidedWhy::Link), "it is on a shared S3 host, so a guided link");
 }
 
 #[cfg(target_os = "macos")]

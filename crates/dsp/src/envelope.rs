@@ -190,7 +190,7 @@ impl PeakHold {
             self.hold_left -= 1;
         } else {
             self.env += (x - self.env) * self.release;
-            if self.env < 1e-30 {
+            if self.env < 1e-9 {
                 self.env = 0.0;
             }
         }
@@ -291,16 +291,30 @@ impl AutoReleaseSmoother {
         self.auto
     }
 
+    /// The two memory poles of the automatic release, dB (fast, slow).
+    pub fn memory(&self) -> (f32, f32) {
+        (self.m1, self.m2)
+    }
+
     #[inline]
     pub fn process(&mut self, gr_db: f32) -> f32 {
         let c = if gr_db > self.y { self.attack } else { self.release };
         self.y += (gr_db - self.y) * c;
-        if self.y < 1e-9 {
+        if self.y < 1e-4 {
             self.y = 0.0;
         }
         if self.auto {
             self.m1 += (self.y - self.m1) * self.c1;
             self.m2 += (self.m1 - self.m2) * self.c2;
+            // A one-pole decay never reaches zero by itself: it stalls in the
+            // denormals, which stay slow for as long as the track plays.
+            // (Far below anything audible: they steer the release time.)
+            if self.m1 < 1e-4 {
+                self.m1 = 0.0;
+            }
+            if self.m2 < 1e-4 {
+                self.m2 = 0.0;
+            }
             self.tick += 1;
             if self.tick >= AUTO_RELEASE_STRIDE {
                 self.tick = 0;
@@ -585,5 +599,28 @@ mod tests {
         }
         // One time constant: 12 · e⁻¹.
         assert!((s.value() - 12.0 * (-1.0f32).exp()).abs() < 0.1, "{}", s.value());
+    }
+
+    #[test]
+    fn auto_release_state_is_exactly_zero_after_silence() {
+        let sr = 48_000.0;
+        let mut s = AutoReleaseSmoother::default();
+        s.set_attack_ms(1.0, sr);
+        s.set_auto(100.0, 1_200.0, 10.0, sr);
+        for _ in 0..48_000 {
+            s.process(12.0);
+        }
+        for _ in 0..(10 * 48_000) {
+            s.process(0.0);
+        }
+        assert_eq!(s.value(), 0.0);
+        assert_eq!(s.memory(), (0.0, 0.0));
+        let mut p = PeakHold::new();
+        p.set(1.0, 100.0, sr);
+        p.process(1.0);
+        for _ in 0..(10 * 48_000) {
+            p.process(0.0);
+        }
+        assert_eq!(p.value(), 0.0);
     }
 }

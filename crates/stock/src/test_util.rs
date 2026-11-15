@@ -155,3 +155,30 @@ pub fn param_change_step(make: fn() -> Box<dyn Processor>, setup: &[(u32, f32)],
     };
     (run(from, Some(to)), run(from, None).max(run(to, None)))
 }
+
+/// Feed a one-sample pulse of 0.5 and then silence (24 576 frames in all) in
+/// blocks of `block` frames and return `meter()` afterwards. The peak meters
+/// must read the same whatever the host's buffer size.
+pub fn meter_after_pulse(make: fn() -> Box<dyn Processor>, block: usize) -> Vec<f32> {
+    let mut p = make();
+    p.prepare(SR, block);
+    let mut buf = AudioBuffer::new(2, block);
+    let tr = Transport::default();
+    let total = 24_576usize;
+    let mut pos = 0;
+    while pos < total {
+        buf.set_frames(block);
+        buf.clear();
+        if pos == 0 {
+            buf.channel_mut(0)[10] = 0.5;
+            buf.channel_mut(1)[10] = 0.5;
+        }
+        let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+        p.process(&mut ctx);
+        pos += block;
+    }
+    let mut m = vec![0.0f32; 320];
+    let n = p.meter(&mut m);
+    m.truncate(n);
+    m
+}

@@ -18,7 +18,8 @@
 //! * **Transients** — attack/sustain shaper keyed on the level difference of a
 //!   fast and a slow envelope: positive pushes onsets, negative softens them.
 //! * **Boom** — a sine oscillator tuned to 30…120 Hz whose level follows the
-//!   envelope of the input's content under 150 Hz (a 150 Hz low-pass, mono).
+//!   envelope of the input's content under 150 Hz (a 150 Hz low-pass after a
+//!   20 Hz high-pass, mono: direct current never keeps it sounding).
 //!   When a new hit is detected (a rise of the low band over its own recent
 //!   level, and only if the lows are a fair share of the whole input, so hats
 //!   and clicks do not fire it) the oscillator is restarted **in phase with
@@ -52,7 +53,7 @@ use aitrack_dsp::delay::DelayLine;
 use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower, PeakHold};
 use aitrack_dsp::oversample::Oversampler;
 use aitrack_dsp::smooth::{Smoother, one_pole_coeff};
-use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
+use aitrack_dsp::svf::{DcBlocker, SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain, gain_to_db};
 
 pub const ID: &str = "fx.drumbus";
@@ -110,9 +111,21 @@ const LOCK_MS: f32 = 15.0;
 /// Fraction of the phase error corrected per sample inside the lock window.
 const LOCK_GAIN: f32 = 0.02;
 const GR_FALL_DB_S: f32 = 40.0;
+/// Fall of the peak meters, dB per second (per sample, whatever the buffer).
+const PEAK_FALL_DB_S: f32 = 40.0;
+/// The Boom's key is high-passed here so a DC offset or a rumble under the
+/// lowest note is not taken for a hit.
+const KEY_HP_HZ: f32 = 20.0;
 /// Meter history: buckets and bucket length.
 const HISTORY: usize = 64;
 const BUCKET_MS: f32 = 10.0;
+
+/// One sample of a peak meter's fall (flushed before the denormals).
+#[inline]
+fn fall(peak: f32, decay: f32) -> f32 {
+    let v = peak * decay;
+    if v < 1e-9 { 0.0 } else { v }
+}
 
 pub fn params() -> Vec<ParamInfo> {
     vec![
@@ -156,6 +169,7 @@ fn drive_makeup(curve: Curve, g: f32) -> f32 {
 /// Boom oscillator locked to the hits of the low band.
 #[derive(Clone, Copy, Debug)]
 struct Boom {
+    dc: DcBlocker,
     lp: SvfCoeffs,
     lp_st: SvfState,
     hold: PeakHold,
@@ -176,6 +190,7 @@ struct Boom {
     /// the oscillator frequency.
     omega: f32,
     lag: f32,
+    sr: f64,
     phase: [f32; 2],
     cur: usize,
     fade: f32,
@@ -193,6 +208,7 @@ struct Boom {
 impl Boom {
     fn new() -> Self {
         Self {
+            dc: DcBlocker::default(),
             lp: SvfCoeffs::passthrough(),
             lp_st: SvfState::default(),
             hold: PeakHold::new(),
@@ -209,6 +225,7 @@ impl Boom {
             lock_len: 0,
             omega: 0.0,
             lag: 0.0,
+            sr: 48_000.0,
             phase: [0.0; 2],
             cur: 0,
             fade: 1.0,
@@ -221,7 +238,9 @@ impl Boom {
     }
 
     fn prepare(&mut self, sr: f64) {
+        self.dc = DcBlocker::new(KEY_HP_HZ, sr);
         self.lp = SvfCoeffs::new(SvfMode::Lowpass, BOOM_LP_HZ, std::f32::consts::FRAC_1_SQRT_2, 0.0, sr);
+        self.sr = sr;
         self.fast_release = one_pole_coeff(8.0, sr);
         self.slow_coeff = one_pole_coeff(40.0, sr);
         self.refractory_len = (REFRACTORY_MS as f64 * 0.001 * sr) as u32;
@@ -237,10 +256,14 @@ impl Boom {
         // Hold: half a period of the lowest note, so |lo| has no ripple.
         self.hold.set(14.0, decay_ms, sr);
         let (re, im) = self.lp.response(freq as f64, sr);
-        self.lag = (-im.atan2(re)) as f32;
+        let lp_lag = -im.atan2(re);
+        // The key's high-pass leads by atan(tan(π fc/sr) / tan(π f/sr)).
+        let lead = ((std::f64::consts::PI * KEY_HP_HZ as f64 / sr).tan() / (std::f64::consts::PI * freq as f64 / sr).tan()).atan();
+        self.lag = (lp_lag - lead) as f32;
     }
 
     fn reset(&mut self) {
+        self.dc.reset();
         self.lp_st.reset();
         self.hold.reset();
         self.fast = 0.0;
@@ -257,7 +280,7 @@ impl Boom {
     /// One mono key sample → `(oscillator × envelope, envelope, |key|)`.
     #[inline]
     fn process(&mut self, m: f32) -> (f32, f32, f32) {
-        let lo = self.lp_st.process(&self.lp, m);
+        let lo = self.lp_st.process(&self.lp, self.dc.process(m));
         let a = lo.abs();
         let env = self.hold.process(a);
         let d = lo - self.lo_prev;
@@ -266,12 +289,18 @@ impl Boom {
             self.fast = a;
         } else {
             self.fast += (a - self.fast) * self.fast_release;
+            if self.fast < 1e-9 {
+                self.fast = 0.0;
+            }
         }
         let w = m.abs();
         if w > self.wide {
             self.wide = w;
         } else {
             self.wide += (w - self.wide) * self.fast_release;
+            if self.wide < 1e-9 {
+                self.wide = 0.0;
+            }
         }
         if self.refractory > 0 {
             self.refractory -= 1;
@@ -302,6 +331,9 @@ impl Boom {
             self.lock_age += 1;
         }
         self.slow += (self.fast - self.slow) * self.slow_coeff;
+        if self.slow < 1e-9 {
+            self.slow = 0.0;
+        }
         self.prev_env = env;
         for ph in &mut self.phase {
             *ph += self.omega;
@@ -369,6 +401,8 @@ pub struct DrumBus {
     gr_disp: f32,
     in_peak: f32,
     out_peak: f32,
+    /// Per-sample factor of the peak meters' fall.
+    peak_decay: f32,
     boom_level: f32,
     trans_db: f32,
     hist_boom: [f32; HISTORY],
@@ -441,6 +475,7 @@ impl DrumBus {
             gr_disp: 0.0,
             in_peak: 0.0,
             out_peak: 0.0,
+            peak_decay: 1.0,
             boom_level: 0.0,
             trans_db: 0.0,
             hist_boom: [0.0; HISTORY],
@@ -538,12 +573,13 @@ impl Segmented for DrumBus {
         let lat = self.latency;
         let comp_on = self.comp_on;
         let (thr, trans_amount) = (self.comp_thr, self.trans_amount);
-        let mut in_peak = self.in_peak * 0.5;
-        let mut out_peak = self.out_peak * 0.5;
+        let decay = self.peak_decay;
+        let mut in_peak = self.in_peak;
+        let mut out_peak = self.out_peak;
         let mut gr_max = 0.0f32;
         let this = &mut *self;
         for_frames(ctx.buffer, start, end, |_, l, r| {
-            in_peak = in_peak.max(l.abs()).max(r.abs());
+            in_peak = fall(in_peak, decay).max(l.abs()).max(r.abs());
             this.dry[0].push(l);
             this.dry[1].push(r);
             let dry = [this.dry[0].read(lat), this.dry[1].read(lat)];
@@ -636,7 +672,7 @@ impl Segmented for DrumBus {
             let og = this.output.next();
             let ol = (dry[0] + (y[0] - dry[0]) * mix) * og;
             let or = (dry[1] + (y[1] - dry[1]) * mix) * og;
-            out_peak = out_peak.max(ol.abs()).max(or.abs());
+            out_peak = fall(out_peak, decay).max(ol.abs()).max(or.abs());
             (sanitize(ol), sanitize(or))
         });
         self.in_peak = in_peak;
@@ -653,6 +689,7 @@ impl Processor for DrumBus {
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
         self.sr = sample_rate;
+        self.peak_decay = db_to_gain(-PEAK_FALL_DB_S / sample_rate as f32);
         for s in [&mut self.trim, &mut self.drive_g, &mut self.drive_c, &mut self.drive_wet, &mut self.crunch_k, &mut self.crunch_wet, &mut self.comp_amount, &mut self.comp_makeup, &mut self.boom_amount, &mut self.damp_wet, &mut self.mix, &mut self.output] {
             s.set_time(20.0, sample_rate);
         }
@@ -1100,5 +1137,50 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The peak meters fall in dB per second, not per call: after the same
+    /// pulse they read alike with any host buffer size.
+    #[test]
+    fn peak_meters_do_not_depend_on_the_block_size() {
+        use crate::test_util::meter_after_pulse;
+        // 0.5 → −6 dBFS, falling 40 dB/s for the 0.512 s that follow.
+        let want = -6.02 - 40.0 * 24_566.0 / 48_000.0;
+        for block in [64usize, 128, 512, 2048] {
+            let m = meter_after_pulse(create, block);
+            for (name, k) in [("input", 1usize), ("output", 2)] {
+                assert!((m[k] - want).abs() < 1.5, "{name} peak with {block}-frame blocks reads {} dB, want {want}", m[k]);
+            }
+        }
+    }
+
+    #[test]
+    fn boom_state_is_exactly_zero_after_silence() {
+        let sr = SR;
+        let mut b = Boom::new();
+        b.prepare(sr);
+        b.set(55.0, 300.0, sr);
+        let hit = kicks(55.0, 90.0, &[(0, 0.8, 0.0)]);
+        for i in 0..14_400 {
+            b.process(hit(i).0);
+        }
+        for _ in 0..(10 * 48_000) {
+            b.process(0.0);
+        }
+        assert_eq!((b.fast, b.wide, b.slow, b.lo_prev), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(b.hold.value(), 0.0);
+        // The same through the device: its peak meters empty out too.
+        let mut d = neutral();
+        set_plain(&mut d, p::BOOM_AMOUNT, 100.0);
+        process_stereo(&mut d, |i| if i < 14_400 { hit(i) } else { (0.0, 0.0) }, 14_400 + 10 * 48_000);
+        assert_eq!((d.in_peak, d.out_peak), (0.0, 0.0));
+    }
+
+    #[test]
+    fn boom_does_not_follow_direct_current() {
+        // A steady offset is not a low note: after the step has died away the
+        // oscillator must be silent.
+        let boom = boom_only(|d: &mut DrumBus| set_plain(d, p::BOOM_DECAY, 50.0), |i| if i > 2_000 { (0.5, 0.5) } else { (0.0, 0.0) }, 96_000);
+        assert!(peak(&boom[72_000..]) < 1e-4, "boom from DC: {}", peak(&boom[72_000..]));
     }
 }

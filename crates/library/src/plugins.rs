@@ -324,9 +324,14 @@ pub fn find_bundles(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let path = e.path();
+            // A link is never a bundle, and is never followed: it could point anywhere.
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
             if want(&name) {
                 out.push(path);
-            } else if e.file_type().is_ok_and(|t| t.is_dir()) {
+            } else if kind.is_dir() {
                 walk(&path, depth + 1, out, want);
             }
         }
@@ -345,9 +350,13 @@ fn find_nested(root: &Path, ext: &str) -> Vec<PathBuf> {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.filter_map(|e| e.ok()) {
             let path = e.path();
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
             if path.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)) {
                 out.push(path);
-            } else if e.file_type().is_ok_and(|t| t.is_dir()) {
+            } else if kind.is_dir() {
                 walk(&path, depth + 1, ext, out);
             }
         }
@@ -356,6 +365,16 @@ fn find_nested(root: &Path, ext: &str) -> Vec<PathBuf> {
     walk(root, 0, ext, &mut out);
     out.sort();
     out
+}
+
+/// Every symlink inside `bundle` must really resolve to somewhere inside it
+/// (a bundle is moved into the plugin folder, so what leaves it would then point
+/// at the user's own files), and the bundle itself must not be a link.
+pub fn verify_bundle_links(bundle: &Path) -> Result<()> {
+    if fs::symlink_metadata(bundle).map_err(io)?.file_type().is_symlink() {
+        return Err(err(format!("{} is a link, not a plugin bundle", bundle.display())));
+    }
+    crate::install::verify_links_inside(bundle)
 }
 
 /// Copy a tree keeping permissions and links, refusing links that leave it.
@@ -405,7 +424,7 @@ pub fn copy_tree(src: &Path, dst: &Path, limits: Limits) -> Result<()> {
         Ok(())
     }
     let (mut count, mut bytes) = (0, 0);
-    go(src, dst, Path::new(src.file_name().unwrap_or_default()), &mut count, &mut bytes, limits)
+    go(src, dst, Path::new(""), &mut count, &mut bytes, limits)
 }
 
 /// A disk image mounted read-only. Detached on drop.
@@ -447,29 +466,8 @@ fn open_container(file: &Path, container: Container, work: &Path, raw: &Path, st
     match container {
         Container::Zip => unpack_zip_limited(file, raw, stop, limits)?,
         Container::TarGz => {
-            let mut a = tar::Archive::new(flate2::read::GzDecoder::new(BufReader::new(File::open(file).map_err(io)?)));
-            a.set_preserve_permissions(true);
-            a.set_unpack_xattrs(false);
-            let (mut files, mut bytes) = (0usize, 0u64);
-            for e in a.entries().map_err(io)? {
-                if stop.load(Ordering::Relaxed) {
-                    return Err(err("cancelled"));
-                }
-                let mut e = e.map_err(io)?;
-                files += 1;
-                bytes += e.size();
-                if files > limits.files || bytes > limits.bytes {
-                    return Err(err("the archive expands to more than it is allowed to"));
-                }
-                if e.header().entry_type().is_symlink() || e.header().entry_type().is_hard_link() {
-                    let target = e.link_name().map_err(io)?.map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
-                    let rel = e.path().map_err(io)?.into_owned();
-                    if !crate::install::link_stays_inside(&rel, &target) {
-                        return Err(err("the archive has a link that leaves its folder"));
-                    }
-                }
-                e.unpack_in(raw).map_err(io)?;
-            }
+            let archive_bytes = fs::metadata(file).map_err(io)?.len().max(1);
+            crate::install::unpack_tar_limited(flate2::read::GzDecoder::new(BufReader::new(File::open(file).map_err(io)?)), raw, stop, limits, archive_bytes)?;
         }
         Container::Dmg => {
             if !cfg!(target_os = "macos") {
@@ -626,6 +624,10 @@ fn install_in(plan: &InstallPlan, fetcher: &dyn Fetcher, stop: &AtomicBool, tx: 
         .collect();
     if bundles.is_empty() {
         return Err(err(format!("{} has no plugin inside that can be installed without running its installer: open the maker's page", entry.name)));
+    }
+    // Nothing is checked, signed or moved before its links are known to stay inside it.
+    for b in &bundles {
+        verify_bundle_links(b)?;
     }
     // Check each staged bundle before anything reaches the plugin folders.
     say(tx, PluginStage::Checking, 0, bundles.len() as u64);

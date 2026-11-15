@@ -367,3 +367,41 @@ fn cpu_per_midi_device() {
         println!("{:<16} {:>10.5} {:>14.0}   (dropped {})", id, 100.0 * el / seconds, el * 1e9 / blocks as f64, d.dropped);
     }
 }
+
+/// Two arpeggiators, a chord device and an echo in one project never invent
+/// the same note id (a fixed base per device kind used to clash).
+#[test]
+fn generated_note_ids_never_collide_between_devices() {
+    let ids_of = |id: &str| -> Vec<i32> {
+        let mut p = aitrack_stock::create(id).unwrap();
+        p.prepare(SR, 4096);
+        let mut d = Driver::new(256);
+        let mut ids = Vec::new();
+        for b in 0..400 {
+            d.events.clear();
+            if b == 0 {
+                for key in [60u8, 64, 67] {
+                    d.events.push(Event { offset: 0, kind: EventKind::NoteOn { channel: 0, key, velocity: 0.8, note_id: -1 } });
+                }
+            }
+            d.out.clear();
+            let ctx = MidiContext { sample_rate: SR, frames: 256, events: &d.events, transport: &d.transport };
+            p.process_midi(&ctx, &mut EventSink::new(&mut d.out, &mut d.dropped));
+            d.transport.position_samples += 256;
+            d.transport.position_beats += 256.0 / SR * d.transport.bpm / 60.0;
+            ids.extend(d.out.iter().filter_map(|e| match e.kind {
+                EventKind::NoteOn { note_id, .. } if note_id != -1 => Some(note_id),
+                _ => None,
+            }));
+        }
+        ids
+    };
+    let sets: Vec<(&str, std::collections::BTreeSet<i32>)> =
+        ["midi.arp", "midi.arp", "midi.chord", "midi.echo", "midi.arp"].iter().map(|id| (*id, ids_of(id).into_iter().collect())).collect();
+    for (i, (id, set)) in sets.iter().enumerate() {
+        assert!(!set.is_empty() && set.iter().all(|n| *n >= 0x4000_0000), "{id} #{i} makes ids in the high range: {set:?}");
+        for (j, (other, o)) in sets.iter().enumerate().skip(i + 1) {
+            assert!(set.is_disjoint(o), "{id} #{i} and {other} #{j} share note ids");
+        }
+    }
+}

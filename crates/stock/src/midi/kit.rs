@@ -141,26 +141,44 @@ pub fn fold_octaves(mut key: i32) -> u8 {
 
 // ───────────────────────────── Note ids ─────────────────────────────
 
-static INSTANCES: AtomicU32 = AtomicU32::new(0);
+/// Next unclaimed block of ids, shared by every device of the process.
+static NEXT_BLOCK: AtomicU32 = AtomicU32::new(0);
 
-/// Ids for the notes a device invents: a high range of its own so they never
-/// meet the ids of the notes of clips or of other devices.
+const ID_FLOOR: i32 = 0x4000_0000;
+/// Ids per block: a device takes a new block when it has used one up.
+const BLOCK_IDS: u32 = 1 << 12;
+/// Blocks before the range wraps (2^30 ids in all, a billion notes).
+const BLOCKS: u32 = 1 << 18;
+
+/// Ids for the notes a device invents: a high range that no other device
+/// (nor the notes of clips, which sit below it) can hand out. Every device
+/// claims blocks of ids from one shared counter, so two devices never
+/// get the same id, however many there are in a project, until a billion
+/// ids have been given out in total. Taking a block is one atomic add: no
+/// allocation, no lock, safe on the audio thread.
 #[derive(Clone, Debug)]
 pub struct IdAlloc {
-    base: i32,
-    next: u32,
+    block: u32,
+    used: u32,
 }
 
 impl IdAlloc {
     pub fn new() -> Self {
-        let n = INSTANCES.fetch_add(1, Ordering::Relaxed);
-        Self { base: 0x4000_0000 + ((n & 0x3F) << 24) as i32, next: 0 }
+        Self { block: Self::claim(), used: 0 }
+    }
+
+    fn claim() -> u32 {
+        NEXT_BLOCK.fetch_add(1, Ordering::Relaxed) % BLOCKS
     }
 
     #[inline]
     pub fn next(&mut self) -> i32 {
-        let id = self.base | (self.next & 0x00FF_FFFF) as i32;
-        self.next = self.next.wrapping_add(1);
+        if self.used == BLOCK_IDS {
+            self.block = Self::claim();
+            self.used = 0;
+        }
+        let id = ID_FLOOR + (self.block * BLOCK_IDS + self.used) as i32;
+        self.used += 1;
         id
     }
 }
@@ -467,11 +485,51 @@ mod tests {
     }
 
     #[test]
+    fn ids_never_repeat_across_many_devices_in_one_project() {
+        // More instances than any fixed-width device number could tell apart.
+        let mut allocs: Vec<IdAlloc> = (0..300).map(|_| IdAlloc::new()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for round in 0..6_000 {
+            for (i, a) in allocs.iter_mut().enumerate() {
+                let id = a.next();
+                assert!(id >= 0x4000_0000, "ids stay in the high range");
+                assert!(seen.insert(id), "id {id:#x} repeated (instance {i}, round {round})");
+            }
+        }
+    }
+
+    #[test]
+    fn layers_of_many_pitch_devices_never_share_a_note_id() {
+        use super::super::fxtest::{Rig, off, on};
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..140 {
+            let mut r = Rig::new(super::super::pitch::create());
+            let set = |r: &mut Rig, id: u32, plain: f32| {
+                let n = r.p.info().params.iter().find(|i| i.id == id).unwrap().to_normalized(plain);
+                r.p.set_param(id, n);
+            };
+            set(&mut r, super::super::pitch::p::LAYER, 1.0);
+            set(&mut r, super::super::pitch::p::OCTAVE, 1.0);
+            for i in 0..3 {
+                r.run(&[(0, on(60 + i, 0.8)), (10, off(60 + i))], 64, 64);
+            }
+            for (_, k) in &r.log {
+                if let EventKind::NoteOn { note_id, .. } = k
+                    && *note_id >= 0x4000_0000
+                {
+                    assert!(ids.insert(*note_id), "note id {note_id:#x} given to two notes");
+                }
+            }
+        }
+        assert_eq!(ids.len(), 140 * 3);
+    }
+
+    #[test]
     fn ids_are_high_and_distinct_between_devices() {
         let (mut a, mut b) = (IdAlloc::new(), IdAlloc::new());
         let (x, y) = (a.next(), b.next());
         assert!(x >= 0x4000_0000 && y >= 0x4000_0000);
-        assert_ne!(x >> 24, y >> 24);
+        assert_ne!(x, y);
         assert_ne!(a.next(), x);
     }
 

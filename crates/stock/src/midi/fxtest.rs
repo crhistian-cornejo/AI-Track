@@ -72,6 +72,22 @@ impl Rig {
         }
     }
 
+    /// The log with note ids zeroed: ids are per device instance, so two
+    /// runs of equal music differ only there.
+    pub fn log_no_ids(&self) -> Vec<(i64, EventKind)> {
+        self.log
+            .iter()
+            .map(|(t, k)| {
+                let k = match *k {
+                    EventKind::NoteOn { channel, key, velocity, .. } => EventKind::NoteOn { channel, key, velocity, note_id: 0 },
+                    EventKind::NoteOff { channel, key, velocity, .. } => EventKind::NoteOff { channel, key, velocity, note_id: 0 },
+                    k => k,
+                };
+                (*t, k)
+            })
+            .collect()
+    }
+
     /// Note-ons and note-offs in the log, times in samples.
     pub fn notes(&self) -> Vec<Note> {
         self.log

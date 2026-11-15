@@ -32,6 +32,7 @@
 //! Meter layout: `[position in cycle, cycle length, held keys, sounding notes]`.
 
 use crate::common::{ParamStore, write_meter};
+use crate::midi::kit::IdAlloc;
 use aitrack_dsp::{Category, EventKind, EventSink, MidiContext, ParamInfo, PluginInfo, ProcessContext, Processor};
 
 pub const ID: &str = "midi.arp";
@@ -92,10 +93,6 @@ const STEP_SHORT: [&str; 8] = ["Vel 1", "Vel 2", "Vel 3", "Vel 4", "Vel 5", "Vel
 
 const MAX_HELD: usize = 16;
 const MAX_ACTIVE: usize = 128;
-/// Generated note ids live in their own range so they never clash with the
-/// ids of the keys played.
-const ID_BASE: i32 = 0x4100_0000;
-const ID_MASK: u32 = 0x00FF_FFFF;
 /// A transport position this far (quarter notes) from where the last block
 /// ended counts as a jump.
 const JUMP_TOL: f64 = 2e-3;
@@ -188,7 +185,7 @@ pub struct Arp {
     grid_sig: u64,
     next_k: i64,
     note_origin: i64,
-    id_counter: u32,
+    ids: IdAlloc,
     dropped: u64,
     // Per block.
     frames: i64,
@@ -349,7 +346,7 @@ impl Arp {
             grid_sig: 0,
             next_k: 0,
             note_origin: 0,
-            id_counter: 0,
+            ids: IdAlloc::new(),
             dropped: 0,
             frames: 0,
             spb: 24_000.0,
@@ -504,8 +501,7 @@ impl Arp {
                 return;
             }
         }
-        self.id_counter = self.id_counter.wrapping_add(1);
-        let note_id = ID_BASE + (self.id_counter & ID_MASK) as i32;
+        let note_id = self.ids.next();
         let velocity = velocity.clamp(1.0 / 127.0, 1.0);
         if out.push(at as u32, EventKind::NoteOn { channel, key, velocity, note_id }) {
             self.active[self.active_len] = Active { key, channel, note_id, off_at: self.clock + at + gate };

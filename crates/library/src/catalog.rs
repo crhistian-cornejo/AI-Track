@@ -35,6 +35,10 @@ pub const ALLOWED_LICENSES: &[&str] = &[
     "u-he-EULA",
 ];
 
+/// Hosts anyone can put files on (cloud buckets, file sharing). They are never
+/// "the maker's domain": a catalog entry may not allow them.
+pub const SHARED_HOSTS: &[&str] = &["amazonaws.com", "dropbox.com", "dropboxusercontent.com", "drive.google.com", "googleusercontent.com", "storage.googleapis.com", "cloudfront.net", "blob.core.windows.net", "onedrive.live.com", "mega.nz", "wetransfer.com"];
+
 pub const CATEGORIES: &[&str] = &["dynamics", "eq", "saturation", "reverb", "delay", "modulation", "glitch", "vocal", "utility", "synth", "sampler", "multi"];
 
 /// Largest download any artifact may declare.
@@ -283,6 +287,9 @@ impl Catalog {
             if p.allowed_hosts.iter().any(|h| h.is_empty() || h != &h.to_ascii_lowercase() || h.contains(['/', ':', '*', '@'])) {
                 return Err(bad(format!("{id}: allowed_hosts are bare lower-case host names")));
             }
+            if let Some(h) = p.allowed_hosts.iter().find(|h| SHARED_HOSTS.iter().any(|s| *h == s || h.ends_with(&format!(".{s}")))) {
+                return Err(bad(format!("{id}: {h} is a shared host, not the maker's own domain; make it a guided link")));
+            }
             let mut seen = std::collections::HashSet::new();
             for a in &p.artifact {
                 let Some(os) = a.os else { return Err(bad(format!("{id}: artifact without os"))) };
@@ -437,6 +444,15 @@ size = 0
         c.plugin[0].artifact[0].size = 5;
         assert!(c.plugin[0].installable(Os::Macos));
         assert!(!c.plugin[0].installable(Os::Windows), "no artifact for Windows");
+    }
+
+    #[test]
+    fn a_shared_host_is_not_the_makers_domain() {
+        for host in ["s3.amazonaws.com", "bucket.s3.amazonaws.com", "dl.dropboxusercontent.com", "d1.cloudfront.net"] {
+            let shared = GOOD.replace("maker.example", host);
+            assert!(Catalog::parse(&shared).unwrap_err().to_string().contains("shared host"), "{host}");
+        }
+        assert!(Catalog::parse(GOOD).is_ok());
     }
 
     #[test]

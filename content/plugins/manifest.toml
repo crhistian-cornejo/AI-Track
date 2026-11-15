@@ -149,29 +149,6 @@ sha256 = ""
 size = 0
 
 [[plugin]]
-id = "sforzando"
-name = "sforzando"
-vendor = "Plogue"
-category = "sampler"
-version = "1.982"
-tags = ["sfz", "sampler"]
-homepage = "https://www.plogue.com/downloads.html"
-license = "Proprietary-Freeware"
-license_notice = "Free to use. AI-Track downloads it from s3.amazonaws.com, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://www.plogue.com/downloads.html."
-lane = "direct"
-formats = ["vst3", "clap"]
-bundle_ids = ["sforzando"]
-allowed_hosts = ["s3.amazonaws.com"]
-description = "Player for SFZ instruments."
-notes = "[V] Hosted on the maker's S3 bucket. Windows is an installer program (guided link)."
-[[plugin.artifact]]
-os = "macos"
-url = "https://s3.amazonaws.com/sforzando/MAC_sforzando_v1.982.dmg"
-sha256 = ""
-size = 0
-container = "dmg"
-
-[[plugin]]
 id = "zebralette-3"
 name = "Zebralette 3"
 vendor = "u-he"
@@ -516,6 +493,21 @@ formats = ["vst3"]
 bundle_ids = ["Glitch2"]
 description = "Glitch and stutter multi-effect, free since August 2026."
 notes = "Check that the licence is permanent."
+
+[[plugin]]
+id = "sforzando"
+name = "sforzando"
+vendor = "Plogue"
+category = "sampler"
+tags = ["sfz", "sampler"]
+homepage = "https://www.plogue.com/downloads.html"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3", "clap"]
+bundle_ids = ["sforzando"]
+description = "Player for SFZ instruments."
+notes = "The maker serves it from a shared Amazon S3 address, which is not a domain only the maker controls, so it stays a link. The macOS disk image is on the Downloads page."
 
 [[plugin]]
 id = "obxd"

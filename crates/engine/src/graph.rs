@@ -652,10 +652,12 @@ impl RackNode {
             c.target = (c.gain.0 * sel, c.gain.1 * sel);
             c.events.clear();
             c.choke_at = u32::MAX;
-            if c.asleep && c.target == (0.0, 0.0) {
-                continue;
+            if c.asleep {
+                if c.target == (0.0, 0.0) {
+                    continue;
+                }
+                c.wake();
             }
-            c.asleep = false;
             if std::mem::take(&mut c.all_off) {
                 c.held = [0; 2];
                 c.events.push(0, EventKind::AllNotesOff);
@@ -739,7 +741,44 @@ impl RackNode {
     }
 }
 
+/// Forget the state of every device of a chain: nothing of what was in
+/// flight when the chain went to sleep may come out when it wakes.
+fn reset_devices(devs: &mut [DeviceNode]) {
+    for d in devs {
+        match d {
+            DeviceNode::Proc(p) => {
+                p.sleeping = false;
+                p.silent_samples = 0;
+                if !p.proc.is_crashed() {
+                    // SAFETY: the audio thread owns the installed graph (see `SharedProcessor`).
+                    let proc = unsafe { p.proc.get_mut() };
+                    if guarded(|| proc.reset()).is_none() {
+                        p.proc.mark_crashed();
+                    }
+                }
+            }
+            DeviceNode::Rack(r) => {
+                r.dry_delay.clear();
+                for c in r.chains.iter_mut().chain(r.returns.iter_mut()) {
+                    c.delay.clear();
+                    reset_devices(&mut c.devices);
+                }
+            }
+            DeviceNode::Missing(_) => {}
+        }
+    }
+}
+
 impl ChainNode {
+    /// Back from sleep: the delay line and the devices start empty, so the
+    /// audio (and the reverb tails) from before it fell asleep are not
+    /// replayed.
+    fn wake(&mut self) {
+        self.asleep = false;
+        self.delay.clear();
+        reset_devices(&mut self.devices);
+    }
+
     /// Ramp the chain's gain from where the last block left it to this
     /// block's target, with the choke fade on top, in place on `buf`.
     fn apply_gain(&mut self, choke_step: f32) {

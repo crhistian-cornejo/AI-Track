@@ -21,6 +21,7 @@
 //! Not in this device: strum, chance per voice and learn (the spec's extras).
 
 use crate::common::ParamStore;
+use crate::midi::kit::IdAlloc;
 use crate::midi::theory::{ROOT_NAMES, SCALE_NAMES, Snap, scale_mask, snap_note};
 use aitrack_dsp::{Category, EventKind, EventSink, MidiContext, ParamInfo, PluginInfo, ProcessContext, Processor};
 
@@ -57,8 +58,6 @@ const VOICE_LEVEL: [&str; VOICES] = ["Level 1", "Level 2", "Level 3", "Level 4",
 const DEFAULT_INTERVALS: [f32; VOICES] = [0.0, 4.0, 7.0, 12.0, 16.0, 19.0];
 
 const MAX_NOTES: usize = 64;
-const ID_BASE: i32 = 0x4200_0000;
-const ID_MASK: u32 = 0x00FF_FFFF;
 
 pub fn params() -> Vec<ParamInfo> {
     let mut v = Vec::new();
@@ -102,7 +101,7 @@ pub struct Chord {
     count: [u8; 2048],
     /// Note id of the note currently sounding on each output key.
     cur_id: [i32; 2048],
-    id_counter: u32,
+    ids: IdAlloc,
     dropped: u64,
 }
 
@@ -141,7 +140,7 @@ impl Chord {
             played_len: 0,
             count: [0; 2048],
             cur_id: [0; 2048],
-            id_counter: 0,
+            ids: IdAlloc::new(),
             dropped: 0,
         };
         c.refresh();
@@ -161,11 +160,6 @@ impl Chord {
     #[inline]
     fn slot(channel: u8, key: u8) -> usize {
         (channel as usize & 15) * 128 + (key as usize & 127)
-    }
-
-    fn next_id(&mut self) -> i32 {
-        self.id_counter = self.id_counter.wrapping_add(1);
-        ID_BASE + (self.id_counter & ID_MASK) as i32
     }
 
     /// Release the output keys of `played[i]` and forget it.
@@ -214,7 +208,7 @@ impl Chord {
                     self.dropped += 1;
                 }
             }
-            let id = self.next_id();
+            let id = self.ids.next();
             if out.push(at, EventKind::NoteOn { channel, key: k, velocity: (velocity * v.level).clamp(1.0 / 127.0, 1.0), note_id: id }) {
                 self.cur_id[s] = id;
                 self.count[s] += 1;

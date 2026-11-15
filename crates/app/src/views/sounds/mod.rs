@@ -9,8 +9,9 @@
 //! virtualised (`uniform_list`), so ten thousand sounds scroll as smoothly as ten.
 
 pub mod logic;
+mod search;
 
-use crate::bridge::{SoundGroup, SoundKind, SoundOrigin, SoundPage, SpliceState};
+use crate::bridge::{SoundEnv, SoundGroup, SoundKind, SoundOrigin, SoundPage, SpliceState};
 use crate::icons::{Icon, icon};
 use crate::theme::*;
 use crate::views::palette::peaks::MiniPeaks;
@@ -55,6 +56,9 @@ pub struct Sounds {
     /// The results are stale: ask the library again.
     pub dirty: bool,
     last_query: Option<crate::bridge::SoundQuery>,
+    /// The search thread, once the library has one to offer (stub bridges search on the UI thread: demo data, tiny).
+    searcher: Option<search::Searcher>,
+    searcher_tried: bool,
     settle: Option<Instant>,
     playing: Option<PreviewSig>,
     /// The Splice folder last handed to the library.
@@ -82,6 +86,8 @@ impl Sounds {
             peaks: MiniPeaks::default(),
             dirty: true,
             last_query: None,
+            searcher: None,
+            searcher_tried: false,
             settle: None,
             playing: None,
             splice_folder: None,
@@ -237,13 +243,28 @@ pub fn tick(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     let mut filters = f.clone();
     filters.fit = fit_on;
     let q = build_query(&ws.sounds.text, &filters, ws.s.project.scale, ws.s.project.tempo.initial_bpm());
+    if !ws.sounds.searcher_tried {
+        ws.sounds.searcher_tried = true;
+        ws.sounds.searcher = ws.b.library.sound_searcher().map(search::Searcher::spawn);
+    }
+    // An answer from the search thread (the one asked last, never an older one).
+    if let Some(page) = ws.sounds.searcher.as_mut().and_then(search::Searcher::poll) {
+        show_page(ws, page);
+        changed = true;
+    }
     if ws.sounds.dirty || ws.sounds.last_query.as_ref() != Some(&q) {
         ws.sounds.dirty = false;
-        let keep = ws.sounds.selected.and_then(|i| ws.sounds.page.hits.get(i)).map(|h| h.item.id);
-        ws.sounds.page = ws.b.library.search_sounds(&q);
-        ws.sounds.selected = keep.and_then(|id| ws.sounds.page.hits.iter().position(|h| h.item.id == id));
+        if ws.sounds.searcher.is_some() {
+            let env = SoundEnv { splice_folder: ws.sounds.splice_folder.clone(), scanning: ws.b.library.scan_status().running };
+            if let Some(s) = ws.sounds.searcher.as_mut() {
+                s.ask(q.clone(), env);
+            }
+        } else {
+            let page = ws.b.library.search_sounds(&q);
+            show_page(ws, page);
+            changed = true;
+        }
         ws.sounds.last_query = Some(q);
-        changed = true;
     }
     // What lacks a key or tempo is listened to in the background (once per session): the list never waits for it.
     if !ws.sounds.analysis_asked && ws.sounds.page.hits.iter().any(|h| h.unanalysed) && !ws.b.library.scan_status().running {
@@ -272,9 +293,16 @@ pub fn tick(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     changed
 }
 
+/// Show a page of results, keeping the selected sound selected if it is still in it.
+fn show_page(ws: &mut Workspace, page: SoundPage) {
+    let keep = ws.sounds.selected.and_then(|i| ws.sounds.page.hits.get(i)).map(|h| h.item.id);
+    ws.sounds.page = page;
+    ws.sounds.selected = keep.and_then(|id| ws.sounds.page.hits.iter().position(|h| h.item.id == id));
+}
+
 /// Is the panel animating or loading something that wants the next frame?
 pub fn wants_frames(ws: &Workspace) -> bool {
-    ws.sounds.prefs.open && (ws.sounds.settle.is_some() || ws.sounds.dirty)
+    ws.sounds.prefs.open && (ws.sounds.settle.is_some() || ws.sounds.dirty || ws.sounds.searcher.as_ref().is_some_and(search::Searcher::pending))
 }
 
 // ───────────────────────────── Drawing ─────────────────────────────

@@ -114,14 +114,15 @@ pub struct DropFit {
 
 /// What dropping `item` leaves, with "fit to song" on. A tonal sound moves the
 /// shortest way to the song's key (minor over its relative major is 0); a loop
-/// whose tempo was measured (not guessed from its length) is warped to the song.
+/// whose tempo was measured (not guessed from its length) is warped to the song,
+/// unless it is too far from every multiple of the song's (the preview leaves it as it is too).
 pub fn drop_fit(item: &LibraryItem, trust: BpmTrust, song_scale: Option<Scale>, song_bpm: f64) -> DropFit {
     let key = match (item.key, song_scale) {
         (Some(k), Some(song)) => fit_key(song, Some(k.root), Some(k.kind)),
         _ => Fit::NONE,
     };
     let transpose = if key.kind == FitKind::Transposed { key.semitones as f32 } else { 0. };
-    let tempo = item.bpm.filter(|_| item.is_loop).and_then(|b| fit_tempo(song_bpm, b).map(|t| (b, t)));
+    let tempo = item.bpm.filter(|_| item.is_loop).and_then(|b| fit_tempo(song_bpm, b).filter(|t| t.usable).map(|t| (b, t)));
     let original_bpm = tempo.map(|(b, t)| f64::from(b * t.factor));
     let tonal = item.key.is_some() && !atonal_by_name(item);
     DropFit {
@@ -378,6 +379,22 @@ mod tests {
         let half = drop_fit(&item(Some(am()), Some(64.), true, "Pad loop"), BpmTrust::Reliable, Some(am()), 128.);
         assert_eq!(half.original_bpm, Some(128.));
         assert_eq!(half.mode, aitrack_model::WarpMode::Complex);
+    }
+
+    #[test]
+    fn dropping_a_loop_never_stretches_past_what_the_preview_would() {
+        // 100 BPM in a 300 BPM song is 3x at best: the preview plays it as it is, so a drop leaves it unwarped too.
+        let wild = item(Some(am()), Some(100.), true, "Bass loop");
+        let f = drop_fit(&wild, BpmTrust::Reliable, Some(am()), 300.);
+        assert!(f.original_bpm.is_none() && !f.warp, "{f:?}");
+        let hit = hit("x", Some(am()), Some(100.), true, "Bass loop");
+        let filters = Filters { fit: true, ..Filters::default() };
+        let tempo = TempoMap::constant(300.);
+        let req = preview_request(&hit, &filters, Some(am()), &tempo, (0, false));
+        assert!(req.original_bpm.is_none(), "preview and drop agree");
+        // Within range both stretch.
+        let ok = drop_fit(&item(Some(am()), Some(120.), true, "Bass loop"), BpmTrust::Reliable, Some(am()), 128.);
+        assert_eq!(ok.original_bpm, Some(120.));
     }
 
     #[test]

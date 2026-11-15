@@ -459,8 +459,29 @@ pub fn set_many(ws: &mut Workspace, label: &str, device: DeviceId, values: &[(u3
     ws.s.seal();
 }
 
-/// Part of a continuous gesture on one device (drag, scroll, key repeat).
+/// The coalescing key of a glide over `values`: the device and the
+/// parameters moved, so moving another control starts a new undo step.
+pub fn glide_key(device: DeviceId, values: &[(u32, f32)]) -> String {
+    let mut ids: Vec<u32> = values.iter().map(|v| v.0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let list: Vec<String> = ids.iter().map(u32::to_string).collect();
+    format!("fx-{}-{}", device.0, list.join("."))
+}
+
+/// Part of a continuous gesture on one control of a device (scroll, key
+/// repeat): merged with the last glide over the same parameters only.
 pub fn set_gliding(ws: &mut Workspace, device: DeviceId, values: &[(u32, f32)]) {
+    if values.is_empty() {
+        return;
+    }
+    let cmds = values.iter().map(|&(param, v)| Command::SetParam { device, param, value: Some(v.clamp(0., 1.)) }).collect();
+    ws.s.edit_coalesced(&glide_key(device, values), "Change parameter", cmds);
+}
+
+/// A handle drag: sealed when it starts and ends, so every frame of it joins
+/// one step whichever of its axes moved.
+fn set_dragging(ws: &mut Workspace, device: DeviceId, values: &[(u32, f32)]) {
     if values.is_empty() {
         return;
     }
@@ -477,7 +498,7 @@ pub fn begin_drag(ws: &mut Workspace, drag: FxDrag, cx: &mut Context<Workspace>)
 fn drag_move(ws: &mut Workspace, e: &MouseMoveEvent, cx: &mut Context<Workspace>) {
     let Some(mut drag) = ws.fx.drag.take() else { return };
     let changed = drag.advance((f32::from(e.position.x), f32::from(e.position.y)), e.modifiers.shift, e.modifiers.alt);
-    set_gliding(ws, drag.device, &changed);
+    set_dragging(ws, drag.device, &changed);
     ws.fx.drag = Some(drag);
     cx.notify();
 }
@@ -794,6 +815,33 @@ mod tests {
         d.advance((5000., 70.), false, false);
         assert_eq!(d.x.unwrap().value, 1.);
         assert!(d.advance((6000., 70.), false, false).is_empty());
+    }
+
+    #[test]
+    fn two_controls_of_one_device_are_two_undo_steps() {
+        let mut s = crate::state::AppState::new(crate::demo::project());
+        let eq = s.project.tracks.iter().flat_map(|t| &t.devices).find(|d| d.name == "EQ").unwrap().id;
+        let glide = |s: &mut crate::state::AppState, values: &[(u32, f32)]| {
+            let cmds = values.iter().map(|&(param, v)| Command::SetParam { device: eq, param, value: Some(v) }).collect();
+            s.edit_coalesced(&glide_key(eq, values), "Change parameter", cmds);
+        };
+        let before = s.history.steps().count();
+        let was = s.project.device(eq).unwrap().params.get(&3).copied();
+        s.seal();
+        // A continuous move of one parameter is one step...
+        for i in 1..=5 {
+            glide(&mut s, &[(2, i as f32 * 0.1)]);
+        }
+        assert_eq!(s.history.steps().count(), before + 1);
+        // ...and moving another parameter of the same device, with no seal in
+        // between (wheel, arrow keys), starts the next.
+        for i in 1..=5 {
+            glide(&mut s, &[(3, i as f32 * 0.1)]);
+        }
+        assert_eq!(s.history.steps().count(), before + 2);
+        s.undo();
+        assert_eq!(s.project.device(eq).unwrap().params.get(&3), was.as_ref());
+        assert_eq!(s.project.device(eq).unwrap().params[&2], 0.5, "the first control's move is still there");
     }
 
     #[test]

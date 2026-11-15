@@ -229,45 +229,6 @@ impl RealLibrary {
         self.root_kinds.borrow_mut().clear();
     }
 
-    /// Where a sample of library `lib` in root `root` comes from.
-    fn origin_of(&self, lib: usize, root: i64) -> SoundOrigin {
-        if lib == FACTORY {
-            return SoundOrigin::Factory;
-        }
-        let mut kinds = self.root_kinds.borrow_mut();
-        if kinds.is_empty()
-            && let Some(l) = &self.libs[lib]
-            && let Ok(roots) = l.roots()
-        {
-            kinds.extend(roots.into_iter().map(|r| ((lib, r.id.0), r.kind)));
-        }
-        match kinds.get(&(lib, root)) {
-            Some(RootKind::Splice) => SoundOrigin::Splice,
-            Some(RootKind::Factory) => SoundOrigin::Factory,
-            _ => SoundOrigin::Mine,
-        }
-    }
-
-    /// Where the Splice folder stands (for the panel's status line).
-    fn splice_state(&self) -> SpliceState {
-        let Some(folder) = self.splice_folder.clone() else { return SpliceState::Unknown };
-        if !folder.is_dir() {
-            return SpliceState::Missing(folder);
-        }
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let sounds = self.libs[USER]
-            .as_ref()
-            .and_then(|l| l.root_stats().ok())
-            .and_then(|stats| stats.into_iter().find(|s| s.root.kind == RootKind::Splice && canon(&s.root.path) == canon(&folder)))
-            .map(|s| s.samples);
-        match sounds {
-            Some(_) if self.status.running => SpliceState::Scanning(folder),
-            Some(n) => SpliceState::Indexed { folder, sounds: n },
-            None if self.status.running => SpliceState::Scanning(folder),
-            None => SpliceState::Unknown,
-        }
-    }
-
     /// Make the Splice folder a collection of the user library: a root of kind
     /// Splice, scanned when it is new. Any other root that was the Splice one
     /// goes back to being an ordinary folder.
@@ -335,7 +296,57 @@ impl RealLibrary {
     }
 }
 
-impl LibraryBridge for RealLibrary {
+/// What a sound search reads: both indexes and where each sound comes from.
+/// Borrowed from the bridge for a search on its own thread, or owned by the
+/// search thread (`sound_searcher`), which has connections of its own.
+struct SoundView<'a> {
+    libs: &'a [Option<Library>; 2],
+    root_kinds: &'a RefCell<HashMap<(usize, i64), RootKind>>,
+    splice_folder: Option<&'a Path>,
+    /// A scan is running.
+    scanning: bool,
+}
+
+impl SoundView<'_> {
+    /// Where a sample of library `lib` in root `root` comes from.
+    fn origin_of(&self, lib: usize, root: i64) -> SoundOrigin {
+        if lib == FACTORY {
+            return SoundOrigin::Factory;
+        }
+        let mut kinds = self.root_kinds.borrow_mut();
+        if kinds.is_empty()
+            && let Some(l) = &self.libs[lib]
+            && let Ok(roots) = l.roots()
+        {
+            kinds.extend(roots.into_iter().map(|r| ((lib, r.id.0), r.kind)));
+        }
+        match kinds.get(&(lib, root)) {
+            Some(RootKind::Splice) => SoundOrigin::Splice,
+            Some(RootKind::Factory) => SoundOrigin::Factory,
+            _ => SoundOrigin::Mine,
+        }
+    }
+
+    /// Where the Splice folder stands (for the panel's status line).
+    fn splice_state(&self) -> SpliceState {
+        let Some(folder) = self.splice_folder.map(Path::to_path_buf) else { return SpliceState::Unknown };
+        if !folder.is_dir() {
+            return SpliceState::Missing(folder);
+        }
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let sounds = self.libs[USER]
+            .as_ref()
+            .and_then(|l| l.root_stats().ok())
+            .and_then(|stats| stats.into_iter().find(|s| s.root.kind == RootKind::Splice && canon(&s.root.path) == canon(&folder)))
+            .map(|s| s.samples);
+        match sounds {
+            Some(_) if self.scanning => SpliceState::Scanning(folder),
+            Some(n) => SpliceState::Indexed { folder, sounds: n },
+            None if self.scanning => SpliceState::Scanning(folder),
+            None => SpliceState::Unknown,
+        }
+    }
+
     fn bpm_trust(&self, id: u64) -> BpmTrust {
         let source = self.lib(id).and_then(|(lib, sample)| {
             lib.connection().query_row("SELECT bpm_source FROM samples WHERE id = ?1", [sample.0], |r| r.get::<_, Option<String>>(0)).ok().flatten()
@@ -343,24 +354,18 @@ impl LibraryBridge for RealLibrary {
         BpmTrust::from_source(source.as_deref())
     }
 
-    fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
-        let cache_key = format!("{query}\u{1}{key:?}");
-        if let Some((k, v)) = &*self.search_cache.borrow()
-            && *k == cache_key
-        {
-            return v.clone();
+    fn fill_keys(&self, samples: &mut [Sample]) {
+        if let Some(user) = &self.libs[USER] {
+            let _ = user.fill_from_cache(samples);
         }
-        let mut q = SearchQuery { limit: 500, ..Default::default() };
-        if !query.trim().is_empty() {
-            q.text = Some(query.trim().to_owned());
-        }
-        q.filters.key = key.map(|scale| KeyFilter { scale, mode: KeyMatch::Compatible, include_atonal: true });
-        let v = self.query(|l| l.search(&q));
-        *self.search_cache.borrow_mut() = Some((cache_key, v.clone()));
-        v
     }
 
-    fn search_sounds(&self, q: &SoundQuery) -> SoundPage {
+    fn lib(&self, id: u64) -> Option<(&Library, SampleId)> {
+        let (i, s) = split_id(id);
+        Some((self.libs.get(i)?.as_ref()?, s))
+    }
+
+    fn search(&self, q: &SoundQuery) -> SoundPage {
         use aitrack_library::{fit_tempo, key_compat, query::tempo_compat};
         let mut sq = SearchQuery { limit: 1500, ..Default::default() };
         if !q.text.trim().is_empty() {
@@ -444,6 +449,53 @@ impl LibraryBridge for RealLibrary {
             h
         }).collect();
         SoundPage { hits, more, tags, splice: self.splice_state() }
+    }
+}
+
+impl RealLibrary {
+    fn view(&self) -> SoundView<'_> {
+        SoundView { libs: &self.libs, root_kinds: &self.root_kinds, splice_folder: self.splice_folder.as_deref(), scanning: self.status.running }
+    }
+}
+
+impl LibraryBridge for RealLibrary {
+    fn bpm_trust(&self, id: u64) -> BpmTrust {
+        self.view().bpm_trust(id)
+    }
+
+    fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
+        let cache_key = format!("{query}\u{1}{key:?}");
+        if let Some((k, v)) = &*self.search_cache.borrow()
+            && *k == cache_key
+        {
+            return v.clone();
+        }
+        let mut q = SearchQuery { limit: 500, ..Default::default() };
+        if !query.trim().is_empty() {
+            q.text = Some(query.trim().to_owned());
+        }
+        q.filters.key = key.map(|scale| KeyFilter { scale, mode: KeyMatch::Compatible, include_atonal: true });
+        let v = self.query(|l| l.search(&q));
+        *self.search_cache.borrow_mut() = Some((cache_key, v.clone()));
+        v
+    }
+
+    fn search_sounds(&self, q: &SoundQuery) -> SoundPage {
+        self.view().search(q)
+    }
+
+    fn sound_searcher(&self) -> Option<SoundSearchFn> {
+        let (factory, user) = (self.factory_path.clone(), self.user_path.clone());
+        let mut libs: Option<[Option<Library>; 2]> = None;
+        Some(Box::new(move |q, env| {
+            // Opened on first use, on the search thread: connections are not shared with the UI's.
+            let libs = libs.get_or_insert_with(|| [factory.as_deref().and_then(|p| Library::open(p).ok()), None]);
+            if libs[USER].is_none() {
+                libs[USER] = Library::open(&user).ok();
+            }
+            let kinds = RefCell::default();
+            SoundView { libs, root_kinds: &kinds, splice_folder: env.splice_folder.as_deref(), scanning: env.scanning }.search(q)
+        }))
     }
 
     fn plugin_cards(&mut self) -> Vec<aitrack_library::plugins::PluginCard> {
@@ -796,6 +848,11 @@ mod tests {
         assert!(matches!(page.splice, SpliceState::Indexed { sounds: 1, .. }), "{:?}", page.splice);
         assert_eq!(lib.search_sounds(&SoundQuery { origin: Some(SoundOrigin::Factory), ..query.clone() }).hits.len(), 0, "a collection filter");
         assert_eq!(lib.search_sounds(&SoundQuery { origin: Some(SoundOrigin::Splice), ..query.clone() }).hits.len(), 1);
+        // The search thread's connections of its own answer the same, from another thread.
+        let mut search = lib.sound_searcher().expect("the real library searches off the UI thread");
+        let (q, env) = (query.clone(), SoundEnv { splice_folder: Some(splice.clone()), scanning: false });
+        let threaded = std::thread::spawn(move || search(&q, &env)).join().unwrap();
+        assert_eq!(threaded, page);
         // A download lands in the folder later: it appears without asking.
         write_wav(&folder.join("Kick Sub 02.wav"), 0.3);
         wait(&mut lib, "the watcher", |l| l.search_sounds(&query).hits.len() == 2);

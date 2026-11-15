@@ -6,7 +6,8 @@
 //! needs **0** semitones (same notes), over C minor **+3**, and E minor over A
 //! minor **+5**. Of the moves that leave the fewest notes out of the song's
 //! scale the shortest one wins, and when two are as short, the lower (it
-//! degrades a stretched loop less).
+//! degrades a stretched loop less). A sample whose notes already all belong
+//! to the song's scale is never moved.
 
 use aitrack_model::{Key, Scale, ScaleKind};
 
@@ -84,20 +85,24 @@ pub fn fit_key(project: Scale, root: Option<Key>, kind: Option<ScaleKind>) -> Fi
     if sample == project {
         return Fit { semitones: 0, kind: FitKind::Same };
     }
+    // Already inside the song's notes: nothing to move, whatever the tonics say.
+    if s & !p == 0 {
+        return Fit { semitones: 0, kind: FitKind::Relative };
+    }
     let tonics = [project.root, relative_root(project)];
     let best = MOVES
         .map(|d| {
             let out = (rotate(s, d) & !p).count_ones();
             let lands_on_tonic = tonics.contains(&Key((root.0 + (d + 12) as u8) % 12));
-            // Fewest notes out of the song's scale, then landing on its tonic (or its
-            // relative), then the shortest move, then downwards.
-            (out, !lands_on_tonic, d.abs(), d > 0, d)
+            // Fewest notes out of the song's scale, then the shortest move, then landing on
+            // its tonic (or its relative), then downwards.
+            (out, d.abs(), !lands_on_tonic, d > 0, d)
         })
         .min()
         .map(|t| t.4)
         .unwrap_or(0);
     if best == 0 {
-        // Nothing to move: the same notes under another name.
+        // No move does better than staying.
         return Fit { semitones: 0, kind: FitKind::Relative };
     }
     Fit { semitones: best, kind: FitKind::Transposed }
@@ -204,6 +209,44 @@ mod tests {
         }
         // Even tie (a 6 either way): downwards.
         assert_eq!(semitones_between(6, Key(0)), -6);
+    }
+
+    #[test]
+    fn a_sample_already_in_the_song_key_is_never_moved() {
+        let mut compatible = 0;
+        let mut moved_shortest = 0;
+        for pr in 0..12u8 {
+            for pk in ScaleKind::ALL {
+                let project = s(pr, pk);
+                for sr in 0..12u8 {
+                    for sk in ScaleKind::ALL {
+                        let f = fit_key(project, Some(Key(sr)), Some(sk));
+                        let mask = Scale::new(Key(sr), sk).mask();
+                        if mask & !project.mask() == 0 {
+                            compatible += 1;
+                            assert_eq!(f.semitones, 0, "{sr} {sk:?} already fits {pr} {pk:?}: {f:?}");
+                            assert!(matches!(f.kind, FitKind::Same | FitKind::Relative), "{f:?}");
+                            continue;
+                        }
+                        // Needs a move: the fewest stray notes, then the shortest jump.
+                        let out = |d: i8| (rotate(mask, d) & !project.mask()).count_ones();
+                        let best_out = MOVES.map(out).min().unwrap();
+                        let shortest = MOVES.filter(|&d| out(d) == best_out).map(i8::abs).min().unwrap();
+                        assert_eq!(out(f.semitones), best_out, "{sr} {sk:?} -> {pr} {pk:?}: {f:?}");
+                        assert_eq!(f.semitones.abs(), shortest, "{sr} {sk:?} -> {pr} {pk:?}: {f:?}");
+                        assert_eq!(f.kind == FitKind::Transposed, f.semitones != 0, "{f:?}");
+                        moved_shortest += 1;
+                    }
+                }
+            }
+        }
+        assert!(compatible > 0 && moved_shortest > 0);
+    }
+
+    #[test]
+    fn f_minor_in_a_chromatic_c_project_stays_put() {
+        let f = fit_key(s(C, ScaleKind::Chromatic), Some(Key(5)), Some(ScaleKind::Minor));
+        assert_eq!(f.semitones, 0, "{f:?}");
     }
 
     #[test]

@@ -93,3 +93,26 @@ fn latency_and_tail_are_sane() {
         }
     }
 }
+
+#[test]
+fn cpu_budgets_stay_realtime_capable() {
+    // Even in unoptimized/debug-like test builds, 1 second of 48 kHz stereo
+    // audio per stock plugin must finish well under real-time.
+    let blocks_1s = (SR as usize).div_ceil(BLOCK);
+    let max_wall = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(800)
+    } else {
+        std::time::Duration::from_millis(120)
+    };
+    for entry in aitrack_stock::registry() {
+        let mut p = (entry.create)();
+        p.prepare(SR, BLOCK);
+        let mut d = Driver::new();
+        let t0 = std::time::Instant::now();
+        for _ in 0..blocks_1s {
+            d.block(p.as_mut(), 5);
+        }
+        let elapsed = t0.elapsed();
+        assert!(elapsed <= max_wall, "{} took {:?} for 1s audio (limit {:?})", entry.id, elapsed, max_wall);
+    }
+}

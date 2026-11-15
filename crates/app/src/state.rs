@@ -1188,6 +1188,46 @@ impl AppState {
         }])
     }
 
+    /// Snapshot the rack's current macro values as a new variation.
+    pub fn save_rack_variation(&mut self, rack: DeviceId, name: Option<String>) -> bool {
+        let Some(DeviceKind::Rack(r)) = self.project.device(rack).map(|d| &d.kind) else { return false };
+        let mut variations = r.variations.clone();
+        let next_num = variations.len() + 1;
+        let var_name = name.unwrap_or_else(|| format!("Var {next_num}"));
+        let values = r.macros.iter().map(|m| m.value).collect();
+        variations.push(Variation { name: var_name, values });
+        self.edit("Save macro variation", vec![Command::SetVariations { rack, variations }])
+    }
+
+    /// Apply a saved macro variation to all macros in a single undo step.
+    pub fn recall_rack_variation(&mut self, rack: DeviceId, index: usize) -> bool {
+        let Some(DeviceKind::Rack(r)) = self.project.device(rack).map(|d| &d.kind) else { return false };
+        let Some(var) = r.variations.get(index) else { return false };
+        let cmds: Vec<Command> = var
+            .values
+            .iter()
+            .enumerate()
+            .take(r.macros.len())
+            .map(|(i, &value)| Command::SetMacro { rack, index: i, value })
+            .collect();
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        self.edit("Recall macro variation", cmds)
+    }
+
+    /// Remove a saved macro variation by index.
+    pub fn delete_rack_variation(&mut self, rack: DeviceId, index: usize) -> bool {
+        let Some(DeviceKind::Rack(r)) = self.project.device(rack).map(|d| &d.kind) else { return false };
+        if index >= r.variations.len() {
+            return false;
+        }
+        let mut variations = r.variations.clone();
+        variations.remove(index);
+        self.edit("Delete macro variation", vec![Command::SetVariations { rack, variations }])
+    }
+
     pub fn toggle_device(&mut self, device: DeviceId) -> bool {
         let Some(enabled) = self.project.device(device).map(|d| d.enabled) else { return false };
         self.edit("Toggle device", vec![Command::SetDeviceEnabled { device, enabled: !enabled }])
@@ -2465,5 +2505,33 @@ mod tests {
         s.resize_notes(clip, &[s.clip_notes(clip).unwrap().1.notes.iter().find(|n| n.id == note_id).unwrap().clone()], PPQ * 2);
         s.seal();
         assert!(s.chop(clip) >= 2);
+    }
+
+    #[test]
+    fn rack_macro_variations_save_recall_delete() {
+        let mut s = state();
+        let track = s.selected_track.unwrap();
+        let rack = s.add_stock_device(track, "rack.instrument", "Inst Rack").unwrap();
+        assert!(s.set_macro(rack, 0, 0.25));
+        assert!(s.set_macro(rack, 3, 0.8));
+        s.seal();
+        assert!(s.save_rack_variation(rack, Some("Warm".into())));
+
+        assert!(s.set_macro(rack, 0, 0.9));
+        assert!(s.set_macro(rack, 3, 0.1));
+        s.seal();
+        assert!(s.save_rack_variation(rack, None));
+
+        assert!(s.recall_rack_variation(rack, 0));
+        let DeviceKind::Rack(r) = &s.project.device(rack).unwrap().kind else { panic!("expected rack") };
+        assert!((r.macros[0].value - 0.25).abs() < 1e-6);
+        assert!((r.macros[3].value - 0.8).abs() < 1e-6);
+        assert_eq!(r.variations.len(), 2);
+        assert_eq!(r.variations[1].name, "Var 2");
+
+        assert!(s.delete_rack_variation(rack, 0));
+        let DeviceKind::Rack(r) = &s.project.device(rack).unwrap().kind else { panic!("expected rack") };
+        assert_eq!(r.variations.len(), 1);
+        assert_eq!(r.variations[0].name, "Var 2");
     }
 }

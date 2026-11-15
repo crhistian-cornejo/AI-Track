@@ -323,6 +323,14 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
             v[128..139].copy_from_slice(&[lufs, lufs - 0.8, lufs - 1.2, 6.5, -1.2, -1.4, 0.7 * env + 0.1, 0.66 * env + 0.1, 0.25, 0.24, 0.62]);
             put(&v)
         }
+        "fx.drum_extract" => {
+            let mut v = [0.0f32; 70];
+            for (i, s) in v[..64].iter_mut().enumerate() {
+                *s = spectrum(i * 2);
+            }
+            v[64..70].copy_from_slice(&[env, 0.6 * env, hat, (env * 0.7 + hat * 0.3).min(1.0), 0.7 * env + 0.08, 0.68 * env + 0.08]);
+            put(&v)
+        }
         "fx.compressor" => put(&[-7.0 * env, level, level - 7.0 * env + 3.0]),
         "fx.gate" => put(&[if env > 0.25 { 0.0 } else { -40.0 * (1.0 - env * 4.0) }, level, if env > 0.25 { 1.0 } else { 0.0 }]),
         "fx.transient" => put(&[if playing { 6.0 * env - 2.0 * (1.0 - env) * hat } else { 0.0 }]),
@@ -1171,6 +1179,95 @@ pub enum AiEvent {
     Proposal { label: String, agent: String, commands: Vec<aitrack_model::Command> },
     Failed { job: JobId, message: String },
     Analyzed { job: JobId, path: PathBuf, analysis: AudioAnalysis },
+    DrumsReady { job: JobId, result: DrumExtraction },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DrumExtractMode {
+    #[default]
+    Auto,
+    PureDsp,
+    DemucsHybrid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DrumClassTag {
+    Kick,
+    Snare,
+    Clap,
+    ClosedHat,
+    OpenHat,
+    Tom,
+    Perc,
+    Crash,
+}
+
+impl DrumClassTag {
+    pub const ALL: [Self; 8] = [Self::Kick, Self::Snare, Self::Clap, Self::ClosedHat, Self::OpenHat, Self::Tom, Self::Perc, Self::Crash];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kick => "Kick",
+            Self::Snare => "Snare",
+            Self::Clap => "Clap",
+            Self::ClosedHat => "Hat",
+            Self::OpenHat => "Open Hat",
+            Self::Tom => "Tom",
+            Self::Perc => "Perc",
+            Self::Crash => "Crash",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrumOneShot {
+    pub id: usize,
+    pub name: String,
+    pub class: DrumClassTag,
+    pub time_sec: f64,
+    pub duration_sec: f64,
+    pub peak_db: f32,
+    pub isolation_score: f32,
+    pub path: PathBuf,
+    pub peaks: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrumLoop {
+    pub name: String,
+    pub bpm: f32,
+    pub bars: u8,
+    pub start_sec: f64,
+    pub duration_sec: f64,
+    pub isolation_score: f32,
+    pub path: PathBuf,
+    pub peaks: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrumExtraction {
+    pub source_path: PathBuf,
+    pub source_name: String,
+    pub engine_used: String,
+    pub sample_rate: u32,
+    pub duration_sec: f64,
+    pub bpm: Option<f32>,
+    pub clean_stem_path: PathBuf,
+    pub oneshots: Vec<DrumOneShot>,
+    pub loops: Vec<DrumLoop>,
+    pub out_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrumExtractRequest {
+    pub path: PathBuf,
+    pub engine: DrumExtractMode,
+    pub de_bleed: f32,
+    pub de_reverb: f32,
+    pub transient: f32,
+    pub sensitivity: f32,
+    pub loop_bars: u8,
+    pub normalize_db: Option<f32>,
 }
 
 /// Result of analysing an audio file.
@@ -1254,6 +1351,8 @@ pub trait AiBridge {
     /// Audio to MIDI; notes are timed at `bpm`.
     fn extract_midi(&mut self, path: &Path, mode: MidiMode, bpm: f64) -> JobId;
     fn split_stems(&mut self, path: &Path) -> JobId;
+    /// Extract clean isolated drum one-shots (one by one) and seamless loops.
+    fn extract_drums(&mut self, req: DrumExtractRequest) -> JobId;
     /// The stem model's licence notice while it still has to be accepted.
     fn stem_license(&self) -> Option<ModelNotice> {
         None
@@ -1292,6 +1391,7 @@ struct StubJob {
 enum StubJobKind {
     Midi(String),
     Stems(PathBuf),
+    Drums(DrumExtractRequest),
     /// The reply text and, when the message names a track, a proposal.
     Chat(String, Option<(String, Vec<aitrack_model::Command>)>),
     Fail(String),
@@ -1331,6 +1431,13 @@ impl AiBridge for StubAi {
         self.push(StubJobKind::Stems(path.to_path_buf()))
     }
 
+    fn extract_drums(&mut self, req: DrumExtractRequest) -> JobId {
+        if req.path.as_os_str().is_empty() {
+            return self.push(StubJobKind::Fail("no audio file".into()));
+        }
+        self.push(StubJobKind::Drums(req))
+    }
+
     fn chat(&mut self, text: &str, project: &Project) {
         // The stub "understands" one thing: a message naming a track proposes
         // nudging its level up, so the proposal flow can be exercised.
@@ -1353,15 +1460,17 @@ impl AiBridge for StubAi {
             let total = match job.kind {
                 StubJobKind::Midi(_) => 1.6,
                 StubJobKind::Stems(_) => 3.2,
+                StubJobKind::Drums(_) => 1.2,
                 StubJobKind::Chat(..) => 0.9,
                 StubJobKind::Fail(_) | StubJobKind::Analyze(_) => 0.3,
             };
             let f = (secs / total).min(1.);
             if f < 1. {
-                if f - job.reported >= 0.04 && matches!(job.kind, StubJobKind::Midi(_) | StubJobKind::Stems(_)) {
+                if f - job.reported >= 0.04 && matches!(job.kind, StubJobKind::Midi(_) | StubJobKind::Stems(_) | StubJobKind::Drums(_)) {
                     job.reported = f;
                     let label = match job.kind {
                         StubJobKind::Midi(_) => "Extracting MIDI",
+                        StubJobKind::Drums(_) => "Isolating clean drums",
                         _ => "Splitting stems",
                     };
                     out.push(AiEvent::Progress { job: job.id, label: label.into(), fraction: f });
@@ -1389,6 +1498,38 @@ impl AiBridge for StubAi {
                     out.push(AiEvent::StemsReady {
                         job: job.id,
                         stems: vec![stem("Vocals"), stem("Drums"), stem("Bass"), stem("Other")],
+                    });
+                }
+                StubJobKind::Drums(req) => {
+                    let source_name = req.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Track".into());
+                    let mk_peaks = |n: usize| (0..n).map(|i| (1.0 - i as f32 / n as f32).powi(2)).collect();
+                    out.push(AiEvent::DrumsReady {
+                        job: job.id,
+                        result: DrumExtraction {
+                            source_path: req.path.clone(),
+                            source_name: source_name.clone(),
+                            engine_used: "RX HPSS + Spectral De-Bleed (stub)".into(),
+                            sample_rate: 44_100,
+                            duration_sec: 4.0,
+                            bpm: Some(120.0),
+                            clean_stem_path: req.path.with_extension("clean_drums.wav"),
+                            oneshots: vec![
+                                DrumOneShot { id: 1, name: "Kick 01".into(), class: DrumClassTag::Kick, time_sec: 0.0, duration_sec: 0.24, peak_db: -1.0, isolation_score: 0.94, path: req.path.with_extension("kick_01.wav"), peaks: mk_peaks(32) },
+                                DrumOneShot { id: 2, name: "Snare 01".into(), class: DrumClassTag::Snare, time_sec: 0.5, duration_sec: 0.22, peak_db: -1.0, isolation_score: 0.91, path: req.path.with_extension("snare_01.wav"), peaks: mk_peaks(32) },
+                                DrumOneShot { id: 3, name: "Closed Hat 01".into(), class: DrumClassTag::ClosedHat, time_sec: 0.25, duration_sec: 0.09, peak_db: -1.0, isolation_score: 0.89, path: req.path.with_extension("hat_01.wav"), peaks: mk_peaks(32) },
+                            ],
+                            loops: vec![DrumLoop {
+                                name: format!("{source_name} Drums {}B 120BPM (Main)", req.loop_bars),
+                                bpm: 120.0,
+                                bars: req.loop_bars,
+                                start_sec: 0.0,
+                                duration_sec: req.loop_bars as f64 * 2.0,
+                                isolation_score: 0.92,
+                                path: req.path.with_extension("drums_loop.wav"),
+                                peaks: mk_peaks(64),
+                            }],
+                            out_dir: req.path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                        },
                     });
                 }
                 StubJobKind::Chat(text, proposal) => {

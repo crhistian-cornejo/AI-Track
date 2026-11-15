@@ -322,6 +322,11 @@ pub fn run(ws: &mut Workspace, action: slash::Action, cx: &mut Context<Workspace
             card(ws, cx, name);
             ws.split_stems(cx);
         }
+        A::ExtractDrums => {
+            let Some((name, _)) = audio_target(ws) else { return note(ws, "Select an audio clip first, then run /drums again.", cx) };
+            card(ws, cx, name);
+            ws.extract_drums_from_selection(cx);
+        }
         A::ImportAudio => {
             card(ws, cx, "Pick a file; it lands on a new track at the playhead".into());
             ws.pick_audio_file(cx);

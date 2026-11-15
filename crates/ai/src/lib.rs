@@ -16,6 +16,7 @@ pub mod analysis;
 pub mod audio;
 pub mod chords;
 pub mod classify;
+pub mod drum_extract;
 pub mod dsp;
 mod error;
 pub mod features;
@@ -33,6 +34,10 @@ pub mod worker;
 pub use analysis::{RootNote, SampleAnalysis, analyze, analyze_audio};
 pub use chords::{ChordSegment, detect_chords};
 pub use classify::SampleCategory;
+pub use drum_extract::{
+    DrumClass, DrumExtractOptions, DrumExtractionResult, ExtractedLoop, ExtractedOneShot,
+    ExtractionEngine, extract_drums,
+};
 pub use error::{Error, Result};
 pub use key::{KeyEstimate, detect_key};
 pub use midi::{MidiEngine, MidiOptions, extract_midi};

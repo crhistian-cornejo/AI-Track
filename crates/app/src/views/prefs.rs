@@ -782,6 +782,64 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
         })
         .collect();
 
+    let mut track_rows = div().flex().flex_col().gap(px(4.));
+    for t in &ws.s.project.tracks {
+        let mut stock_n = 0usize;
+        let mut ext_n = 0usize;
+        fn count_devs(devs: &[aitrack_model::Device], stock: &mut usize, ext: &mut usize) {
+            for d in devs {
+                match &d.kind {
+                    aitrack_model::DeviceKind::Stock { .. } => *stock += 1,
+                    aitrack_model::DeviceKind::Plugin { .. } => *ext += 1,
+                    aitrack_model::DeviceKind::Rack(r) => {
+                        for c in &r.chains {
+                            count_devs(&c.devices, stock, ext);
+                        }
+                    }
+                }
+            }
+        }
+        count_devs(&t.devices, &mut stock_n, &mut ext_n);
+
+        // Estimate decoded sample memory referenced by this track's audio clips.
+        let mut seen_src = std::collections::HashSet::new();
+        let mut sample_bytes = 0u64;
+        for p in &t.arrangement {
+            if let Some(clip) = ws.s.project.clips.get(&p.clip)
+                && seen_src.insert(clip.source)
+                && let Some(aitrack_model::Source::Audio(a)) = ws.s.project.sources.get(&clip.source)
+            {
+                sample_bytes += a.frames * a.channels.max(1) as u64 * 4;
+            }
+        }
+        let sample_mb = sample_bytes as f64 / (1024. * 1024.);
+        let dev_summary = if ext_n > 0 {
+            format!("{stock_n} stock · {ext_n} ext")
+        } else {
+            format!("{stock_n} stock")
+        };
+        let ram_summary = if sample_bytes > 0 { format!("{sample_mb:.1} MB") } else { "—".into() };
+        track_rows = track_rows.child(
+            div()
+                .px(px(SP2))
+                .py(px(6.))
+                .rounded(px(r_sm()))
+                .bg(content(0.03))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(label(t.name.clone(), TEXT_SM, pal.text))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP3))
+                        .child(label(dev_summary, TEXT_XS, pal.muted))
+                        .child(mono(ram_summary, TEXT_XS, pal.faint)),
+                ),
+        );
+    }
+
     div()
         .flex()
         .flex_col()
@@ -820,6 +878,9 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
                 cx.notify();
             })),
         ))
+        .when(!ws.s.project.tracks.is_empty(), |d| {
+            d.child(section_title("TRACK BREAKDOWN")).child(track_rows)
+        })
         .into_any_element()
 }
 

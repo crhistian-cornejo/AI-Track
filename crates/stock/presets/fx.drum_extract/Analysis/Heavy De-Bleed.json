@@ -1,0 +1,7 @@
+{
+  "name": "Heavy De-Bleed",
+  "plugin": "fx.drum_extract",
+  "author": "AI-Track",
+  "tags": ["drums", "de-bleed", "isolate", "rx"],
+  "params": { "0": 0.95, "1": 0.65, "2": 0.50, "3": 0.55, "4": 0.5, "5": 0.0, "6": 0.0 }
+}

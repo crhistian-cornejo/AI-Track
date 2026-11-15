@@ -7,7 +7,7 @@
 //! Frames are requested only while the transport plays, meters fall, or a
 //! drag or animation is in flight; an idle window draws nothing.
 
-use crate::bridge::{AiEvent, AudioAnalysis, Bridges, JobId, LibraryItem, MidiMode, ModelNotice};
+use crate::bridge::{AiEvent, AudioAnalysis, Bridges, DrumExtractMode, DrumExtractRequest, JobId, LibraryItem, MidiMode, ModelNotice};
 use crate::icons::Icon;
 use crate::state::*;
 use crate::theme::{self, *};
@@ -310,6 +310,8 @@ pub struct Workspace {
     analysis_jobs: std::collections::HashMap<JobId, SourceId>,
     /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
     midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
+    /// Clean drum extraction jobs (from `/drums`) → arrangement placement tick.
+    drum_jobs: std::collections::HashMap<JobId, Option<Tick>>,
     pub organize: OrganizeUi,
     /// Devices open in windows of their own (`views::device_window`).
     pub device_windows: std::collections::HashMap<DeviceId, gpui::WindowHandle<views::device_window::DeviceWindow>>,
@@ -448,6 +450,7 @@ impl Workspace {
             midi_mode: MidiMode::default(),
             analysis_jobs: Default::default(),
             midi_jobs: Default::default(),
+            drum_jobs: Default::default(),
             organize: OrganizeUi::default(),
             device_windows: Default::default(),
             window_pending: None,
@@ -1767,6 +1770,50 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn extract_drums_from_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((name, path)) = self.audio_target() else {
+            self.toast("Select an audio clip first", cx);
+            return;
+        };
+        let id = self.b.ai.extract_drums(DrumExtractRequest {
+            path: path.clone(),
+            engine: DrumExtractMode::Auto,
+            de_bleed: 0.75,
+            de_reverb: 0.45,
+            transient: 0.35,
+            sensitivity: 0.60,
+            loop_bars: 2,
+            normalize_db: Some(-1.0),
+        });
+        self.drum_jobs.insert(id, self.audio_start(&path));
+        self.chat_log.push(ChatEntry::Job { id, label: format!("Extracting clean drums from {name}"), fraction: 0., done: false });
+        self.ensure_ai_poll(cx);
+        cx.notify();
+    }
+
+    /// Put an extracted clean drum one-shot, loop, or stem onto a new audio track at the playhead bar.
+    pub fn insert_extracted_audio(&mut self, path: std::path::PathBuf, name: String, bpm: Option<f32>, cx: &mut Context<Self>) {
+        let start = Snap::Bar.floor(self.b.engine.transport().position.max(0));
+        let (sample_rate, channels, frames) =
+            hound::WavReader::open(&path).map(|r| (r.spec().sample_rate, r.spec().channels, r.duration() as u64)).unwrap_or((44_100, 2, 0));
+        let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
+        let mut cmds = audio_track_commands(&mut self.s, &name, Color::palette(12), &path, (sample_rate, channels, frames), start, index);
+        if let Some(bpm) = bpm {
+            for c in &mut cmds {
+                if let Command::AddSource { source, .. } = c
+                    && let Source::Audio(a) = source.as_mut()
+                {
+                    a.warp.original_bpm = Some(f64::from(bpm));
+                    a.warp.enabled = true;
+                }
+            }
+        }
+        if self.s.edit(&format!("Add {name}"), cmds) {
+            self.toast(format!("Added \"{name}\" track"), cx);
+            cx.notify();
+        }
+    }
+
     /// The user answered a model licence card.
     pub fn resolve_license(&mut self, index: usize, accept: bool, cx: &mut Context<Self>) {
         let Some(ChatEntry::License { notice, audio, clip_name, status }) = self.chat_log.get_mut(index) else { return };
@@ -1955,7 +2002,15 @@ impl Workspace {
     fn poll_ai(&mut self, cx: &mut Context<Self>) -> bool {
         for ev in self.b.ai.poll() {
             match ev {
-                AiEvent::Progress { job, fraction, .. } => self.set_job(job, fraction, false),
+                AiEvent::Progress { job, label, fraction } => {
+                    self.set_job(job, fraction, false);
+                    for st in self.fx.drum_extract.values_mut() {
+                        if st.active_job == Some(job) {
+                            st.progress = fraction;
+                            st.progress_label = label.clone();
+                        }
+                    }
+                }
                 AiEvent::MidiReady { job, source_name, notes } => {
                     self.set_job(job, 1., true);
                     if notes.is_empty() {
@@ -1987,6 +2042,40 @@ impl Workspace {
                         self.chat_log.extend(proposal_entry(&self.s, id));
                     }
                 }
+                AiEvent::DrumsReady { job, result } => {
+                    self.set_job(job, 1., true);
+                    let mut handled_by_device = false;
+                    for st in self.fx.drum_extract.values_mut() {
+                        if st.active_job == Some(job) {
+                            st.active_job = None;
+                            st.progress = 1.0;
+                            st.progress_label = format!("Done · {} one-shots, {} loops", result.oneshots.len(), result.loops.len());
+                            st.error = None;
+                            st.result = Some(result.clone());
+                            handled_by_device = true;
+                        }
+                    }
+                    if handled_by_device {
+                        self.toast(format!("Extracted {} one-shots & {} loops", result.oneshots.len(), result.loops.len()), cx);
+                    }
+                    if let Some(maybe_start) = self.drum_jobs.remove(&job) {
+                        let start = maybe_start.unwrap_or(0);
+                        let mut tracks_to_add = vec![(format!("{} Clean Drums", result.source_name), result.clean_stem_path.clone())];
+                        for lp in result.loops.iter().take(2) {
+                            tracks_to_add.push((lp.name.clone(), lp.path.clone()));
+                        }
+                        let cmds = stem_commands(&mut self.s, &tracks_to_add, start);
+                        let label = format!(
+                            "Add clean drum stem + {} loop(s) ({} one-shots saved in {})",
+                            result.loops.len().min(2),
+                            result.oneshots.len(),
+                            result.out_dir.display()
+                        );
+                        if let Some(id) = self.s.propose(&label, Origin::Feature("drum-extract".into()), cmds) {
+                            self.chat_log.extend(proposal_entry(&self.s, id));
+                        }
+                    }
+                }
                 AiEvent::Analyzed { job, analysis, .. } => {
                     self.set_job(job, 1., true);
                     if let Some(source) = self.analysis_jobs.remove(&job) {
@@ -2006,7 +2095,18 @@ impl Workspace {
                     self.set_job(job, 1., true);
                     self.analysis_jobs.remove(&job);
                     self.midi_jobs.remove(&job);
-                    self.chat_log.push(ChatEntry::Assistant(format!("That failed: {message}")));
+                    self.drum_jobs.remove(&job);
+                    let mut device_only = false;
+                    for st in self.fx.drum_extract.values_mut() {
+                        if st.active_job == Some(job) {
+                            st.active_job = None;
+                            st.error = Some(message.clone());
+                            device_only = true;
+                        }
+                    }
+                    if !device_only {
+                        self.chat_log.push(ChatEntry::Assistant(format!("That failed: {message}")));
+                    }
                 }
             }
         }
@@ -2475,7 +2575,8 @@ impl Render for Workspace {
             views::palette::close(self, window, cx);
         }
         let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
-        let animate = self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self);
+        let animate = window.is_visible()
+            && (self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self));
         let throttle_ok = !self.look.app.low_power || self.drag.is_some() || self.last_frame.elapsed() >= Duration::from_millis(50);
         if animate && throttle_ok {
             self.last_frame = Instant::now();

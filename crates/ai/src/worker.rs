@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{SampleAnalysis, analyze};
 use crate::chords::{ChordOptions, ChordSegment, chords_per_bar, detect_chords};
+use crate::drum_extract::{DrumExtractOptions, DrumExtractionResult, extract_drums_with};
 use crate::midi::{MidiOptions, extract_midi_with};
 use crate::models::{InstalledModel, ModelManager, ModelStatus};
 use crate::progress::{CancelToken, Progress};
@@ -44,6 +45,12 @@ pub enum Job {
         out_dir: PathBuf,
         #[serde(default)]
         options: StemOptions,
+    },
+    ExtractDrums {
+        path: PathBuf,
+        out_dir: PathBuf,
+        #[serde(default)]
+        options: DrumExtractOptions,
     },
     DetectChords {
         path: PathBuf,
@@ -70,6 +77,9 @@ pub enum JobOutput {
     },
     Files {
         files: Vec<PathBuf>,
+    },
+    Drums {
+        result: Box<DrumExtractionResult>,
     },
     Chords {
         segments: Vec<ChordSegment>,
@@ -104,6 +114,13 @@ pub fn run_job(
             options,
         } => Ok(JobOutput::Files {
             files: split_stems_with(manager, path, out_dir, options, progress, cancel)?,
+        }),
+        Job::ExtractDrums {
+            path,
+            out_dir,
+            options,
+        } => Ok(JobOutput::Drums {
+            result: Box::new(extract_drums_with(manager, path, out_dir, options, progress, cancel)?),
         }),
         Job::DetectChords { path, options } => {
             let a = audio::load(path)?;

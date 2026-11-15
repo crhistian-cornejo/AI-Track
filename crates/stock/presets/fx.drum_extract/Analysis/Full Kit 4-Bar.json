@@ -1,0 +1,7 @@
+{
+  "name": "Full Kit 4-Bar",
+  "plugin": "fx.drum_extract",
+  "author": "AI-Track",
+  "tags": ["drums", "loop", "4-bar", "kit"],
+  "params": { "0": 0.75, "1": 0.40, "2": 0.30, "3": 0.60, "4": 1.0, "5": 0.0, "6": 0.0 }
+}

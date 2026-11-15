@@ -16,11 +16,15 @@ Measured locally on `aarch64-apple-darwin` (Apple Silicon) after Block D optimiz
 
 ## Observed Result (`--release`)
 
-- **Wall-clock render time**: `1.190 s`
-- **Real-Time Factor (RTF)**: `0.119` (`11.9%` DSP budget / ~`8.4x` faster than real-time)
+- **Wall-clock render time**: `1.211 s` (re-verified post Drum Extractor & Performance breakdown integration; prior baseline `1.190 s`)
+- **Real-Time Factor (RTF)**: `0.121` (`12.1%` DSP budget / ~`8.3x` faster than real-time)
 - **Status**: `ok` (`0` assertions failed)
 
-## Additional Block D Verifications
+## Additional Performance & Budget Verifications
+
+- **Per-plugin RT CPU budget**: `cpu_budgets_stay_realtime_capable` verified across all stock instruments and effects (including `fx.drum_extract`) in `aitrack-stock`.
+- **Window idle & visibility gating**: `animate()` pauses `window.request_animation_frame()` when `!window.is_visible()` or while the app is completely idle (`crates/app/src/workspace.rs`).
+- **Per-track RAM & device breakdown**: Preferences → Performance displays per-track stock/external plugin counts and estimated decoded sample RAM (`crates/app/src/views/prefs.rs`).
 
 - **Audio-thread denormals**: `aitrack_dsp::disable_denormals()` (`x86_64` FTZ/DAZ + `aarch64` `FPCR.FZ`) invoked at audio thread entry in `crates/engine/src/rt.rs`.
 - **Silence & tail sleep gating**: `tests::idle_device_sleeps_after_tail_and_wakes_on_audio` verified in `aitrack-engine`.

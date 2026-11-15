@@ -32,6 +32,7 @@ pub fn window_size(plugin: &str) -> (f32, f32) {
         "instrument.wavetable" => (1320., 900.),
         "instrument.vault" => (1360., 860.),
         "instrument.sampler" | "instrument.drum" => (1120., 600.),
+        "fx.drum_extract" => (1080., 620.),
         "fx.eq" | "fx.multiband" => (1040., 520.),
         _ => (900., 480.),
     }

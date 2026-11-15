@@ -1,0 +1,7 @@
+{
+  "name": "Electronic Loop",
+  "plugin": "fx.drum_extract",
+  "author": "AI-Track",
+  "tags": ["drums", "electronic", "edm", "loop"],
+  "params": { "0": 0.85, "1": 0.55, "2": 0.50, "3": 0.70, "4": 0.0, "5": 0.5, "6": 0.6666667 }
+}

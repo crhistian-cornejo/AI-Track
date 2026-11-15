@@ -578,6 +578,69 @@ fn rack_body(
         let k = knob_control(("macro", (id.0 as usize) << 8 | i), m.value, false, enabled, KnobTarget::Macro { rack: id, index: i }, cx);
         macros = macros.child(knob_cell(k, &m.name, format!("{:.0}%", m.value * 100.), CELL_W));
     }
+    let mut var_row = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(SP1))
+        .child(label("VARIATIONS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD));
+    for (vi, var) in rack.variations.iter().enumerate() {
+        let chip_id = ("rack-var", (id.0 as usize) << 8 | vi);
+        var_row = var_row.child(
+            div()
+                .id(chip_id)
+                .h(px(20.))
+                .px(px(SP2))
+                .gap(px(SP1))
+                .flex()
+                .items_center()
+                .rounded(px(r_sm()))
+                .bg(content(0.06))
+                .border_1()
+                .border_color(border())
+                .cursor_pointer()
+                .hover(|s| s.bg(content(0.12)).border_color(accent()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.s.recall_rack_variation(id, vi);
+                    cx.notify();
+                }))
+                .child(label(var.name.clone(), TEXT_XS, pal.text))
+                .child(
+                    div()
+                        .id(("rack-var-del", (id.0 as usize) << 8 | vi))
+                        .px(px(2.))
+                        .rounded(px(2.))
+                        .hover(|s| s.bg(with_alpha(pal.record, 0.25)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.s.delete_rack_variation(id, vi);
+                            cx.notify();
+                        }))
+                        .child(icon(Icon::X, 10., pal.faint)),
+                ),
+        );
+    }
+    var_row = var_row.child(
+        div()
+            .id(("rack-var-save", id.0 as usize))
+            .h(px(20.))
+            .px(px(SP2))
+            .gap(px(SP1))
+            .flex()
+            .items_center()
+            .rounded(px(r_sm()))
+            .bg(accent_alpha(0.14))
+            .border_1()
+            .border_color(accent_alpha(0.4))
+            .cursor_pointer()
+            .hover(|s| s.bg(accent_alpha(0.24)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.s.save_rack_variation(id, None);
+                cx.notify();
+            }))
+            .child(icon(Icon::Add, 10., pal.accent))
+            .child(label("Save", TEXT_XS, pal.accent)),
+    );
     let macros = div()
         .flex_none()
         .p(px(SP2))
@@ -585,7 +648,8 @@ fn rack_body(
         .flex_col()
         .gap(px(SP2))
         .child(label("MACROS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
-        .child(macros);
+        .child(macros)
+        .child(var_row);
     if rack.kind != RackKind::Drum {
         let show_macros = ws.fx.macros.contains(&id);
         return div()

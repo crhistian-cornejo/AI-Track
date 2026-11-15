@@ -318,7 +318,7 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "fx.chorus" => DeviceGroup::FxModulation,
         "fx.filter" => DeviceGroup::FxFilter,
         "fx.multiband" => DeviceGroup::FxMastering,
-        "fx.analyzer" => DeviceGroup::FxAnalysis,
+        "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,
         "fx.midside" | "fx.utility" | "rack.audio" => DeviceGroup::FxStereoUtility,
         _ => DeviceGroup::FxStereoUtility,
     }

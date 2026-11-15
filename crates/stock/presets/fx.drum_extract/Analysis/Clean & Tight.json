@@ -1,0 +1,7 @@
+{
+  "name": "Clean & Tight",
+  "plugin": "fx.drum_extract",
+  "author": "AI-Track",
+  "tags": ["drums", "oneshot", "de-bleed", "clean"],
+  "params": { "0": 0.75, "1": 0.45, "2": 0.35, "3": 0.60, "4": 0.5, "5": 0.0, "6": 0.0 }
+}

@@ -76,7 +76,8 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let ws = cx.new(|cx| workspace::Workspace::new(demo::project(), bridges(), cx));
+                let initial = if std::env::var_os("AITRACK_DEMO").is_some() { demo::project() } else { demo::empty() };
+                let ws = cx.new(|cx| workspace::Workspace::new(initial, bridges(), cx));
                 ws.update(cx, |ws, cx| {
                     ws.focus.focus(window, cx);
                     cx.on_blur(&ws.focus, window, |ws, _, cx| {

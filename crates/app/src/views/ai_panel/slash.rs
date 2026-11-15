@@ -41,6 +41,7 @@ impl Tab {
 pub enum Action {
     ExtractMidi(MidiMode),
     SplitStems,
+    ExtractDrums,
     ImportAudio,
     AnalyseKeyBpm,
     FindSamplesInKey,
@@ -69,6 +70,7 @@ pub static ENTRIES: &[Entry] = &[
     Entry { action: Action::ExtractMidi(MidiMode::Monophonic), command: "midi-mono", title: "Extract MIDI · Mono", hint: "One note at a time: bass, lead, vocal", icon: Icon::Extract, tab: Tab::Midi, keywords: &["melody", "monophonic", "bassline", "transcribe"] },
     Entry { action: Action::ExtractMidi(MidiMode::Drums), command: "midi-drums", title: "Extract MIDI · Drums", hint: "Kick, snare and hats as drum notes", icon: Icon::Drum, tab: Tab::Midi, keywords: &["beat", "groove", "drums to midi", "transcribe"] },
     Entry { action: Action::SplitStems, command: "stems", title: "Split stems", hint: "Vocals · drums · bass · other", icon: Icon::Split, tab: Tab::Audio, keywords: &["separate", "demucs", "isolate", "acapella", "vocals"] },
+    Entry { action: Action::ExtractDrums, command: "drums", title: "Extract clean drums", hint: "Isolated one-shots one by one & bar loops (WAV/MP3)", icon: Icon::Drum, tab: Tab::Audio, keywords: &["oneshot", "one-shot", "drum", "loop", "de-bleed", "kick", "snare", "hat", "rx"] },
     Entry { action: Action::ImportAudio, command: "import", title: "Import audio", hint: "New track, detects key and BPM", icon: Icon::FolderOpen, tab: Tab::Audio, keywords: &["file", "add", "open", "load"] },
     Entry { action: Action::AnalyseKeyBpm, command: "analyse", title: "Analyse key / BPM", hint: "Of the selected audio clip", icon: Icon::Gauge, tab: Tab::Audio, keywords: &["analyze", "tempo", "detect", "key", "bpm", "scale"] },
     Entry { action: Action::FindSamplesInKey, command: "samples", title: "Find samples in key", hint: "From the library, in the project key", icon: Icon::Search, tab: Tab::Library, keywords: &["browse", "loops", "one-shots", "library", "match"] },

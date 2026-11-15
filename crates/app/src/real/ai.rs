@@ -4,6 +4,7 @@
 //! agent is connected over MCP.
 
 use crate::bridge::*;
+use aitrack_ai::drum_extract::{DrumClass, DrumExtractOptions, DrumExtractionResult, ExtractionEngine};
 use aitrack_ai::worker::{Job, JobEvent, JobHandle, JobOutput, Worker};
 use aitrack_ai::{MidiEngine, MidiOptions, ModelManager, StemOptions};
 use aitrack_model::{PPQ, Project};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 enum Kind {
     Midi { name: String },
     Stems,
+    Drums,
     Analyze(PathBuf),
 }
 
@@ -36,6 +38,61 @@ fn manager() -> ModelManager {
 fn stem_name(path: &Path) -> String {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     stem.rsplit(" - ").next().unwrap_or(&stem).to_owned()
+}
+
+fn drum_class_tag(c: DrumClass) -> DrumClassTag {
+    match c {
+        DrumClass::Kick => DrumClassTag::Kick,
+        DrumClass::Snare => DrumClassTag::Snare,
+        DrumClass::Clap => DrumClassTag::Clap,
+        DrumClass::ClosedHat => DrumClassTag::ClosedHat,
+        DrumClass::OpenHat => DrumClassTag::OpenHat,
+        DrumClass::Tom => DrumClassTag::Tom,
+        DrumClass::Perc => DrumClassTag::Perc,
+        DrumClass::Crash => DrumClassTag::Crash,
+    }
+}
+
+fn to_drum_extraction(r: &DrumExtractionResult) -> DrumExtraction {
+    DrumExtraction {
+        source_path: r.source_path.clone(),
+        source_name: r.source_name.clone(),
+        engine_used: r.engine_used.clone(),
+        sample_rate: r.sample_rate,
+        duration_sec: r.duration_sec,
+        bpm: r.bpm,
+        clean_stem_path: r.clean_stem_path.clone(),
+        oneshots: r
+            .oneshots
+            .iter()
+            .map(|o| DrumOneShot {
+                id: o.id,
+                name: o.name.clone(),
+                class: drum_class_tag(o.class),
+                time_sec: o.time_sec,
+                duration_sec: o.duration_sec,
+                peak_db: o.peak_db,
+                isolation_score: o.isolation_score,
+                path: o.path.clone(),
+                peaks: o.peaks.clone(),
+            })
+            .collect(),
+        loops: r
+            .loops
+            .iter()
+            .map(|l| DrumLoop {
+                name: l.name.clone(),
+                bpm: l.bpm,
+                bars: l.bars,
+                start_sec: l.start_sec,
+                duration_sec: l.duration_sec,
+                isolation_score: l.isolation_score,
+                path: l.path.clone(),
+                peaks: l.peaks.clone(),
+            })
+            .collect(),
+        out_dir: r.out_dir.clone(),
+    }
 }
 
 impl RealAi {
@@ -79,6 +136,27 @@ impl AiBridge for RealAi {
         let song = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
         let out_dir = crate::appearance::config_dir().join("stems").join(&song);
         self.submit(Job::SplitStems { path: path.to_path_buf(), out_dir, options: StemOptions::default() }, Kind::Stems)
+    }
+
+    fn extract_drums(&mut self, req: DrumExtractRequest) -> JobId {
+        let song = req.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
+        let out_dir = crate::appearance::config_dir().join("drum_extracts").join(&song);
+        let engine = match req.engine {
+            DrumExtractMode::Auto => ExtractionEngine::Auto,
+            DrumExtractMode::PureDsp => ExtractionEngine::PureDsp,
+            DrumExtractMode::DemucsHybrid => ExtractionEngine::DemucsHybrid,
+        };
+        let options = DrumExtractOptions {
+            engine,
+            de_bleed: req.de_bleed,
+            de_reverb: req.de_reverb,
+            transient_focus: req.transient,
+            sensitivity: req.sensitivity,
+            loop_bars: req.loop_bars,
+            normalize_peak_db: req.normalize_db,
+            ..DrumExtractOptions::default()
+        };
+        self.submit(Job::ExtractDrums { path: req.path, out_dir, options }, Kind::Drums)
     }
 
     fn stem_license(&self) -> Option<ModelNotice> {
@@ -169,6 +247,9 @@ impl AiBridge for RealAi {
                             },
                             (Ok(JobOutput::Files { files }), Kind::Stems) => {
                                 AiEvent::StemsReady { job: id, stems: files.iter().map(|f| (stem_name(f), f.clone())).collect() }
+                            }
+                            (Ok(JobOutput::Drums { result }), Kind::Drums) => {
+                                AiEvent::DrumsReady { job: id, result: to_drum_extraction(&result) }
                             }
                             (Ok(JobOutput::Analysis { analysis: a }), Kind::Analyze(path)) => AiEvent::Analyzed {
                                 job: id,

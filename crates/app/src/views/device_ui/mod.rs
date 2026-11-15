@@ -22,6 +22,7 @@ pub mod chorus;
 pub mod clipper;
 pub mod delay;
 pub mod drum;
+pub mod drum_extract;
 pub mod dynamics;
 pub mod eq;
 pub mod filter;
@@ -261,6 +262,8 @@ pub struct UiState {
     pub synth: HashMap<DeviceId, crate::views::device_window::synth::SynthView>,
     /// The Vault browsers (factory list, favourites, filters per device).
     pub vault: crate::views::device_window::vault::VaultState,
+    /// State of each Drum Extractor device (source file, job progress, extracted slices).
+    pub drum_extract: HashMap<DeviceId, drum_extract::ExtractViewState>,
     last_change: Instant,
     pub sample_rate: f64,
 }
@@ -286,6 +289,7 @@ impl Default for UiState {
             painting: None,
             synth: HashMap::new(),
             vault: Default::default(),
+            drum_extract: HashMap::new(),
             last_change: Instant::now() - Duration::from_secs(10),
             sample_rate: 48_000.,
         }
@@ -404,6 +408,7 @@ impl UiState {
         self.wave_previews.prune(&alive);
         self.synth.retain(|id, _| alive(*id));
         self.vault.prune(&alive);
+        self.drum_extract.retain(|id, _| alive(*id));
     }
 }
 
@@ -633,6 +638,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.chorus"
             | "fx.utility"
             | "fx.analyzer"
+            | "fx.drum_extract"
             | "instrument.wavetable"
             | "instrument.acid303"
             | "instrument.kick808"
@@ -662,6 +668,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.chorus" => chorus::render(ws, dev, cx),
         "fx.utility" => utility::render(ws, dev, cx),
         "fx.analyzer" => analyzer::render(ws, dev, cx),
+        "fx.drum_extract" => drum_extract::render(ws, dev, cx),
         "instrument.wavetable" => wavetable::render(ws, dev, cx),
         "instrument.acid303" => acid303::render(ws, dev, cx),
         "instrument.kick808" => kick808::render(ws, dev, cx),

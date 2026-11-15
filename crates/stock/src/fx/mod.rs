@@ -5,6 +5,7 @@ pub mod chorus;
 pub mod clipper;
 pub mod compressor;
 pub mod delay;
+pub mod drum_extract;
 pub mod eq;
 pub mod filter;
 pub mod gate;

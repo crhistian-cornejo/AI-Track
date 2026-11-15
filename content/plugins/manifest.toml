@@ -36,13 +36,13 @@ notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribu
 [[plugin.artifact]]
 os = "macos"
 url = "https://www.tokyodawn.net/labs/Nova/2.2.3/TDR%20Nova.zip"
-sha256 = ""
-size = 0
+sha256 = "85d3b0409260f0211c8fe4fdb0c5ff7e9a2249808a21fe0d21abd1ebc636e12d"
+size = 27043108
 [[plugin.artifact]]
 os = "windows"
 url = "https://www.tokyodawn.net/labs/Nova/2.2.3/TDR%20Nova%20(no%20installer).zip"
-sha256 = ""
-size = 0
+sha256 = "9bb52d042bd95dd85456da66316347a00d865d9d3f6652333e1a2bc195cb8907"
+size = 18361796
 
 [[plugin]]
 id = "tdr-kotelnikov"
@@ -63,13 +63,13 @@ notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribu
 [[plugin.artifact]]
 os = "macos"
 url = "https://www.tokyodawn.net/labs/Kotelnikov/1.6.7/TDR%20Kotelnikov.zip"
-sha256 = ""
-size = 0
+sha256 = "59e580a260fb66db6f608b92434c9cf9e426eb83734995b5d4633930783389da"
+size = 25033721
 [[plugin.artifact]]
 os = "windows"
 url = "https://www.tokyodawn.net/labs/Kotelnikov/1.6.7/TDR%20Kotelnikov%20(no%20installer).zip"
-sha256 = ""
-size = 0
+sha256 = "dfc2d3ad466352ab9efe63841f6051b33097e717ed822e3ff5e9321276bf18f4"
+size = 17668143
 
 [[plugin]]
 id = "tdr-slickeq"
@@ -90,13 +90,13 @@ notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribu
 [[plugin.artifact]]
 os = "macos"
 url = "https://www.tokyodawn.net/labs/SlickEQ/1.3.9/TDR%20VOS%20SlickEQ.zip"
-sha256 = ""
-size = 0
+sha256 = "9146a0e145680965c54296c68996a5982bd0e164b6fbfd767c8b26d32f8e70fa"
+size = 23946431
 [[plugin.artifact]]
 os = "windows"
 url = "https://www.tokyodawn.net/labs/SlickEQ/1.3.9/TDR%20VOS%20SlickEQ%20(no%20installer).zip"
-sha256 = ""
-size = 0
+sha256 = "b005f5899dfe928b549c7d2b7c3acb0d7b45e72a2e6a784bf6c269f8ea0d2d4b"
+size = 18180003
 
 [[plugin]]
 id = "youlean-loudness-meter-2"
@@ -117,14 +117,14 @@ notes = "[V] The URLs change with each version (they carry the upload month): ch
 [[plugin.artifact]]
 os = "macos"
 url = "https://cdn.youlean.co/wp-content/uploads/2026/09/Youlean-Loudness-Meter-2-V2.5.15-macOS.dmg"
-sha256 = ""
-size = 0
+sha256 = "0497a988c390e12ac4a7d71fe12aa11847af1787d972d40fc2ae03c25131eeab"
+size = 99391961
 container = "dmg"
 [[plugin.artifact]]
 os = "windows"
 url = "https://cdn.youlean.co/wp-content/uploads/2026/09/Youlean-Loudness-Meter-2-V2.5.15-Windows.zip"
-sha256 = ""
-size = 0
+sha256 = "ad8b4eb2b6a8397961f053011ad44b348255c40cec28df4af0afb0b6d474757b"
+size = 69627504
 
 [[plugin]]
 id = "tal-noisemaker"
@@ -145,8 +145,8 @@ notes = "[V] The macOS zip holds the maker's installer package, which is expande
 [[plugin.artifact]]
 os = "macos"
 url = "https://tal-software.com/downloads/plugins/TAL-NoiseMaker-installer_macos.zip"
-sha256 = ""
-size = 0
+sha256 = "7d756aba0af00d46a14c579bf3317316326b6d50382411c3c7605520c1026dc4"
+size = 22524919
 
 [[plugin]]
 id = "zebralette-3"
@@ -162,19 +162,19 @@ license_notice = "Free to use. AI-Track downloads it from dl.u-he.com, the maker
 lane = "direct"
 formats = ["vst3", "clap"]
 bundle_ids = ["Zebralette3"]
-allowed_hosts = ["dl.u-he.com"]
+allowed_hosts = ["dl.u-he.com", "uhe-dl.b-cdn.net", "u-he.com"]
 description = "Wavetable synthesizer, the free sibling of Zebra."
 notes = "[V] The EULA lets anyone distribute it free of charge; we still only download from the maker."
 [[plugin.artifact]]
 os = "macos"
-url = "https://dl.u-he.com/releases/Zebralette3_300_20399__Mac.zip"
-sha256 = ""
-size = 0
+url = "https://u-he.com/downloads/releases/Zebralette3_300_20399_Mac.zip"
+sha256 = "2ff7b8a0c9e29de90d659da0c3b01486918db2c33ba238ce6ba0cc965f4240f7"
+size = 56608221
 [[plugin.artifact]]
 os = "windows"
 url = "https://dl.u-he.com/releases/Zebralette3_300_20399_Win.zip"
-sha256 = ""
-size = 0
+sha256 = "04a8c72dbf731514b7d32505cc17ef83945ef358f313f74432beb269f79d3642"
+size = 15224036
 
 [[plugin]]
 id = "podolski"
@@ -190,19 +190,19 @@ license_notice = "Free to use. AI-Track downloads it from dl.u-he.com, the maker
 lane = "direct"
 formats = ["vst3"]
 bundle_ids = ["Podolski"]
-allowed_hosts = ["dl.u-he.com"]
+allowed_hosts = ["dl.u-he.com", "uhe-dl.b-cdn.net", "u-he.com"]
 description = "Light, fast synthesizer."
 notes = "[V] VST3 only, no CLAP."
 [[plugin.artifact]]
 os = "macos"
 url = "https://dl.u-he.com/releases/Podolski_123_12092_Mac.zip"
-sha256 = ""
-size = 0
+sha256 = "b3477dbd7306d733303bb3656798e8dbff2876cebc5057dd25bf05ae7162baa4"
+size = 53040979
 [[plugin.artifact]]
 os = "windows"
 url = "https://dl.u-he.com/releases/Podolski_123_12092_Win.zip"
-sha256 = ""
-size = 0
+sha256 = "d0ef1c3ee15a4377c4664114af08bd4cf1a7d2b7cbe504c8d5f4ff1df784c83a"
+size = 36535299
 
 [[plugin]]
 id = "surge-xt"
@@ -224,13 +224,13 @@ notes = "[V] Asset names read through the GitHub API; the plugins-only zips are 
 [[plugin.artifact]]
 os = "macos"
 url = "https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-macos-1.3.4-pluginsonly.zip"
-sha256 = ""
-size = 0
+sha256 = "37d8d809693adc86587b7bc75a2384fc4e905f259aa9b9a21777749d36fbf8aa"
+size = 186958216
 [[plugin.artifact]]
 os = "windows"
 url = "https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-win64-1.3.4-pluginsonly.zip"
-sha256 = ""
-size = 0
+sha256 = "564e162c560af07ad4ed47fe1bfcd827cf97a575de30d06c48249aad2e7c35e6"
+size = 49093875
 
 [[plugin]]
 id = "dexed"
@@ -251,8 +251,8 @@ notes = "[V] The dmg URL is the one on the project's release page; formats insid
 [[plugin.artifact]]
 os = "macos"
 url = "https://github.com/asb2m10/dexed/releases/download/v1.1.0/Dexed-1.1.0-macOS.dmg"
-sha256 = ""
-size = 0
+sha256 = "f95b5d4a8985af444094fd3d76c5f4c86795f56169b9b9a1f4d620bb54c300ce"
+size = 22849347
 container = "dmg"
 
 [[plugin]]

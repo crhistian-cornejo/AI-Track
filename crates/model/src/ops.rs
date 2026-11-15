@@ -23,6 +23,95 @@ pub fn source_len(p: &Project, clip: ClipId) -> Option<Tick> {
     }
 }
 
+/// Change the project tempo to `bpm` without cutting or padding the samples:
+/// the commands are `SetTempo` plus an `UpdateClip` for every audio clip that
+/// plays in real time (warp off, or on with no tempo to follow). Such a clip
+/// keeps its length in seconds, so its length, offset, loop, fades and
+/// volume envelope (all in ticks) scale by `new / old`; a warped clip
+/// stretches by itself and a notes clip is musical time, so neither changes.
+/// A one-shot clip never passes the end of its file, and a clip that grows
+/// stops where the next clip of its track and lane starts (clips never
+/// overlap), at every place it is used. Apply the lot as one undo step.
+///
+/// The factor is the ratio of the first tempo points, as `SetTempo` edits
+/// only that one: exact for a constant tempo. `None` for a tempo that is
+/// not a positive number or does not change the (clamped) tempo.
+pub fn set_tempo_keeping_samples(p: &Project, bpm: f64) -> Option<Vec<Command>> {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return None;
+    }
+    let old = p.tempo.initial_bpm();
+    let mut map = p.tempo.clone();
+    map.set_initial_bpm(bpm);
+    let new = map.initial_bpm();
+    if new == old {
+        return None;
+    }
+    let k = new / old;
+    let scale = |t: Tick| (t as f64 * k).round() as Tick;
+    let mut cmds = vec![Command::SetTempo { bpm }];
+    for (&id, clip) in &p.clips {
+        let Some(Source::Audio(file)) = p.sources.get(&clip.source) else { continue };
+        if file.warp.enabled && file.warp.original_bpm.is_some_and(|b| b > 0.0) {
+            continue;
+        }
+        let mut c = clip.clone();
+        c.offset = scale(clip.offset);
+        c.length = scale(clip.length).max(MIN_CLIP_LEN);
+        c.looping = clip.looping.map(|l| LoopRegion { start: scale(l.start), end: scale(l.end) });
+        c.fade_in.length = scale(clip.fade_in.length);
+        c.fade_out.length = scale(clip.fade_out.length);
+        for lane in &mut c.envelopes {
+            for pt in &mut lane.points {
+                pt.tick = scale(pt.tick);
+            }
+        }
+        if c.length > clip.length {
+            c.length = c.length.min(room_before_next(p, id).max(clip.length));
+        }
+        // Rounding must not carry a one-shot a tick past the end of its file.
+        if clip.looping.is_none_or(|l| l.end <= l.start) {
+            let rate = file.warp.speed_ratio().max(1e-6);
+            let room = |bpm: f64, offset: Tick| {
+                let len = file.length_ticks(bpm);
+                (len > 0).then(|| ((len - offset) as f64 / rate).floor().max(0.0) as Tick)
+            };
+            if let (Some(was), Some(now)) = (room(old, clip.offset), room(new, c.offset))
+                && clip.length <= was
+            {
+                c.length = c.length.min(now.max(MIN_CLIP_LEN));
+            }
+        }
+        clamp_fades(&mut c, Edge::End);
+        if c != *clip {
+            cmds.push(Command::UpdateClip { id, clip: Box::new(c) });
+        }
+    }
+    Some(cmds)
+}
+
+/// How long clip `id` can be before it runs into the next clip of the lane
+/// of every placement it has (unlimited when it is last everywhere).
+fn room_before_next(p: &Project, id: ClipId) -> Tick {
+    let mut room = Tick::MAX;
+    for t in &p.tracks {
+        for pl in t.arrangement.iter().filter(|pl| pl.clip == id) {
+            let next = t.arrangement.iter().filter(|o| o.id != pl.id && o.lane == pl.lane && o.start > pl.start).map(|o| o.start).min();
+            if let Some(next) = next {
+                room = room.min(next - pl.start);
+            }
+        }
+    }
+    room
+}
+
+/// Give a clip a new colour (every placement of it follows); `None` when it
+/// already has it or is unknown.
+pub fn set_clip_color(p: &Project, clip: ClipId, color: Color) -> Option<Command> {
+    let old = p.clips.get(&clip)?;
+    (old.color != color).then(|| Command::UpdateClip { id: clip, clip: Box::new(Clip { color, ..old.clone() }) })
+}
+
 /// Set both fades. Lengths are kept inside the clip without overlapping (the
 /// fade that changed gives way to the other) and curves inside -1..=1.
 pub fn set_fades(p: &Project, clip: ClipId, fade_in: Fade, fade_out: Fade) -> Option<Command> {
@@ -1465,5 +1554,155 @@ mod tests {
         let Some(Source::Notes(src)) = old.p.sources.get(&c.source) else { unreachable!() };
         assert_eq!(heard_notes(c, &src.notes).len(), 3);
         assert!(rebase_all_notes(&mut old.p).is_empty());
+    }
+
+    // ── set_tempo_keeping_samples ──
+
+    /// Seconds a clip lasts from where it is placed, at the project's tempo.
+    fn seconds(p: &Project, start: Tick, length: Tick) -> f64 {
+        p.tempo.tick_to_seconds(start + length) - p.tempo.tick_to_seconds(start)
+    }
+
+    /// Put another audio clip on the fixture's track at `start` (lane `lane`).
+    fn add_clip_at(f: &mut Fixture, start: Tick, lane: u16, length: Tick) -> ClipId {
+        let source = f.p.clips[&f.clip].source;
+        let clip = f.p.alloc_clip_id();
+        f.p.clips.insert(clip, Clip::new("next", Color(0), source, length));
+        let id = f.p.alloc_placement_id();
+        let arr = &mut f.p.track_mut(f.track).unwrap().arrangement;
+        arr.push(Placement { id, clip, start, lane });
+        arr.sort_by_key(|pl| pl.start);
+        clip
+    }
+
+    #[test]
+    fn raising_the_tempo_keeps_an_unwarped_sample_as_long_in_seconds() {
+        // 4 s of audio = 8 beats at 120 BPM, placed whole at beat 4.
+        let mut f = fixture(Some(8), 8 * BEAT);
+        let (clip, start) = (f.clip, 4 * BEAT);
+        assert!((seconds(&f.p, start, 8 * BEAT) - 4.0).abs() < 1e-9);
+        let cmds = set_tempo_keeping_samples(&f.p, 140.0).expect("tempo changes");
+        assert_eq!(cmds[0], Command::SetTempo { bpm: 140.0 });
+        round_trip(&mut f.p, cmds, |p| {
+            assert_eq!(p.tempo.initial_bpm(), 140.0);
+            let c = &p.clips[&clip];
+            assert_eq!(c.length, 8960, "8 beats * 140/120");
+            assert!((seconds(p, start, c.length) - 4.0).abs() < 1e-3, "still 4 s: {}", seconds(p, start, c.length));
+            assert_eq!(c.length, source_len(p, clip).unwrap(), "it ends exactly where the file ends");
+        });
+        // The way down shortens it by the same rule.
+        let cmds = set_tempo_keeping_samples(&f.p, 60.0).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            assert_eq!(p.clips[&clip].length, 4 * BEAT);
+            assert!((seconds(p, start, 4 * BEAT) - 4.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn it_is_one_undo_step_through_history() {
+        let mut f = fixture(Some(8), 8 * BEAT);
+        let before = f.p.clone();
+        let cmds = set_tempo_keeping_samples(&f.p, 140.0).unwrap();
+        let mut h = crate::history::History::default();
+        h.apply(&mut f.p, "Change tempo", crate::history::Origin::User, cmds).unwrap();
+        assert_eq!(h.steps().count(), 1);
+        assert!(f.p.clips[&f.clip].length > 8 * BEAT);
+        h.undo(&mut f.p).unwrap();
+        assert_eq!(f.p, before);
+        h.redo(&mut f.p).unwrap();
+        assert_eq!(f.p.clips[&f.clip].length, 8960);
+    }
+
+    #[test]
+    fn offset_loop_fades_and_envelope_scale_with_the_clip() {
+        let mut f = fixture(Some(8), 6 * BEAT);
+        let clip = f.clip;
+        edit(&mut f, |c| {
+            c.offset = 2 * BEAT;
+            c.looping = Some(LoopRegion { start: 2 * BEAT, end: 6 * BEAT });
+            c.fade_in = Fade { length: BEAT, curve: 0.25 };
+            c.fade_out = Fade { length: 2 * BEAT, curve: 0.0 };
+            c.envelopes.push(envelope(&[(0, 1.0), (3 * BEAT, 0.5)]));
+        });
+        let cmds = set_tempo_keeping_samples(&f.p, 60.0).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let c = &p.clips[&clip];
+            assert_eq!((c.offset, c.length), (BEAT, 3 * BEAT));
+            assert_eq!(c.looping, Some(LoopRegion { start: BEAT, end: 3 * BEAT }));
+            assert_eq!((c.fade_in.length, c.fade_in.curve, c.fade_out.length), (BEAT / 2, 0.25, BEAT));
+            assert_eq!(c.envelopes[0].points.iter().map(|pt| pt.tick).collect::<Vec<_>>(), [0, BEAT + BEAT / 2]);
+        });
+    }
+
+    #[test]
+    fn warped_and_notes_clips_follow_the_tempo_by_themselves() {
+        // Warp on with a known tempo: the engine stretches it, so its musical length stays.
+        let mut f = fixture(Some(8), 8 * BEAT);
+        let src = f.p.clips[&f.clip].source;
+        let Some(Source::Audio(a)) = f.p.sources.get_mut(&src) else { unreachable!() };
+        a.warp.enabled = true;
+        a.warp.original_bpm = Some(120.0);
+        let cmds = set_tempo_keeping_samples(&f.p, 140.0).unwrap();
+        assert_eq!(cmds, vec![Command::SetTempo { bpm: 140.0 }]);
+        // Warp on but no tempo to follow is real time, like warp off.
+        let Some(Source::Audio(a)) = f.p.sources.get_mut(&src) else { unreachable!() };
+        a.warp.original_bpm = None;
+        assert_eq!(set_tempo_keeping_samples(&f.p, 140.0).unwrap().len(), 2);
+        // Notes are musical time.
+        let n = fixture(None, 4 * BEAT);
+        assert_eq!(set_tempo_keeping_samples(&n.p, 90.0), Some(vec![Command::SetTempo { bpm: 90.0 }]));
+    }
+
+    #[test]
+    fn a_growing_clip_stops_at_the_next_clip_of_its_track_and_lane() {
+        let mut f = fixture(Some(8), 8 * BEAT);
+        let clip = f.clip;
+        // The next clip on the same lane begins 9 beats after this one: 8640 ticks.
+        let next = add_clip_at(&mut f, 13 * BEAT, 0, 2 * BEAT);
+        // One on another lane, one before it and one on another track do not matter.
+        add_clip_at(&mut f, 12 * BEAT, 1, BEAT);
+        add_clip_at(&mut f, BEAT, 0, BEAT);
+        let cmds = set_tempo_keeping_samples(&f.p, 140.0).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            assert_eq!(p.clips[&clip].length, 9 * BEAT, "cut where the next clip starts");
+            assert_eq!(p.clips[&next].length, 2240, "the next clip is a sample too and grows by 140/120");
+        });
+    }
+
+    #[test]
+    fn shrinking_is_never_limited_and_a_one_shot_never_passes_its_file() {
+        let mut f = fixture(Some(8), 8 * BEAT);
+        let clip = f.clip;
+        add_clip_at(&mut f, 13 * BEAT, 0, BEAT);
+        // Down to 60 BPM: half as long, whatever follows.
+        let cmds = set_tempo_keeping_samples(&f.p, 60.0).unwrap();
+        round_trip(&mut f.p, cmds, |p| assert_eq!(p.clips[&clip].length, 4 * BEAT));
+        // A clip cut short of its file grows by the same factor, up to the file at most.
+        let mut g = fixture(Some(8), 2 * BEAT);
+        let cmds = set_tempo_keeping_samples(&g.p, 240.0).unwrap();
+        round_trip(&mut g.p, cmds, |p| assert_eq!(p.clips[&g.clip].length, 4 * BEAT));
+        // Rounding must not carry a whole-file clip a tick past its file.
+        let mut h = fixture(Some(8), 8 * BEAT);
+        for bpm in [97.3, 133.7, 171.9, 61.1] {
+            let cmds = set_tempo_keeping_samples(&h.p, bpm).unwrap();
+            Command::Batch { commands: cmds }.apply(&mut h.p).unwrap();
+            let c = &h.p.clips[&h.clip];
+            assert!(c.length <= source_len(&h.p, h.clip).unwrap(), "{bpm}: {} > file", c.length);
+        }
+    }
+
+    #[test]
+    fn nothing_to_do_for_the_same_or_a_bad_tempo() {
+        let f = fixture(Some(8), 8 * BEAT);
+        assert_eq!(set_tempo_keeping_samples(&f.p, 120.0), None);
+        for bad in [f64::NAN, 0.0, -90.0, f64::INFINITY] {
+            assert_eq!(set_tempo_keeping_samples(&f.p, bad), None, "{bad}");
+        }
+        // Out-of-range tempos are clamped like SetTempo does, and the clips follow the clamped value.
+        let cmds = set_tempo_keeping_samples(&f.p, 5000.0).unwrap();
+        let mut p = f.p.clone();
+        Command::Batch { commands: cmds }.apply(&mut p).unwrap();
+        let max = p.tempo.initial_bpm();
+        assert!(max < 5000.0 && p.clips[&f.clip].length > 8 * BEAT);
     }
 }

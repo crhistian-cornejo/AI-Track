@@ -8,8 +8,8 @@
 //! the stubs.
 
 use aitrack_dsp::ParamInfo;
-use aitrack_model::{DeviceId, DeviceKind, Key, PluginFormat, Project, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
-use std::collections::{BTreeMap, HashMap};
+use aitrack_model::{DeviceId, DeviceKind, InputSource, Key, Monitor, PluginFormat, Project, Quantize, Scale, ScaleKind, SceneId, Tick, TrackId, TrackKind, PPQ};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -66,10 +66,99 @@ pub trait EngineBridge {
     fn toggle_record(&mut self);
     fn set_looping(&mut self, on: bool);
     fn set_metronome(&mut self, on: bool);
+    /// Bars of metronome count-in before playback starts (0 = off).
+    fn set_count_in(&mut self, _bars: u32) {}
+    fn count_in(&self) -> u32 {
+        0
+    }
+    /// Quantisation of scene launches into empty slots and track stops.
+    fn set_global_quantize(&mut self, _quantize: Quantize) {}
+    fn global_quantize(&self) -> Quantize {
+        Quantize::Bar
+    }
+    /// Stop the Session clips and let every track follow the arrangement again.
+    fn back_to_arrangement(&mut self) {}
     fn locate(&mut self, tick: Tick);
     fn transport(&self) -> TransportState;
     /// A new snapshot of the project after an edit (the engine compiles it off the audio thread).
     fn update_project(&mut self, project: &Project);
+    /// Where recording stands (a take being captured, and on which tracks).
+    fn recording_state(&self) -> RecordingState {
+        RecordingState::default()
+    }
+    /// The WAV files that finished since the last call (one per armed audio
+    /// track of a take). They are written a moment after the take ends: ask
+    /// until the ones expected are in.
+    fn finish_audio_recording(&mut self) -> Vec<AudioTake> {
+        Vec::new()
+    }
+    /// Where the engine writes the audio takes.
+    fn set_recording_dir(&mut self, _dir: &Path) {}
+    /// The hardware channels an audio track records and monitors.
+    fn set_track_input(&mut self, _track: TrackId, _input: InputSource) {}
+    /// How an audio track is monitored while armed.
+    fn set_track_monitor(&mut self, _track: TrackId, _monitor: Monitor) {}
+    /// The notes of the take that are complete so far, each handed out once.
+    /// Call it now and then during a take.
+    fn take_recorded_notes(&mut self) -> Vec<RecNote> {
+        Vec::new()
+    }
+    /// The finished take (the notes not handed out yet), once, after it ended.
+    fn finish_midi_recording(&mut self) -> Option<MidiTake> {
+        None
+    }
+    /// The MIDI input ports of the system, as of the last look (every 3 s).
+    fn midi_ports(&self) -> Vec<MidiPortState> {
+        Vec::new()
+    }
+    /// Switch a port on or off (remembered; opening happens in the background).
+    fn set_midi_port_enabled(&mut self, _id: &str, _enabled: bool) {}
+    /// The track live MIDI goes to; `None` = every armed instrument track.
+    fn midi_target(&self) -> Option<TrackId> {
+        None
+    }
+    /// Choose that track (remembered).
+    fn set_midi_target(&mut self, _track: Option<TrackId>) {}
+    /// MIDI messages read since the engine started: an activity light.
+    fn midi_message_count(&self) -> u64 {
+        0
+    }
+    /// Bytes of the sample cache held by warp renders (part of its total).
+    fn sample_cache_warp_bytes(&self) -> usize {
+        0
+    }
+    /// Fast path for a knob in a drag: set a device parameter (normalised) on
+    /// the running graph at once, no compile and no project snapshot. `false`
+    /// when the engine cannot take it (the caller sends the project instead).
+    fn fast_param(&mut self, _device: DeviceId, _param: u32, _normalized: f32) -> bool {
+        false
+    }
+    /// Fast path for a fader: a track's volume in dB.
+    fn fast_track_volume(&mut self, _track: TrackId, _db: f32) -> bool {
+        false
+    }
+    fn fast_track_pan(&mut self, _track: TrackId, _pan: f32) -> bool {
+        false
+    }
+    /// Fast path for a send knob: the level in dB of send `index` of the track.
+    fn fast_send_level(&mut self, _track: TrackId, _index: usize, _db: f32) -> bool {
+        false
+    }
+    /// Fast path while a rack's chain selector is dragged: the zone gains
+    /// follow within the block, no compile.
+    fn fast_rack_selector(&mut self, _rack: DeviceId, _value: u8) -> bool {
+        false
+    }
+    /// Graphs the engine has compiled and project snapshots it absorbed
+    /// without compiling (tests of the fast path; 0 for engines that don't count).
+    #[allow(dead_code)]
+    fn compile_count(&self) -> u64 {
+        0
+    }
+    #[allow(dead_code)]
+    fn patch_count(&self) -> u64 {
+        0
+    }
     /// Per-track peak meters, including the Main track.
     fn meter(&self, track: TrackId) -> MeterLevel;
     /// DSP load, 0..=1.
@@ -112,6 +201,10 @@ pub trait EngineBridge {
     /// editor housekeeping). Returns true when the UI should repaint.
     fn idle(&mut self) -> bool {
         false
+    }
+    /// What the engine reports about itself (read again only when it changes).
+    fn health(&self) -> EngineHealth {
+        EngineHealth::default()
     }
     /// A non-blocking problem to show above the workspace (no audio device…).
     fn banner(&self) -> Option<String> {
@@ -166,6 +259,11 @@ pub trait EngineBridge {
     fn set_sandbox_plugins(&mut self, _on: bool) {}
     /// Audition an audio file at a low level (`None` stops).
     fn preview(&mut self, _path: Option<&Path>) {}
+    /// Audition a sound adjusted to the song: stretched to its tempo and
+    /// transposed to its key, entering on the next bar when the song runs.
+    fn preview_synced(&mut self, _req: &SyncedPreview) {}
+    /// Level of the preview, 0..=1.
+    fn set_preview_volume(&mut self, _volume: f32) {}
     /// Audition an audio file the way a clip plays it: `ratio` times faster
     /// (transpose and detune) and backwards when `reverse`.
     fn preview_pitched(&mut self, path: Option<&Path>, _ratio: f64, _reverse: bool) {
@@ -205,6 +303,8 @@ pub struct StubEngine {
     tracks: Vec<(TrackId, TrackKind, bool)>,
     slots: BTreeMap<TrackId, SlotState>,
     clip_slots: BTreeMap<TrackId, Vec<SceneId>>,
+    count_in: u32,
+    global_quantize: Quantize,
     audio: AudioConfig,
     /// Stock plugin id of every device, for the synthetic device meters.
     devices: HashMap<DeviceId, String>,
@@ -214,6 +314,28 @@ pub struct StubEngine {
     synth_pos: u64,
     noise: u32,
     born: Instant,
+    /// What the "plugins" report as their live state (tests of save/export).
+    pub live_states: Vec<(DeviceId, Vec<u8>)>,
+    /// Project snapshots received, and fast-path calls (tests of drags).
+    pub project_updates: u64,
+    pub fast_calls: u64,
+    /// Stub MIDI: the ports switched off and the chosen target.
+    midi_off: BTreeSet<String>,
+    midi_to: Option<TrackId>,
+    /// Stub recording: the armed tracks, the notes a take has played so far and
+    /// the take that ends when the transport stops (tests set these).
+    pub armed_midi: Vec<TrackId>,
+    pub armed_audio: Vec<TrackId>,
+    /// Files the take wrote (handed out once) and what the engine was told.
+    pub audio_takes: Vec<AudioTake>,
+    pub track_io: BTreeMap<TrackId, (InputSource, Monitor)>,
+    pub rec_dir: Option<PathBuf>,
+    pub played: Vec<RecNote>,
+    pub rec_take: Option<MidiTake>,
+    rec_started: Option<Tick>,
+    /// The last synced preview asked for, and the preview level (tests).
+    pub last_synced: Option<SyncedPreview>,
+    pub preview_volume: f32,
 }
 
 impl Default for StubEngine {
@@ -226,6 +348,8 @@ impl Default for StubEngine {
             tracks: Vec::new(),
             slots: BTreeMap::new(),
             clip_slots: BTreeMap::new(),
+            count_in: 0,
+            global_quantize: Quantize::Bar,
             audio: AudioConfig::default(),
             devices: HashMap::new(),
             analysis: false,
@@ -233,6 +357,21 @@ impl Default for StubEngine {
             synth_pos: 0,
             noise: 0x1234_5678,
             born: Instant::now(),
+            live_states: Vec::new(),
+            project_updates: 0,
+            fast_calls: 0,
+            midi_off: BTreeSet::new(),
+            midi_to: None,
+            armed_midi: Vec::new(),
+            armed_audio: Vec::new(),
+            audio_takes: Vec::new(),
+            track_io: BTreeMap::new(),
+            rec_dir: None,
+            played: Vec::new(),
+            rec_take: None,
+            rec_started: None,
+            last_synced: None,
+            preview_volume: 1.,
         }
     }
 }
@@ -442,6 +581,26 @@ impl EngineBridge for StubEngine {
         self.state.metronome = on;
     }
 
+    fn set_count_in(&mut self, bars: u32) {
+        self.count_in = bars;
+    }
+
+    fn count_in(&self) -> u32 {
+        self.count_in
+    }
+
+    fn set_global_quantize(&mut self, quantize: Quantize) {
+        self.global_quantize = quantize;
+    }
+
+    fn global_quantize(&self) -> Quantize {
+        self.global_quantize
+    }
+
+    fn back_to_arrangement(&mut self) {
+        self.slots.clear();
+    }
+
     fn locate(&mut self, tick: Tick) {
         self.state.position = tick.max(0);
         if self.state.playing {
@@ -453,7 +612,115 @@ impl EngineBridge for StubEngine {
         TransportState { position: self.now_tick(), ..self.state }
     }
 
+    fn preview_synced(&mut self, req: &SyncedPreview) {
+        self.last_synced = Some(req.clone());
+    }
+
+    fn set_preview_volume(&mut self, volume: f32) {
+        self.preview_volume = volume.clamp(0., 1.);
+    }
+
+    fn recording_state(&self) -> RecordingState {
+        let capturing = self.state.recording && self.state.playing;
+        RecordingState {
+            capturing,
+            start_tick: self.rec_started.unwrap_or(0),
+            pass: 0,
+            tracks: self.armed_midi.clone(),
+            audio_tracks: self.armed_audio.clone(),
+            takes_started: 0,
+            takes_finished: 0,
+            dropped: 0,
+        }
+    }
+
+    fn take_recorded_notes(&mut self) -> Vec<RecNote> {
+        std::mem::take(&mut self.played)
+    }
+
+    fn finish_audio_recording(&mut self) -> Vec<AudioTake> {
+        if self.state.recording && self.state.playing {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.audio_takes)
+    }
+
+    fn set_recording_dir(&mut self, dir: &Path) {
+        self.rec_dir = Some(dir.to_path_buf());
+    }
+
+    fn set_track_input(&mut self, track: TrackId, input: InputSource) {
+        self.track_io.entry(track).or_insert((InputSource::None, Monitor::Auto)).0 = input;
+    }
+
+    fn set_track_monitor(&mut self, track: TrackId, monitor: Monitor) {
+        self.track_io.entry(track).or_insert((InputSource::None, Monitor::Auto)).1 = monitor;
+    }
+
+    fn finish_midi_recording(&mut self) -> Option<MidiTake> {
+        if self.state.recording && self.state.playing {
+            return None;
+        }
+        self.rec_take.take()
+    }
+
+    fn midi_ports(&self) -> Vec<MidiPortState> {
+        [("stub-keys", "Stub Keyboard"), ("stub-pads", "Stub Pad Controller")]
+            .into_iter()
+            .map(|(id, name)| {
+                let enabled = !self.midi_off.contains(id);
+                MidiPortState { id: id.into(), name: name.into(), enabled, open: enabled }
+            })
+            .collect()
+    }
+
+    fn set_midi_port_enabled(&mut self, id: &str, enabled: bool) {
+        if enabled {
+            self.midi_off.remove(id);
+        } else {
+            self.midi_off.insert(id.to_owned());
+        }
+    }
+
+    fn midi_target(&self) -> Option<TrackId> {
+        self.midi_to
+    }
+
+    fn set_midi_target(&mut self, track: Option<TrackId>) {
+        self.midi_to = track;
+    }
+
+    fn fast_param(&mut self, _: DeviceId, _: u32, _: f32) -> bool {
+        self.fast_calls += 1;
+        true
+    }
+
+    fn fast_rack_selector(&mut self, _: DeviceId, _: u8) -> bool {
+        self.fast_calls += 1;
+        true
+    }
+
+    fn fast_track_volume(&mut self, _: TrackId, _: f32) -> bool {
+        self.fast_calls += 1;
+        true
+    }
+
+    fn fast_track_pan(&mut self, _: TrackId, _: f32) -> bool {
+        self.fast_calls += 1;
+        true
+    }
+
+    fn fast_send_level(&mut self, _: TrackId, _: usize, _: f32) -> bool {
+        self.fast_calls += 1;
+        true
+    }
+
+    fn compile_count(&self) -> u64 {
+        self.project_updates
+    }
+
     fn update_project(&mut self, project: &Project) {
+        self.project_updates += 1;
         let bpm = project.tempo.initial_bpm();
         if (bpm - self.bpm).abs() > 1e-9 && self.state.playing {
             self.state.position = self.now_tick();
@@ -598,6 +865,10 @@ impl EngineBridge for StubEngine {
     }
 
     fn test_tone(&mut self) {}
+
+    fn plugin_states(&mut self) -> Vec<(DeviceId, Vec<u8>)> {
+        self.live_states.clone()
+    }
 
     fn export(&mut self, options: ExportOptions, _project: &Project, progress: ProgressFn) {
         stub_export(options, progress);
@@ -986,6 +1257,145 @@ impl PluginCatalog for StubCatalog {
     }
 }
 
+// ───────────────────────────── Sounds panel ─────────────────────────────
+
+/// Loops, one-shots or both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SoundKind {
+    #[default]
+    All,
+    Loops,
+    OneShots,
+}
+
+/// The broad kinds of sound the panel's chips offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundGroup {
+    Drums,
+    Bass,
+    Synths,
+    Instruments,
+    Vocals,
+    Fx,
+}
+
+impl SoundGroup {
+    pub const ALL: [SoundGroup; 6] = [Self::Drums, Self::Bass, Self::Synths, Self::Instruments, Self::Vocals, Self::Fx];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Drums => "Drums",
+            Self::Bass => "Bass",
+            Self::Synths => "Synths",
+            Self::Instruments => "Instruments",
+            Self::Vocals => "Vocals",
+            Self::Fx => "FX",
+        }
+    }
+}
+
+/// Which collection a sound comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundOrigin {
+    /// The sound bank that ships with AI-Track.
+    Factory,
+    /// The folder the Splice desktop app downloads the user's licensed sounds to.
+    Splice,
+    /// The user's own folders.
+    Mine,
+}
+
+impl SoundOrigin {
+    pub const ALL: [SoundOrigin; 3] = [Self::Splice, Self::Factory, Self::Mine];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Factory => "Factory",
+            Self::Splice => "Splice",
+            Self::Mine => "Mine",
+        }
+    }
+}
+
+/// What the Sounds panel asks the library for. The key and BPM are the
+/// project's when "fit to song" is on; the library only filters by them, the
+/// panel works out how each result is adjusted ([`aitrack_library::fit`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoundQuery {
+    pub text: String,
+    pub kind: SoundKind,
+    pub group: Option<SoundGroup>,
+    /// Keys that fit this one (relative and Camelot neighbours too), or exactly it.
+    pub key: Option<(Scale, bool)>,
+    /// Loops whose tempo (½×, 1× or 2×) is within this many percent of the BPM; one-shots always pass.
+    pub bpm: Option<(f32, f32)>,
+    pub tag: Option<String>,
+    pub origin: Option<SoundOrigin>,
+    pub favorites: bool,
+    /// 0 = a few hundred.
+    pub limit: usize,
+}
+
+/// One result of the Sounds panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundHit {
+    pub item: LibraryItem,
+    pub origin: SoundOrigin,
+    pub tags: Vec<String>,
+    pub bpm_trust: BpmTrust,
+    /// Missing its key or tempo: the analysis is working on it in the background.
+    pub unanalysed: bool,
+}
+
+/// Where the Splice folder stands, for the panel's one-line status.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SpliceState {
+    /// Nothing to say (not looked at yet, or a library without folders).
+    #[default]
+    Unknown,
+    /// There is no such folder: the panel says how to choose it.
+    Missing(PathBuf),
+    /// Indexed as a collection, with this many sounds.
+    Indexed { folder: PathBuf, sounds: u64 },
+    /// Being read now.
+    Scanning(PathBuf),
+}
+
+/// A page of results.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoundPage {
+    pub hits: Vec<SoundHit>,
+    /// More matched than `hits` holds.
+    pub more: bool,
+    /// The genres/tags in the results with their counts, most common first (for the tag chips).
+    pub tags: Vec<(String, usize)>,
+    pub splice: SpliceState,
+}
+
+/// A preview of a sound adjusted to the song (see `EngineBridge::preview_synced`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncedPreview {
+    pub path: PathBuf,
+    /// The sound's tempo, read at the ½×/1×/2× that lands nearest the song's; `None` = not stretched.
+    pub original_bpm: Option<f64>,
+    pub project_bpm: f64,
+    /// Transposition in semitones.
+    pub semitones: i8,
+    /// Pitched material (stretched keeping its pitch) as against percussion.
+    pub tonal: bool,
+    /// Play again and again (loops); one-shots play once.
+    pub looped: bool,
+    /// Time until the next bar of the running song, for the sound to enter on it; `None` = at once.
+    pub start_in: Option<std::time::Duration>,
+    /// Length of a bar at the song's tempo, to keep the entry on the grid if the render takes longer than `start_in`.
+    pub bar: std::time::Duration,
+}
+
+/// The first Re-Pitch ratio of a plain preview, for the stub's records and tests.
+pub fn semitone_ratio(semitones: i8) -> f64 {
+    2f64.powf(f64::from(semitones) / 12.)
+}
+
 // ───────────────────────────── Library ─────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1003,6 +1413,277 @@ pub struct LibraryItem {
     pub favorite: bool,
 }
 
+/// A note played during a take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecNote {
+    pub track: TrackId,
+    pub key: u8,
+    /// 0..=1.
+    pub velocity: f32,
+    /// On the timeline (inside the loop for a loop take).
+    pub start_tick: Tick,
+    pub length_ticks: Tick,
+    /// Loop pass it was played in.
+    pub pass: u32,
+}
+
+/// A finished MIDI take.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiTake {
+    /// The notes not handed out by [`EngineBridge::take_recorded_notes`] yet.
+    pub notes: Vec<RecNote>,
+    pub start_tick: Tick,
+    pub end_tick: Tick,
+    /// Loop passes it went through (1 = none).
+    pub passes: u32,
+}
+
+/// Where recording stands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecordingState {
+    /// A take is being captured right now.
+    pub capturing: bool,
+    /// Where it began.
+    pub start_tick: Tick,
+    pub pass: u32,
+    /// The armed instrument tracks, which get the notes.
+    pub tracks: Vec<TrackId>,
+    /// The armed audio tracks with an input, which get a file each.
+    pub audio_tracks: Vec<TrackId>,
+    /// Takes started and fully drained since the engine started: a take is
+    /// over (its files may still be arriving) when they are equal.
+    pub takes_started: u64,
+    pub takes_finished: u64,
+    /// Pieces of audio and notes the engine could not queue since it started.
+    pub dropped: u64,
+}
+
+/// Follows the engine's running count of lost pieces of a recording and says
+/// how many the last take lost.
+#[derive(Debug, Default)]
+pub struct DropTracker {
+    base: Option<u64>,
+    was_capturing: bool,
+    lost: u64,
+}
+
+impl DropTracker {
+    /// Call every frame with whether a take is being captured and the engine's
+    /// total. Returns what the latest take lost (0 once a new one begins).
+    pub fn update(&mut self, capturing: bool, total: u64) -> u64 {
+        if capturing {
+            if !self.was_capturing {
+                self.base = Some(total);
+                self.lost = 0;
+            }
+        } else {
+            // Losses while the take drains to disk count too.
+            let base = *self.base.get_or_insert(total);
+            self.lost = total.saturating_sub(base);
+        }
+        self.was_capturing = capturing;
+        self.lost
+    }
+}
+
+/// A WAV file written by an audio take.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTake {
+    pub track: TrackId,
+    pub path: PathBuf,
+    /// Timeline tick of its first frame.
+    pub start_tick: Tick,
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Set when the file could not be written (`frames` is what made it).
+    pub error: Option<String>,
+}
+
+/// A MIDI input port as the Preferences page shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiPortState {
+    /// Stable id, to pass to [`EngineBridge::set_midi_port_enabled`].
+    pub id: String,
+    pub name: String,
+    /// The user's choice (on unless switched off).
+    pub enabled: bool,
+    /// Messages from this port reach the engine right now.
+    pub open: bool,
+}
+
+/// What the audio engine reports about itself: contained panics, repaired
+/// samples, devices silenced after a panic, and what the last compile had to
+/// work around. Empty = all well.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineHealth {
+    pub callback_panics: u64,
+    pub node_panics: u64,
+    /// Non-finite samples replaced by silence at the output.
+    pub sanitized_samples: u64,
+    /// Devices silenced after a panic, until the graph is rebuilt.
+    pub crashed_devices: Vec<DeviceId>,
+    /// `file:line` of the last contained panic.
+    pub last_panic: Option<String>,
+    /// Non-fatal problems of the last compile (missing plugin, bad route…).
+    pub warnings: Vec<String>,
+    /// Stretched renders that failed (newest last): those clips play in Re-Pitch.
+    pub warp_failures: Vec<String>,
+    /// Pieces of audio or notes the last recording could not keep.
+    pub recording_lost: u64,
+    /// The last compile failed: the previous graph keeps playing.
+    pub error: Option<String>,
+}
+
+impl EngineHealth {
+    pub fn is_clean(&self) -> bool {
+        self.callback_panics == 0
+            && self.node_panics == 0
+            && self.sanitized_samples == 0
+            && self.crashed_devices.is_empty()
+            && self.warnings.is_empty()
+            && self.warp_failures.is_empty()
+            && self.recording_lost == 0
+            && self.error.is_none()
+    }
+
+    /// Something stopped sound (a panic, a silenced device, a failed compile),
+    /// as opposed to a warning about the project or a repaired sample.
+    pub fn is_fault(&self) -> bool {
+        self.callback_panics > 0 || self.node_panics > 0 || !self.crashed_devices.is_empty() || self.error.is_some()
+    }
+
+    /// One line per problem; `name_of` names a crashed device.
+    pub fn lines(&self, name_of: impl Fn(DeviceId) -> Option<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(e) = &self.error {
+            out.push(format!("The project could not be compiled; the previous version keeps playing: {e}"));
+        }
+        for d in &self.crashed_devices {
+            out.push(format!("{} crashed and is silent until the project is rebuilt", name_of(*d).unwrap_or_else(|| format!("Device {}", d.0))));
+        }
+        if self.callback_panics > 0 {
+            out.push(format!("{} audio callback panic{} answered with silence", self.callback_panics, if self.callback_panics == 1 { "" } else { "s" }));
+        }
+        if self.sanitized_samples > 0 {
+            out.push(format!("{} invalid sample{} (NaN or infinite) replaced with silence", self.sanitized_samples, if self.sanitized_samples == 1 { "" } else { "s" }));
+        }
+        if let Some(at) = &self.last_panic {
+            out.push(format!("Last panic at {at}"));
+        }
+        if self.recording_lost > 0 {
+            // A piece is about 5 ms of audio (256 frames) or one note event.
+            out.push(format!(
+                "The last recording lost {} piece{} of audio or notes (about {} ms of sound at most): the disk or the computer could not keep up",
+                self.recording_lost,
+                if self.recording_lost == 1 { "" } else { "s" },
+                self.recording_lost * 256 * 1000 / 48_000
+            ));
+        }
+        out.extend(self.warnings.iter().cloned());
+        // The newest few: the list only grows.
+        let shown = self.warp_failures.len().min(3);
+        out.extend(self.warp_failures[self.warp_failures.len() - shown..].iter().map(|f| format!("A clip could not be time-stretched and plays in Re-Pitch: {f}")));
+        if self.warp_failures.len() > shown {
+            out.push(format!("…and {} more clips could not be time-stretched", self.warp_failures.len() - shown));
+        }
+        out
+    }
+
+    /// How many problems the status bar counts as warnings.
+    pub fn warning_count(&self) -> usize {
+        self.warnings.len() + self.warp_failures.len() + usize::from(self.recording_lost > 0)
+    }
+}
+
+/// Remembers which problems the user was already told about, so each one
+/// gets a toast the first time it appears and not on every frame.
+#[derive(Debug, Default)]
+pub struct NoticeLog {
+    warnings: BTreeSet<String>,
+    crashed: BTreeSet<DeviceId>,
+    error: Option<String>,
+    panicked: bool,
+    sanitized: bool,
+    warp_seen: usize,
+    lost_seen: u64,
+}
+
+impl NoticeLog {
+    /// The toasts for what is new in `h` since the last call. A problem that
+    /// went away is forgotten, so it is told again if it comes back.
+    pub fn fresh(&mut self, h: &EngineHealth) -> Vec<String> {
+        let mut out = Vec::new();
+        self.warnings.retain(|w| h.warnings.contains(w));
+        for w in &h.warnings {
+            if self.warnings.insert(w.clone()) {
+                out.push(format!("Engine: {w}"));
+            }
+        }
+        self.crashed.retain(|d| h.crashed_devices.contains(d));
+        for d in &h.crashed_devices {
+            if self.crashed.insert(*d) {
+                out.push("A device crashed and was silenced; see the audio status in the status bar".to_owned());
+            }
+        }
+        if h.error != self.error {
+            if let Some(e) = &h.error {
+                out.push(format!("The project could not be compiled: {e}"));
+            }
+            self.error = h.error.clone();
+        }
+        let panicked = h.callback_panics > 0 || h.node_panics > 0;
+        if panicked && !self.panicked {
+            out.push("The audio engine contained a crash and answered with silence".to_owned());
+        }
+        self.panicked = panicked;
+        // Warp renders that failed: told when more of them appear.
+        if h.warp_failures.len() > self.warp_seen {
+            let n = h.warp_failures.len() - self.warp_seen;
+            out.push(if n == 1 { "A clip could not be time-stretched and plays in Re-Pitch".to_owned() } else { format!("{n} clips could not be time-stretched and play in Re-Pitch") });
+        }
+        self.warp_seen = h.warp_failures.len();
+        if h.recording_lost > self.lost_seen {
+            out.push(format!("The recording lost audio: {} piece{} could not be kept (the disk or the computer could not keep up)", h.recording_lost, if h.recording_lost == 1 { "" } else { "s" }));
+        }
+        self.lost_seen = h.recording_lost;
+        let sanitized = h.sanitized_samples > 0;
+        if sanitized && !self.sanitized {
+            out.push("Invalid audio (NaN) was replaced with silence".to_owned());
+        }
+        self.sanitized = sanitized;
+        out
+    }
+}
+
+/// How far a library sample's BPM can be trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BpmTrust {
+    /// Set by the user, written in the file name or measured from the audio.
+    #[default]
+    Reliable,
+    /// Guessed from the length of the file alone (assuming 4/4 and a whole
+    /// number of bars): a loop warped to it can be badly out of tempo.
+    Estimate,
+}
+
+impl BpmTrust {
+    /// From the library's `bpm_source` column (`user`, `audio`, `filename`,
+    /// `estimate`); a missing source (a tempo filled in from the analysis
+    /// cache) is a measured one.
+    pub fn from_source(source: Option<&str>) -> Self {
+        match source {
+            Some("estimate") => Self::Estimate,
+            _ => Self::Reliable,
+        }
+    }
+
+    /// Whether a loop may be warped to this BPM the moment it is dropped.
+    pub fn allows_auto_warp(self) -> bool {
+        self == Self::Reliable
+    }
+}
+
 /// What "Organize on disk" would do, shown before anything moves.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrganizePreview {
@@ -1018,6 +1699,43 @@ pub struct OrganizePreview {
 pub trait LibraryBridge {
     /// Free-text search, optionally restricted to a key (compatible keys first).
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem>;
+    /// How far the BPM of sample `id` can be trusted (a loop whose BPM is
+    /// only guessed from its length is not warped automatically).
+    fn bpm_trust(&self, _id: u64) -> BpmTrust {
+        BpmTrust::Reliable
+    }
+    /// Search for the Sounds panel: filters by type, key, tempo, tag, collection and favourites.
+    fn search_sounds(&self, _q: &SoundQuery) -> SoundPage {
+        SoundPage::default()
+    }
+    /// The Splice download folder to index as a collection (`None` = none chosen
+    /// and none found at Splice's default place). Cheap: call it as often as you like.
+    fn set_splice_folder(&mut self, _folder: Option<PathBuf>) {}
+    /// The free-plugin catalog with what each one is doing here. Cheap; refreshed
+    /// about every two seconds, so a plugin the user installs by hand shows up.
+    /// The demo library lists them all as it finds them (nothing installed).
+    fn plugin_cards(&mut self) -> Vec<aitrack_library::plugins::PluginCard> {
+        static DEMO: std::sync::OnceLock<Vec<aitrack_library::plugins::PluginCard>> = std::sync::OnceLock::new();
+        DEMO.get_or_init(|| {
+            let none = std::env::temp_dir().join("aitrack-demo-no-plugins");
+            let dirs = aitrack_library::plugins::UserDirs { vst3: none.join("VST3"), clap: none.join("CLAP"), system: Vec::new() };
+            aitrack_library::plugins::PluginInstaller::new(none, dirs).cards()
+        })
+        .clone()
+    }
+    /// Download and install plugin `id` (only when the user asked for it).
+    fn install_plugin(&mut self, _id: &str) -> Result<(), String> {
+        Err("The demo library cannot install plugins".into())
+    }
+    fn cancel_plugin_install(&mut self, _id: &str) {}
+    /// Remove what AI-Track installed of `id`; the summary is for a toast.
+    fn uninstall_plugin(&mut self, _id: &str) -> Result<String, String> {
+        Err("Nothing installed by AI-Track".into())
+    }
+    /// Bundles installed since the last call: the plugin host scans exactly these.
+    fn take_installed_plugins(&mut self) -> Vec<PathBuf> {
+        Vec::new()
+    }
     /// Samples ranked for the project's key and tempo.
     fn recommend(&self, scale: Option<Scale>, _bpm: f64) -> Vec<LibraryItem> {
         self.search("", scale)
@@ -1146,6 +1864,74 @@ impl LibraryBridge for StubLibrary {
         // Exact key matches first.
         out.sort_by_key(|i| (i.key != key, i.name.clone()));
         out
+    }
+
+    fn search_sounds(&self, q: &SoundQuery) -> SoundPage {
+        let text = q.text.trim().to_lowercase();
+        let origin_of = |id: u64| match id % 5 {
+            0 => SoundOrigin::Splice,
+            1 | 2 => SoundOrigin::Factory,
+            _ => SoundOrigin::Mine,
+        };
+        let group_of = |i: &LibraryItem| {
+            let c = i.category.to_lowercase();
+            let any = |words: &[&str]| words.iter().any(|w| c.contains(w));
+            if any(&["kick", "snare", "clap", "hat", "perc"]) {
+                SoundGroup::Drums
+            } else if any(&["bass"]) {
+                SoundGroup::Bass
+            } else if any(&["vocal"]) {
+                SoundGroup::Vocals
+            } else if any(&["riser", "impact", "atmos", "fx"]) {
+                SoundGroup::Fx
+            } else if any(&["lead", "pad", "pluck"]) {
+                SoundGroup::Synths
+            } else {
+                SoundGroup::Instruments
+            }
+        };
+        let tag_of = |i: &LibraryItem| if i.is_loop { "loop" } else { "one-shot" }.to_owned();
+        let fits_key = |sample: Option<Scale>, (song, exact): (Scale, bool)| match sample {
+            None => true,
+            Some(k) if exact => k == song,
+            Some(k) => {
+                k == song
+                    || k.mask() == song.mask()
+                    || k.camelot().zip(song.camelot()).is_some_and(|(a, b)| aitrack_library::query::camelot_neighbors(&b).contains(&a))
+            }
+        };
+        let mut hits: Vec<SoundHit> = self
+            .items
+            .iter()
+            .filter(|i| text.is_empty() || i.name.to_lowercase().contains(&text) || i.category.to_lowercase().contains(&text))
+            .filter(|i| match q.kind {
+                SoundKind::All => true,
+                SoundKind::Loops => i.is_loop,
+                SoundKind::OneShots => !i.is_loop,
+            })
+            .filter(|i| q.group.is_none_or(|g| group_of(i) == g))
+            .filter(|i| q.key.is_none_or(|k| fits_key(i.key, k)))
+            .filter(|i| {
+                q.bpm.is_none_or(|(bpm, tol)| {
+                    !i.is_loop
+                        || i.bpm.is_some_and(|b| [0.5f32, 1., 2.].iter().any(|f| ((b * f) - bpm).abs() <= bpm * tol / 100.))
+                })
+            })
+            .filter(|i| q.tag.as_ref().is_none_or(|t| &tag_of(i) == t))
+            .filter(|i| q.origin.is_none_or(|o| origin_of(i.id) == o))
+            .filter(|i| !q.favorites || i.favorite)
+            .map(|i| SoundHit { item: i.clone(), origin: origin_of(i.id), tags: vec![tag_of(i)], bpm_trust: BpmTrust::Reliable, unanalysed: false })
+            .collect();
+        hits.sort_by(|a, b| a.item.name.cmp(&b.item.name));
+        let mut tags: BTreeMap<String, usize> = BTreeMap::new();
+        for h in &hits {
+            for t in &h.tags {
+                *tags.entry(t.clone()).or_default() += 1;
+            }
+        }
+        let mut tags: Vec<(String, usize)> = tags.into_iter().collect();
+        tags.sort_by_key(|(t, n)| (std::cmp::Reverse(*n), t.clone()));
+        SoundPage { hits, more: false, tags, splice: SpliceState::Indexed { folder: PathBuf::from("~/Splice/sounds"), sounds: 6 } }
     }
 }
 
@@ -1591,6 +2377,81 @@ mod tests {
         assert!(!e.transport().playing);
         e.stop();
         assert_eq!(e.transport().position, 0);
+    }
+
+    #[test]
+    fn engine_problems_are_told_once_and_again_if_they_return() {
+        let mut log = NoticeLog::default();
+        let mut h = EngineHealth::default();
+        assert!(h.is_clean() && log.fresh(&h).is_empty());
+        h.warnings = vec!["Plugin Foo is missing".into()];
+        assert!(!h.is_clean() && !h.is_fault(), "a warning is not a fault");
+        assert_eq!(log.fresh(&h), vec!["Engine: Plugin Foo is missing".to_owned()]);
+        assert!(log.fresh(&h).is_empty(), "not again while it stays");
+        h.warnings.push("A send points nowhere".into());
+        assert_eq!(log.fresh(&h).len(), 1, "only the new one");
+        h.warnings.clear();
+        assert!(log.fresh(&h).is_empty());
+        h.warnings = vec!["Plugin Foo is missing".into()];
+        assert_eq!(log.fresh(&h).len(), 1, "it came back");
+        // Warp renders that failed are told as they come and listed, but are not a fault.
+        h.warp_failures = vec!["pad.wav: boom".into()];
+        assert!(!h.is_clean() && !h.is_fault());
+        assert_eq!(h.warning_count(), 2);
+        assert_eq!(log.fresh(&h), vec!["A clip could not be time-stretched and plays in Re-Pitch".to_owned()]);
+        assert!(log.fresh(&h).is_empty());
+        h.warp_failures.push("lead.wav: boom".into());
+        assert!(log.fresh(&h)[0].starts_with("A clip"));
+        assert!(h.lines(|_| None).iter().any(|l| l.contains("pad.wav")));
+        h.warp_failures.clear();
+        // A recording that lost audio says so once it is over, with how much.
+        h.recording_lost = 7;
+        assert!(!h.is_fault() && !h.is_clean());
+        let told = log.fresh(&h);
+        assert_eq!(told.len(), 1);
+        assert!(told[0].contains("7 pieces"), "{told:?}");
+        assert!(h.lines(|_| None).iter().any(|l| l.contains("7 pieces")));
+        assert!(log.fresh(&h).is_empty());
+        h.recording_lost = 0;
+        // Faults.
+        h.crashed_devices = vec![DeviceId(7)];
+        h.node_panics = 1;
+        h.sanitized_samples = 3;
+        h.error = Some("no Main track".into());
+        assert!(h.is_fault());
+        assert_eq!(log.fresh(&h).len(), 4, "crashed device, compile error, panic, invalid audio");
+        assert!(log.fresh(&h).is_empty());
+        let lines = h.lines(|d| (d.0 == 7).then(|| "EQ Eight".to_owned()));
+        assert!(lines.iter().any(|l| l.starts_with("EQ Eight crashed")));
+        assert!(lines.iter().any(|l| l.contains("3 invalid samples")));
+        assert!(lines.iter().any(|l| l.contains("no Main track")));
+        assert!(lines.contains(&"Plugin Foo is missing".to_owned()));
+    }
+
+    #[test]
+    fn the_losses_of_a_recording_are_counted_for_that_take_only() {
+        let mut t = DropTracker::default();
+        assert_eq!(t.update(false, 5), 0, "drops before any take are not a take's");
+        assert_eq!(t.update(true, 5), 0);
+        assert_eq!(t.update(true, 9), 0, "told once it is over, not while it runs");
+        assert_eq!(t.update(false, 12), 7, "the tail that drained to disk counts too");
+        assert_eq!(t.update(false, 12), 7);
+        assert_eq!(t.update(true, 12), 0, "a new take starts from nothing");
+        assert_eq!(t.update(false, 12), 0);
+    }
+
+    #[test]
+    fn the_stub_bridge_lists_midi_ports_and_remembers_the_choices() {
+        let mut e = StubEngine::default();
+        assert!(e.midi_ports().iter().all(|p| p.enabled && p.open), "every port on by default");
+        e.set_midi_port_enabled("stub-pads", false);
+        let ports = e.midi_ports();
+        assert_eq!(ports.iter().filter(|p| p.enabled).count(), 1);
+        assert!(ports.iter().find(|p| p.id == "stub-pads").is_some_and(|p| !p.open));
+        e.set_midi_target(Some(TrackId(3)));
+        assert_eq!(e.midi_target(), Some(TrackId(3)));
+        e.set_midi_target(None);
+        assert_eq!(e.midi_target(), None, "None = the armed tracks");
     }
 
     #[test]

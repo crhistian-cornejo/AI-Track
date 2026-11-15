@@ -101,6 +101,7 @@ pub fn render_rename(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElem
     let pal = p();
     let what = match ws.ui.rename_target {
         Some(crate::commands::RenameTarget::Clip(_)) => "Clip name",
+        Some(crate::commands::RenameTarget::Scene(_)) => "Scene name",
         _ => "Track name",
     };
     div()

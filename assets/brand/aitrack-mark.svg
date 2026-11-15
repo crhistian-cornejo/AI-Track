@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="27 40 202 176" role="img" aria-labelledby="t">
+  <title id="t">AI-Track</title>
+  <!-- Mark only, no tile. Bars take the surrounding text colour. -->
+  <g fill="currentColor">
+    <rect x="35"  y="160" width="18" height="48" rx="9"/>
+    <rect x="63"  y="112" width="18" height="96" rx="9"/>
+    <rect x="91"  y="80"  width="18" height="72" rx="9"/>
+    <rect x="147" y="80"  width="18" height="72" rx="9"/>
+    <rect x="175" y="112" width="18" height="96" rx="9"/>
+    <rect x="203" y="160" width="18" height="48" rx="9"/>
+  </g>
+  <rect x="119" y="48" width="18" height="104" rx="9" fill="#F0783C"/>
+</svg>

@@ -12,6 +12,7 @@
 //!   plus 16 macros with variations (Ableton racks, Logic Smart Controls).
 //! * The step sequencer (FL Studio) is a view over a drum rack's notes.
 
+use crate::format::LoadError;
 use crate::ids::*;
 use crate::scale::Scale;
 use crate::time::{Tick, TempoMap, PPQ};
@@ -146,11 +147,21 @@ impl Project {
         serde_json::to_string_pretty(self)
     }
 
-    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        let mut p: Project = serde_json::from_str(s)?;
+    /// Open a project file's text. `format_version` is read first: a file
+    /// from a newer AI-Track is refused ([`LoadError::TooNew`]) instead of
+    /// being read with fields silently dropped, and an older one goes through
+    /// the migration chain ([`crate::format`]). The ids are made monotonic.
+    pub fn open_json(s: &str) -> Result<Self, LoadError> {
+        let mut p = crate::format::open(s)?;
         let max = p.max_id();
         p.ids.observe(max);
         Ok(p)
+    }
+
+    /// [`open_json`](Self::open_json) with the error as a `serde_json::Error`
+    /// (same checks, same message), for callers that predate [`LoadError`].
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        Self::open_json(s).map_err(<serde_json::Error as serde::de::Error>::custom)
     }
 
     fn max_id(&self) -> u64 {
@@ -170,11 +181,11 @@ impl Project {
     }
 }
 
-fn find_device(chain: &[Device], id: DeviceId) -> Option<&Device> {
+pub(crate) fn find_device(chain: &[Device], id: DeviceId) -> Option<&Device> {
     for d in chain {
         if d.id == id { return Some(d); }
         if let DeviceKind::Rack(rack) = &d.kind {
-            for c in &rack.chains {
+            for c in rack.chains.iter().chain(&rack.returns) {
                 if let Some(found) = find_device(&c.devices, id) { return Some(found); }
             }
         }
@@ -186,7 +197,7 @@ fn find_device_mut(chain: &mut [Device], id: DeviceId) -> Option<&mut Device> {
     for d in chain {
         if d.id == id { return Some(d); }
         if let DeviceKind::Rack(rack) = &mut d.kind {
-            for c in &mut rack.chains {
+            for c in rack.chains.iter_mut().chain(rack.returns.iter_mut()) {
                 if let Some(found) = find_device_mut(&mut c.devices, id) { return Some(found); }
             }
         }
@@ -198,7 +209,7 @@ pub fn visit_devices(chain: &[Device], f: &mut impl FnMut(&Device)) {
     for d in chain {
         f(d);
         if let DeviceKind::Rack(rack) = &d.kind {
-            for c in &rack.chains { visit_devices(&c.devices, f); }
+            for c in rack.chains.iter().chain(&rack.returns) { visit_devices(&c.devices, f); }
         }
     }
 }
@@ -263,6 +274,9 @@ pub struct Track {
     pub solo: bool,
     pub arm: bool,
     pub monitor: Monitor,
+    /// Where an Audio track records from (none until the user picks one).
+    #[serde(default)]
+    pub input: InputSource,
     pub output: Output,
     pub sends: Vec<Send>,
     /// Group or Folder this track lives in.
@@ -301,6 +315,7 @@ impl Track {
             solo: false,
             arm: false,
             monitor: Monitor::Auto,
+            input: InputSource::None,
             output: if kind == TrackKind::Main { Output::Hardware(0) } else { Output::Main },
             sends: Vec::new(),
             parent: None,
@@ -314,6 +329,28 @@ impl Track {
             reported_latency: 0,
             scale: None,
             keyboard_input: false,
+        }
+    }
+}
+
+/// The audio input a track records from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum InputSource {
+    /// Not recording from anything.
+    #[default]
+    None,
+    /// Hardware input channel `first` (0-based), or the stereo pair
+    /// `first`, `first + 1`.
+    Hardware { first: u16, stereo: bool },
+}
+
+impl InputSource {
+    /// `(first channel, channel count)` of a hardware input.
+    pub fn channel_span(self) -> Option<(u16, u16)> {
+        match self {
+            Self::None => None,
+            Self::Hardware { first, stereo } => Some((first, if stereo { 2 } else { 1 })),
         }
     }
 }
@@ -738,7 +775,13 @@ pub struct Rack {
     /// Snapshots of all macro values (macro variations).
     pub variations: Vec<Variation>,
     /// Chain selector value 0..=127 for zone-based chain switching.
+    #[serde(default)]
     pub chain_selector: u8,
+    /// Internal return buses (effect chains the pads send to). Only a Drum
+    /// Rack has them, [`MAX_RETURNS`] at most; a pad's [`Chain::sends`] are
+    /// levels into them, in this order.
+    #[serde(default)]
+    pub returns: Vec<Chain>,
 }
 
 impl Rack {
@@ -751,6 +794,7 @@ impl Rack {
                 .collect(),
             variations: Vec::new(),
             chain_selector: 0,
+            returns: Vec::new(),
         }
     }
 }
@@ -779,6 +823,49 @@ pub struct Chain {
     pub key_range: (u8, u8),
     pub velocity_range: (u8, u8),
     pub selector_range: (u8, u8),
+    /// Fade widths at the low and high end of the key zone (in keys): the
+    /// velocity of a note fades out over them.
+    #[serde(default)]
+    pub key_fade: (u8, u8),
+    /// The same for the velocity zone.
+    #[serde(default)]
+    pub vel_fade: (u8, u8),
+    /// The same for the chain-selector zone (it fades the chain's volume).
+    #[serde(default)]
+    pub sel_fade: (u8, u8),
+    /// Drum Rack choke group, 1..=16; 0 = none. Hitting a pad chokes the
+    /// other pads of its group.
+    #[serde(default)]
+    pub choke: u8,
+    /// Drum Rack: the note the pad's devices get when it is hit (`note` is
+    /// the one that hits it). `None` = the default, middle C.
+    #[serde(default)]
+    pub play_note: Option<u8>,
+    /// Drum Rack: send level in dB into each of the rack's returns, in
+    /// order; missing entries are off ([`SEND_OFF_DB`]).
+    #[serde(default)]
+    pub sends: Vec<f32>,
+    /// Where the chain's audio goes.
+    #[serde(default)]
+    pub output: ChainOut,
+}
+
+/// Most internal returns a Drum Rack has.
+pub const MAX_RETURNS: usize = 6;
+/// Send level that means "off".
+pub const SEND_OFF_DB: f32 = -60.0;
+/// Highest send level.
+pub const SEND_MAX_DB: f32 = 6.0;
+
+/// Where a rack chain's output goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "index")]
+pub enum ChainOut {
+    /// Summed with the other chains into the rack's output.
+    #[default]
+    Rack,
+    /// Straight into the rack's return `n` (instead of the rack output).
+    Return(u8),
 }
 
 impl Chain {
@@ -795,6 +882,13 @@ impl Chain {
             key_range: (0, 127),
             velocity_range: (1, 127),
             selector_range: (0, 127),
+            key_fade: (0, 0),
+            vel_fade: (0, 0),
+            sel_fade: (0, 0),
+            choke: 0,
+            play_note: None,
+            sends: Vec::new(),
+            output: ChainOut::Rack,
         }
     }
 }
@@ -814,6 +908,13 @@ pub struct MacroMapping {
     /// Normalised range the macro sweeps (min may exceed max to invert).
     pub min: f32,
     pub max: f32,
+}
+
+impl MacroMapping {
+    /// Whether the macro sweeps the parameter downwards (`min > max`).
+    pub fn is_inverted(&self) -> bool {
+        self.min > self.max
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

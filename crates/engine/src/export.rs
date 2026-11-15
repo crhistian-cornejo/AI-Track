@@ -459,8 +459,7 @@ impl DitherRng {
 /// Quantise to 16-bit with the chosen dither. `state` holds the shaping
 /// error per channel.
 fn quantize16(x: f32, dither: Dither, rng: &mut DitherRng, err: &mut f32) -> i16 {
-    let scale = 32_767.0f32;
-    let v = x * scale;
+    let v = x * 32_768.0;
     let q = match dither {
         Dither::None => v.round(),
         Dither::Tpdf => (v + rng.uniform() + rng.uniform()).round(),
@@ -494,7 +493,7 @@ pub fn write_wav(path: &Path, buffer: &AudioBuffer, sample_rate: u32, format: Wa
             match format {
                 WavFormat::Int16(d) => w.write_sample(quantize16(x, d, &mut rng, e)).map_err(wav_err)?,
                 WavFormat::Int24 => {
-                    let v = (x * 8_388_607.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+                    let v = (x * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
                     w.write_sample(v).map_err(wav_err)?
                 }
                 WavFormat::Float32 => w.write_sample(x).map_err(wav_err)?,
@@ -567,4 +566,43 @@ pub fn export_stems(
         paths.push(path);
     }
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(format: WavFormat, values: &[f32]) -> Vec<i32> {
+        let mut buf = AudioBuffer::new(1, values.len());
+        buf.channel_mut(0).copy_from_slice(values);
+        let path = std::env::temp_dir().join(format!("aitrack-export-{}-{}.wav", std::process::id(), format.bits()));
+        write_wav(&path, &buf, 48_000, format).unwrap();
+        let read: Vec<i32> = hound::WavReader::open(&path).unwrap().samples::<i32>().map(Result::unwrap).collect();
+        let _ = std::fs::remove_file(&path);
+        read
+    }
+
+    fn same(got: &[i32], want: &[i32]) {
+        assert_eq!(got.len(), want.len());
+        if let Some(i) = (0..got.len()).find(|i| got[*i] != want[*i]) {
+            panic!("sample {i}: wrote {} for {}", got[i], want[i]);
+        }
+    }
+
+    /// Files are read as `i / 2^(bits - 1)`; writing them back undithered
+    /// gives the same integers.
+    #[test]
+    fn integer_export_round_trips_what_import_reads() {
+        let all16: Vec<i32> = (-32_768..=32_767).collect();
+        let samples: Vec<f32> = all16.iter().map(|i| *i as f32 / 32_768.0).collect();
+        same(&roundtrip(WavFormat::Int16(Dither::None), &samples), &all16);
+
+        let all24: Vec<i32> = (-8_388_608..=8_388_607).step_by(257).chain([-8_388_608, -1, 0, 1, 8_388_607]).collect();
+        let samples: Vec<f32> = all24.iter().map(|i| *i as f32 / 8_388_608.0).collect();
+        same(&roundtrip(WavFormat::Int24, &samples), &all24);
+
+        // Full scale and beyond clips to the top code instead of wrapping.
+        assert_eq!(roundtrip(WavFormat::Int16(Dither::None), &[1.0, 2.0, -1.0, -2.0]), [32_767, 32_767, -32_768, -32_768]);
+        assert_eq!(roundtrip(WavFormat::Int24, &[1.0, 2.0, -1.0, -2.0]), [8_388_607, 8_388_607, -8_388_608, -8_388_608]);
+    }
 }

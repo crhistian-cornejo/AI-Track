@@ -20,6 +20,7 @@ pub mod fallback;
 pub(crate) mod graph;
 pub mod midi_io;
 pub mod mp3;
+pub mod record;
 pub mod rt;
 pub mod sample_cache;
 pub mod shared;

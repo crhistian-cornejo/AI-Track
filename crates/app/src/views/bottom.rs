@@ -256,6 +256,33 @@ fn small_button(id: impl Into<gpui::ElementId>, text: impl Into<SharedString>, e
         .child(mono(text, TEXT_XS, pal.text))
 }
 
+/// A value that opens a menu: its text and a chevron, in a well.
+fn dropdown(id: impl Into<gpui::ElementId>, text: &'static str, tip: &'static str) -> Stateful<Div> {
+    let pal = p();
+    div()
+        .id(id)
+        .h(px(20.))
+        .w(px(88.))
+        .px(px(SP2))
+        .gap(px(SP2))
+        .flex()
+        .items_center()
+        .justify_between()
+        .rounded(px(r_sm()))
+        .bg(pal.well)
+        .border_1()
+        .border_color(border())
+        .cursor_pointer()
+        .hover(|s| s.border_color(border_strong()))
+        .tooltip(widgets::tip(tip, None))
+        .child(mono(text, TEXT_SM, pal.text))
+        .child(icon(Icon::ChevronDown, 10., pal.faint))
+}
+
+/// Every launch mode and quantisation, in the order the panel lists them.
+pub(crate) const LAUNCH_MODES: [LaunchMode; 4] = [LaunchMode::Trigger, LaunchMode::Gate, LaunchMode::Toggle, LaunchMode::Repeat];
+pub(crate) const QUANTIZES: [Quantize; 7] = [Quantize::None, Quantize::Sixteenth, Quantize::Eighth, Quantize::Beat, Quantize::Bar, Quantize::TwoBars, Quantize::FourBars];
+
 /// A small on/off button of the properties column, lit while on.
 fn toggle_button(id: impl Into<gpui::ElementId>, text: &'static str, on: bool) -> Stateful<Div> {
     let b = small_button(id, text, true);
@@ -296,6 +323,131 @@ fn num_box(ws: &Workspace, id: impl Into<gpui::ElementId>, target: NumTarget, sh
         .child(body)
 }
 
+/// A change to a sample's Seg. BPM (the tempo it was recorded at).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SegBpm {
+    Half,
+    Double,
+    Step(f64),
+    /// A typed value (`commit_num_edit` in `workspace.rs`).
+    Set(f64),
+}
+
+impl SegBpm {
+    /// The new Seg. BPM, kept inside the tempo range.
+    fn apply(self, bpm: f64) -> f64 {
+        let next = match self {
+            SegBpm::Half => bpm / 2.,
+            SegBpm::Double => bpm * 2.,
+            SegBpm::Step(d) => bpm + d,
+            SegBpm::Set(v) => v,
+        };
+        if next.is_finite() { next.clamp(20., 999.) } else { bpm }
+    }
+}
+
+/// Change the Seg. BPM of the sample `clip` plays: a `SetWarp` in one undo
+/// step, and the clip stretches to the project tempo from the new value.
+/// Acts on the selected clips as every warp edit does. `false` when nothing
+/// changed (no Seg. BPM yet, or the value is already there).
+pub(crate) fn edit_seg_bpm(s: &mut crate::state::AppState, clip: ClipId, edit: SegBpm) -> bool {
+    s.seal();
+    let changed = s.set_clip_warp("seg-bpm", clip, |w| {
+        if let Some(b) = w.original_bpm {
+            w.original_bpm = Some(edit.apply(b));
+        }
+    });
+    s.seal();
+    changed
+}
+
+/// Launch mode of a clip: one `UpdateClip`, one undo step.
+pub(crate) fn set_launch_mode(s: &mut crate::state::AppState, clip: ClipId, mode: LaunchMode) -> bool {
+    edit_clip(s, clip, "Launch mode", |c| c.launch.mode = mode)
+}
+
+/// Launch quantisation of a clip: one `UpdateClip`, one undo step.
+pub(crate) fn set_launch_quantize(s: &mut crate::state::AppState, clip: ClipId, quantize: Quantize) -> bool {
+    edit_clip(s, clip, "Launch quantisation", |c| c.launch.quantize = quantize)
+}
+
+fn edit_clip(s: &mut crate::state::AppState, id: ClipId, label: &str, f: impl FnOnce(&mut Clip)) -> bool {
+    let Some(mut clip) = s.project.clips.get(&id).cloned() else { return false };
+    let before = clip.clone();
+    f(&mut clip);
+    if clip == before {
+        return false;
+    }
+    s.seal();
+    let ok = s.edit(label, vec![Command::UpdateClip { id, clip: Box::new(clip) }]);
+    s.seal();
+    ok
+}
+
+/// A typed position or length: `bars.beats.sixteenths` as the panel writes
+/// it ("2.1.0"), where missing parts are 0 (so "4" is four bars). Commas
+/// work as separators too. `None` for anything else.
+pub(crate) fn parse_position(text: &str, sig: TimeSignature) -> Option<Tick> {
+    let mut parts = text.trim().split(['.', ',']);
+    let mut next = |max: Tick| -> Option<Tick> {
+        match parts.next() {
+            None => Some(0),
+            Some(t) => t.trim().parse::<Tick>().ok().filter(|v| (0..=max).contains(v)),
+        }
+    };
+    let bars = next(100_000)?;
+    let beats = next(63)?;
+    let sixteenths = next(63)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let beat = (aitrack_model::PPQ * 4 / Tick::from(sig.denominator.max(1))).max(1);
+    Some(bars * sig.bar_ticks().max(1) + beats * beat + sixteenths * (aitrack_model::PPQ / 4))
+}
+
+/// The clip fields a value box types into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipField {
+    Start,
+    Length,
+}
+
+/// Apply typed `text` to a clip field (Enter in its value box): `SetClip`
+/// style `UpdateClip`, one undo step. `false` when the text is not a
+/// position or nothing changes.
+pub(crate) fn commit_clip_field(s: &mut crate::state::AppState, clip: ClipId, field: ClipField, text: &str) -> bool {
+    let Some(ticks) = parse_position(text, s.project.tempo.signature_at(0)) else { return false };
+    match field {
+        ClipField::Start => set_clip_start(s, clip, ticks),
+        ClipField::Length => {
+            s.seal();
+            let ok = s.resize_clip(clip, ticks.max(aitrack_model::ops::MIN_CLIP_LEN));
+            s.seal();
+            ok
+        }
+    }
+}
+
+/// Move where an audio clip starts inside its file (Live's Start marker),
+/// keeping the clip's place on the timeline. It stays inside the file and,
+/// unless the clip loops, shrinks if the tail would run past the end.
+/// Notes clips keep their notes from tick 0, so they have no Start to move.
+pub(crate) fn set_clip_start(s: &mut crate::state::AppState, clip: ClipId, start: Tick) -> bool {
+    let Some(file) = aitrack_model::ops::source_len(&s.project, clip) else { return false };
+    let min = aitrack_model::ops::MIN_CLIP_LEN;
+    let start = start.clamp(0, (file - min).max(0));
+    let Some(old) = s.project.clips.get(&clip) else { return false };
+    let looping = old.looping.is_some();
+    let rate = aitrack_model::ops::clip_rate(&s.project, clip);
+    edit_clip(s, clip, "Clip start", |c| {
+        c.offset = start;
+        if !looping {
+            let room = (((file - start) as f64) / rate).floor().max(min as f64) as Tick;
+            c.length = c.length.min(room);
+        }
+    })
+}
+
 /// A value shown in a well (what Live draws as a number box).
 fn value_box(text: impl Into<SharedString>) -> Div {
     let pal = p();
@@ -311,6 +463,7 @@ pub fn launch_mode_name(m: LaunchMode) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn next_launch_mode(m: LaunchMode) -> LaunchMode {
     match m {
         LaunchMode::Trigger => LaunchMode::Gate,
@@ -456,15 +609,26 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                 .child(div().w(px(3.)).h(px(16.)).rounded(px(2.)).bg(track_color(clip.color)))
                 .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&clip.name, PROPS_W - 64., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))),
         )
-        .child(row("Signature", value_box(format!("{}/{}", sig.numerator, sig.denominator))))
-        .child(row("Start", value_box(format_len(clip.offset, sig))))
+        .child(row(
+            "Signature",
+            value_box(format!("{}/{}", sig.numerator, sig.denominator))
+                .id(("clip-signature", n))
+                .cursor_pointer()
+                .hover(|s| s.border_color(border_strong()))
+                .tooltip(widgets::tip("Project time signature: click to change", None))
+                .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+                    let at = e.position();
+                    this.open_menu(MenuKind::TimeSignature, point(at.x - px(12.), at.y - px(160.)), cx);
+                })),
+        ))
+        .child(row("Start", num_box(ws, ("clip-start", n), NumTarget::ClipStart { clip: id }, format_len(clip.offset, sig), format_len(clip.offset, sig), cx)))
         .child(row(
             "Length",
             div()
                 .flex()
                 .items_center()
                 .gap(px(SP1))
-                .child(value_box(format_len(length, sig)))
+                .child(num_box(ws, ("clip-length", n), NumTarget::ClipLength { clip: id }, format_len(length, sig), format_len(length, sig), cx))
                 .child(small_button(("clip-half", n), ":2", length >= 2 * aitrack_model::ops::MIN_CLIP_LEN).tooltip(widgets::tip("Half as long", None)).on_click(cx.listener(
                     move |this, _, _, cx| {
                         resize(this, id, length / 2);
@@ -492,21 +656,17 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
         .when_some(clip.looping, |d, lp| d.child(row("Loop len", value_box(format_len(lp.end - lp.start, sig)))))
         .child(row(
             "Launch",
-            small_button(("clip-mode", n), launch_mode_name(mode), true).tooltip(widgets::tip("Launch mode: click to change", None)).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    update_clip(this, id, "Launch mode", |c| c.launch.mode = next_launch_mode(mode));
-                    cx.notify();
-                },
-            )),
+            dropdown(("clip-mode", n), launch_mode_name(mode), "Launch mode: click to choose").on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                let at = e.position();
+                this.open_menu(MenuKind::ClipLaunch(id), point(at.x - px(12.), at.y - px(160.)), cx);
+            })),
         ))
         .child(row(
             "Quantize",
-            small_button(("clip-quant", n), quantize_name(quant), true).tooltip(widgets::tip("Launch quantisation: click to change", None)).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    update_clip(this, id, "Launch quantisation", |c| c.launch.quantize = next_quantize(quant));
-                    cx.notify();
-                },
-            )),
+            dropdown(("clip-quant", n), quantize_name(quant), "Launch quantisation: when the clip starts after you launch it").on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                let at = e.position();
+                this.open_menu(MenuKind::ClipQuantize(id), point(at.x - px(12.), at.y - px(220.)), cx);
+            })),
         ));
 
     let mut column = div().flex().flex_col().child(clip_box);
@@ -572,7 +732,39 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                                 })),
                         ),
                 ))
-                .when_some(warp.original_bpm, |d, b| d.child(row("Seg. BPM", value_box(format!("{b:.2}")))))
+                .when_some(warp.original_bpm, |d, b| {
+                    d.child(row(
+                        "Seg. BPM",
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SP1))
+                            .child(small_button(("seg-bpm-down", n), "−", true).tooltip(widgets::tip("Seg. BPM −1: the tempo the sample was recorded at", None)).on_click(cx.listener(move |this, _, _, cx| {
+                                edit_seg_bpm(&mut this.s, id, SegBpm::Step(-1.));
+                                cx.notify();
+                            })))
+                            .child(num_box(ws, ("seg-bpm", n), NumTarget::SegBpm { clip: id }, format!("{b:.2}"), plain_text(b), cx))
+                            .child(small_button(("seg-bpm-up", n), "+", true).tooltip(widgets::tip("Seg. BPM +1", None)).on_click(cx.listener(move |this, _, _, cx| {
+                                edit_seg_bpm(&mut this.s, id, SegBpm::Step(1.));
+                                cx.notify();
+                            }))),
+                    ))
+                    .child(row(
+                        "",
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SP1))
+                            .child(small_button(("seg-bpm-half", n), "÷2", true).tooltip(widgets::tip("Halve Seg. BPM: the clip plays twice as fast", None)).on_click(cx.listener(move |this, _, _, cx| {
+                                edit_seg_bpm(&mut this.s, id, SegBpm::Half);
+                                cx.notify();
+                            })))
+                            .child(small_button(("seg-bpm-double", n), "×2", true).tooltip(widgets::tip("Double Seg. BPM: the clip plays at half speed", None)).on_click(cx.listener(move |this, _, _, cx| {
+                                edit_seg_bpm(&mut this.s, id, SegBpm::Double);
+                                cx.notify();
+                            }))),
+                    ))
+                })
                 // A clip stretched with Cmd/Ctrl + an edge.
                 .when(stretch != 1., |d| {
                     d.child(row("Stretch", value_box(format!("×{stretch:.2}")).id(("stretch", n)).tooltip(widgets::tip("Stretched in time: Cmd/Ctrl + drag a clip edge in the arrangement", None))))
@@ -921,6 +1113,106 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 mod tests {
     use super::*;
     use aitrack_model::NoteId;
+
+    #[test]
+    fn seg_bpm_halves_and_doubles_in_one_undo_step() {
+        let mut s = crate::state::AppState::new(crate::demo::project());
+        let clip = *s.project.clips.iter().find(|(_, c)| matches!(s.project.sources.get(&c.source), Some(Source::Audio(_)))).unwrap().0;
+        let warp = |s: &crate::state::AppState| match s.project.sources.get(&s.project.clips[&clip].source) {
+            Some(Source::Audio(a)) => a.warp.clone(),
+            _ => unreachable!(),
+        };
+        let stretch = |s: &crate::state::AppState| aitrack_model::ops::stretch_factor(&warp(s), s.project.tempo.initial_bpm());
+        let project_bpm = s.project.tempo.initial_bpm();
+        s.seal();
+        s.set_clip_warp("setup", clip, |w| {
+            w.enabled = true;
+            w.original_bpm = Some(project_bpm);
+        });
+        s.seal();
+        assert!((stretch(&s) - 1.).abs() < 1e-9);
+        let steps = s.history.steps().count();
+        let before = warp(&s);
+        assert!(edit_seg_bpm(&mut s, clip, SegBpm::Double));
+        assert_eq!(warp(&s).original_bpm, Some(project_bpm * 2.));
+        assert!((stretch(&s) - 2.).abs() < 1e-9, "the clip re-stretches");
+        assert_eq!(s.history.steps().count(), steps + 1, "one undo step");
+        assert!(edit_seg_bpm(&mut s, clip, SegBpm::Half));
+        assert_eq!(warp(&s), before, "÷2 undoes ×2");
+        assert!(edit_seg_bpm(&mut s, clip, SegBpm::Step(1.)));
+        assert_eq!(warp(&s).original_bpm, Some(project_bpm + 1.));
+        assert!(s.undo());
+        assert_eq!(warp(&s), before);
+        assert!(!edit_seg_bpm(&mut s, clip, SegBpm::Set(project_bpm)), "same value, no step");
+    }
+
+    fn audio_clip(s: &crate::state::AppState) -> ClipId {
+        *s.project.clips.iter().find(|(_, c)| matches!(s.project.sources.get(&c.source), Some(Source::Audio(_)))).unwrap().0
+    }
+
+    #[test]
+    fn launch_mode_and_quantize_pick_a_value_in_one_undo_step() {
+        let mut s = crate::state::AppState::new(crate::demo::project());
+        let clip = audio_clip(&s);
+        let before = s.project.clips[&clip].clone();
+        let steps = s.history.steps().count();
+        let (mode, quant) = (LaunchMode::Repeat, Quantize::TwoBars);
+        let (mode, quant) = if before.launch.mode == mode { (LaunchMode::Gate, quant) } else { (mode, quant) };
+        let quant = if before.launch.quantize == quant { Quantize::Bar } else { quant };
+        assert!(set_launch_mode(&mut s, clip, mode));
+        assert!(!set_launch_mode(&mut s, clip, mode), "same value, no step");
+        assert!(set_launch_quantize(&mut s, clip, quant));
+        assert_eq!((s.project.clips[&clip].launch.mode, s.project.clips[&clip].launch.quantize), (mode, quant));
+        assert_eq!(s.history.steps().count(), steps + 2);
+        assert!(s.undo() && s.undo());
+        assert_eq!(s.project.clips[&clip], before);
+    }
+
+    #[test]
+    fn typed_positions_follow_the_panel_format() {
+        let four = TimeSignature { numerator: 4, denominator: 4 };
+        let p = aitrack_model::PPQ;
+        assert_eq!(parse_position("2.0.0", four), Some(8 * p));
+        assert_eq!(parse_position("1.2.2", four), Some(4 * p + 2 * p + p / 2));
+        assert_eq!(parse_position("4", four), Some(16 * p));
+        assert_eq!(parse_position(" 0,1 ", four), Some(p), "comma separates parts too");
+        assert_eq!(parse_position("a", four), None);
+        assert_eq!(parse_position("1.2.3.4", four), None);
+        assert_eq!(parse_position("-1", four), None);
+        // What the panel prints parses back to the same tick.
+        let six8 = TimeSignature { numerator: 6, denominator: 8 };
+        let t = 3 * six8.bar_ticks() + 2 * (p / 2) + p / 4;
+        assert_eq!(parse_position(&format_len(t, six8), six8), Some(t));
+    }
+
+    #[test]
+    fn typed_start_and_length_are_one_undo_step_each() {
+        let mut s = crate::state::AppState::new(crate::demo::project());
+        let clip = audio_clip(&s);
+        let p = aitrack_model::PPQ;
+        let before = s.project.clips[&clip].clone();
+        let steps = s.history.steps().count();
+        assert!(commit_clip_field(&mut s, clip, ClipField::Length, "0.2.0"));
+        assert_eq!(s.project.clips[&clip].length, 2 * p);
+        assert!(commit_clip_field(&mut s, clip, ClipField::Start, "0.1.0"));
+        assert_eq!(s.project.clips[&clip].offset, p);
+        assert_eq!(s.history.steps().count(), steps + 2);
+        assert!(!commit_clip_field(&mut s, clip, ClipField::Start, "nope"));
+        assert!(s.undo() && s.undo());
+        assert_eq!(s.project.clips[&clip], before);
+        // A start past the file's end is held inside it.
+        assert!(set_clip_start(&mut s, clip, 1_000_000_000));
+        let file = aitrack_model::ops::source_len(&s.project, clip).unwrap();
+        assert!(s.project.clips[&clip].offset < file);
+    }
+
+    #[test]
+    fn seg_bpm_stays_in_the_tempo_range() {
+        assert_eq!(SegBpm::Half.apply(30.), 20.);
+        assert_eq!(SegBpm::Double.apply(700.), 999.);
+        assert_eq!(SegBpm::Set(f64::NAN).apply(120.), 120.);
+        assert_eq!(SegBpm::Step(-1.).apply(120.5), 119.5);
+    }
 
     #[test]
     fn audio_clips_get_the_sample_editor_and_steps_stay_steps() {

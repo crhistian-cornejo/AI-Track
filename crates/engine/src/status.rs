@@ -191,6 +191,68 @@ pub(crate) struct SharedStatus {
     pub anchor: AnchorSlot,
     /// Time base of every `*_nanos` value here.
     pub epoch: Instant,
+    /// Whole device callbacks that panicked and were answered with silence.
+    pub callback_panics: AtomicU64,
+    /// Processors that panicked in `process` and were silenced (once each).
+    pub node_panics: AtomicU64,
+    /// Non-finite samples the output bus replaced with zero.
+    pub sanitized_samples: AtomicU64,
+    /// Input frames dropped (backlog or a full queue) and silent frames made up for a short queue.
+    pub input_dropped: AtomicU64,
+    pub input_underruns: AtomicU64,
+    /// Events the MIDI effects of the current graph lost to full queues.
+    pub midi_dropped: AtomicU64,
+    /// Generation of the graph the audio thread runs (see `CompiledGraph::generation`).
+    pub graph_gen: AtomicU64,
+    /// Live MIDI messages the audio thread has read (all ports and the UI keyboard).
+    pub midi_messages: AtomicU64,
+    /// The track live MIDI goes to (`u64::MAX` = every armed instrument track).
+    pub midi_target: AtomicU64,
+    /// A take is being captured (transport recording, count-in over).
+    pub rec_capturing: AtomicBool,
+    /// Timeline tick the current / last take began and ended at (`f64` bits).
+    pub rec_start_tick: AtomicU64,
+    pub rec_end_tick: AtomicU64,
+    /// Takes started / fully drained so far.
+    pub rec_sessions: AtomicU64,
+    pub rec_ended: AtomicU64,
+    /// Loop passes of the current take.
+    pub rec_pass: AtomicU32,
+    /// Recorded events / audio chunks the queues had no room for.
+    pub rec_dropped: AtomicU64,
+    /// Armed instrument / audio tracks of the current graph.
+    pub armed_midi: Mutex<Vec<TrackId>>,
+    pub armed_audio: Mutex<Vec<TrackId>>,
+    /// `crashed` flag of every processor of the current graph, sorted by id.
+    pub crash_flags: Mutex<Vec<(DeviceId, Arc<AtomicBool>)>>,
+}
+
+/// What the real-time path had to survive since the engine started: the
+/// numbers behind the UI's "audio fault" indicator. Everything here is
+/// published by the audio thread with plain atomic adds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioHealth {
+    /// Device callbacks that panicked; each was answered with silence.
+    pub callback_panics: u64,
+    /// Devices that panicked while processing; each stays silent until it is
+    /// rebuilt (see [`AudioHealth::crashed_devices`]).
+    pub node_panics: u64,
+    /// Non-finite (NaN / infinite) samples replaced by zero at the output.
+    pub sanitized_samples: u64,
+    /// Events the MIDI effects of the current graph lost to full queues.
+    pub midi_events_dropped: u64,
+    /// The devices of the current graph that are silenced after a panic.
+    pub crashed_devices: Vec<DeviceId>,
+    /// `file:line` of the last panic contained on the audio thread (its
+    /// message is not printed there). Process-wide.
+    pub last_panic: Option<String>,
+}
+
+impl AudioHealth {
+    /// No panic and no repaired sample so far.
+    pub fn is_clean(&self) -> bool {
+        self.callback_panics == 0 && self.node_panics == 0 && self.sanitized_samples == 0
+    }
 }
 
 /// Latency the device callbacks measure from cpal's stream timestamps, in
@@ -421,6 +483,44 @@ impl SharedStatus {
             io: IoLatency::default(),
             anchor: AnchorSlot::default(),
             epoch: Instant::now(),
+            callback_panics: AtomicU64::new(0),
+            node_panics: AtomicU64::new(0),
+            sanitized_samples: AtomicU64::new(0),
+            rec_capturing: AtomicBool::new(false),
+            rec_start_tick: AtomicU64::new(0f64.to_bits()),
+            rec_end_tick: AtomicU64::new(0f64.to_bits()),
+            rec_sessions: AtomicU64::new(0),
+            rec_ended: AtomicU64::new(0),
+            rec_pass: AtomicU32::new(0),
+            rec_dropped: AtomicU64::new(0),
+            armed_midi: Mutex::new(Vec::new()),
+            armed_audio: Mutex::new(Vec::new()),
+            input_dropped: AtomicU64::new(0),
+            input_underruns: AtomicU64::new(0),
+            midi_dropped: AtomicU64::new(0),
+            graph_gen: AtomicU64::new(0),
+            midi_messages: AtomicU64::new(0),
+            midi_target: AtomicU64::new(u64::MAX),
+            crash_flags: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn health(&self) -> AudioHealth {
+        let crashed_devices = self
+            .crash_flags
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, flag)| flag.load(Ordering::Relaxed))
+            .map(|(id, _)| *id)
+            .collect();
+        AudioHealth {
+            callback_panics: self.callback_panics.load(Ordering::Relaxed),
+            node_panics: self.node_panics.load(Ordering::Relaxed),
+            sanitized_samples: self.sanitized_samples.load(Ordering::Relaxed),
+            midi_events_dropped: self.midi_dropped.load(Ordering::Relaxed),
+            crashed_devices,
+            last_panic: crate::rt::last_audio_panic(),
         }
     }
 

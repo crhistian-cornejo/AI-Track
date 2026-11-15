@@ -151,6 +151,180 @@ pub fn gain_computer(level_db: f32, threshold_db: f32, ratio: f32, knee_db: f32)
     }
 }
 
+/// Peak follower with instant attack, a hold time and an exponential
+/// release, fed with rectified samples. The hold bridges the gaps between
+/// the peaks of a periodic signal, so a steady tone reads as its amplitude
+/// with no ripple, while a transient still lets go after the release.
+#[derive(Clone, Copy, Debug)]
+pub struct PeakHold {
+    env: f32,
+    hold_left: u32,
+    hold: u32,
+    release: f32,
+}
+
+impl Default for PeakHold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeakHold {
+    pub fn new() -> Self {
+        Self { env: 0.0, hold_left: 0, hold: 0, release: 1.0 }
+    }
+
+    /// Hold in milliseconds, then a release with the given time constant.
+    pub fn set(&mut self, hold_ms: f32, release_ms: f32, sample_rate: f64) {
+        self.hold = (hold_ms as f64 * 0.001 * sample_rate).round() as u32;
+        self.release = one_pole_coeff(release_ms, sample_rate);
+    }
+
+    /// `x` is a magnitude (≥ 0).
+    #[inline]
+    pub fn process(&mut self, x: f32) -> f32 {
+        if x >= self.env {
+            self.env = x;
+            self.hold_left = self.hold;
+        } else if self.hold_left > 0 {
+            self.hold_left -= 1;
+        } else {
+            self.env += (x - self.env) * self.release;
+            if self.env < 1e-30 {
+                self.env = 0.0;
+            }
+        }
+        self.env
+    }
+
+    pub fn value(&self) -> f32 {
+        self.env
+    }
+
+    pub fn reset(&mut self) {
+        self.env = 0.0;
+        self.hold_left = 0;
+    }
+}
+
+/// Gain-reduction smoother of a bus compressor: branching (attack while the
+/// reduction grows, release while it shrinks), with a fixed release or an
+/// **automatic** one. The automatic release is program dependent: the
+/// reduction feeds two cascaded poles (the slow one fed by the fast one) and
+/// the release time runs from `fast_ms` to `slow_ms` as that memory goes
+/// from 0 to `depth_db`, so a brief hit lets go quickly while a sustained
+/// reduction recovers slowly and does not pump on bass.
+/// Input and output are gain reduction in dB (≥ 0).
+#[derive(Clone, Copy, Debug)]
+pub struct AutoReleaseSmoother {
+    attack: f32,
+    release: f32,
+    auto: bool,
+    fast_ms: f32,
+    slow_ms: f32,
+    depth_db: f32,
+    sample_rate: f64,
+    y: f32,
+    m1: f32,
+    m2: f32,
+    c1: f32,
+    c2: f32,
+    tick: u32,
+}
+
+/// How often (samples) the automatic release time is recomputed.
+const AUTO_RELEASE_STRIDE: u32 = 16;
+
+impl Default for AutoReleaseSmoother {
+    fn default() -> Self {
+        Self {
+            attack: 1.0,
+            release: 1.0,
+            auto: false,
+            fast_ms: 100.0,
+            slow_ms: 1_200.0,
+            depth_db: 10.0,
+            sample_rate: 48_000.0,
+            y: 0.0,
+            m1: 0.0,
+            m2: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            tick: 0,
+        }
+    }
+}
+
+impl AutoReleaseSmoother {
+    pub fn set_attack_ms(&mut self, ms: f32, sample_rate: f64) {
+        self.sample_rate = sample_rate;
+        self.attack = one_pole_coeff(ms, sample_rate);
+    }
+
+    /// Fixed release (time constant, ms).
+    pub fn set_release_ms(&mut self, ms: f32, sample_rate: f64) {
+        self.sample_rate = sample_rate;
+        self.auto = false;
+        self.release = one_pole_coeff(ms, sample_rate);
+    }
+
+    /// Automatic release between `fast_ms` and `slow_ms`, reaching the slow
+    /// end when the reduction memory is `depth_db` deep.
+    pub fn set_auto(&mut self, fast_ms: f32, slow_ms: f32, depth_db: f32, sample_rate: f64) {
+        self.sample_rate = sample_rate;
+        self.auto = true;
+        self.fast_ms = fast_ms;
+        self.slow_ms = slow_ms.max(fast_ms);
+        self.depth_db = depth_db.max(0.1);
+        self.c1 = one_pole_coeff(150.0, sample_rate);
+        self.c2 = one_pole_coeff(600.0, sample_rate);
+        self.release = one_pole_coeff(self.current_release_ms(), sample_rate);
+    }
+
+    /// Release time (ms) in effect now (automatic mode follows the memory).
+    pub fn current_release_ms(&self) -> f32 {
+        let t = (self.m2 / self.depth_db).clamp(0.0, 1.0);
+        self.fast_ms + (self.slow_ms - self.fast_ms) * t
+    }
+
+    pub fn is_auto(&self) -> bool {
+        self.auto
+    }
+
+    #[inline]
+    pub fn process(&mut self, gr_db: f32) -> f32 {
+        let c = if gr_db > self.y { self.attack } else { self.release };
+        self.y += (gr_db - self.y) * c;
+        if self.y < 1e-9 {
+            self.y = 0.0;
+        }
+        if self.auto {
+            self.m1 += (self.y - self.m1) * self.c1;
+            self.m2 += (self.m1 - self.m2) * self.c2;
+            self.tick += 1;
+            if self.tick >= AUTO_RELEASE_STRIDE {
+                self.tick = 0;
+                self.release = one_pole_coeff(self.current_release_ms(), self.sample_rate);
+            }
+        }
+        self.y
+    }
+
+    pub fn value(&self) -> f32 {
+        self.y
+    }
+
+    pub fn reset(&mut self) {
+        self.y = 0.0;
+        self.m1 = 0.0;
+        self.m2 = 0.0;
+        self.tick = 0;
+        if self.auto {
+            self.release = one_pole_coeff(self.fast_ms, self.sample_rate);
+        }
+    }
+}
+
 /// Envelope stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdsrStage {
@@ -346,5 +520,70 @@ mod tests {
             g.process(0.0);
         }
         assert!(g.value() < 4.0 && g.value() > 0.0);
+    }
+
+    #[test]
+    fn peak_hold_bridges_the_gaps_of_a_rectified_sine() {
+        let sr = 48_000.0;
+        let mut ph = PeakHold::new();
+        ph.set(1.5, 5.0, sr);
+        // 1 kHz: rectified peaks every 0.5 ms, well inside the 1.5 ms hold.
+        let mut lo = f32::MAX;
+        for i in 0..4_800 {
+            let x = (std::f64::consts::TAU * 1000.0 * i as f64 / sr).sin() as f32;
+            let v = ph.process(x.abs());
+            if i > 480 {
+                lo = lo.min(v);
+            }
+        }
+        assert!(lo > 0.99, "{lo}");
+        // After the signal stops it falls: 1.5 ms hold, then the release.
+        let mut v = 0.0;
+        for _ in 0..(sr as usize / 10) {
+            v = ph.process(0.0);
+        }
+        assert!(v < 1e-3, "{v}");
+    }
+
+    #[test]
+    fn auto_release_is_fast_for_hits_and_slow_for_sustained_reduction() {
+        let sr = 48_000.0;
+        // Time (s) the reduction takes to fall to a quarter after stopping.
+        let fall_time = |hold_s: f32| {
+            let mut s = AutoReleaseSmoother::default();
+            s.set_attack_ms(1.0, sr);
+            s.set_auto(100.0, 1_200.0, 10.0, sr);
+            for _ in 0..(hold_s * sr as f32) as usize {
+                s.process(10.0);
+            }
+            let start = s.value();
+            let mut n = 0usize;
+            while s.process(0.0) > start * 0.25 && n < 200_000 {
+                n += 1;
+            }
+            n as f32 / sr as f32
+        };
+        let brief = fall_time(0.05);
+        let long = fall_time(4.0);
+        assert!(brief < 0.3, "brief hit released in {brief} s");
+        assert!(long > 0.9, "sustained reduction released in {long} s");
+        assert!(long > 4.0 * brief);
+    }
+
+    #[test]
+    fn fixed_release_matches_its_time_constant() {
+        let sr = 48_000.0;
+        let mut s = AutoReleaseSmoother::default();
+        s.set_attack_ms(0.01, sr);
+        s.set_release_ms(200.0, sr);
+        for _ in 0..48_000 {
+            s.process(12.0);
+        }
+        assert!((s.value() - 12.0).abs() < 0.01);
+        for _ in 0..9_600 {
+            s.process(0.0);
+        }
+        // One time constant: 12 · e⁻¹.
+        assert!((s.value() - 12.0 * (-1.0f32).exp()).abs() < 0.1, "{}", s.value());
     }
 }

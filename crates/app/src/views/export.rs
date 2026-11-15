@@ -120,9 +120,12 @@ impl Workspace {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::unbounded::<ExportProgress>();
         let flag = cancel.clone();
+        // What was tweaked in the plugin windows and not saved yet is in the
+        // render: the offline instances are built from the project's states.
+        let project = self.s.export_snapshot(&mut *self.b.engine);
         self.b.engine.export(
             options,
-            &self.s.project,
+            &project,
             Box::new(move |p| {
                 let _ = tx.send_blocking(p);
                 !flag.load(Ordering::Relaxed)

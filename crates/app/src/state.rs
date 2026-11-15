@@ -10,6 +10,185 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const BAR: Tick = 4 * PPQ;
 
+/// What [`AppState::sync_engine`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Synced {
+    Nothing,
+    /// The project went to the engine.
+    Full,
+    /// Only parameter values went, by the fast path.
+    Fast,
+}
+
+/// A take being captured: the tracks it records and its first tick.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecView {
+    pub start: Tick,
+    pub tracks: Vec<TrackId>,
+}
+
+/// The audio files of a take that has ended and are still arriving (the
+/// engine writes them on a background thread).
+#[derive(Debug)]
+struct PendingAudio {
+    expected: usize,
+    got: Vec<crate::bridge::AudioTake>,
+    /// When the take was seen to be over, to give up waiting for a file.
+    over_since: Option<std::time::Instant>,
+    /// The loop the transport was looping over while it recorded.
+    looped: Option<(Tick, Tick)>,
+}
+
+/// How long to wait for the files of a take once it is over.
+const AUDIO_FILES_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What [`AppState::poll_recording`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecPoll {
+    /// Tracks that got a clip (or notes) from a take that just ended.
+    pub committed: usize,
+    /// Audio clips made from the files of a take.
+    pub audio_clips: usize,
+    /// Takes that failed (a file that could not be written, one that never arrived).
+    pub errors: Vec<String>,
+    /// The view of the take in progress changed: repaint.
+    pub changed: bool,
+}
+
+/// Where the clip of an audio take goes, as `(timeline start, offset into the
+/// file, length)`, all in ticks. Recorded in a loop, the file holds every pass
+/// one after the other, but the clip fills only the loop, as in Live: it shows
+/// the last whole pass (the offset points at it) and the other passes stay in
+/// the file. A take that began before the loop runs from where it began to the
+/// loop's end; one that never reached the end of the loop is one plain clip.
+/// `file` is the length of the whole recording.
+fn audio_take_span(start: Tick, file: Tick, looped: Option<(Tick, Tick)>) -> (Tick, Tick, Tick) {
+    let Some((ls, le)) = looped.filter(|(a, b)| b > a) else { return (start, 0, file) };
+    if start + file <= le {
+        return (start, 0, file);
+    }
+    if start < ls {
+        return (start, 0, le - start);
+    }
+    let (len, first) = (le - ls, le - start);
+    // Whole passes in the file after the first (partial, unless it began at the loop start).
+    let (done, from) = if first == len { (file / len, 0) } else { ((file - first) / len, first) };
+    if done >= 1 { (ls, from + (done - 1) * len, len) } else { (start, 0, le - start) }
+}
+
+/// The folder audio takes are written to: `Recordings` next to the saved
+/// project, else a folder under the settings until it has a file (Collect All
+/// and Save gathers them into the project then).
+pub fn recordings_dir(project_file: Option<&std::path::Path>) -> std::path::PathBuf {
+    match project_file.and_then(crate::project_io::project_folder) {
+        Some(folder) => folder.join("Recordings"),
+        None => crate::appearance::config_dir().join("Recordings"),
+    }
+}
+
+/// One move of a knob, fader, pan or send, as the engine's fast path takes it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FastEdit {
+    Param { device: DeviceId, param: u32, value: f32 },
+    Volume { track: TrackId, db: f32 },
+    Pan { track: TrackId, pan: f32 },
+    Send { track: TrackId, index: usize, db: f32 },
+    /// A Drum/Instrument Rack's chain selector (0..=127).
+    Selector { rack: DeviceId, value: u8 },
+}
+
+impl FastEdit {
+    /// The fast edits `commands` make, if every one of them is such a move.
+    /// `project` is the state before them (to see which send changed).
+    fn of_all(project: &Project, commands: &[Command]) -> Option<Vec<FastEdit>> {
+        let mut out = Vec::new();
+        let mut macro_move = false;
+        for c in commands {
+            match c {
+                // A macro moves the parameters mapped to it, by the same rule the
+                // engine compiles (`min + (max - min) * value`): live, no recompile.
+                Command::SetMacro { rack, index, value } => {
+                    let Some(DeviceKind::Rack(r)) = project.device(*rack).map(|d| &d.kind) else { return None };
+                    let m = r.macros.get(*index)?;
+                    let v = value.clamp(0., 1.);
+                    out.extend(m.mappings.iter().map(|x| FastEdit::Param { device: x.device, param: x.param, value: x.min + (x.max - x.min) * v }));
+                    macro_move = true;
+                }
+                Command::SetRackSelector { rack, value } => out.push(FastEdit::Selector { rack: *rack, value: *value }),
+                Command::SetParam { device, param, value: Some(v) } => out.push(FastEdit::Param { device: *device, param: *param, value: *v }),
+                Command::SetTrack { id, change: TrackProp::VolumeDb(db) } => out.push(FastEdit::Volume { track: *id, db: *db }),
+                Command::SetTrack { id, change: TrackProp::Pan(pan) } => out.push(FastEdit::Pan { track: *id, pan: *pan }),
+                Command::SetTrack { id, change: TrackProp::Sends(new) } => {
+                    let old = &project.track(*id)?.sends;
+                    // Only level changes: same sends, same order, same routing.
+                    if old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.target != b.target || a.pre_fader != b.pre_fader) {
+                        return None;
+                    }
+                    out.extend(old.iter().zip(new).enumerate().filter(|(_, (a, b))| a.level_db != b.level_db).map(|(index, (_, b))| FastEdit::Send { track: *id, index, db: b.level_db }));
+                }
+                _ => return None,
+            }
+        }
+        // A macro nothing is mapped to has nothing to tell the engine, but the move still counts.
+        (!out.is_empty() || macro_move).then_some(out)
+    }
+
+    fn send(&self, engine: &mut dyn crate::bridge::EngineBridge) -> bool {
+        match *self {
+            FastEdit::Param { device, param, value } => engine.fast_param(device, param, value),
+            FastEdit::Volume { track, db } => engine.fast_track_volume(track, db),
+            FastEdit::Pan { track, pan } => engine.fast_track_pan(track, pan),
+            FastEdit::Send { track, index, db } => engine.fast_send_level(track, index, db),
+            FastEdit::Selector { rack, value } => engine.fast_rack_selector(rack, value),
+        }
+    }
+
+    /// What the edit writes to: a later edit of the same thing replaces it.
+    fn target(&self) -> (u8, u64, u64) {
+        match *self {
+            FastEdit::Param { device, param, .. } => (0, device.0, u64::from(param)),
+            FastEdit::Volume { track, .. } => (1, track.0, 0),
+            FastEdit::Pan { track, .. } => (2, track.0, 0),
+            FastEdit::Send { track, index, .. } => (3, track.0, index as u64),
+            FastEdit::Selector { rack, .. } => (4, rack.0, 0),
+        }
+    }
+}
+
+/// The fast edits since the engine was last told, and the revisions they span.
+#[derive(Debug, Default)]
+struct FastLog {
+    from: u64,
+    upto: u64,
+    edits: Vec<FastEdit>,
+    /// At least one fast move was recorded (it may have had nothing to send).
+    noted: bool,
+}
+
+impl FastLog {
+    /// Record an edit that took the project from revision `before` to `after`.
+    /// `None` (not a fast move) empties the log: the engine needs the project.
+    fn note(&mut self, before: u64, after: u64, fast: Option<Vec<FastEdit>>) {
+        let Some(fast) = fast else {
+            *self = Self::default();
+            return;
+        };
+        if !self.noted || self.upto != before {
+            *self = FastLog { from: before, upto: after, edits: Vec::new(), noted: true };
+        }
+        self.upto = after;
+        for e in fast {
+            self.edits.retain(|x| x.target() != e.target());
+            self.edits.push(e);
+        }
+    }
+
+    /// The edits, when they explain every revision from `synced` to `now`.
+    fn since(&self, synced: Option<u64>, now: u64) -> Option<Vec<FastEdit>> {
+        (self.noted && synced == Some(self.from) && self.upto == now).then(|| self.edits.clone())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainView {
     Session,
@@ -115,6 +294,23 @@ impl AutoRange {
 pub struct AppState {
     pub project: Project,
     pub history: History,
+    /// The project before the first frame of a tempo drag, the revision after
+    /// its last frame and the clips it has changed: every frame scales the
+    /// samples from the start, so rounding does not pile up. See [`AppState::set_tempo`].
+    tempo_base: Option<(Project, u64, BTreeSet<ClipId>)>,
+    /// The knob, fader, pan and send moves of a drag the engine has not been
+    /// told about, and whether it is a revision behind the project because of them.
+    fast: FastLog,
+    engine_behind: bool,
+    /// Notes of the take being played that are complete so far, and where the
+    /// take began and on which tracks (the arrangement draws the clip growing).
+    pub rec_notes: Vec<crate::bridge::RecNote>,
+    pub rec_view: Option<RecView>,
+    /// Audio files of the take being finished: how many are expected and what has come in.
+    pending_audio: Option<PendingAudio>,
+    /// Audio files this session's takes wrote: the ones a project that is never
+    /// saved leaves behind in the settings folder (see `project_io::remove_orphan_takes`).
+    pub session_takes: BTreeSet<std::path::PathBuf>,
     pub view: MainView,
     pub bottom_tab: BottomTab,
     pub tool: Tool,
@@ -166,6 +362,13 @@ impl AppState {
             selected_notes: BTreeSet::new(),
             automation_shown: BTreeSet::new(),
             auto_lanes: BTreeMap::new(),
+            tempo_base: None,
+            fast: FastLog::default(),
+            engine_behind: false,
+            rec_notes: Vec::new(),
+            rec_view: None,
+            pending_audio: None,
+            session_takes: BTreeSet::new(),
             automation_arm: false,
             auto_writes: BTreeMap::new(),
             arrange: ArrangeView { px_per_beat: 7., scroll_x: 0., scroll_y: 0. },
@@ -218,6 +421,10 @@ impl AppState {
     }
 
     pub fn edit_as(&mut self, label: &str, origin: Origin, commands: Vec<Command>) -> bool {
+        // The clips this edit lands replace what they cover, in this step. A
+        // drag in flight is left alone: it settles when it ends, not when
+        // some other edit (an analysis that finished, say) happens by.
+        let commands = self.overwriting(commands);
         match self.history.apply(&mut self.project, label, origin, commands) {
             Ok(()) => true,
             Err(e) => {
@@ -227,10 +434,234 @@ impl AppState {
         }
     }
 
+    /// Collect what the engine recorded: while a take is captured keep its
+    /// finished notes (the arrangement shows the clip growing); when it ends,
+    /// turn it into clips ([`commit_take`](Self::commit_take)).
+    pub fn poll_recording(&mut self, engine: &mut dyn crate::bridge::EngineBridge) -> RecPoll {
+        self.poll_recording_at(engine, std::time::Instant::now())
+    }
+
+    pub fn poll_recording_at(&mut self, engine: &mut dyn crate::bridge::EngineBridge, now: std::time::Instant) -> RecPoll {
+        let state = engine.recording_state();
+        let mut poll = RecPoll::default();
+        if state.capturing {
+            self.rec_notes.extend(engine.take_recorded_notes());
+            let view = Some(RecView { start: state.start_tick, tracks: state.tracks.clone() });
+            poll.changed = self.rec_view != view || !self.rec_notes.is_empty();
+            self.rec_view = view;
+            if !state.audio_tracks.is_empty() {
+                let pending = self.pending_audio.get_or_insert(PendingAudio { expected: 0, got: Vec::new(), over_since: None, looped: None });
+                pending.expected = pending.expected.max(state.audio_tracks.len());
+                pending.over_since = None;
+                pending.looped = self.project.loop_region.filter(|_| engine.transport().looping);
+            }
+        } else if self.rec_view.take().is_some() {
+            poll.changed = true;
+        }
+        if let Some(mut take) = engine.finish_midi_recording() {
+            let mut all = std::mem::take(&mut self.rec_notes);
+            all.append(&mut take.notes);
+            take.notes = all;
+            self.rec_view = None;
+            poll.committed = self.commit_take(&take);
+            poll.changed = true;
+        }
+        // The audio files arrive a moment after the take ends: collect them and
+        // make the clips once the ones expected are in (or the wait is over).
+        let fresh = engine.finish_audio_recording();
+        if !fresh.is_empty() {
+            self.pending_audio.get_or_insert(PendingAudio { expected: fresh.len(), got: Vec::new(), over_since: None, looped: None }).got.extend(fresh);
+        }
+        if let Some(pending) = &mut self.pending_audio
+            && !state.capturing
+        {
+            let over = state.takes_started == state.takes_finished;
+            if over {
+                pending.over_since.get_or_insert(now);
+            }
+            let complete = over && !pending.got.is_empty() && pending.got.len() >= pending.expected;
+            let gave_up = pending.over_since.is_some_and(|t| now.saturating_duration_since(t) > AUDIO_FILES_WAIT);
+            if complete || gave_up {
+                let pending = self.pending_audio.take().expect("pending");
+                if pending.got.len() < pending.expected {
+                    poll.errors.push(format!("{} of {} audio recordings never arrived", pending.expected - pending.got.len(), pending.expected));
+                }
+                let (clips, errors) = self.commit_audio_takes(&pending.got, pending.looped);
+                poll.audio_clips = clips;
+                poll.errors.extend(errors);
+                poll.changed = true;
+            }
+        }
+        poll
+    }
+
+    /// Turn the files of a take into audio clips: one source, clip and
+    /// placement per file, at the tick the take began, in one undo step
+    /// ("Record audio") that replaces what the clips land on like any clip.
+    /// A file that failed to write is reported (and used if any of it made it).
+    /// A take of a track that has no input now is left out.
+    pub fn commit_audio_takes(&mut self, takes: &[crate::bridge::AudioTake], looped: Option<(Tick, Tick)>) -> (usize, Vec<String>) {
+        let (mut cmds, mut errors, mut clips) = (Vec::new(), Vec::new(), 0);
+        let bpm = self.project.tempo.initial_bpm();
+        for t in takes {
+            let Some(track) = self.project.track(t.track).filter(|x| x.kind == TrackKind::Audio && x.input != InputSource::None) else { continue };
+            let name = track.name.clone();
+            let color = track.color;
+            self.session_takes.insert(t.path.clone());
+            if let Some(e) = &t.error {
+                errors.push(format!("Recording on {name} failed: {e}"));
+            }
+            if t.frames == 0 {
+                continue;
+            }
+            let file = AudioSource { path: t.path.clone(), hash: None, sample_rate: t.sample_rate, channels: t.channels, frames: t.frames, warp: Warp::default(), key: None };
+            let (start, offset, length) = audio_take_span(t.start_tick.max(0), file.length_ticks(bpm).max(PPQ), looped);
+            let (source, clip, placement) = (self.project.alloc_source_id(), self.project.alloc_clip_id(), self.project.alloc_placement_id());
+            let mut c = Clip::new("Recorded", color, source, length);
+            c.offset = offset;
+            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Audio(file)) });
+            cmds.push(Command::AddClip { id: clip, clip: Box::new(c) });
+            cmds.push(Command::PlaceClip { track: t.track, placement: Placement { id: placement, clip, start, lane: 0 } });
+            clips += 1;
+        }
+        if cmds.is_empty() {
+            return (0, errors);
+        }
+        self.seal();
+        let ok = self.edit("Record audio", cmds);
+        self.seal();
+        (if ok { clips } else { 0 }, errors)
+    }
+
+    /// Tell the engine each audio track's input and monitor mode where the
+    /// project differs from what `sent` says it was told (a track just made,
+    /// a project just opened, a mixer choice). Returns how many tracks it updated.
+    pub fn sync_track_io(&self, sent: &mut BTreeMap<TrackId, (InputSource, Monitor)>, engine: &mut dyn crate::bridge::EngineBridge) -> usize {
+        sent.retain(|id, _| self.project.track(*id).is_some_and(|t| t.kind == TrackKind::Audio));
+        let mut n = 0;
+        for t in self.project.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
+            let now = (t.input, t.monitor);
+            if sent.get(&t.id) != Some(&now) {
+                engine.set_track_input(t.id, t.input);
+                engine.set_track_monitor(t.id, t.monitor);
+                sent.insert(t.id, now);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Turn a finished take into clips, one undo step for every armed track
+    /// that played something. Without a loop each track gets a new clip from
+    /// where the take began; looping, every pass lands in one clip over the
+    /// loop, and if a clip already sits there (an earlier take) the notes are
+    /// added to it: overdub. Returns how many tracks got notes.
+    pub fn commit_take(&mut self, take: &crate::bridge::MidiTake) -> usize {
+        // The engine reports every note at its place on the timeline, inside
+        // the loop for each pass (`RecordedNote.pass` only says which pass it was
+        // played in) and `passes` > 1 means the loop wrapped at least once. So
+        // all the passes share one stretch: the loop, or from where the take
+        // began when that was before the loop (an intro played into it).
+        let looped = take.passes > 1 && self.project.loop_region.is_some();
+        let (start, len) = match self.project.loop_region.filter(|_| looped) {
+            Some((a, b)) => (take.start_tick.min(a), b - take.start_tick.min(a)),
+            None => {
+                let last = take.notes.iter().map(|n| n.start_tick + n.length_ticks).max().unwrap_or(0);
+                (take.start_tick, (take.end_tick.max(last) - take.start_tick).max(PPQ))
+            }
+        };
+        let mut by_track: BTreeMap<TrackId, Vec<&crate::bridge::RecNote>> = BTreeMap::new();
+        for n in &take.notes {
+            if self.project.track(n.track).is_some_and(|t| t.kind.has_clips()) {
+                by_track.entry(n.track).or_default().push(n);
+            }
+        }
+        let mut cmds = Vec::new();
+        let tracks = by_track.len();
+        for (track, played) in by_track {
+            let mut notes = Vec::new();
+            for n in played {
+                let at = (n.start_tick - start).clamp(0, len - 1);
+                notes.push(Note::new(self.project.alloc_note_id(), n.key, at, n.length_ticks.clamp(1, (len - at).max(1)), n.velocity.clamp(0.01, 1.)));
+            }
+            // A clip over the same stretch, from an earlier take: add to it.
+            let existing = looped
+                .then(|| {
+                    self.project.track(track)?.arrangement.iter().filter(|p| p.start == start && p.lane == 0).find_map(|p| {
+                        let c = self.project.clips.get(&p.clip).filter(|c| c.length == len)?;
+                        matches!(self.project.sources.get(&c.source), Some(Source::Notes(_))).then_some(c.source)
+                    })
+                })
+                .flatten();
+            if let Some(source) = existing {
+                cmds.push(Command::AddNotes { source, notes });
+                continue;
+            }
+            let Some(color) = self.project.track(track).map(|t| t.color) else { continue };
+            let (source, clip, placement) = (self.project.alloc_source_id(), self.project.alloc_clip_id(), self.project.alloc_placement_id());
+            let mut c = Clip::new("Recorded", color, source, len);
+            c.looping = None;
+            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
+            cmds.push(Command::AddClip { id: clip, clip: Box::new(c) });
+            cmds.push(Command::PlaceClip { track, placement: Placement { id: placement, clip, start, lane: 0 } });
+        }
+        if cmds.is_empty() {
+            return 0;
+        }
+        self.seal();
+        let ok = self.edit("Record MIDI", cmds);
+        self.seal();
+        if ok { tracks } else { 0 }
+    }
+
+    /// Hand the engine what changed since `synced` (the revision it last got).
+    /// A drag of knobs, faders, pans and sends goes through the engine's fast
+    /// path (no project snapshot, no compile); anything else sends the project.
+    /// The engine is then a revision behind until [`settle_engine`](Self::settle_engine).
+    pub fn sync_engine(&mut self, engine: &mut dyn crate::bridge::EngineBridge, synced: &mut Option<u64>) -> Synced {
+        let rev = self.revision();
+        if *synced == Some(rev) {
+            return Synced::Nothing;
+        }
+        if let Some(edits) = self.fast.since(*synced, rev)
+            && edits.iter().all(|e| e.send(engine))
+        {
+            self.fast = FastLog::default();
+            *synced = Some(rev);
+            self.engine_behind = true;
+            return Synced::Fast;
+        }
+        self.fast = FastLog::default();
+        engine.update_project(&self.project);
+        *synced = Some(rev);
+        self.engine_behind = false;
+        Synced::Full
+    }
+
+    /// A drag has settled: give the engine the project itself, so what it
+    /// holds matches (this costs no compile either). `true` if it was behind.
+    pub fn settle_engine(&mut self, engine: &mut dyn crate::bridge::EngineBridge) -> bool {
+        std::mem::take(&mut self.engine_behind) && {
+            engine.update_project(&self.project);
+            true
+        }
+    }
+
+    #[cfg(test)]
+    pub fn engine_is_behind(&self) -> bool {
+        self.engine_behind
+    }
+
     /// Part of a continuous gesture: merges with the previous step of the same `key`.
     pub fn edit_coalesced(&mut self, key: &str, label: &str, commands: Vec<Command>) -> bool {
+        self.note_landed(&commands);
+        // A knob, fader, pan or send move can go straight to the engine ([`FastEdit`]).
+        let (before, fast) = (self.revision(), FastEdit::of_all(&self.project, &commands));
         match self.history.apply_coalesced(&mut self.project, key, label, commands) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.fast.note(before, self.revision(), fast);
+                true
+            }
             Err(e) => {
                 self.last_error = Some(e.to_string());
                 false
@@ -238,18 +669,27 @@ impl AppState {
         }
     }
 
-    /// End of a gesture: the next drag starts a fresh undo step.
+    /// End of a gesture: the clips it moved or made longer replace what they
+    /// were left on (part of the gesture's undo step), and the next drag
+    /// starts a fresh step.
     pub fn seal(&mut self) {
+        let settle = self.settle_gesture();
+        if let Err(e) = self.history.amend(&mut self.project, settle) {
+            self.last_error = Some(e.to_string());
+        }
         self.history.seal();
+        self.tempo_base = None;
     }
 
     pub fn undo(&mut self) -> bool {
+        self.ed.landed.clear();
         let done = self.history.undo(&mut self.project).unwrap_or(false);
         self.prune_selection();
         done
     }
 
     pub fn redo(&mut self) -> bool {
+        self.ed.landed.clear();
         let done = self.history.redo(&mut self.project).unwrap_or(false);
         self.prune_selection();
         done
@@ -818,6 +1258,10 @@ impl AppState {
     /// the grid, Shift+←/→ change the length, Ctrl+↑/↓ the velocity.
     /// With no notes selected, ←/→ nudge the selected arrangement clip.
     pub fn key_edit(&mut self, e: KeyEdit) -> bool {
+        // In the Session View the arrows walk the slots.
+        if self.view == MainView::Session {
+            return self.session_key(e);
+        }
         let grid = self.grid();
         if let Some((clip, source, sel)) = self.key_notes() {
             let scale = self.clip_scale(Some(clip));
@@ -897,6 +1341,13 @@ impl AppState {
     /// Ctrl+D: duplicate the selected notes right after themselves, or the
     /// selected arrangement clip right after itself (as an independent copy).
     pub fn duplicate_selection(&mut self) -> bool {
+        // In the Device View: the picked devices, right after themselves.
+        if self.ed.area == crate::editing::Area::Devices {
+            let ids = self.selected_devices();
+            if !ids.is_empty() {
+                return self.duplicate_devices(&ids);
+            }
+        }
         if let Some(done) = self.duplicate_auto_range() {
             return done;
         }
@@ -917,7 +1368,14 @@ impl AppState {
             }
             return ok;
         }
-        let Some((track, id)) = self.selected_placement else { return false };
+        // No clip picked: the track headers have the key (Live's Cmd+D on a track).
+        let Some((track, id)) = self.selected_placement else {
+            if self.ed.area == crate::editing::Area::Arrange {
+                let ids = self.selected_tracks();
+                return self.duplicate_tracks(&ids);
+            }
+            return false;
+        };
         let Some(place) = self.project.track(track).and_then(|t| t.arrangement.iter().find(|p| p.id == id)).cloned() else { return false };
         let Some(length) = self.project.clips.get(&place.clip).map(|c| c.length) else { return false };
         // An independent copy: MIDI clips get their own notes, audio shares the file.
@@ -1199,24 +1657,6 @@ impl AppState {
         self.edit("Save macro variation", vec![Command::SetVariations { rack, variations }])
     }
 
-    /// Apply a saved macro variation to all macros in a single undo step.
-    pub fn recall_rack_variation(&mut self, rack: DeviceId, index: usize) -> bool {
-        let Some(DeviceKind::Rack(r)) = self.project.device(rack).map(|d| &d.kind) else { return false };
-        let Some(var) = r.variations.get(index) else { return false };
-        let cmds: Vec<Command> = var
-            .values
-            .iter()
-            .enumerate()
-            .take(r.macros.len())
-            .map(|(i, &value)| Command::SetMacro { rack, index: i, value })
-            .collect();
-        if cmds.is_empty() {
-            return false;
-        }
-        self.seal();
-        self.edit("Recall macro variation", cmds)
-    }
-
     /// Remove a saved macro variation by index.
     pub fn delete_rack_variation(&mut self, rack: DeviceId, index: usize) -> bool {
         let Some(DeviceKind::Rack(r)) = self.project.device(rack).map(|d| &d.kind) else { return false };
@@ -1234,7 +1674,35 @@ impl AppState {
     }
 
     pub fn add_stock_device(&mut self, track: TrackId, plugin_id: &str, name: &str) -> Option<DeviceId> {
-        let index = self.project.track(track)?.devices.len();
+        self.add_stock_device_in(track, None, plugin_id, name)
+    }
+
+    /// Where a new device of `track` goes: the end of `into` (a chain of a rack
+    /// of that track, or a Drum Rack return) when given, else the end of the track's chain.
+    fn new_device_slot(&self, track: TrackId, into: Option<racks::Container>) -> Option<DeviceSlot> {
+        if let Some(c) = into
+            && let racks::Container::Rack { rack, .. } | racks::Container::Return { rack, .. } = c
+            && self.project.device_track(rack) == Some(track)
+            && let Some(chain) = racks::chain(&self.project, c)
+        {
+            return Some(c.slot(chain.len()));
+        }
+        Some(DeviceSlot::Track { track, index: self.project.track(track)?.devices.len() })
+    }
+
+    /// Add a stock device at the end of `into` (see [`new_device_slot`](Self::new_device_slot)).
+    pub fn add_stock_device_in(&mut self, track: TrackId, into: Option<racks::Container>, plugin_id: &str, name: &str) -> Option<DeviceId> {
+        let mut slot = self.new_device_slot(track, into)?;
+        // The engine runs MIDI effects before everything else, in the order they
+        // were put in: a new one goes after the last MIDI effect of the chain, so
+        // the chain reads as it runs.
+        if plugin_id.starts_with("midi.")
+            && into.is_none()
+            && let DeviceSlot::Track { index, .. } = &mut slot
+        {
+            let is_midi = |d: &Device| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi."));
+            *index = self.project.track(track)?.devices.iter().rposition(is_midi).map_or(0, |i| i + 1);
+        }
         let id = self.project.alloc_device_id();
         let mut device = Device::stock(id, plugin_id, name);
         if let Some(kind) = match plugin_id {
@@ -1245,13 +1713,16 @@ impl AppState {
         } {
             device.kind = DeviceKind::Rack(Rack::new(kind));
         }
-        let slot = DeviceSlot::Track { track, index };
         self.edit("Add device", vec![Command::AddDevice { slot, device: Box::new(device) }]).then_some(id)
     }
 
     /// Add a third-party VST3/CLAP plugin to the end of a track's chain.
     pub fn add_plugin_device(&mut self, track: TrackId, plugin: &crate::bridge::ExternalPlugin) -> Option<DeviceId> {
-        let index = self.project.track(track)?.devices.len();
+        self.add_plugin_device_in(track, None, plugin)
+    }
+
+    pub fn add_plugin_device_in(&mut self, track: TrackId, into: Option<racks::Container>, plugin: &crate::bridge::ExternalPlugin) -> Option<DeviceId> {
+        let slot = self.new_device_slot(track, into)?;
         let id = self.project.alloc_device_id();
         let mut device = Device::stock(id, "", plugin.name.clone());
         device.kind = DeviceKind::Plugin {
@@ -1261,7 +1732,6 @@ impl AppState {
             vendor: plugin.vendor.clone(),
             is_instrument: plugin.is_instrument,
         };
-        let slot = DeviceSlot::Track { track, index };
         self.edit("Add device", vec![Command::AddDevice { slot, device: Box::new(device) }]).then_some(id)
     }
 
@@ -1346,8 +1816,34 @@ impl AppState {
         self.edit("Delete clip", vec![Command::RemovePlacement { track, id }])
     }
 
+    /// Change the tempo. Samples that play in real time (audio clips without
+    /// warp) keep their duration: their length in ticks follows
+    /// ([`ops::set_tempo_keeping_samples`]), in the same undo step. During a
+    /// drag every frame is worked out from the project as it was before the
+    /// drag, so the clips neither drift nor get stuck on rounding.
     pub fn set_tempo(&mut self, bpm: f64) -> bool {
-        self.edit_coalesced("tempo", "Change tempo", vec![Command::SetTempo { bpm: (bpm * 100.).round() / 100. }])
+        if !bpm.is_finite() || bpm <= 0. {
+            return false;
+        }
+        let bpm = (bpm * 100.).round() / 100.;
+        let (base, touched) = match self.tempo_base.take() {
+            Some((base, revision, touched)) if revision == self.revision() => (base, touched),
+            _ => (self.project.clone(), BTreeSet::new()),
+        };
+        // `None` = the start tempo again: only the clips an earlier frame changed go back.
+        let mut cmds = ops::set_tempo_keeping_samples(&base, bpm).unwrap_or_else(|| vec![Command::SetTempo { bpm }]);
+        let changed: BTreeSet<ClipId> = cmds.iter().filter_map(|c| if let Command::UpdateClip { id, .. } = c { Some(*id) } else { None }).collect();
+        for id in touched.difference(&changed) {
+            if let Some(clip) = base.clips.get(id) {
+                cmds.push(Command::UpdateClip { id: *id, clip: Box::new(clip.clone()) });
+            }
+        }
+        let touched: BTreeSet<ClipId> = touched.union(&changed).copied().collect();
+        let ok = self.edit_coalesced("tempo", "Change tempo", cmds);
+        if ok {
+            self.tempo_base = Some((base, self.revision(), touched));
+        }
+        ok
     }
 
     pub fn set_time_signature(&mut self, sig: TimeSignature) -> bool {
@@ -1619,20 +2115,184 @@ impl AppState {
         ok
     }
 
-    /// Store the states the plugins report (before saving): one sealed undo
-    /// step "Plugin state" for the devices whose stored state differs.
-    /// Devices no longer in the project are left out. Returns whether any changed.
-    pub fn store_plugin_states(&mut self, states: Vec<(DeviceId, Vec<u8>)>) -> bool {
-        let cmds: Vec<Command> = states
+    fn plugin_state_commands(&self, states: Vec<(DeviceId, Vec<u8>)>) -> Vec<Command> {
+        states
             .into_iter()
             .filter(|(device, state)| self.project.device(*device).is_some_and(|d| d.state.as_deref() != Some(state.as_slice())))
             .map(|(device, state)| Command::SetDeviceState { device, state: Some(state), preset: None })
+            .collect()
+    }
+
+    /// Write the states the live plugins report into the project **without an
+    /// undo step** (before saving or exporting): they are the plugins' own
+    /// state echoed back, not an edit by the user, so Cmd+Z after saving still
+    /// undoes the user's last edit. The revision does not move either (the
+    /// engine already has these states). Returns whether any changed.
+    pub fn capture_plugin_states(&mut self, states: Vec<(DeviceId, Vec<u8>)>) -> bool {
+        let cmds = self.plugin_state_commands(states);
+        if cmds.is_empty() {
+            return false;
+        }
+        match (Command::Batch { commands: cmds }).apply(&mut self.project) {
+            Ok(_) => true,
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// The project as the exporter must render it: the live plugin states
+    /// captured first, so what the user hears in the plugin windows is what
+    /// the offline render builds.
+    pub fn export_snapshot(&mut self, engine: &mut dyn crate::bridge::EngineBridge) -> Project {
+        let states = engine.plugin_states();
+        self.capture_plugin_states(states);
+        self.project.clone()
+    }
+
+    // ── Track management: delete, reorder, colour ──
+
+    /// Delete `ids` (the Main track stays). A group goes alone: its tracks move
+    /// up to its parent ([`groups::ungroup_commands`]). One undo step.
+    pub fn delete_tracks(&mut self, ids: &[TrackId]) -> bool {
+        let mut cmds = Vec::new();
+        for &id in ids {
+            let Some(t) = self.project.track(id) else { continue };
+            match t.kind {
+                TrackKind::Main => {}
+                TrackKind::Group | TrackKind::Folder => cmds.extend(groups::ungroup_commands(&self.project, id).unwrap_or_default()),
+                _ => cmds.push(Command::RemoveTrack { id }),
+            }
+        }
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit(if ids.len() == 1 { "Delete track" } else { "Delete tracks" }, cmds);
+        self.seal();
+        if ok {
+            self.ed.tracks.retain(|t| self.project.track(*t).is_some());
+            if self.selected_track.is_some_and(|t| self.project.track(t).is_none()) {
+                self.selected_track = None;
+            }
+            self.prune_selection();
+        }
+        ok
+    }
+
+    /// Move track `id` (with the tracks of its group, if it is one) next to
+    /// `target`: before it, or after it and its group's members, at its level
+    /// (dropping next to a track of a group puts it in that group). Tracks and
+    /// returns keep to their own sections, and Main never moves.
+    pub fn move_track(&mut self, id: TrackId, target: TrackId, after: bool) -> bool {
+        let Some(cmds) = self.move_track_commands(id, target, after) else { return false };
+        self.seal();
+        let ok = self.edit("Move track", cmds);
+        self.seal();
+        ok
+    }
+
+    fn move_track_commands(&self, id: TrackId, target: TrackId, after: bool) -> Option<Vec<Command>> {
+        let p = &self.project;
+        let (x, t) = (p.track(id)?, p.track(target)?);
+        let section = |k: TrackKind| matches!(k, TrackKind::Return | TrackKind::Vca);
+        if id == target || t.kind == TrackKind::Main || section(x.kind) != section(t.kind) {
+            return None;
+        }
+        if !after {
+            return tracks::move_track_before(p, id, target);
+        }
+        // After the target and its members: in front of the next track of its level.
+        let last = std::iter::once(target).chain(groups::descendants(p, target)).filter_map(|m| p.track_index(m)).max()?;
+        let next = p.tracks.iter().skip(last + 1).find(|n| n.parent == t.parent).map(|n| n.id);
+        if next == Some(id) {
+            return None;
+        }
+        tracks::move_track(p, id, next, t.parent)
+    }
+
+    /// Duplicate `ids` (devices) right after themselves in their chains, as one
+    /// undo step; the copies become the picked devices.
+    pub fn duplicate_devices(&mut self, ids: &[DeviceId]) -> bool {
+        let mut scratch = self.project.clone();
+        let Some(d) = tracks::duplicate_devices(&mut scratch, ids) else { return false };
+        self.seal();
+        let ok = self.edit(if d.devices.len() == 1 { "Duplicate device" } else { "Duplicate devices" }, d.commands);
+        self.seal();
+        if ok {
+            self.ed.devices = d.devices;
+        }
+        ok
+    }
+
+    /// Duplicate `ids` (with their devices, clips and automation; a group with
+    /// its tracks) right after themselves, as one undo step. The copies become
+    /// the selection.
+    pub fn duplicate_tracks(&mut self, ids: &[TrackId]) -> bool {
+        // A track inside another selected one is copied with it.
+        let roots: Vec<TrackId> = ids.iter().copied().filter(|&t| !groups::ancestors(&self.project, t).any(|a| ids.contains(&a))).collect();
+        let mut scratch = self.project.clone();
+        let (mut cmds, mut made) = (Vec::new(), Vec::new());
+        for id in roots {
+            let Some(d) = tracks::duplicate_track(&mut scratch, id) else { continue };
+            if (Command::Batch { commands: d.commands.clone() }).apply(&mut scratch).is_err() {
+                continue;
+            }
+            cmds.extend(d.commands);
+            made.push(d.track);
+        }
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit(if made.len() == 1 { "Duplicate track" } else { "Duplicate tracks" }, cmds);
+        self.seal();
+        if ok {
+            self.ed.tracks = made.iter().copied().collect();
+            self.selected_track = made.first().copied();
+        }
+        ok
+    }
+
+    /// Give `ids` the palette colour `color`. The clips that wore the old
+    /// colour of their track follow it; a clip coloured by hand keeps its own.
+    pub fn set_tracks_color(&mut self, ids: &[TrackId], color: Color) -> bool {
+        let mut cmds = Vec::new();
+        for &id in ids {
+            let Some(t) = self.project.track(id) else { continue };
+            let Some(set) = tracks::set_track_color(&self.project, id, color) else { continue };
+            cmds.push(set);
+            for pl in &t.arrangement {
+                if let Some(c) = self.project.clips.get(&pl.clip).filter(|c| c.color == t.color)
+                    && !cmds.iter().any(|x| matches!(x, Command::UpdateClip { id, .. } if *id == pl.clip))
+                {
+                    cmds.push(Command::UpdateClip { id: pl.clip, clip: Box::new(Clip { color, ..c.clone() }) });
+                }
+            }
+        }
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit("Change track colour", cmds);
+        self.seal();
+        ok
+    }
+
+    /// Give the selected clips the colour `color`.
+    pub fn set_clips_color(&mut self, color: Color) -> bool {
+        let mut clips: Vec<ClipId> = self.clip_selection().iter().map(|(_, pl, _)| pl.clip).collect();
+        clips.dedup();
+        let cmds: Vec<Command> = clips
+            .into_iter()
+            .filter_map(|id| self.project.clips.get(&id).filter(|c| c.color != color).map(|c| Command::UpdateClip { id, clip: Box::new(Clip { color, ..c.clone() }) }))
             .collect();
         if cmds.is_empty() {
             return false;
         }
         self.seal();
-        let ok = self.edit("Plugin state", cmds);
+        let ok = self.edit("Change clip colour", cmds);
         self.seal();
         ok
     }
@@ -1997,6 +2657,681 @@ mod tests {
 
     fn state() -> AppState {
         AppState::new(crate::demo::project())
+    }
+
+    fn device_with_state(s: &mut AppState) -> (TrackId, DeviceId) {
+        let track = s.add_track(TrackKind::Instrument).unwrap();
+        let id = s.add_stock_device(track, "fx.eq", "EQ").unwrap();
+        s.seal();
+        (track, id)
+    }
+
+    #[test]
+    fn saving_captures_plugin_states_without_an_undo_step() {
+        let mut s = state();
+        let (track, device) = device_with_state(&mut s);
+        s.set_track(track, TrackProp::VolumeDb(-3.));
+        s.seal();
+        let (steps, revision, label) = (s.history.steps().count(), s.revision(), s.history.undo_label().map(str::to_owned));
+        assert!(s.capture_plugin_states(vec![(device, vec![7, 7]), (DeviceId(u64::MAX), vec![1])]));
+        assert_eq!(s.project.device(device).unwrap().state.as_deref(), Some(&[7u8, 7][..]));
+        assert_eq!(s.history.steps().count(), steps, "no \"Plugin state\" step");
+        assert_eq!(s.revision(), revision);
+        assert_eq!(s.history.undo_label().map(str::to_owned), label);
+        assert!(!s.capture_plugin_states(vec![(device, vec![7, 7])]), "unchanged: nothing to do");
+        // Cmd+Z after saving undoes the user's last edit.
+        s.undo();
+        assert_eq!(s.project.track(track).unwrap().volume_db, 0.);
+    }
+
+    #[test]
+    fn the_export_gets_the_live_unsaved_plugin_state() {
+        let mut s = state();
+        let (_, device) = device_with_state(&mut s);
+        let mut engine = crate::bridge::StubEngine::default();
+        engine.live_states = vec![(device, vec![9, 9, 9])];
+        assert_eq!(s.project.device(device).unwrap().state, None, "nothing saved yet");
+        let steps = s.history.steps().count();
+        let exported = s.export_snapshot(&mut engine);
+        assert_eq!(exported.device(device).unwrap().state.as_deref(), Some(&[9u8, 9, 9][..]));
+        assert_eq!(s.history.steps().count(), steps, "exporting adds no undo step");
+    }
+
+    fn names(s: &AppState) -> Vec<String> {
+        s.project.tracks.iter().map(|t| t.name.clone()).collect()
+    }
+
+    fn add_named(s: &mut AppState, kind: TrackKind, name: &str) -> TrackId {
+        let id = s.add_track(kind).unwrap();
+        s.set_track(id, TrackProp::Name(name.into()));
+        s.seal();
+        id
+    }
+
+    #[test]
+    fn tracks_are_reordered_as_siblings_and_never_past_the_returns_or_main() {
+        let mut s = AppState::new(Project::new("t"));
+        let (a, b, c) = (add_named(&mut s, TrackKind::Audio, "A"), add_named(&mut s, TrackKind::Audio, "B"), add_named(&mut s, TrackKind::Audio, "C"));
+        let r = add_named(&mut s, TrackKind::Return, "R");
+        assert_eq!(names(&s), ["A", "B", "C", "R", "Main"]);
+        // C before A.
+        assert!(s.move_track(c, a, false));
+        assert_eq!(names(&s)[..3], ["C", "A", "B"]);
+        // A after B, which is the last of the tracks (still before the return).
+        assert!(s.move_track(a, b, true));
+        assert_eq!(names(&s)[..3], ["C", "B", "A"]);
+        assert_eq!(s.project.tracks.iter().position(|t| t.id == r), Some(3));
+        // A track cannot go among the returns, nor onto itself, nor move Main.
+        assert!(!s.move_track(a, r, false));
+        assert!(!s.move_track(a, a, true));
+        let main = s.project.main_track().id;
+        assert!(!s.move_track(main, a, false) && !s.move_track(a, main, false));
+        // Already there: no step.
+        let steps = s.history.steps().count();
+        assert!(!s.move_track(c, b, false));
+        assert_eq!(s.history.steps().count(), steps);
+        // One undo step per move.
+        s.undo();
+        assert_eq!(names(&s)[..3], ["C", "A", "B"]);
+    }
+
+    #[test]
+    fn a_group_moves_with_its_tracks() {
+        let mut s = AppState::new(Project::new("t"));
+        let (a, b, c) = (add_named(&mut s, TrackKind::Audio, "A"), add_named(&mut s, TrackKind::Audio, "B"), add_named(&mut s, TrackKind::Audio, "C"));
+        let d = add_named(&mut s, TrackKind::Audio, "D");
+        s.ed.tracks = [b, c].into();
+        s.selected_track = Some(b);
+        let group = s.group_tracks().expect("B and C are grouped");
+        let order = |s: &AppState| names(s).into_iter().filter(|n| n != "Main").collect::<Vec<_>>();
+        // The group goes after D: its members follow it.
+        assert!(s.move_track(group, d, true));
+        let o = order(&s);
+        let at = |n: &str| o.iter().position(|x| x == n).unwrap();
+        let g = at("Group");
+        assert!(at("D") < g, "the group went after D: {o:?}");
+        assert_eq!(at("B").min(at("C")), g + 1, "its members right after it, in order: {o:?}");
+        assert_eq!(at("B").max(at("C")), g + 2, "{o:?}");
+        // Dropped next to a track of a group, a track joins that group.
+        let member = if at("B") < at("C") { "B" } else { "C" };
+        let member = s.project.tracks.iter().find(|t| t.name == member).unwrap().id;
+        assert!(s.move_track(a, member, false));
+        assert_eq!(s.project.track(a).unwrap().parent, Some(group));
+    }
+
+    #[test]
+    fn duplicating_tracks_copies_devices_and_clips_and_selects_the_copy() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Instrument, "Keys");
+        s.add_stock_device(t, "fx.eq", "EQ").unwrap();
+        let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        let note = Note::new(s.project.alloc_note_id(), 60, 0, PPQ, 0.8);
+        s.edit("clip", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![note] })) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("riff", Color::palette(1), src, PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
+        ]);
+        s.seal();
+        s.selected_track = Some(t);
+        s.ed.area = crate::editing::Area::Arrange;
+        s.selected_placement = None;
+        let steps = s.history.steps().count();
+        assert!(s.duplicate_selection(), "Cmd+D on a track header");
+        assert_eq!(s.history.steps().count(), steps + 1, "one undo step");
+        let copy = s.project.tracks.iter().find(|x| x.name == "Keys copy").expect("the copy");
+        assert_eq!(copy.devices.len(), 1);
+        assert_ne!(copy.devices[0].id, s.project.track(t).unwrap().devices[0].id, "its own device");
+        assert_eq!(copy.arrangement.len(), 1);
+        assert_ne!(copy.arrangement[0].clip, clip, "its own clip");
+        assert_eq!(s.selected_track, Some(copy.id));
+        s.undo();
+        assert!(s.project.tracks.iter().all(|x| x.name != "Keys copy"));
+        let main = s.project.main_track().id;
+        assert!(!s.duplicate_tracks(&[main]), "Main cannot be duplicated");
+    }
+
+    #[test]
+    fn a_tempo_drag_keeps_the_samples_as_long_as_they_are_in_seconds_in_one_undo_step() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Audio, "Loop");
+        let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        // A one-second file, two beats at 120 BPM, with a small clip next to it.
+        let file = AudioSource { path: "x.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 48_000, warp: Warp::default(), key: None };
+        s.edit("clip", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Audio(file)) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("hit", Color::palette(1), src, 2 * PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
+        ]);
+        s.seal();
+        let steps = s.history.steps().count();
+        // Drag 120 -> 140 in small steps and let go.
+        for i in 1..=200 {
+            assert!(s.set_tempo(120. + i as f64 * 0.1));
+        }
+        s.seal();
+        assert_eq!(s.project.tempo.initial_bpm(), 140.);
+        // One second at 140 BPM is 2.333 beats: the clip is longer in ticks, to the tick.
+        assert_eq!(s.project.clips[&clip].length, (PPQ as f64 * 2. * 140. / 120.).round() as Tick);
+        assert_eq!(s.history.steps().count(), steps + 1, "the whole drag is one step");
+        // Back to the start tempo in the same way: nothing drifted.
+        for i in 1..=200 {
+            s.set_tempo(140. - i as f64 * 0.1);
+        }
+        s.seal();
+        assert_eq!(s.project.tempo.initial_bpm(), 120.);
+        assert_eq!(s.project.clips[&clip].length, 2 * PPQ);
+        s.undo();
+        assert_eq!(s.project.tempo.initial_bpm(), 140., "undo goes back to the tempo before the second drag");
+        assert_eq!(s.project.clips[&clip].length, (PPQ as f64 * 2. * 140. / 120.).round() as Tick);
+        s.undo();
+        assert_eq!((s.project.tempo.initial_bpm(), s.project.clips[&clip].length), (120., 2 * PPQ));
+    }
+
+    #[test]
+    fn a_drag_of_knobs_faders_and_sends_never_sends_the_project() {
+        use crate::bridge::{EngineBridge, StubEngine};
+        let mut s = AppState::new(crate::demo::project());
+        let mut engine = StubEngine::default();
+        let mut synced = None;
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Full, "the first sync sends the project");
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Nothing);
+        let (updates, compiles) = (engine.project_updates, engine.compile_count());
+        let track = s.project.tracks.iter().find(|t| t.kind == TrackKind::Audio && !t.sends.is_empty()).map(|t| t.id).or_else(|| s.project.tracks.iter().find(|t| !t.sends.is_empty()).map(|t| t.id)).expect("a track with sends");
+        let device = s.project.tracks.iter().flat_map(|t| &t.devices).next().map(|d| d.id).expect("a device");
+        s.seal();
+        // 60 frames: a fader, a send and a knob move together.
+        for i in 0..60 {
+            let v = i as f32 / 60.;
+            s.set_track_coalesced(&format!("fader-{}", track.0), track, TrackProp::VolumeDb(-30. + v * 30.));
+            s.set_send(track, 0, -40. + v * 30.);
+            s.set_param(device, 3, v);
+            assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Fast, "frame {i}");
+        }
+        s.seal();
+        assert_eq!(engine.project_updates, updates, "not one project snapshot during the drag");
+        assert_eq!(engine.compile_count(), compiles, "and so no compile");
+        assert_eq!(engine.fast_calls, 60 * 3);
+        // The drag is one undo step per control, and the engine is told the project once it settles.
+        assert!(s.engine_is_behind());
+        assert!(s.settle_engine(&mut engine));
+        assert_eq!(engine.project_updates, updates + 1);
+        assert!(!s.settle_engine(&mut engine), "once");
+        // Anything else sends the project, and so does an undo.
+        s.edit("Rename", vec![Command::SetTrack { id: track, change: TrackProp::Name("Renamed".into()) }]);
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Full);
+        s.undo();
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Full);
+    }
+
+    #[test]
+    fn dragging_a_macro_moves_its_mapped_parameters_live_and_never_sends_the_project() {
+        use crate::bridge::StubEngine;
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Audio, "FX");
+        let rack = s.add_stock_device(t, "rack.audio", "Rack").unwrap();
+        let (a, b) = (s.project.alloc_device_id(), s.project.alloc_device_id());
+        s.edit("chain", vec![
+            Command::AddChain { rack, index: 0, chain: Box::new(Chain::new("A", Color::palette(1))) },
+            Command::AddDevice { slot: DeviceSlot::Rack { rack, chain: 0, index: 0 }, device: Box::new(Device::stock(a, "fx.filter", "Filter")) },
+            Command::AddDevice { slot: DeviceSlot::Rack { rack, chain: 0, index: 1 }, device: Box::new(Device::stock(b, "fx.eq", "EQ")) },
+            Command::AddMapping { rack, macro_index: 0, index: 0, mapping: MacroMapping { device: a, param: 0, min: 0.2, max: 0.8 } },
+            Command::AddMapping { rack, macro_index: 0, index: 1, mapping: MacroMapping { device: b, param: 1, min: 0.0, max: 1.0 } },
+        ]);
+        s.seal();
+        let mut e = StubEngine::default();
+        let mut synced = None;
+        s.sync_engine(&mut e, &mut synced);
+        let updates = e.project_updates;
+        for i in 0..60 {
+            s.set_macro(rack, 0, i as f32 / 59.);
+            assert_eq!(s.sync_engine(&mut e, &mut synced), Synced::Fast, "frame {i}");
+        }
+        s.seal();
+        assert_eq!(e.project_updates, updates, "no project snapshot while the macro moves");
+        assert_eq!(e.fast_calls, 60 * 2, "each frame sets the two mapped parameters");
+        // A macro with nothing mapped has nothing to tell the engine, and still costs no snapshot.
+        let calls = e.fast_calls;
+        s.set_macro(rack, 5, 0.5);
+        assert_eq!(s.sync_engine(&mut e, &mut synced), Synced::Fast);
+        assert_eq!((e.fast_calls, e.project_updates), (calls, updates));
+    }
+
+    #[test]
+    fn a_move_that_is_not_a_plain_value_change_takes_the_slow_way() {
+        use crate::bridge::StubEngine;
+        let mut s = AppState::new(crate::demo::project());
+        let mut engine = StubEngine::default();
+        let mut synced = None;
+        s.sync_engine(&mut engine, &mut synced);
+        let track = s.project.tracks.iter().find(|t| !t.sends.is_empty()).map(|t| t.id).unwrap();
+        // A send's pre/post switch is a routing change: the engine compiles.
+        let mut sends = s.project.track(track).unwrap().sends.clone();
+        sends[0].pre_fader = !sends[0].pre_fader;
+        s.edit_coalesced("send", "Change sends", vec![Command::SetTrack { id: track, change: TrackProp::Sends(sends) }]);
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Full);
+        // A fader move after a different edit in between is also not covered by the log.
+        s.set_track_coalesced("fader", track, TrackProp::VolumeDb(-5.));
+        s.edit("Rename", vec![Command::SetTrack { id: track, change: TrackProp::Name("X".into()) }]);
+        assert_eq!(s.sync_engine(&mut engine, &mut synced), Synced::Full);
+    }
+
+    #[test]
+    fn cmd_d_in_the_device_view_duplicates_the_picked_devices_after_themselves() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Instrument, "Keys");
+        let eq = s.add_stock_device(t, "fx.eq", "EQ").unwrap();
+        let comp = s.add_stock_device(t, "fx.compressor", "Comp").unwrap();
+        s.seal();
+        s.ed.area = crate::editing::Area::Devices;
+        s.ed.devices = vec![eq];
+        let steps = s.history.steps().count();
+        assert!(s.duplicate_selection());
+        assert_eq!(s.history.steps().count(), steps + 1, "one undo step");
+        let chain: Vec<&str> = s.project.track(t).unwrap().devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(chain, ["EQ", "EQ", "Comp"], "the copy sits right after the original");
+        let copy = s.project.track(t).unwrap().devices[1].id;
+        assert!(copy != eq && copy != comp);
+        assert_eq!(s.ed.devices, vec![copy], "the copy is the pick now");
+        s.undo();
+        assert_eq!(s.project.track(t).unwrap().devices.len(), 2);
+    }
+
+    fn armed_keys(s: &mut AppState) -> TrackId {
+        let t = add_named(s, TrackKind::Instrument, "Keys");
+        s.set_track(t, TrackProp::Arm(true));
+        s.seal();
+        t
+    }
+
+    fn rec_note(track: TrackId, key: u8, start: Tick, len: Tick) -> crate::bridge::RecNote {
+        crate::bridge::RecNote { track, key, velocity: 0.8, start_tick: start, length_ticks: len, pass: 0 }
+    }
+
+    fn clips_of(s: &AppState, t: TrackId) -> Vec<(Tick, Tick, usize)> {
+        let mut v: Vec<_> = s
+            .project
+            .track(t)
+            .unwrap()
+            .arrangement
+            .iter()
+            .map(|p| {
+                let c = &s.project.clips[&p.clip];
+                let n = match s.project.sources.get(&c.source) {
+                    Some(Source::Notes(n)) => n.notes.len(),
+                    _ => 0,
+                };
+                (p.start, c.length, n)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_take_becomes_a_clip_with_its_notes_in_one_undo_step() {
+        use crate::bridge::{EngineBridge, MidiTake, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = armed_keys(&mut s);
+        let mut e = StubEngine::default();
+        e.armed_midi = vec![t];
+        e.toggle_record();
+        e.play();
+        let steps = s.history.steps().count();
+        // While the take runs, finished notes are collected and the clip is shown growing.
+        e.played = vec![rec_note(t, 60, 4 * PPQ, PPQ / 2)];
+        let poll = s.poll_recording(&mut e);
+        assert!(poll.changed && poll.committed == 0);
+        assert_eq!(s.rec_view.as_ref().map(|v| v.tracks.clone()), Some(vec![t]));
+        assert_eq!(s.rec_notes.len(), 1);
+        assert_eq!(s.history.steps().count(), steps, "nothing in the project until the take ends");
+        // Stop: the take ends with the notes not handed out yet.
+        e.stop();
+        e.rec_take = Some(MidiTake { notes: vec![rec_note(t, 64, 5 * PPQ, PPQ), rec_note(t, 67, 6 * PPQ, 2 * PPQ)], start_tick: 4 * PPQ, end_tick: 8 * PPQ, passes: 1 });
+        let poll = s.poll_recording(&mut e);
+        assert_eq!(poll.committed, 1);
+        assert!(s.rec_view.is_none() && s.rec_notes.is_empty());
+        assert_eq!(clips_of(&s, t), [(4 * PPQ, 4 * PPQ, 3)], "one clip from where the take began, to where it stopped, with every note");
+        assert_eq!(s.history.steps().count(), steps + 1);
+        let Some(Source::Notes(n)) = s.project.sources.values().find(|x| matches!(x, Source::Notes(_))) else { panic!() };
+        let mut starts: Vec<_> = n.notes.iter().map(|n| n.start).collect();
+        starts.sort();
+        assert_eq!(starts, [0, PPQ, 2 * PPQ], "notes are relative to the clip: from tick 0");
+        assert_eq!(s.history.undo_label(), Some("Record MIDI"));
+        s.undo();
+        assert!(clips_of(&s, t).is_empty());
+        // Nothing played: no clip, no step.
+        e.rec_take = Some(MidiTake { notes: vec![], start_tick: 0, end_tick: 4 * PPQ, passes: 1 });
+        assert_eq!(s.poll_recording(&mut e).committed, 0);
+        assert!(clips_of(&s, t).is_empty());
+    }
+
+    #[test]
+    fn a_take_replaces_what_it_lands_on_like_any_clip() {
+        use crate::bridge::{MidiTake, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = armed_keys(&mut s);
+        let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        s.edit("old", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("old", Color::palette(1), src, 8 * PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
+        ]);
+        s.seal();
+        let mut e = StubEngine::default();
+        e.rec_take = Some(MidiTake { notes: vec![rec_note(t, 60, 2 * PPQ, PPQ)], start_tick: 2 * PPQ, end_tick: 4 * PPQ, passes: 1 });
+        assert_eq!(s.poll_recording(&mut e).committed, 1);
+        let spans: Vec<(Tick, Tick)> = clips_of(&s, t).into_iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(spans, [(0, 2 * PPQ), (2 * PPQ, 2 * PPQ), (4 * PPQ, 4 * PPQ)], "the old clip keeps what is left either side");
+    }
+
+    #[test]
+    fn recording_in_a_loop_overdubs_the_clip_that_is_already_there() {
+        use crate::bridge::{MidiTake, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = armed_keys(&mut s);
+        let other = add_named(&mut s, TrackKind::Instrument, "Other");
+        s.set_track(other, TrackProp::Arm(true));
+        s.edit("loop", vec![Command::SetLoop { region: Some((4 * PPQ, 8 * PPQ)) }]);
+        s.seal();
+        let mut e = StubEngine::default();
+        // Two passes over the loop: notes of both land in one clip over the loop.
+        e.rec_take = Some(MidiTake {
+            notes: vec![rec_note(t, 60, 4 * PPQ, PPQ), crate::bridge::RecNote { pass: 1, ..rec_note(t, 62, 6 * PPQ, PPQ) }, rec_note(other, 48, 5 * PPQ, PPQ)],
+            start_tick: 4 * PPQ,
+            end_tick: 8 * PPQ,
+            passes: 2,
+        });
+        assert_eq!(s.poll_recording(&mut e).committed, 2, "both armed tracks");
+        assert_eq!(clips_of(&s, t), [(4 * PPQ, 4 * PPQ, 2)]);
+        assert_eq!(clips_of(&s, other), [(4 * PPQ, 4 * PPQ, 1)]);
+        // Another take over the same loop: the notes are added to the clip.
+        e.rec_take = Some(MidiTake { notes: vec![rec_note(t, 65, 7 * PPQ, PPQ / 2)], start_tick: 4 * PPQ, end_tick: 8 * PPQ, passes: 2 });
+        let steps = s.history.steps().count();
+        assert_eq!(s.poll_recording(&mut e).committed, 1);
+        assert_eq!(clips_of(&s, t), [(4 * PPQ, 4 * PPQ, 3)], "still one clip, one note more");
+        assert_eq!(s.history.steps().count(), steps + 1);
+        s.undo();
+        assert_eq!(clips_of(&s, t), [(4 * PPQ, 4 * PPQ, 2)], "undo takes only the overdub back");
+    }
+
+    #[test]
+    fn after_duplicating_a_track_with_devices_every_new_id_is_still_free() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Instrument, "Keys");
+        s.add_stock_device(t, "fx.eq", "EQ").unwrap();
+        s.add_stock_device(t, "rack.audio", "Rack").unwrap();
+        s.seal();
+        s.selected_track = Some(t);
+        assert!(s.duplicate_tracks(&[t]));
+        // Devices, tracks, clips and notes added afterwards get ids nobody has.
+        let again = s.add_stock_device(t, "fx.compressor", "Comp").expect("a device can be added after duplicating");
+        let mut ids = vec![again];
+        ids.extend(s.project.tracks.iter().flat_map(|x| x.devices.iter().map(|d| d.id)).filter(|d| *d != again));
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "no two devices share an id");
+        let later = s.add_track(TrackKind::Audio).expect("and a track");
+        assert!(s.project.tracks.iter().filter(|x| x.id == later).count() == 1);
+        assert!(s.last_error.is_none(), "{:?}", s.last_error);
+    }
+
+    fn audio_track_with_input(s: &mut AppState) -> TrackId {
+        let t = add_named(s, TrackKind::Audio, "Mic");
+        s.set_track(t, TrackProp::Input(InputSource::Hardware { first: 0, stereo: false }));
+        s.set_track(t, TrackProp::Arm(true));
+        s.seal();
+        t
+    }
+
+    fn take_of(track: TrackId, name: &str, start: Tick, frames: u64) -> crate::bridge::AudioTake {
+        crate::bridge::AudioTake { track, path: format!("/rec/{name}.wav").into(), start_tick: start, frames, sample_rate: 48_000, channels: 1, error: None }
+    }
+
+    #[test]
+    fn an_audio_take_becomes_a_clip_at_its_start_tick_in_one_undo_step() {
+        use crate::bridge::{EngineBridge, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let (a, b) = (audio_track_with_input(&mut s), audio_track_with_input(&mut s));
+        let mut e = StubEngine::default();
+        e.armed_audio = vec![a, b];
+        e.toggle_record();
+        e.play();
+        let now = std::time::Instant::now();
+        assert_eq!(s.poll_recording_at(&mut e, now), RecPoll { changed: true, ..RecPoll::default() }, "capturing: nothing in the project yet");
+        e.stop();
+        // The files arrive after the take is over: one now, the other a moment later.
+        e.audio_takes = vec![take_of(a, "a", 8 * PPQ, 96_000)];
+        let steps = s.history.steps().count();
+        let poll = s.poll_recording_at(&mut e, now);
+        assert_eq!(poll.audio_clips, 0, "still waiting for the second file");
+        assert_eq!(s.history.steps().count(), steps);
+        e.audio_takes = vec![take_of(b, "b", 8 * PPQ, 96_000)];
+        let poll = s.poll_recording_at(&mut e, now);
+        assert_eq!(poll.audio_clips, 2);
+        assert_eq!(s.history.steps().count(), steps + 1, "one undo step for both files");
+        assert_eq!(s.history.undo_label(), Some("Record audio"));
+        for t in [a, b] {
+            let pl = &s.project.track(t).unwrap().arrangement;
+            assert_eq!(pl.len(), 1);
+            assert_eq!(pl[0].start, 8 * PPQ, "at the tick the take began");
+            // Two seconds at 120 BPM: four beats.
+            assert_eq!(s.project.clips[&pl[0].clip].length, 4 * PPQ);
+        }
+        s.undo();
+        assert!(s.project.track(a).unwrap().arrangement.is_empty() && s.project.track(b).unwrap().arrangement.is_empty());
+    }
+
+    #[test]
+    fn an_audio_take_replaces_what_it_lands_on() {
+        use crate::bridge::{StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = audio_track_with_input(&mut s);
+        let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        s.edit("old", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("old", Color::palette(1), src, 16 * PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
+        ]);
+        s.seal();
+        let mut e = StubEngine::default();
+        e.audio_takes = vec![take_of(t, "over", 4 * PPQ, 48_000)];
+        e.armed_audio = vec![t];
+        assert_eq!(s.poll_recording(&mut e).audio_clips, 1);
+        let spans: Vec<(Tick, Tick)> = clips_of(&s, t).into_iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(spans, [(0, 4 * PPQ), (4 * PPQ, 2 * PPQ), (6 * PPQ, 10 * PPQ)], "the old clip keeps what is left either side");
+    }
+
+    #[test]
+    fn a_failed_take_is_reported_and_a_missing_file_is_given_up_on() {
+        use crate::bridge::{EngineBridge, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let (a, b) = (audio_track_with_input(&mut s), audio_track_with_input(&mut s));
+        let mut e = StubEngine::default();
+        e.armed_audio = vec![a, b];
+        e.toggle_record();
+        e.play();
+        let t0 = std::time::Instant::now();
+        s.poll_recording_at(&mut e, t0);
+        e.stop();
+        // One file failed to write after a few frames; the other never shows up.
+        e.audio_takes = vec![crate::bridge::AudioTake { error: Some("disk full".into()), ..take_of(a, "a", 0, 4_800) }];
+        let early = s.poll_recording_at(&mut e, t0);
+        assert!(early.errors.is_empty() && early.audio_clips == 0, "still waiting for the other");
+        let late = s.poll_recording_at(&mut e, t0 + std::time::Duration::from_secs(11));
+        assert_eq!(late.audio_clips, 1, "what made it to the disk is kept");
+        assert!(late.errors.iter().any(|m| m.contains("disk full") && m.contains("Mic")), "{:?}", late.errors);
+        assert!(late.errors.iter().any(|m| m.contains("never arrived")), "{:?}", late.errors);
+        // A take of a track whose input was switched off meanwhile is left out.
+        s.set_track(b, TrackProp::Input(InputSource::None));
+        assert_eq!(s.commit_audio_takes(&[take_of(b, "b", 0, 1_000)], None).0, 0);
+    }
+
+    #[test]
+    fn the_engine_is_told_each_audio_tracks_input_and_monitor_when_they_change() {
+        use crate::bridge::StubEngine;
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Audio, "Mic");
+        let keys = add_named(&mut s, TrackKind::Instrument, "Keys");
+        let mut e = StubEngine::default();
+        let mut sent = BTreeMap::new();
+        assert_eq!(s.sync_track_io(&mut sent, &mut e), 1, "audio tracks only, once");
+        assert_eq!(s.sync_track_io(&mut sent, &mut e), 0, "nothing changed");
+        assert!(!e.track_io.contains_key(&keys));
+        let pair = InputSource::Hardware { first: 2, stereo: true };
+        s.set_track(t, TrackProp::Input(pair));
+        s.set_track(t, TrackProp::Monitor(Monitor::In));
+        assert_eq!(s.sync_track_io(&mut sent, &mut e), 1);
+        assert_eq!(e.track_io[&t], (pair, Monitor::In));
+        // A project opened later starts from nothing sent: everything is told again.
+        sent.clear();
+        assert_eq!(s.sync_track_io(&mut sent, &mut e), 1);
+        // A deleted track is forgotten.
+        s.delete_tracks(&[t]);
+        s.sync_track_io(&mut sent, &mut e);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn audio_takes_go_next_to_a_saved_project_or_under_the_settings() {
+        let saved = std::env::temp_dir().join("song").join("Song.aitrack");
+        let dir = recordings_dir(Some(&saved));
+        assert!(dir.ends_with("Recordings") && dir.parent().is_some_and(|p| p.ends_with("song")), "{dir:?}");
+        let unsaved = recordings_dir(None);
+        assert!(unsaved.ends_with("Recordings") && unsaved.starts_with(crate::appearance::config_dir()));
+    }
+
+    #[test]
+    fn loop_takes_keep_each_note_where_the_engine_put_it_whatever_pass_it_was_played_in() {
+        use crate::bridge::{MidiTake, RecNote, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = armed_keys(&mut s);
+        s.edit("loop", vec![Command::SetLoop { region: Some((4 * PPQ, 8 * PPQ)) }]);
+        s.seal();
+        let mut e = StubEngine::default();
+        // Recording started in the middle of the loop (beat 6): the first pass
+        // runs 6..8, the second 4..8. The engine reports in-loop ticks for both.
+        let note = |key, at, pass| RecNote { pass, ..rec_note(t, key, at, PPQ / 2) };
+        e.rec_take = Some(MidiTake { notes: vec![note(60, 6 * PPQ, 0), note(62, 4 * PPQ, 1), note(60, 6 * PPQ, 1), note(64, 7 * PPQ, 2)], start_tick: 6 * PPQ, end_tick: 7 * PPQ + PPQ / 2, passes: 3 });
+        assert_eq!(s.poll_recording(&mut e).committed, 1);
+        // One clip over the loop (not over the take), notes at their loop positions.
+        assert_eq!(clips_of(&s, t), [(4 * PPQ, 4 * PPQ, 4)]);
+        let Some(Source::Notes(n)) = s.project.sources.values().find(|x| matches!(x, Source::Notes(_))) else { panic!() };
+        let mut at: Vec<(u8, Tick)> = n.notes.iter().map(|n| (n.key, n.start)).collect();
+        at.sort();
+        assert_eq!(at, [(60, 2 * PPQ), (60, 2 * PPQ), (62, 0), (64, 3 * PPQ)], "beat 6 of the song is beat 2 of the clip in every pass");
+        s.undo();
+        // A take that began before the loop (an intro) keeps its intro in the clip.
+        e.rec_take = Some(MidiTake { notes: vec![note(60, 2 * PPQ, 0), note(62, 5 * PPQ, 1)], start_tick: 2 * PPQ, end_tick: 8 * PPQ, passes: 2 });
+        assert_eq!(s.poll_recording(&mut e).committed, 1);
+        assert_eq!(clips_of(&s, t), [(2 * PPQ, 6 * PPQ, 2)], "from where it began to the loop end");
+        s.undo();
+        // Looping on but the loop never wrapped: an ordinary take, relative to where it began.
+        e.rec_take = Some(MidiTake { notes: vec![note(60, 5 * PPQ, 0)], start_tick: 5 * PPQ, end_tick: 7 * PPQ, passes: 1 });
+        assert_eq!(s.poll_recording(&mut e).committed, 1);
+        assert_eq!(clips_of(&s, t), [(5 * PPQ, 2 * PPQ, 1)]);
+    }
+
+    #[test]
+    fn a_loop_recording_fills_only_the_loop_with_its_last_whole_pass() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = audio_track_with_input(&mut s);
+        let bar = 4 * PPQ;
+        // Something after the loop that the recording must not touch.
+        let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        s.edit("later", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("later", Color::palette(1), src, 4 * bar)) },
+            Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 2 * bar, lane: 0 } },
+        ]);
+        s.seal();
+        // Three passes over a one-bar loop at 120 BPM: 6 s of audio, 288 000 frames.
+        let spans = |s: &AppState| -> Vec<(Tick, Tick, Tick)> {
+            let mut v: Vec<_> = s.project.track(t).unwrap().arrangement.iter().map(|p| (p.start, s.project.clips[&p.clip].length, s.project.clips[&p.clip].offset)).collect();
+            v.sort();
+            v
+        };
+        let three = take_of(t, "loop", 0, 288_000);
+        let (n, errors) = s.commit_audio_takes(&[three], Some((0, bar)));
+        assert_eq!((n, errors.len()), (1, 0));
+        assert_eq!(spans(&s), [(0, bar, 2 * bar), (2 * bar, 4 * bar, 0)], "one bar, showing the third pass; what follows is untouched");
+        s.undo();
+        // Started in the middle of the loop (beat 2): the first pass is partial.
+        // 2 + 4 + 4 + 1 beats = 11 beats = 5.5 s.
+        let mid = take_of(t, "mid", 2 * PPQ, 264_000);
+        s.commit_audio_takes(&[mid], Some((0, bar)));
+        assert_eq!(spans(&s)[0], (0, bar, 2 * PPQ + bar), "the last whole pass starts after the partial one and one whole pass");
+        assert_eq!(spans(&s).len(), 2);
+        s.undo();
+        // Began before the loop (an intro): from where it began to the loop end.
+        let intro = take_of(t, "intro", 0, 288_000);
+        s.commit_audio_takes(&[intro], Some((bar, 2 * bar)));
+        assert_eq!(spans(&s)[0], (0, 2 * bar, 0));
+        s.undo();
+        // No loop, or a take that never reached the loop end: one plain clip.
+        s.commit_audio_takes(&[take_of(t, "plain", PPQ, 48_000)], Some((0, bar)));
+        assert_eq!(spans(&s)[0], (PPQ, 2 * PPQ, 0));
+        s.undo();
+        s.commit_audio_takes(&[take_of(t, "free", 0, 288_000)], None);
+        assert_eq!(spans(&s)[0].1, 12 * PPQ);
+    }
+
+    #[test]
+    fn deleting_tracks_is_one_undo_step_and_leaves_the_main_track() {
+        let mut s = AppState::new(Project::new("t"));
+        let (a, b) = (add_named(&mut s, TrackKind::Audio, "A"), add_named(&mut s, TrackKind::Instrument, "B"));
+        let main = s.project.main_track().id;
+        assert!(!s.delete_tracks(&[main]));
+        assert!(s.delete_tracks(&[a, b, main]));
+        assert!(s.project.track(a).is_none() && s.project.track(b).is_none() && s.project.track(main).is_some());
+        s.undo();
+        assert!(s.project.track(a).is_some() && s.project.track(b).is_some(), "one undo brings both back");
+    }
+
+    #[test]
+    fn colours_change_the_track_and_the_clips_that_followed_it() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Instrument, "K");
+        let old = s.project.track(t).unwrap().color;
+        let (src, c1, c2, p1, p2) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id(), s.project.alloc_placement_id());
+        let hand = Color::palette(9);
+        assert_ne!(hand, old);
+        s.edit("clips", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddClip { id: c1, clip: Box::new(Clip::new("one", old, src, PPQ)) },
+            Command::AddClip { id: c2, clip: Box::new(Clip::new("two", hand, src, PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: p1, clip: c1, start: 0, lane: 0 } },
+            Command::PlaceClip { track: t, placement: Placement { id: p2, clip: c2, start: 4 * PPQ, lane: 0 } },
+        ]);
+        let new = Color::palette(5);
+        assert!(s.set_tracks_color(&[t], new));
+        assert_eq!(s.project.track(t).unwrap().color, new);
+        assert_eq!(s.project.clips[&c1].color, new, "followed the track");
+        assert_eq!(s.project.clips[&c2].color, hand, "coloured by hand: kept");
+        assert!(!s.set_tracks_color(&[t], new), "same colour: no step");
+        s.undo();
+        assert_eq!((s.project.track(t).unwrap().color, s.project.clips[&c1].color), (old, old));
+        // The selected clips take a colour of their own.
+        s.select_clips(vec![p2], Some(p2));
+        assert!(s.set_clips_color(Color::palette(1)));
+        assert_eq!(s.project.clips[&c2].color, Color::palette(1));
+    }
+
+    #[test]
+    fn midi_effects_are_put_before_the_other_devices_in_the_order_they_were_added() {
+        let mut s = state();
+        let track = s.add_track(TrackKind::Instrument).unwrap();
+        for (id, name) in [("fx.eq", "EQ"), ("midi.arp", "Arp"), ("fx.reverb", "Reverb"), ("midi.chord", "Chord")] {
+            s.add_stock_device(track, id, name).unwrap();
+        }
+        let chain: Vec<String> = s.project.track(track).unwrap().devices.iter().filter_map(|d| match &d.kind {
+            DeviceKind::Stock { plugin_id } => Some(plugin_id.clone()),
+            _ => None,
+        }).collect();
+        let midi: Vec<&String> = chain.iter().filter(|id| id.starts_with("midi.")).collect();
+        assert_eq!(midi, ["midi.arp", "midi.chord"]);
+        let last_midi = chain.iter().rposition(|id| id.starts_with("midi.")).unwrap();
+        assert!(chain[..=last_midi].iter().all(|id| id.starts_with("midi.")), "{chain:?}");
     }
 
     #[test]
@@ -2522,7 +3857,7 @@ mod tests {
         s.seal();
         assert!(s.save_rack_variation(rack, None));
 
-        assert!(s.recall_rack_variation(rack, 0));
+        assert!(s.recall_variation_except(rack, 0, &Default::default()));
         let DeviceKind::Rack(r) = &s.project.device(rack).unwrap().kind else { panic!("expected rack") };
         assert!((r.macros[0].value - 0.25).abs() < 1e-6);
         assert!((r.macros[3].value - 0.8).abs() < 1e-6);

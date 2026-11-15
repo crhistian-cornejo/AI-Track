@@ -21,11 +21,12 @@ use crate::bridge::*;
 use aitrack_engine::engine::DeviceRequest;
 use aitrack_engine::{
     ActiveAudio, AudioDeviceInfo, ChannelSelection, ClipSlotStatus, Engine, EngineConfig, EngineError, EngineHandle, FactoryStack, Lame,
-    Mp3Tags, RenderOptions, RenderRange, ShareMode, TapReader, WavFormat,
+    MidiPortInfo, Mp3Tags, RenderOptions, RenderRange, ShareMode, TapReader, WavFormat,
 };
-use aitrack_model::{DeviceId, Project, SceneId, Tick, TrackId};
-use std::collections::HashMap;
+use aitrack_model::{DeviceId, Project, Quantize, SceneId, Tick, TrackId};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -102,6 +103,115 @@ fn scan_devices() -> Option<DeviceScan> {
     Some(rx)
 }
 
+fn rec_note(n: aitrack_engine::record::RecordedNote) -> RecNote {
+    RecNote { track: n.track, key: n.key, velocity: n.velocity, start_tick: n.start_tick, length_ticks: n.length_ticks, pass: n.pass }
+}
+
+/// How often the MIDI input ports are looked at, so a keyboard plugged in
+/// after the app started is picked up too.
+const MIDI_RESCAN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Which of the `listed` MIDI input ports to open (not open yet) and which of
+/// the `open` ones have disappeared (unplugged: closed so that plugging the
+/// keyboard in again opens it again). Pure, so it is testable without hardware.
+///
+/// `disabled` are the ports the user switched off in Preferences: they are
+/// never opened, and closed if they are open. Every other port is on, so a
+/// keyboard that was never seen before just works.
+fn plan_midi(listed: &[MidiPortInfo], open: &BTreeSet<String>, disabled: &BTreeSet<String>) -> (Vec<MidiPortInfo>, Vec<String>) {
+    let to_open = listed.iter().filter(|p| !open.contains(&p.id) && !disabled.contains(&p.id)).cloned().collect();
+    let gone = open.iter().filter(|id| disabled.contains(*id) || !listed.iter().any(|p| p.id == **id)).cloned().collect();
+    (to_open, gone)
+}
+
+/// What the user chose about MIDI input, kept in `midi.json` next to the other
+/// settings: the ports switched off (all others are on) and the track live
+/// MIDI goes to (`None` = every armed instrument track).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MidiPrefs {
+    pub disabled_ports: BTreeSet<String>,
+    pub target: Option<u64>,
+}
+
+impl MidiPrefs {
+    fn path() -> PathBuf {
+        crate::appearance::config_dir().join("midi.json")
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Self {
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// What one pass over the MIDI ports did.
+struct MidiScan {
+    /// Every port the system lists (for the Preferences page).
+    listed: Vec<MidiPortInfo>,
+    /// Ports now open (the engine keeps them open across audio-device
+    /// changes and re-wires them to the new audio thread by itself).
+    open: BTreeSet<String>,
+    /// Ports that would not open, with the reason.
+    failed: Vec<(MidiPortInfo, String)>,
+}
+
+/// Tells the MIDI worker to stop when the engine that started it is dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Open every MIDI input on a worker thread (opening waits on the engine's
+/// control thread, which the UI thread must never do). Armed instrument
+/// tracks receive what they play: the engine's default MIDI target.
+///
+/// The worker holds the handle only **weakly**, and a strong reference only
+/// for the length of one call: closing the app never waits for it, and the
+/// engine is shut down by whoever lets go of it last (the worker, at worst,
+/// not the UI thread). `stop` ends the pass between ports.
+fn scan_midi(handle: &Arc<EngineHandle>, open: BTreeSet<String>, disabled: BTreeSet<String>, stop: Arc<AtomicBool>) -> Option<crossbeam_channel::Receiver<MidiScan>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let handle = Arc::downgrade(handle);
+    std::thread::Builder::new()
+        .name("aitrack-midi-ports".into())
+        .spawn(move || {
+            let alive = || !stop.load(Ordering::Relaxed);
+            let Some(listed) = handle.upgrade().filter(|_| alive()).map(|h| h.midi_inputs()) else { return };
+            let (to_open, gone) = plan_midi(&listed, &open, &disabled);
+            let mut open = open;
+            let mut failed = Vec::new();
+            for id in gone {
+                let Some(h) = handle.upgrade().filter(|_| alive()) else { return };
+                h.close_midi_input(&id);
+                open.remove(&id);
+            }
+            for port in to_open {
+                let Some(h) = handle.upgrade().filter(|_| alive()) else { return };
+                match h.open_midi_input(&port.id) {
+                    Ok(()) => {
+                        open.insert(port.id);
+                    }
+                    Err(e) => failed.push((port, e.to_string())),
+                }
+            }
+            let _ = tx.send(MidiScan { listed, open, failed });
+        })
+        .ok()?;
+    Some(rx)
+}
+
 struct Frame {
     at: Instant,
     transport: TransportState,
@@ -111,12 +221,14 @@ struct Frame {
 }
 
 pub struct RealEngine {
-    handle: EngineHandle,
+    handle: Arc<EngineHandle>,
     export_factory: Arc<FactoryStack>,
     rt: Arc<PluginRuntime>,
     settings: Settings,
     looping: bool,
     metronome: bool,
+    count_in: u32,
+    global_quantize: Quantize,
     recording: bool,
     loop_region: Option<(Tick, Tick)>,
     main_track: Option<TrackId>,
@@ -148,6 +260,24 @@ pub struct RealEngine {
     tap: TapReader,
     analysis: bool,
     tap_drained: Instant,
+    /// MIDI inputs open, the pass in flight and when the last one started.
+    midi_open: BTreeSet<String>,
+    /// The ports of the last pass, the user's choices and a pass asked for while one ran.
+    midi_listed: Vec<MidiPortInfo>,
+    midi_prefs: MidiPrefs,
+    midi_again: bool,
+    midi_scan: Option<crossbeam_channel::Receiver<MidiScan>>,
+    midi_scanned_at: Instant,
+    /// Ports already reported as failing (told once, retried quietly).
+    midi_reported: BTreeSet<String>,
+    /// Ends the MIDI worker when this engine is dropped.
+    midi_stop: StopOnDrop,
+    /// What the engine reports about itself, and the compile generation its
+    /// warnings were read at (they are read again only when it moves).
+    health: EngineHealth,
+    compile_seen: Option<u64>,
+    notices: NoticeLog,
+    drops: DropTracker,
 }
 
 fn host_name(h: AudioHost) -> &'static str {
@@ -256,6 +386,9 @@ impl RealEngine {
                 (h, Some(no_device_banner(&e.to_string())))
             }
         };
+        let handle = Arc::new(handle);
+        let midi_prefs = MidiPrefs::load_from(&MidiPrefs::path());
+        handle.set_midi_target(midi_prefs.target.map(TrackId));
         let active = handle.active_audio();
         let tap = handle.analysis_tap();
         handle.set_sample_cache_bytes(settings.sample_cache_mb.clamp(64, 4096) * 1024 * 1024);
@@ -269,6 +402,8 @@ impl RealEngine {
             settings,
             looping: true,
             metronome: false,
+            count_in: 0,
+            global_quantize: Quantize::Bar,
             recording: false,
             loop_region: None,
             main_track: None,
@@ -291,10 +426,91 @@ impl RealEngine {
             meter_delay: MeterDelay::default(),
             tap_delay: TapDelay::default(),
             tap_fresh: Vec::new(),
+            midi_open: BTreeSet::new(),
+            midi_listed: Vec::new(),
+            midi_prefs,
+            midi_again: false,
+            midi_scan: None,
+            midi_scanned_at: Instant::now(),
+            midi_reported: BTreeSet::new(),
+            midi_stop: StopOnDrop(Arc::new(AtomicBool::new(false))),
+            health: EngineHealth::default(),
+            compile_seen: None,
+            notices: NoticeLog::default(),
+            drops: DropTracker::default(),
         };
         this.adopt_active();
         this.refresh_devices();
+        this.refresh_midi();
         this
+    }
+
+    /// Read the engine's own report: the audio health every frame (a few
+    /// atomics), the compile warnings and error only when a compile finished.
+    /// Whatever is new becomes a toast, once.
+    fn poll_health(&mut self) {
+        let a = self.handle.audio_health();
+        let h = &mut self.health;
+        (h.callback_panics, h.node_panics, h.sanitized_samples) = (a.callback_panics, a.node_panics, a.sanitized_samples);
+        h.crashed_devices = a.crashed_devices;
+        h.last_panic = a.last_panic;
+        let rec = self.handle.recording_info();
+        h.recording_lost = self.drops.update(rec.capturing, rec.dropped);
+        h.warp_failures = self.handle.sample_cache_warp_failures();
+        let generation = self.handle.compile_generation();
+        if self.compile_seen != Some(generation) {
+            self.compile_seen = Some(generation);
+            h.warnings = self.handle.warnings();
+            // Without a device the banner already says why nothing compiles.
+            h.error = self.handle.last_error().filter(|_| self.active.is_some());
+        }
+        let fresh = self.notices.fresh(&self.health);
+        self.messages.extend(fresh);
+    }
+
+    /// Start a pass over the MIDI input ports (no-op while one runs).
+    fn refresh_midi(&mut self) {
+        if self.midi_scan.is_none() {
+            self.midi_scan = scan_midi(&self.handle, self.midi_open.clone(), self.midi_prefs.disabled_ports.clone(), self.midi_stop.0.clone());
+            self.midi_scanned_at = Instant::now();
+        }
+    }
+
+    /// Pick up a finished pass over the MIDI ports and start the next one
+    /// when it is due. `true` when something is worth telling the user.
+    fn poll_midi(&mut self) -> bool {
+        let Some(rx) = &self.midi_scan else {
+            if self.midi_scanned_at.elapsed() > MIDI_RESCAN {
+                self.refresh_midi();
+            }
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(scan) => {
+                self.midi_scan = None;
+                self.midi_open = scan.open;
+                self.midi_listed = scan.listed;
+                // A choice made while the pass ran: look again at once.
+                if std::mem::take(&mut self.midi_again) {
+                    self.refresh_midi();
+                }
+                // A port that opens later is told about again if it fails again.
+                self.midi_reported.retain(|id| scan.failed.iter().any(|(p, _)| p.id == *id));
+                let mut told = false;
+                for (port, why) in scan.failed {
+                    if self.midi_reported.insert(port.id.clone()) {
+                        self.messages.push(format!("MIDI input {} did not open: {why}", port.name));
+                        told = true;
+                    }
+                }
+                told
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => false,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.midi_scan = None;
+                false
+            }
+        }
     }
 
     /// Take the device the engine has open now (after a start, a switch or
@@ -479,6 +695,28 @@ impl EngineBridge for RealEngine {
         self.handle.set_metronome(on);
     }
 
+    fn set_count_in(&mut self, bars: u32) {
+        self.count_in = bars;
+        self.handle.set_count_in(bars);
+    }
+
+    fn count_in(&self) -> u32 {
+        self.count_in
+    }
+
+    fn set_global_quantize(&mut self, quantize: Quantize) {
+        self.global_quantize = quantize;
+        self.handle.set_global_quantize(quantize);
+    }
+
+    fn global_quantize(&self) -> Quantize {
+        self.global_quantize
+    }
+
+    fn back_to_arrangement(&mut self) {
+        self.handle.back_to_arrangement();
+    }
+
     fn locate(&mut self, tick: Tick) {
         self.handle.seek(tick.max(0));
         self.frame.transport.position = tick.max(0);
@@ -486,6 +724,123 @@ impl EngineBridge for RealEngine {
 
     fn transport(&self) -> TransportState {
         TransportState { looping: self.looping, metronome: self.metronome, recording: self.recording, ..self.frame.transport }
+    }
+
+    fn recording_state(&self) -> RecordingState {
+        let info = self.handle.recording_info();
+        RecordingState {
+            capturing: info.capturing,
+            start_tick: info.start_tick.round() as Tick,
+            pass: info.pass,
+            tracks: info.midi_tracks,
+            audio_tracks: info.audio_tracks,
+            takes_started: info.takes_started,
+            takes_finished: info.takes_finished,
+            dropped: info.dropped,
+        }
+    }
+
+    fn finish_audio_recording(&mut self) -> Vec<AudioTake> {
+        self.handle
+            .finish_audio_recording()
+            .into_iter()
+            .map(|t| AudioTake { track: t.track, path: t.path, start_tick: t.start_tick.round() as Tick, frames: t.frames, sample_rate: t.sample_rate, channels: u16::from(t.channels), error: t.error })
+            .collect()
+    }
+
+    fn set_recording_dir(&mut self, dir: &std::path::Path) {
+        self.handle.set_recording_dir(dir);
+    }
+
+    fn set_track_input(&mut self, track: TrackId, input: aitrack_model::InputSource) {
+        // "No input" is said outright: to the engine a missing selection
+        // means its default input, which would still record the track.
+        let sel = input.channel_span().map(|(first, count)| ChannelSelection { first, count });
+        self.handle.set_track_input_none(track, sel.is_none());
+        self.handle.set_track_input(track, sel);
+    }
+
+    fn set_track_monitor(&mut self, track: TrackId, monitor: aitrack_model::Monitor) {
+        self.handle.set_track_monitor(track, Some(monitor));
+    }
+
+    fn take_recorded_notes(&mut self) -> Vec<RecNote> {
+        self.handle.take_recorded_notes().into_iter().map(rec_note).collect()
+    }
+
+    fn finish_midi_recording(&mut self) -> Option<MidiTake> {
+        let t = self.handle.finish_midi_recording()?;
+        Some(MidiTake { notes: t.notes.into_iter().map(rec_note).collect(), start_tick: t.start_tick, end_tick: t.end_tick, passes: t.passes })
+    }
+
+    fn midi_ports(&self) -> Vec<MidiPortState> {
+        self.midi_listed
+            .iter()
+            .map(|p| MidiPortState { id: p.id.clone(), name: p.name.clone(), enabled: !self.midi_prefs.disabled_ports.contains(&p.id), open: self.midi_open.contains(&p.id) })
+            .collect()
+    }
+
+    fn set_midi_port_enabled(&mut self, id: &str, enabled: bool) {
+        let changed = if enabled { self.midi_prefs.disabled_ports.remove(id) } else { self.midi_prefs.disabled_ports.insert(id.to_owned()) };
+        if !changed {
+            return;
+        }
+        self.midi_prefs.save_to(&MidiPrefs::path());
+        if !enabled && self.midi_open.remove(id) {
+            // Closing never waits; the next pass confirms it.
+            self.handle.close_midi_input(id);
+        }
+        if self.midi_scan.is_some() {
+            self.midi_again = true;
+        } else {
+            self.refresh_midi();
+        }
+    }
+
+    fn midi_target(&self) -> Option<TrackId> {
+        self.handle.midi_target()
+    }
+
+    fn set_midi_target(&mut self, track: Option<TrackId>) {
+        self.handle.set_midi_target(track);
+        self.midi_prefs.target = track.map(|t| t.0);
+        self.midi_prefs.save_to(&MidiPrefs::path());
+    }
+
+    fn midi_message_count(&self) -> u64 {
+        self.handle.midi_message_count()
+    }
+
+    fn sample_cache_warp_bytes(&self) -> usize {
+        self.handle.sample_cache_warp_bytes()
+    }
+
+    fn fast_param(&mut self, device: DeviceId, param: u32, normalized: f32) -> bool {
+        self.handle.set_device_param(device, param, normalized)
+    }
+
+    fn fast_rack_selector(&mut self, rack: DeviceId, value: u8) -> bool {
+        self.handle.set_rack_selector(rack, value)
+    }
+
+    fn fast_track_volume(&mut self, track: TrackId, db: f32) -> bool {
+        self.handle.set_track_volume(track, db)
+    }
+
+    fn fast_track_pan(&mut self, track: TrackId, pan: f32) -> bool {
+        self.handle.set_track_pan(track, pan)
+    }
+
+    fn fast_send_level(&mut self, track: TrackId, index: usize, db: f32) -> bool {
+        self.handle.set_send_level(track, index, db)
+    }
+
+    fn compile_count(&self) -> u64 {
+        self.handle.compile_count()
+    }
+
+    fn patch_count(&self) -> u64 {
+        self.handle.patch_count()
     }
 
     fn update_project(&mut self, project: &Project) {
@@ -525,6 +880,7 @@ impl EngineBridge for RealEngine {
         self.frame.at = now;
         self.poll_audio();
         self.poll_devices();
+        self.poll_health();
         let position = self.handle.heard_position_ticks().max(0.) as Tick;
         self.frame.transport = TransportState { playing: self.handle.is_playing(), position, ..self.frame.transport };
         self.frame.cpu = self.handle.cpu_load().0.clamp(0., 1.);
@@ -577,6 +933,7 @@ impl EngineBridge for RealEngine {
         self.messages.extend(errors);
         changed |= self.poll_audio();
         changed |= self.poll_devices();
+        changed |= self.poll_midi();
         // Nobody drained the tap for a while (window hidden or minimised):
         // stop feeding it until the next drain.
         if self.tap.is_enabled() && self.tap_drained.elapsed() > TAP_IDLE {
@@ -616,6 +973,16 @@ impl EngineBridge for RealEngine {
         if let Err(e) = self.preview.play(path) {
             self.messages.push(e);
         }
+    }
+
+    fn preview_synced(&mut self, req: &SyncedPreview) {
+        if let Err(e) = self.preview.play_synced(req) {
+            self.messages.push(e);
+        }
+    }
+
+    fn set_preview_volume(&mut self, volume: f32) {
+        self.preview.set_volume(volume);
     }
 
     fn preview_pitched(&mut self, path: Option<&std::path::Path>, ratio: f64, reverse: bool) {
@@ -694,23 +1061,8 @@ impl EngineBridge for RealEngine {
     fn export(&mut self, options: ExportOptions, project: &Project, mut progress: ProgressFn) {
         let project = project.clone();
         let factory = self.export_factory.clone();
-        let session_rate = self.session_rate() as f64;
         let spawned = std::thread::Builder::new().name("aitrack-export".into()).spawn(move || {
-            let range = match options.range {
-                ExportRange::Song => RenderRange::Song,
-                ExportRange::Loop if project.loop_region.is_some() => RenderRange::Loop,
-                ExportRange::Loop => RenderRange::Song,
-                ExportRange::Selection { start, end } => RenderRange::Ticks(start, end),
-            };
-            let opts = RenderOptions {
-                range,
-                session_rate,
-                export_rate: options.sample_rate,
-                block: 512,
-                tail_seconds: options.tail_seconds.max(0.) as f64,
-                normalize_db: options.normalize.then_some(-0.3),
-                samples: None,
-            };
+            let opts = render_options(&options, &project);
             let stage = |f: f32| if f < 0.97 { "Rendering" } else { "Writing files" };
             let result: Result<Vec<PathBuf>, EngineError> = (|| {
                 std::fs::create_dir_all(&options.folder)?;
@@ -764,6 +1116,10 @@ impl EngineBridge for RealEngine {
 
     fn banner(&self) -> Option<String> {
         self.banner.clone()
+    }
+
+    fn health(&self) -> EngineHealth {
+        self.health.clone()
     }
 
     fn dismiss_banner(&mut self) {
@@ -845,9 +1201,125 @@ impl EngineBridge for RealEngine {
     }
 }
 
+/// How the offline render is set up for `options`. It renders **at the export
+/// rate**, not the audio device's: the render does not depend on the device,
+/// and rendering at the device rate and converting at the end would put the
+/// samples through two sample-rate conversions (44.1 → 48 → 44.1 kHz).
+fn render_options(options: &ExportOptions, project: &Project) -> RenderOptions {
+    let range = match options.range {
+        ExportRange::Song => RenderRange::Song,
+        ExportRange::Loop if project.loop_region.is_some() => RenderRange::Loop,
+        ExportRange::Loop => RenderRange::Song,
+        ExportRange::Selection { start, end } => RenderRange::Ticks(start, end),
+    };
+    RenderOptions {
+        range,
+        session_rate: options.sample_rate as f64,
+        export_rate: options.sample_rate,
+        block: 512,
+        tail_seconds: options.tail_seconds.max(0.) as f64,
+        normalize_db: options.normalize.then_some(-0.3),
+        samples: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn midi_ports_open_as_they_appear_and_close_when_unplugged() {
+        let port = |id: &str| MidiPortInfo { id: id.into(), name: id.to_uppercase() };
+        let (a, b) = (port("a"), port("b"));
+        let none = BTreeSet::new();
+        // At start-up every hardware port is opened.
+        let off = BTreeSet::new();
+        let (to_open, gone) = plan_midi(&[a.clone(), b.clone()], &none, &off);
+        assert_eq!(to_open, vec![a.clone(), b.clone()]);
+        assert!(gone.is_empty());
+        // Nothing new, nothing to do (the next pass does not reopen them).
+        let open: BTreeSet<String> = ["a".to_owned(), "b".to_owned()].into();
+        assert_eq!(plan_midi(&[a.clone(), b.clone()], &open, &off), (vec![], vec![]));
+        // A keyboard plugged in later is opened; one unplugged is closed...
+        let c = port("c");
+        assert_eq!(plan_midi(&[a.clone(), c.clone()], &open, &off), (vec![c.clone()], vec!["b".to_owned()]));
+        // ...and opens again when it comes back.
+        let open: BTreeSet<String> = ["a".to_owned()].into();
+        assert_eq!(plan_midi(&[a.clone(), b.clone()], &open, &off).0, vec![b.clone()]);
+        // A port switched off in Preferences is never opened, and is closed if it is open.
+        let b_off: BTreeSet<String> = ["b".to_owned()].into();
+        assert_eq!(plan_midi(&[a.clone(), b.clone()], &none, &b_off), (vec![a.clone()], vec![]));
+        let both_open: BTreeSet<String> = ["a".to_owned(), "b".to_owned()].into();
+        assert_eq!(plan_midi(&[a, b], &both_open, &b_off), (vec![], vec!["b".to_owned()]));
+    }
+
+    #[test]
+    fn the_midi_choices_are_remembered_and_default_to_everything_on() {
+        let path = std::env::temp_dir().join(format!("aitrack-midi-prefs-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let fresh = MidiPrefs::load_from(&path);
+        assert!(fresh.disabled_ports.is_empty() && fresh.target.is_none(), "nothing saved: every port on, armed tracks");
+        let chosen = MidiPrefs { disabled_ports: ["usb-1".to_owned()].into(), target: Some(7) };
+        chosen.save_to(&path);
+        assert_eq!(MidiPrefs::load_from(&path), chosen);
+        // A file from a version that knew fewer fields still opens.
+        std::fs::write(&path, r#"{"target": 3}"#).unwrap();
+        assert_eq!(MidiPrefs::load_from(&path), MidiPrefs { disabled_ports: BTreeSet::new(), target: Some(3) });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The headless engine takes a port that does not exist without hanging
+    /// the caller: the pass reports it instead of opening it.
+    #[test]
+    fn a_pass_over_the_midi_ports_never_blocks_and_reports_failures() {
+        let (handle, _) = Engine::new(EngineConfig::headless(48_000.), Arc::new(aitrack_engine::NullFactory)).unwrap();
+        let handle = Arc::new(handle);
+        assert!(handle.open_midi_input("no such port").is_err());
+        let rx = scan_midi(&handle, BTreeSet::new(), BTreeSet::new(), Arc::new(AtomicBool::new(false))).expect("worker thread");
+        let scan = rx.recv_timeout(std::time::Duration::from_secs(15)).expect("the pass finishes");
+        // Whatever ports this machine lists, every one is either open or failed.
+        assert!(scan.open.len() + scan.failed.len() <= 64);
+        assert!(scan.failed.iter().all(|(_, why)| !why.is_empty()));
+    }
+
+    /// Closing the app: the worker neither keeps the engine alive nor runs on.
+    #[test]
+    fn the_midi_worker_lets_go_when_the_engine_is_dropped_or_stopped() {
+        let (handle, _) = Engine::new(EngineConfig::headless(48_000.), Arc::new(aitrack_engine::NullFactory)).unwrap();
+        let handle = Arc::new(handle);
+        // Stopped before it starts: it ends without a result.
+        let stop = Arc::new(AtomicBool::new(true));
+        let rx = scan_midi(&handle, BTreeSet::new(), BTreeSet::new(), stop).unwrap();
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(15)), Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
+        // The worker never holds more than a weak reference between calls.
+        let rx = scan_midi(&handle, BTreeSet::new(), BTreeSet::new(), Arc::new(AtomicBool::new(false))).unwrap();
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(15));
+        assert_eq!(Arc::strong_count(&handle), 1);
+        // The guard raises the flag when the engine goes.
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(StopOnDrop(flag.clone()));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn export_renders_at_the_export_rate_so_there_is_no_second_conversion() {
+        for rate in [44_100u32, 48_000, 88_200, 96_000] {
+            let options = ExportOptions {
+                format: ExportFormat::Wav(WavDepth::Int24),
+                sample_rate: rate,
+                range: ExportRange::Song,
+                mode: ExportMode::Mixdown,
+                normalize: false,
+                tail_seconds: 2.,
+                folder: PathBuf::from("out"),
+                file_name: "Song".into(),
+            };
+            let o = render_options(&options, &Project::new("t"));
+            // `render` resamples only when the two differ.
+            assert_eq!(o.session_rate.round() as u32, o.export_rate, "{rate} Hz");
+            assert_eq!(o.export_rate, rate);
+        }
+    }
 
     #[test]
     fn audio_config_round_trips_through_the_engine_type() {

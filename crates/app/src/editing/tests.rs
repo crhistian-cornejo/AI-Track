@@ -1106,13 +1106,13 @@ fn plugin_window_edits_become_one_undo_step_per_gesture_and_states_are_stored() 
     assert!(!s.apply_plugin_edits(&[PluginEdit { device: DeviceId(9999), param: 1, value: 0.5, kind: K::Value }], None));
     s.undo();
     assert_eq!(s.project.device(device).unwrap().params.get(&3), None);
-    // States: only what differs, in one step, unknown devices left out.
-    assert!(s.store_plugin_states(vec![(device, vec![1, 2, 3]), (DeviceId(9999), vec![4])]));
+    // States: only what differs, with no undo step, unknown devices left out.
+    let (n, label) = (steps(&s), s.history.undo_label().map(str::to_owned));
+    assert!(s.capture_plugin_states(vec![(device, vec![1, 2, 3]), (DeviceId(9999), vec![4])]));
     assert_eq!(s.project.device(device).unwrap().state.as_deref(), Some(&[1u8, 2, 3][..]));
-    assert_eq!(s.history.undo_label(), Some("Plugin state"));
-    let n = steps(&s);
-    assert!(!s.store_plugin_states(vec![(device, vec![1, 2, 3])]), "unchanged: no undo step");
-    assert_eq!(steps(&s), n);
+    assert_eq!(steps(&s), n, "a plugin state is not an undo step");
+    assert_eq!(s.history.undo_label().map(str::to_owned), label);
+    assert!(!s.capture_plugin_states(vec![(device, vec![1, 2, 3])]), "unchanged: nothing to do");
 }
 
 // ── Automation lanes made from the UI ──
@@ -1300,4 +1300,122 @@ fn pitch_preserving_warp_modes_keep_clip_rate_at_one_when_transposed() {
     let rate = aitrack_model::ops::clip_rate(&s.project, clip);
     assert!((rate - 2f64.powf(7.0 / 12.0)).abs() < 1e-6, "Re-Pitch changes clip rate");
     let _ = pl;
+}
+
+// ── One clip per moment on a track (editing/overwrite.rs) ──
+
+#[test]
+fn a_dropped_clip_replaces_what_it_covers() {
+    let Song { mut s, midi, midi2, .. } = song();
+    midi_clip(&mut s, midi, 0, 8 * BEAT, &[(60, 0, BEAT), (62, 3 * BEAT, BEAT), (64, 6 * BEAT, BEAT)]);
+    midi_clip(&mut s, midi2, 0, 8 * BEAT, &[(60, 0, BEAT)]);
+    let before = steps(&s);
+    let new = midi_clip(&mut s, midi, 2 * BEAT, 2 * BEAT, &[(72, 0, BEAT)]);
+    // The old clip keeps what the new one does not cover, either side of it.
+    assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (2 * BEAT, 2 * BEAT), (4 * BEAT, 4 * BEAT)]);
+    assert_eq!(s.placement(new).unwrap().1.start, 2 * BEAT);
+    assert_eq!(spans(&s, midi2), [(0, 8 * BEAT)], "another track is left alone");
+    assert_eq!(steps(&s), before + 1, "the drop and what it replaces are one undo step");
+    assert!(s.undo());
+    assert_eq!(spans(&s, midi), [(0, 8 * BEAT)]);
+    assert!(s.redo());
+    assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (2 * BEAT, 2 * BEAT), (4 * BEAT, 4 * BEAT)]);
+}
+
+#[test]
+fn a_clip_wholly_covered_goes_with_its_notes() {
+    let Song { mut s, midi, .. } = song();
+    let old = midi_clip(&mut s, midi, 2 * BEAT, 2 * BEAT, &[(60, 0, BEAT)]);
+    let old_clip = s.placement(old).unwrap().1.clip;
+    let old_source = s.project.clips[&old_clip].source;
+    midi_clip(&mut s, midi, 0, 8 * BEAT, &[(72, 0, BEAT)]);
+    assert_eq!(spans(&s, midi), [(0, 8 * BEAT)]);
+    assert!(s.placement(old).is_none());
+    assert!(!s.project.clips.contains_key(&old_clip) && !s.project.sources.contains_key(&old_source), "nothing is left behind");
+    assert!(s.undo());
+    assert_eq!(spans(&s, midi), [(2 * BEAT, 2 * BEAT)]);
+}
+
+#[test]
+fn what_is_left_of_an_overwritten_sample_plays_the_same_audio() {
+    let Song { mut s, audio, .. } = song();
+    audio_clip(&mut s, audio, 0, 2 * BEAT);
+    audio_clip(&mut s, audio, 0, BEAT);
+    assert_eq!(spans(&s, audio), [(0, BEAT), (BEAT, BEAT)]);
+    let rest = s.project.track(audio).unwrap().arrangement.iter().find(|pl| pl.start == BEAT).unwrap().clone();
+    assert_eq!(s.project.clips[&rest.clip].offset, BEAT, "the tail starts a beat into its file, where it always played");
+}
+
+#[test]
+fn a_dragged_clip_replaces_only_what_it_is_dropped_on() {
+    let Song { mut s, midi, .. } = song();
+    let a = midi_clip(&mut s, midi, 0, 2 * BEAT, &[(60, 0, BEAT)]);
+    midi_clip(&mut s, midi, 4 * BEAT, 4 * BEAT, &[(62, 0, BEAT)]);
+    s.seal();
+    let before = steps(&s);
+    let origin = [(a, midi, 0)];
+    // Passing over the other clip leaves it whole…
+    assert!(s.drag_clips(&origin, 5 * BEAT, 0));
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 4 * BEAT), (5 * BEAT, 2 * BEAT)]);
+    assert!(s.drag_clips(&origin, 9 * BEAT, 0));
+    // …and letting go on top of it replaces that part.
+    assert!(s.drag_clips(&origin, 6 * BEAT, 0));
+    s.seal();
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 2 * BEAT), (6 * BEAT, 2 * BEAT)]);
+    assert_eq!(steps(&s), before + 1, "the whole drag is one undo step");
+    assert!(s.undo());
+    assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (4 * BEAT, 4 * BEAT)]);
+    assert!(s.redo());
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 2 * BEAT), (6 * BEAT, 2 * BEAT)]);
+}
+
+#[test]
+fn a_clip_made_longer_replaces_what_it_reaches() {
+    let Song { mut s, midi, .. } = song();
+    let a = midi_clip(&mut s, midi, 0, 2 * BEAT, &[(60, 0, BEAT)]);
+    midi_clip(&mut s, midi, 2 * BEAT, 4 * BEAT, &[(62, 0, BEAT)]);
+    s.seal();
+    let clip = s.placement(a).unwrap().1.clip;
+    let longer = ops::resize_end(&s.project, clip, 3 * BEAT).unwrap();
+    assert!(s.edit_coalesced("clip-resize", "Resize clip", vec![longer]));
+    assert_eq!(spans(&s, midi), [(0, 3 * BEAT), (2 * BEAT, 4 * BEAT)], "nothing is cut while the edge is dragged");
+    s.seal();
+    assert_eq!(spans(&s, midi), [(0, 3 * BEAT), (3 * BEAT, 3 * BEAT)]);
+}
+
+#[test]
+fn an_edit_that_lands_nothing_trims_nothing() {
+    let Song { mut s, midi, .. } = song();
+    let a = midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT)]);
+    // A project saved before clips replaced each other can hold two at once.
+    let (source, clip, id) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+    s.history
+        .apply(&mut s.project, "Old overlap", aitrack_model::Origin::User, vec![
+            Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new() })) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("Old", Color::palette(1), source, 4 * BEAT)) },
+            Command::PlaceClip { track: midi, placement: Placement { id, clip, start: 2 * BEAT, lane: 0 } },
+        ])
+        .unwrap();
+    let gain = ops::set_gain(&s.project, s.placement(a).unwrap().1.clip, -3.0).unwrap();
+    assert!(s.edit("Clip gain", vec![gain]));
+    s.seal();
+    assert_eq!(spans(&s, midi), [(0, 4 * BEAT), (2 * BEAT, 4 * BEAT)]);
+}
+
+#[test]
+fn an_edit_that_arrives_during_a_drag_does_not_settle_it() {
+    let Song { mut s, midi, midi2, .. } = song();
+    let a = midi_clip(&mut s, midi, 0, 2 * BEAT, &[(60, 0, BEAT)]);
+    midi_clip(&mut s, midi, 4 * BEAT, 4 * BEAT, &[(62, 0, BEAT)]);
+    let other = midi_clip(&mut s, midi2, 0, 4 * BEAT, &[(64, 0, BEAT)]);
+    s.seal();
+    let origin = [(a, midi, 0)];
+    assert!(s.drag_clips(&origin, 5 * BEAT, 0));
+    // Something else edits the project while the clip hangs over the other one.
+    let gain = ops::set_gain(&s.project, s.placement(other).unwrap().1.clip, -3.0).unwrap();
+    assert!(s.edit("Clip gain", vec![gain]));
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 4 * BEAT), (5 * BEAT, 2 * BEAT)], "still only passing over");
+    assert!(s.drag_clips(&origin, 9 * BEAT, 0));
+    s.seal();
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 4 * BEAT), (9 * BEAT, 2 * BEAT)], "dropped clear of it: nothing is replaced");
 }

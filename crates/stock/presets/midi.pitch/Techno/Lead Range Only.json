@@ -1,0 +1,21 @@
+{
+  "name": "Lead Range Only",
+  "plugin": "midi.pitch",
+  "author": "AI-Track",
+  "tags": [
+    "techno",
+    "lead",
+    "range",
+    "octave"
+  ],
+  "params": {
+    "0": 0.625,
+    "1": 0.5,
+    "2": 0.47244096,
+    "3": 0.27559054,
+    "4": 0.0,
+    "5": 0.5,
+    "6": 0.0,
+    "7": 0.5
+  }
+}

@@ -152,7 +152,7 @@ pub fn chain_devices(devices: &[Device]) -> Vec<(&Device, usize)> {
         for d in devices {
             out.push((d, depth));
             if let DeviceKind::Rack(r) = &d.kind {
-                for c in &r.chains {
+                for c in r.chains.iter().chain(&r.returns) {
                     walk(&c.devices, depth + 1, out);
                 }
             }

@@ -15,6 +15,7 @@
 
 pub mod buffer;
 pub mod event;
+pub mod midi;
 pub mod param;
 pub mod response;
 
@@ -37,6 +38,7 @@ pub mod wavetable;
 
 pub use buffer::AudioBuffer;
 pub use event::{Event, EventKind};
+pub use midi::{EventQueue, EventSink, MidiContext};
 pub use param::{ParamInfo, ParamScale, ParamValues};
 
 /// Musical transport state for the current block.
@@ -134,6 +136,28 @@ pub trait Processor: Send {
     /// Optional display data for the UI (spectrum, gain reduction…), copied
     /// into a lock-free buffer by the engine. Default: none.
     fn meter(&self, _out: &mut [f32]) -> usize {
+        0
+    }
+
+    /// MIDI effects only (`info().category == Category::MidiEffect`): turn the
+    /// events that reach this device into the ones the rest of the chain
+    /// gets. Add, remove, retime inside the block, change key, velocity or
+    /// channel; whatever should sound *later* goes in an
+    /// [`EventQueue`](crate::EventQueue) the device owns (allocated in
+    /// `prepare`) and is written out by a later call. Offsets written to
+    /// `out` must be below `ctx.frames`. No allocation, no locks.
+    ///
+    /// The audio buffer is never touched and `process` is not called. The
+    /// default passes every event through unchanged.
+    fn process_midi(&mut self, ctx: &MidiContext<'_>, out: &mut EventSink<'_>) {
+        for e in ctx.events {
+            out.push(e.offset, e.kind);
+        }
+    }
+
+    /// Events this processor lost because an internal queue was full, since
+    /// it was created (shown with the engine's audio health). Default: 0.
+    fn dropped_events(&self) -> u64 {
         0
     }
 }

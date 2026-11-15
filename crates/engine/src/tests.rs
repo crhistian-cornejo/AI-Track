@@ -329,31 +329,34 @@ fn rack_chains_are_latency_aligned() {
 // ───────────────────────────── Routing ─────────────────────────────
 
 #[test]
-fn routing_cycles_are_rejected() {
+fn routing_cycles_are_cut_open_with_a_warning() {
+    // (The engine_safety tests cover what plays; this keeps the old shapes.)
     let mut b = P::new(120.0);
     let x = b.track(TrackKind::Audio, "x");
     let y = b.track(TrackKind::Audio, "y");
     b.t(x).output = Output::Track(y);
     b.t(y).output = Output::Track(x);
-    match compile_plain(&b.p) {
-        Err(CompileError::Cycle(ids)) => {
-            assert!(ids.contains(&x) && ids.contains(&y));
-        }
-        other => panic!("expected a cycle, got {:?}", other.err()),
-    }
+    let g = compile_plain(&b.p).expect("an output cycle degrades instead of failing");
+    assert_eq!(g.warnings().len(), 1, "{:?}", g.warnings());
+    assert!(g.warnings()[0].contains("cycle"), "{:?}", g.warnings());
     // A send loop through a return is a cycle too.
     let mut b = P::new(120.0);
     let x = b.track(TrackKind::Audio, "x");
     let r = b.track(TrackKind::Return, "r");
     b.t(x).sends.push(Send { target: r, level_db: 0.0, pre_fader: false });
     b.t(r).sends.push(Send { target: x, level_db: 0.0, pre_fader: false });
-    assert!(matches!(compile_plain(&b.p), Err(CompileError::Cycle(_))));
-    // Routing into a folder is invalid.
+    assert!(compile_plain(&b.p).expect("a send loop degrades instead of failing").warnings().iter().any(|w| w.contains("cycle")));
+    // Routing into a folder is invalid: sent to Main with a warning.
     let mut b = P::new(120.0);
     let f = b.track(TrackKind::Folder, "f");
     let x = b.track(TrackKind::Audio, "x");
     b.t(x).output = Output::Track(f);
-    assert!(matches!(compile_plain(&b.p), Err(CompileError::InvalidRoute { .. })));
+    let g = compile_plain(&b.p).expect("an invalid route degrades instead of failing");
+    assert!(g.warnings().iter().any(|w| w.contains("invalid output")), "{:?}", g.warnings());
+    // A project without Main still cannot compile.
+    let mut b = P::new(120.0);
+    b.p.tracks.retain(|t| t.kind != TrackKind::Main);
+    assert!(matches!(compile_plain(&b.p), Err(CompileError::NoMain)));
 }
 
 fn silenced(p: &Project, id: TrackId) -> bool {
@@ -1086,9 +1089,9 @@ fn sine(frames: usize, amp: f32) -> AudioBuffer {
 fn wav_bit_depths_round_trip() {
     let src = sine(4800, 0.8);
     for (fmt, bits, tol) in [
-        (WavFormat::Int16(Dither::None), 16, 1.0 / 32_767.0),
-        (WavFormat::Int16(Dither::Tpdf), 16, 2.0 / 32_767.0),
-        (WavFormat::Int24, 24, 1.0 / 8_388_607.0),
+        (WavFormat::Int16(Dither::None), 16, 1.0 / 32_768.0),
+        (WavFormat::Int16(Dither::Tpdf), 16, 2.0 / 32_768.0),
+        (WavFormat::Int24, 24, 1.0 / 8_388_608.0),
         (WavFormat::Float32, 32, 0.0),
     ] {
         let path = tmp(&format!("depth{bits}-{fmt:?}.wav").replace([' ', '(', ')'], ""));
@@ -1100,7 +1103,8 @@ fn wav_bit_depths_round_trip() {
         let back: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Float => r.samples::<f32>().map(Result::unwrap).collect(),
             hound::SampleFormat::Int => {
-                let scale = ((1i64 << (bits - 1)) - 1) as f32;
+                // Full scale is 2^(bits-1), the scale the import reads with.
+                let scale = (1i64 << (bits - 1)) as f32;
                 r.samples::<i32>().map(|s| s.unwrap() as f32 / scale).collect()
             }
         };

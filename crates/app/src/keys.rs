@@ -143,6 +143,8 @@ commands! {
     Track6,
     Track7,
     Track8,
+    LaunchSlot,
+    HoldStutter,
 }
 
 const fn main(action: &'static str, label: &'static str, help: &'static str, category: Category, scope: Scope, keys: &'static [&'static str]) -> Entry {
@@ -215,6 +217,7 @@ pub static TABLE: &[Entry] = &[
         K,
         &["mod-shift-g"],
     ),
+    main("DeleteTrack", "Delete Track", "Delete the selected tracks (a group goes alone: its tracks stay).", C::Tracks, K, &["mod-backspace"]),
     cmd(Cmd::FoldTrack, "Fold / Unfold Group", "Fold the selected group, or the group the selected track is in.", C::Tracks, &["s"]),
     cmd(Cmd::ArmTrack, "Arm", "Arm the selected track for recording.", C::Tracks, &["c"]),
     cmd(Cmd::ComputerKeyboard, "Computer MIDI Keyboard", "Play instruments with your PC/Mac keyboard (Z/X octave, C/V velocity).", C::Tracks, &["m"]),
@@ -254,15 +257,20 @@ pub static TABLE: &[Entry] = &[
     main("ToggleDetail", "Detail Panel", "Show or hide the bottom detail panel.", C::Views, W, &["mod-alt-l"]),
     main("TogglePalette", "Search", "Search samples, devices, presets, packs and commands; arrows audition, Enter adds to the selected track.", C::Views, W, &["mod-k"]),
     main("AddLibraryFolder", "Add Library Folder", "Add a folder on this computer or Google Drive, Dropbox, OneDrive or iCloud Drive to the sample library.", C::Views, W, &[]),
+    main("ToggleSounds", "Sounds Panel", "Show or hide the Sounds panel: search the library, hear sounds fitted to the song and drag them in.", C::Views, W, &["mod-shift-k"]),
     main("ToggleAssistant", "Assistant", "Show or hide the AI assistant.", C::Views, W, &["mod-i"]),
     cmd(Cmd::FocusSearch, "Find", "Open the search palette.", C::Views, &["mod-f"]),
     cmd(Cmd::Fullscreen, "Full Screen", "Switch full screen on or off.", C::Views, &["f11"]),
+    cmd(Cmd::LaunchSlot, "Launch Clip", "In the Session View, launch the clip under the cursor (an empty slot stops its track); arrows move the cursor.", C::Views, &["enter"]),
+    cmd(Cmd::HoldStutter, "Stutter Hold", "Switch Hold on or off on the Stutter of the selected track (the pad in the device keeps it while pressed).", C::Transport, &["shift-alt-h"]),
     cmd(Cmd::Shortcuts, "Keyboard Shortcuts", "Search every command and its shortcut.", C::Views, &["mod-/", "?", "shift-/"]),
     // Project
     main("NewProject", "New Project", "Start an empty project.", C::Project, W, &["mod-n"]),
     main("OpenProject", "Open Project…", "Open an .aitrack project file.", C::Project, W, &["mod-o"]),
     main("SaveProject", "Save", "Save the project.", C::Project, W, &["mod-s"]),
     main("SaveProjectAs", "Save As…", "Save the project to a new file.", C::Project, W, &["mod-shift-s"]),
+    main("CollectAndSave", "Collect All and Save", "Copy every audio file the project uses from outside its folder into its Samples folder, then save.", C::Project, W, &[]),
+    main("FindMissingFiles", "Find Missing Files…", "Look for the audio files this project cannot find in a folder you pick.", C::Project, W, &[]),
     main("ExportAudio", "Export Audio…", "Render the song to an audio file.", C::Project, W, &["mod-shift-e"]),
     main("OpenPreferences", "Preferences…", "Audio device, appearance and plugins.", C::Project, W, &["mod-,"]),
     main("Quit", "Quit", "Close AI-Track.", C::Project, Scope::App, &["mod-q"]),
@@ -435,7 +443,8 @@ mod tests {
         }
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
-        const KEYLESS: &[Bound] = &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm")];
+        const KEYLESS: &[Bound] =
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles")];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

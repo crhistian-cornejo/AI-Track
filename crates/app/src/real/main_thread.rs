@@ -55,6 +55,23 @@ impl MainThread {
         rx.recv_timeout(timeout).ok()
     }
 
+    /// Like [`run`](Self::run), but a result that is late is not lost: on a
+    /// timeout the receiver comes back, and the result arrives on it once
+    /// the main thread gets to the job. The caller can go on meanwhile.
+    pub fn run_or_later<R: Send + 'static>(&self, timeout: Duration, f: impl FnOnce() -> R + Send + 'static) -> Result<R, Receiver<R>> {
+        if self.is_main() {
+            return Ok(f());
+        }
+        let (tx, rx) = bounded(1);
+        let sent = self.tx.send(Box::new(move || {
+            let _ = tx.send(f());
+        }));
+        if sent.is_err() {
+            return Err(rx);
+        }
+        rx.recv_timeout(timeout).map_err(|_| rx)
+    }
+
     /// Main thread: run everything queued. Returns how many jobs ran.
     pub fn pump(&self) -> usize {
         debug_assert!(self.is_main());
@@ -83,5 +100,19 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(t.join().unwrap(), Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn a_late_result_is_kept_for_the_caller() {
+        let m = MainThread::new();
+        let other = m.clone();
+        let t = std::thread::spawn(move || other.run_or_later(Duration::from_millis(20), || 5));
+        // Nobody pumps in time: the caller gets the receiver instead.
+        let rx = t.join().unwrap().expect_err("the main thread was busy");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(m.pump(), 1);
+        assert_eq!(rx.try_recv(), Ok(5));
+        // On the main thread itself it just runs.
+        assert_eq!(m.run_or_later(Duration::from_secs(1), || 9).ok(), Some(9));
     }
 }

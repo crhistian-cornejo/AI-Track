@@ -47,7 +47,7 @@ pub fn descendants(p: &Project, group: TrackId) -> Vec<TrackId> {
 /// Whether a track follows its group: it goes to Main (which the engine
 /// reads as "the enclosing group") or straight to the group it was in. A
 /// track routed somewhere of its own (hardware, nowhere) keeps that.
-fn follows_group(output: Output, parent: Option<TrackId>) -> bool {
+pub(crate) fn follows_group(output: Output, parent: Option<TrackId>) -> bool {
     match output {
         Output::Main => true,
         Output::Track(t) => Some(t) == parent,
@@ -56,7 +56,7 @@ fn follows_group(output: Output, parent: Option<TrackId>) -> bool {
 }
 
 /// Where a group goes: its own parent group, else Main.
-fn bus_output(p: &Project, parent: Option<TrackId>) -> Output {
+pub(crate) fn bus_output(p: &Project, parent: Option<TrackId>) -> Output {
     match parent.and_then(|g| p.track(g)) {
         Some(g) if g.kind == TrackKind::Group => Output::Track(g.id),
         _ => Output::Main,

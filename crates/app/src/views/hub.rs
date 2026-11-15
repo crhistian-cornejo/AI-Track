@@ -13,12 +13,16 @@ use gpui::{
 
 pub fn render_hub(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    // Two tabs: the sound packs, and the free plugins that install in one click.
+    if crate::views::plugins::ui(cx).tab == crate::views::plugins::Tab::Plugins {
+        return div().flex().flex_col().child(crate::views::plugins::tab_switch(cx)).child(crate::views::plugins::render_tab(ws, cx)).into_any_element();
+    }
     let mut body = div().id("hub-body").max_h(px(620.)).overflow_y_scroll().px(px(SP4)).pb(px(SP4)).flex().flex_col().gap(px(SP1));
     body = body.child(div().px(px(SP2)).pb(px(SP2)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(
         "Bundled packs ship with AI-Track. Optional packs download here and are added to your library when done. Everything else downloads from its official page under its own licence; AI-Track never redistributes it.",
     ));
     body = body.children(crate::views::palette::pack_list(ws, cx));
-    body.into_any_element()
+    div().flex().flex_col().child(crate::views::plugins::tab_switch(cx)).child(body).into_any_element()
 }
 
 fn human_bytes(b: u64) -> String {

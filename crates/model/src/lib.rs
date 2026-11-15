@@ -11,16 +11,21 @@
 
 pub mod automation;
 pub mod command;
+pub mod format;
 pub mod groups;
 pub mod history;
 pub mod ids;
 pub mod ops;
+pub mod paths;
 pub mod project;
 pub mod racks;
+pub mod routing;
 pub mod scale;
 pub mod time;
+pub mod tracks;
 
 pub use command::{Command, CommandError, TrackProp};
+pub use format::LoadError;
 pub use history::{History, Origin, Proposal, Transaction};
 pub use ids::*;
 pub use project::*;

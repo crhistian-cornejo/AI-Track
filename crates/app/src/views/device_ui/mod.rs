@@ -18,25 +18,40 @@
 
 pub mod acid303;
 pub mod analyzer;
+pub mod arp;
+pub mod autopan;
+pub mod buscomp;
 pub mod chorus;
+pub mod chord;
 pub mod clipper;
+pub mod crusher;
 pub mod delay;
 pub mod drum;
 pub mod drum_extract;
+pub mod drumbus;
 pub mod dynamics;
+pub mod echo;
 pub mod eq;
 pub mod filter;
 pub mod generic;
 pub mod kick808;
 pub mod kit;
+pub mod length;
 pub mod limiter;
+pub mod mbdyn;
+pub mod midi_kit;
 pub mod midside;
 pub mod multiband;
+pub mod pitch;
+pub mod random;
 pub mod reverb;
 pub mod sampler;
 pub mod saturator;
+pub mod scale;
 pub mod shaper;
+pub mod stutter;
 pub mod utility;
+pub mod velocity;
 pub mod vault;
 pub mod wavetable;
 
@@ -302,6 +317,7 @@ fn history_slots(plugin: &str) -> Option<[usize; 3]> {
         "fx.compressor" | "fx.gate" => [0, 1, 2],
         "fx.transient" => [0, 0, 0],
         "fx.limiter" => [0, 2, 1],
+        "fx.buscomp" => [0, 1, 2],
         "fx.saturator" => [0, 1, 1],
         _ => return None,
     })
@@ -417,6 +433,17 @@ impl UiState {
 /// The value a parameter has in the project right now (normalised).
 pub fn current(ws: &Workspace, device: DeviceId, info: &ParamInfo) -> f32 {
     ws.s.project.device(device).and_then(|d| d.params.get(&info.id).copied()).unwrap_or_else(|| info.default_normalized())
+}
+
+/// The plain value a typed number means for a parameter: what the box shows
+/// is sometimes in another unit than the parameter's own (Auto Pan's Spin).
+pub fn typed_to_plain(ws: &Workspace, device: DeviceId, param: u32, typed: f32) -> f32 {
+    autopan::typed_scale(ws, device, param).map_or(typed, |k| typed * k)
+}
+
+/// The inverse: the number a box starts out with for a plain value.
+pub fn plain_to_typed(ws: &Workspace, device: DeviceId, param: u32, plain: f32) -> f32 {
+    autopan::typed_scale(ws, device, param).map_or(plain, |k| plain / k)
 }
 
 /// One sealed edit of a single parameter (clicks, menus, resets).
@@ -630,12 +657,26 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.limiter"
             | "fx.clipper"
             | "fx.multiband"
+            | "fx.buscomp"
+            | "fx.mbdyn"
             | "fx.midside"
             | "fx.saturator"
             | "fx.shaper"
             | "fx.reverb"
             | "fx.delay"
             | "fx.chorus"
+            | "fx.autopan"
+            | "fx.crusher"
+            | "fx.drumbus"
+            | "fx.stutter"
+            | "midi.arp"
+            | "midi.echo"
+            | "midi.random"
+            | "midi.length"
+            | "midi.pitch"
+            | "midi.chord"
+            | "midi.scale"
+            | "midi.velocity"
             | "fx.utility"
             | "fx.analyzer"
             | "fx.drum_extract"
@@ -655,6 +696,8 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.filter" => filter::render(ws, dev, cx),
         "fx.compressor" | "fx.gate" | "fx.transient" => dynamics::render(ws, plugin, dev, cx),
         "fx.limiter" => limiter::render(ws, dev, cx),
+        "fx.buscomp" => buscomp::render(ws, dev, cx),
+        "fx.mbdyn" => mbdyn::render(ws, dev, cx),
         "fx.clipper" => clipper::render(ws, dev, cx),
         "fx.multiband" => multiband::render(ws, dev, cx),
         "fx.midside" => midside::render(ws, dev, cx),
@@ -666,6 +709,18 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.reverb" => reverb::render(ws, dev, cx),
         "fx.delay" => delay::render(ws, dev, cx),
         "fx.chorus" => chorus::render(ws, dev, cx),
+        "fx.autopan" => autopan::render(ws, dev, cx),
+        "fx.crusher" => crusher::render(ws, dev, cx),
+        "fx.drumbus" => drumbus::render(ws, dev, cx),
+        "fx.stutter" => stutter::render(ws, dev, cx),
+        "midi.arp" => arp::render(ws, dev, cx),
+        "midi.echo" => echo::render(ws, dev, cx),
+        "midi.random" => random::render(ws, dev, cx),
+        "midi.length" => length::render(ws, dev, cx),
+        "midi.pitch" => pitch::render(ws, dev, cx),
+        "midi.chord" => chord::render(ws, dev, cx),
+        "midi.scale" => scale::render(ws, dev, cx),
+        "midi.velocity" => velocity::render(ws, dev, cx),
         "fx.utility" => utility::render(ws, dev, cx),
         "fx.analyzer" => analyzer::render(ws, dev, cx),
         "fx.drum_extract" => drum_extract::render(ws, dev, cx),

@@ -123,7 +123,7 @@ fn toggle(id: &'static str, i: Icon, on: bool, color: Hsla) -> gpui::Stateful<Di
 }
 
 /// A short text toggle (TAP), styled as a read-out box.
-fn text_toggle(id: &'static str, text: &'static str) -> gpui::Stateful<Div> {
+fn text_toggle(id: &'static str, text: impl Into<gpui::SharedString>) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .flex_none()
@@ -149,6 +149,57 @@ fn group() -> Div {
     div().flex_none().flex().items_center().gap(px(SP1))
 }
 
+/// Count-in choices in the order a click cycles them: off, 1, 2, 4 bars.
+fn next_count_in(bars: u32) -> u32 {
+    match bars {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 0,
+    }
+}
+
+fn count_in_label(bars: u32, long: bool) -> &'static str {
+    match (bars, long) {
+        (0, true) => "Count-in off",
+        (1, true) => "Count-in 1",
+        (2, true) => "Count-in 2",
+        (_, true) => "Count-in 4",
+        (0, false) => "CI off",
+        (1, false) => "CI 1",
+        (2, false) => "CI 2",
+        (_, false) => "CI 4",
+    }
+}
+
+/// What pressing Record does. It records the notes played on the armed
+/// instrument tracks and, with Automation Arm, the plugin controls moved
+/// meanwhile. With neither there is nothing to capture: it says so instead of
+/// lighting up and recording nothing. A button already lit can always be
+/// switched off.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordPress {
+    Stop,
+    Arm,
+    Unavailable,
+}
+
+fn record_press(recording: bool, can_record: bool) -> RecordPress {
+    match (recording, can_record) {
+        (true, _) => RecordPress::Stop,
+        (false, true) => RecordPress::Arm,
+        (false, false) => RecordPress::Unavailable,
+    }
+}
+
+/// Whether Record has something to capture: an armed instrument track, an
+/// armed audio track that has an input, or Automation Arm for plugin moves.
+fn can_record(s: &crate::state::AppState) -> bool {
+    use aitrack_model::{InputSource, TrackKind};
+    s.automation_arm
+        || s.project.tracks.iter().any(|t| t.arm && (t.kind == TrackKind::Instrument || (t.kind == TrackKind::Audio && t.input != InputSource::None)))
+}
+
 fn cpu_color(load: f32) -> Hsla {
     let pal = p();
     if load > 0.8 {
@@ -162,8 +213,40 @@ fn cpu_color(load: f32) -> Hsla {
 
 // ───────────────────────────── Render ─────────────────────────────
 
+/// What the bar shows at a window width. Controls go in this order as the
+/// window narrows: the CPU read-out and the long count-in label first, then
+/// the computer-keyboard and meters buttons. The centre, the view switch and
+/// the panel buttons always stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BarLayout {
+    cpu: bool,
+    long_labels: bool,
+    extras: bool,
+}
+
+impl BarLayout {
+    fn for_width(width: f32) -> Self {
+        Self { cpu: width >= 1400., long_labels: width >= 1400., extras: width >= 1280. }
+    }
+
+    /// Width the right-hand controls need (px), so the left part gives way
+    /// before they are clipped. Counted from the controls themselves, with a
+    /// little to spare.
+    fn right_width(self) -> f32 {
+        let mut w = 24. * 3. + 24. + 156. + 24. + 3. * SP1 + 9. + SP1 * 6.;
+        if self.cpu {
+            w += 92. + 9. + 2. * SP1;
+        }
+        if self.extras {
+            w += 28. + 24. + 2. * SP1;
+        }
+        w
+    }
+}
+
 pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    let layout = BarLayout::for_width(f32::from(window.viewport_size().width));
     let t = ws.b.engine.transport();
     let project = &ws.s.project;
     let (bar, beat, tick) = project.tempo.bars_beats(t.position);
@@ -181,8 +264,13 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     // Controls must sit outside the drag areas: on Windows the system takes
     // every click in one for moving the window, so a button inside never
     // receives it.
+    // Left and right start from the same width and grow alike, so the centre
+    // stays centred; the right never shrinks below its controls, the left does.
+    let side = layout.right_width();
     let left = div()
-        .flex_1()
+        .flex_grow(1.)
+        .flex_shrink(1.)
+        .flex_basis(px(side))
         .min_w(px(0.))
         .h_full()
         .overflow_hidden()
@@ -348,9 +436,25 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         )
         .child(
             toggle("record", Icon::Record, t.recording, pal.record)
-                .tooltip(widgets::tip("Record", None))
+                .tooltip(if can_record(&ws.s) {
+                    widgets::tip("Record what you play (and the input of audio tracks) on the armed tracks, and plugin moves with Automation Arm", None)
+                } else {
+                    widgets::tip("Arm a track (R on its header) to record on it: an instrument, or an audio track with an input", None)
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.b.engine.toggle_record();
+                    match record_press(this.b.engine.transport().recording, can_record(&this.s)) {
+                        RecordPress::Stop => this.b.engine.toggle_record(),
+                        RecordPress::Arm => {
+                            this.b.engine.toggle_record();
+                            // Record starts the song too, as in every DAW.
+                            if !this.b.engine.transport().playing {
+                                this.b.engine.play();
+                            }
+                        }
+                        RecordPress::Unavailable => {
+                            this.toast("Arm a track first: click R on its header (an audio track also needs an input), then Record", cx);
+                        }
+                    }
                     cx.notify();
                 })),
         );
@@ -366,6 +470,38 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             })),
     );
 
+    // ── Launch: count-in, global quantisation, Back to Arrangement ──
+    let count_in = ws.b.engine.count_in();
+    let global_q = ws.b.engine.global_quantize();
+    let following_session = ws.s.project.tracks.iter().any(|tr| ws.b.engine.slot_state(tr.id).is_some());
+    let launch = group()
+        .child(
+            text_toggle("count-in", count_in_label(count_in, layout.long_labels))
+                .tooltip(widgets::tip("Count-in: bars of metronome before playback starts (click to change: off, 1, 2, 4)", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let next = next_count_in(this.b.engine.count_in());
+                    this.b.engine.set_count_in(next);
+                    cx.notify();
+                })),
+        )
+        .child(
+            text_toggle("global-quantize", format!("Q {}", crate::views::bottom::quantize_name(global_q)))
+                .tooltip(widgets::tip("Global launch quantisation: scene launches into empty slots and clip stops (click to change)", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let next = crate::views::bottom::next_quantize(this.b.engine.global_quantize());
+                    this.b.engine.set_global_quantize(next);
+                    cx.notify();
+                })),
+        )
+        .child(
+            toggle("back-to-arrangement", Icon::Timeline, following_session, pal.record)
+                .tooltip(widgets::tip("Back to Arrangement: stop the Session clips and follow the arrangement again", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.b.engine.back_to_arrangement();
+                    cx.notify();
+                })),
+        );
+
     let centre = div()
         .flex_none()
         .h_full()
@@ -377,7 +513,9 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .child(separator())
         .child(transport)
         .child(separator())
-        .child(looping);
+        .child(looping)
+        .child(separator())
+        .child(launch);
 
     // ── Right: CPU, panels, view switch, assistant ──
     let switch: widgets::OnSelect = {
@@ -388,15 +526,17 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     };
     let view_index = if ws.s.view == MainView::Session { 0 } else { 1 };
     let right = div()
-        .flex_1()
-        .min_w(px(0.))
+        .flex_grow(1.)
+        .flex_shrink_0()
+        .flex_basis(px(side))
+        .min_w(px(side))
         .overflow_hidden()
         .h_full()
         .flex()
         .items_center()
         .gap(px(SP1))
         .child(drag_area().flex_1())
-        .child(
+        .when(layout.cpu, |d| d.child(
             div()
                 .id("cpu")
                 .flex_none()
@@ -409,9 +549,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(label("CPU", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
                 .child(widgets::hbar(load, 24., 4., cpu_color(load)))
                 .child(div().w(px(24.)).flex().justify_end().child(mono(format!("{:.0}%", load * 100.), TEXT_XS, pal.muted))),
-        )
-        .child(separator())
-        .child(
+        ).child(separator()))
+        .when(layout.extras, |d| d.child(
             div()
                 .id("computer-midi-kbd")
                 .flex_none()
@@ -433,7 +572,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 }))
                 .child(icon(Icon::Keyboard, 14., if ws.piano_keyboard { pal.accent } else { pal.muted }))
                 .when(ws.piano_keyboard, |d| d.child(mono(format!("C{}", ws.piano_octave), TEXT_XS, pal.text))),
-        )
+        ))
         .child(
             toggle("toggle-bottom", Icon::PanelBottom, ws.bottom_open, pal.accent)
                 .tooltip(widgets::tip("Detail panel (devices, clip, mixer)", Some("Ctrl+Alt+L")))
@@ -450,14 +589,14 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     cx.notify();
                 })),
         )
-        .child(
+        .when(layout.extras, |d| d.child(
             toggle("meters", Icon::Gauge, ws.meters.open, pal.accent)
                 .tooltip(widgets::tip("Meters: loudness, spectrum, stereo field", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.meters.toggle();
                     cx.notify();
                 })),
-        )
+        ))
         .child(
             toggle("preferences", Icon::Sliders, false, pal.accent)
                 .tooltip(widgets::tip("Preferences", Some("Ctrl+,")))
@@ -572,6 +711,64 @@ mod tests {
         assert_eq!(tap(t0 + Duration::from_secs(10)), None);
         let bpm = tap(t0 + Duration::from_secs(10) + Duration::from_millis(1000)).unwrap();
         assert!((bpm - 60.).abs() < 1e-6, "{bpm}");
+    }
+
+    #[test]
+    fn record_never_arms_silently() {
+        // Nothing armed and no Automation Arm: Record only says what to do.
+        assert_eq!(record_press(false, false), RecordPress::Unavailable);
+        // An armed track (or Automation Arm) gives it something to capture.
+        assert_eq!(record_press(false, true), RecordPress::Arm);
+        // A lit button always switches off, whatever is armed now.
+        assert_eq!(record_press(true, false), RecordPress::Stop);
+        assert_eq!(record_press(true, true), RecordPress::Stop);
+    }
+
+    #[test]
+    fn record_has_something_to_capture_with_an_armed_instrument_track_or_automation_arm() {
+        use aitrack_model::{Project, TrackKind, TrackProp};
+        let mut s = crate::state::AppState::new(Project::new("t"));
+        assert!(!can_record(&s));
+        let audio = s.add_track(TrackKind::Audio).unwrap();
+        s.set_track(audio, TrackProp::Arm(true));
+        assert!(!can_record(&s), "an audio track with no input has nothing to record");
+        s.set_track(audio, TrackProp::Input(aitrack_model::InputSource::Hardware { first: 0, stereo: false }));
+        assert!(can_record(&s), "an armed audio track with an input records");
+        s.set_track(audio, TrackProp::Arm(false));
+        assert!(!can_record(&s));
+        let keys = s.add_track(TrackKind::Instrument).unwrap();
+        s.set_track(keys, TrackProp::Arm(true));
+        assert!(can_record(&s));
+        s.set_track(keys, TrackProp::Arm(false));
+        s.automation_arm = true;
+        assert!(can_record(&s));
+    }
+
+    #[test]
+    fn count_in_cycles_and_reaches_the_engine() {
+        assert_eq!([0, 1, 2, 4, 0].map(next_count_in), [1, 2, 4, 0, 1]);
+        assert_eq!((count_in_label(0, true), count_in_label(4, false)), ("Count-in off", "CI 4"));
+        use crate::bridge::EngineBridge;
+        let mut engine = crate::bridge::StubEngine::default();
+        assert_eq!((engine.count_in(), engine.global_quantize()), (0, aitrack_model::Quantize::Bar));
+        engine.set_count_in(next_count_in(engine.count_in()));
+        engine.set_global_quantize(crate::views::bottom::next_quantize(engine.global_quantize()));
+        assert_eq!((engine.count_in(), engine.global_quantize()), (1, aitrack_model::Quantize::TwoBars));
+    }
+
+    #[test]
+    fn the_bar_drops_controls_in_order_as_the_window_narrows() {
+        let wide = BarLayout::for_width(1480.);
+        let mid = BarLayout::for_width(1300.);
+        let narrow = BarLayout::for_width(1200.);
+        assert_eq!((wide.cpu, wide.long_labels, wide.extras), (true, true, true));
+        assert_eq!((mid.cpu, mid.long_labels, mid.extras), (false, false, true));
+        assert_eq!((narrow.cpu, narrow.extras), (false, false));
+        assert!(wide.right_width() > mid.right_width() && mid.right_width() > narrow.right_width());
+        // Left (the window buttons and search) + centre (about 680 px) + right fit each width.
+        for (w, l) in [(1480., wide), (1280., mid), (1200., narrow)] {
+            assert!(LEFT_INSET + 4. * 24. + 680. + l.right_width() + 2. * SP2 <= w, "{w}");
+        }
     }
 
     #[test]

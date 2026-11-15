@@ -151,7 +151,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
     // Input.
     let input = match t.kind {
         TrackKind::Instrument => t.devices.iter().find(|d| d.is_instrument()).map_or("No instrument".into(), |d| d.name.clone()),
-        TrackKind::Audio => "In 1/2".into(),
+        TrackKind::Audio => crate::mixer_routing::input_label(t.input),
         TrackKind::Group => "Sum".into(),
         TrackKind::Return => "Sends".into(),
         TrackKind::Vca => "VCA".into(),
@@ -202,12 +202,10 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .child(widgets::hbar(if has { pos } else { 0. }, STRIP_W - 28. - SP2, 4., accent_alpha(0.8))),
         );
     }
-    let output = match t.output {
-        Output::Main => "Main".to_owned(),
-        Output::Track(g) => ws.s.project.track(g).map_or("—".into(), |g| g.name.clone()),
-        Output::Hardware(i) => format!("Out {}/{}", i * 2 + 1, i * 2 + 2),
-        Output::None => "None".into(),
-    };
+    let output = crate::mixer_routing::output_label(&ws.s.project, id);
+    let routable = !is_main && !is_vca && t.kind.carries_audio();
+    let monitored = matches!(t.kind, TrackKind::Audio | TrackKind::Instrument);
+    let monitor = t.monitor;
     let pan = t.pan;
     let pan_text = if pan.abs() < 0.01 { "C".to_owned() } else if pan < 0. { format!("{:.0}L", -pan * 50.) } else { format!("{:.0}R", pan * 50.) };
     let fpos = db_to_fader(t.volume_db);
@@ -226,6 +224,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
             this.open_param_menu(id, AutomationTarget::Volume, e.position, cx);
         }));
     let (mute, solo, arm) = (t.mute, t.solo, t.arm);
+    let routing_popover = crate::mixer_routing::popover(ws, id, cx);
     let vca_name = t.vca.and_then(|v| ws.s.project.track(v)).map(|v| v.name.clone());
 
     div()
@@ -245,10 +244,46 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
             this.s.selected_track = Some(id);
             cx.notify();
         }))
-        .when(rows.input, |d| d.child(slot(crate::paint::fit(&input, STRIP_W - 28., TEXT_XS), !is_vca, Some(Icon::Plug))))
+        .when(rows.input, |d| {
+            let el = slot(crate::paint::fit(&input, STRIP_W - 28., TEXT_XS), !is_vca, Some(Icon::Plug));
+            if !monitored {
+                return d.child(el);
+            }
+            d.child(
+                el.id(("strip-input", id.0 as usize))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(border_strong()))
+                    .tooltip(widgets::tip_owned(format!("Monitor: {} — click to change", match monitor {
+                        Monitor::In => "In",
+                        Monitor::Auto => "Auto",
+                        Monitor::Off => "Off",
+                    })))
+                    .on_click(cx.listener(move |_, e: &gpui::ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        crate::mixer_routing::open(id, crate::mixer_routing::Selector::Input, e.position());
+                        cx.notify();
+                    })),
+            )
+        })
         .when(rows.inserts > 0, |d| d.child(inserts))
         .when(rows.sends, |d| d.child(sends))
-        .when(rows.output, |d| d.child(slot(crate::paint::fit(&output, STRIP_W - 28., TEXT_XS), true, Some(Icon::Send))))
+        .when(rows.output, |d| {
+            let el = slot(crate::paint::fit(&output, STRIP_W - 28., TEXT_XS), true, Some(Icon::Send));
+            if !routable {
+                return d.child(el);
+            }
+            d.child(
+                el.id(("strip-output", id.0 as usize))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(border_strong()))
+                    .tooltip(widgets::tip("Output: where this track's signal goes — click to change", None))
+                    .on_click(cx.listener(move |_, e: &gpui::ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        crate::mixer_routing::open(id, crate::mixer_routing::Selector::Output, e.position());
+                        cx.notify();
+                    })),
+            )
+        })
         .when(rows.pan, |d| d.child(
             div()
                 .h(px(PAN_H))
@@ -320,6 +355,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .child(label(crate::paint::fit(&t.name, STRIP_W - 12., TEXT_SM), TEXT_SM, pal.text).font_weight(FontWeight::SEMIBOLD))
                 .child(label(vca_name.map_or_else(|| kind_name(t.kind).to_owned(), |v| format!("→ {v}")), TEXT_XS, pal.muted)),
         )
+        .children(routing_popover)
         .into_any_element()
 }
 

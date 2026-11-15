@@ -160,8 +160,32 @@ pub fn scanner_main(args: &[String]) -> i32 {
     println!("\n{RESULT_SENTINEL}{json}");
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    // Skip plugin destructors/atexit handlers, which can hang or crash.
-    std::process::exit(0);
+    // Skip plugin destructors/atexit handlers, which can hang or crash
+    // (`process::exit` would run them).
+    exit_now()
+}
+
+/// End the process at once: no atexit handlers, no static destructors.
+#[cfg(target_os = "macos")]
+fn exit_now() -> ! {
+    // SAFETY: `_exit` only ends this process; stdout is already flushed.
+    unsafe { libc::_exit(0) }
+}
+
+/// End the process at once: no atexit handlers, no DLL detach calls.
+#[cfg(windows)]
+fn exit_now() -> ! {
+    use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: the pseudo-handle of the current process is always valid.
+    unsafe {
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+    std::process::exit(0)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn exit_now() -> ! {
+    std::process::exit(0)
 }
 
 #[derive(Debug, Default, Clone)]

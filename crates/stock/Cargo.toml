@@ -15,5 +15,9 @@ hound = "3.5"
 # MIT. FFTs for the wavetable mip levels and the wavetable editor.
 realfft = "3"
 
+[dev-dependencies]
+# Only to check that the scale tables of the MIDI devices match the model's.
+aitrack-model.workspace = true
+
 [lints]
 workspace = true

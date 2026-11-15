@@ -17,7 +17,9 @@ use aitrack_library::{
     Analysis, Analyzer, BasicAnalyzer, Category, KeyFilter, KeyHint, KeyMatch, Library, NameHints, OrganizeLayout,
     OrganizeMode, OrganizePlan, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, RecommendQuery, RootKind, Sample, SampleId, ScanEvent, ScanJob, ScanOptions, SearchQuery, Source,
 };
+use aitrack_library::watch::{LibraryWatcher, WatchEvent};
 use aitrack_model::Scale;
+use std::collections::HashMap;
 use crossbeam_channel::{Receiver, unbounded};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -149,6 +151,21 @@ pub struct RealLibrary {
     organize_done: Option<Result<String, String>>,
     journal: Option<PathBuf>,
     errors: Vec<String>,
+    /// The Splice download folder to index as a collection, and the watcher
+    /// that picks up sounds added to the folders later.
+    splice_folder: Option<PathBuf>,
+    watcher: Option<LibraryWatcher>,
+    /// Kind of every root, by (library, id), to tell where a sound comes from.
+    root_kinds: RefCell<HashMap<(usize, i64), RootKind>>,
+    /// The free-plugin installer (`None` where there is no standard plugin folder) and the cards last built from it.
+    plugins: Option<aitrack_library::plugins::PluginInstaller>,
+    plugin_cards: Vec<aitrack_library::plugins::PluginCard>,
+    plugin_cards_at: Option<std::time::Instant>,
+}
+
+/// Where the plugin installer keeps its receipts and work folders: next to the user library.
+fn this_data_dir(user_db: &Path) -> PathBuf {
+    user_db.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 impl RealLibrary {
@@ -167,6 +184,7 @@ impl RealLibrary {
         };
         let f = factory.as_deref().and_then(|p| open(p, "factory"));
         let u = open(&user, "user");
+        let user_for_data = user.clone();
         let mut this = Self {
             libs: [f, u],
             user_path: user,
@@ -180,14 +198,101 @@ impl RealLibrary {
             organize_done: None,
             journal: None,
             errors,
+            splice_folder: None,
+            watcher: None,
+            root_kinds: RefCell::default(),
+            plugins: aitrack_library::plugins::UserDirs::standard().map(|dirs| {
+                let data = this_data_dir(&user_for_data);
+                aitrack_library::plugins::PluginInstaller::new(data, dirs)
+            }),
+            plugin_cards: Vec::new(),
+            plugin_cards_at: None,
         };
+        this.restart_watcher();
         this.refresh();
         this
+    }
+
+    /// Watch the user's folders (the Splice one among them) so sounds that
+    /// land in them later are indexed on their own. Started again whenever a
+    /// folder is added, as the watcher reads the roots when it starts.
+    fn restart_watcher(&mut self) {
+        self.watcher = None;
+        if self.libs[USER].is_some() {
+            self.watcher = LibraryWatcher::start(self.user_path.clone(), self.analyzer.clone(), std::time::Duration::from_millis(800)).ok();
+        }
     }
 
     /// The index changed: drop the cached results.
     fn refresh(&mut self) {
         *self.search_cache.borrow_mut() = None;
+        self.root_kinds.borrow_mut().clear();
+    }
+
+    /// Where a sample of library `lib` in root `root` comes from.
+    fn origin_of(&self, lib: usize, root: i64) -> SoundOrigin {
+        if lib == FACTORY {
+            return SoundOrigin::Factory;
+        }
+        let mut kinds = self.root_kinds.borrow_mut();
+        if kinds.is_empty()
+            && let Some(l) = &self.libs[lib]
+            && let Ok(roots) = l.roots()
+        {
+            kinds.extend(roots.into_iter().map(|r| ((lib, r.id.0), r.kind)));
+        }
+        match kinds.get(&(lib, root)) {
+            Some(RootKind::Splice) => SoundOrigin::Splice,
+            Some(RootKind::Factory) => SoundOrigin::Factory,
+            _ => SoundOrigin::Mine,
+        }
+    }
+
+    /// Where the Splice folder stands (for the panel's status line).
+    fn splice_state(&self) -> SpliceState {
+        let Some(folder) = self.splice_folder.clone() else { return SpliceState::Unknown };
+        if !folder.is_dir() {
+            return SpliceState::Missing(folder);
+        }
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let sounds = self.libs[USER]
+            .as_ref()
+            .and_then(|l| l.root_stats().ok())
+            .and_then(|stats| stats.into_iter().find(|s| s.root.kind == RootKind::Splice && canon(&s.root.path) == canon(&folder)))
+            .map(|s| s.samples);
+        match sounds {
+            Some(_) if self.status.running => SpliceState::Scanning(folder),
+            Some(n) => SpliceState::Indexed { folder, sounds: n },
+            None if self.status.running => SpliceState::Scanning(folder),
+            None => SpliceState::Unknown,
+        }
+    }
+
+    /// Make the Splice folder a collection of the user library: a root of kind
+    /// Splice, scanned when it is new. Any other root that was the Splice one
+    /// goes back to being an ordinary folder.
+    fn sync_splice_root(&mut self) {
+        let Some(lib) = self.libs[USER].as_ref() else { return };
+        let folder = self.splice_folder.clone().filter(|f| f.is_dir());
+        let roots = lib.roots().unwrap_or_default();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        for r in roots.iter().filter(|r| r.kind == RootKind::Splice) {
+            if folder.as_deref().is_none_or(|f| canon(f) != canon(&r.path)) {
+                let _ = lib.add_root(&r.path, RootKind::User);
+            }
+        }
+        let Some(folder) = folder else { return };
+        let known = roots.iter().any(|r| r.kind == RootKind::Splice && canon(&r.path) == canon(&folder));
+        if known {
+            return;
+        }
+        if let Ok(root) = lib.add_root(&folder, RootKind::Splice) {
+            self.refresh();
+            self.restart_watcher();
+            if self.scan.is_none() {
+                self.start_scan(ScanOptions { roots: Some(vec![root]), ..Default::default() });
+            }
+        }
     }
 
     fn query(&self, f: impl Fn(&Library) -> aitrack_library::Result<Vec<Sample>>) -> Vec<LibraryItem> {
@@ -231,6 +336,13 @@ impl RealLibrary {
 }
 
 impl LibraryBridge for RealLibrary {
+    fn bpm_trust(&self, id: u64) -> BpmTrust {
+        let source = self.lib(id).and_then(|(lib, sample)| {
+            lib.connection().query_row("SELECT bpm_source FROM samples WHERE id = ?1", [sample.0], |r| r.get::<_, Option<String>>(0)).ok().flatten()
+        });
+        BpmTrust::from_source(source.as_deref())
+    }
+
     fn search(&self, query: &str, key: Option<Scale>) -> Vec<LibraryItem> {
         let cache_key = format!("{query}\u{1}{key:?}");
         if let Some((k, v)) = &*self.search_cache.borrow()
@@ -246,6 +358,134 @@ impl LibraryBridge for RealLibrary {
         let v = self.query(|l| l.search(&q));
         *self.search_cache.borrow_mut() = Some((cache_key, v.clone()));
         v
+    }
+
+    fn search_sounds(&self, q: &SoundQuery) -> SoundPage {
+        use aitrack_library::{fit_tempo, key_compat, query::tempo_compat};
+        let mut sq = SearchQuery { limit: 1500, ..Default::default() };
+        if !q.text.trim().is_empty() {
+            sq.text = Some(q.text.trim().to_owned());
+        }
+        sq.filters.category = q.group.map(|g| match g {
+            SoundGroup::Drums => Category::Drums,
+            SoundGroup::Bass => Category::Bass,
+            SoundGroup::Synths => Category::Synths,
+            SoundGroup::Instruments => Category::Instruments,
+            SoundGroup::Vocals => Category::Vocals,
+            SoundGroup::Fx => Category::Fx,
+        });
+        sq.filters.is_loop = match q.kind {
+            SoundKind::All => None,
+            SoundKind::Loops => Some(true),
+            SoundKind::OneShots => Some(false),
+        };
+        // Drums and effects have no key and fit any song.
+        sq.filters.key = q.key.map(|(scale, exact)| KeyFilter { scale, mode: if exact { KeyMatch::Exact } else { KeyMatch::Compatible }, include_atonal: true });
+        sq.filters.genre = q.tag.clone();
+        sq.filters.favorites_only = q.favorites;
+        let mut hits: Vec<(f32, SoundHit)> = Vec::new();
+        for (i, lib) in self.libs.iter().enumerate() {
+            let Some(lib) = lib else { continue };
+            let Ok(mut samples) = lib.search(&sq) else { continue };
+            self.fill_keys(&mut samples);
+            for smp in &samples {
+                let origin = self.origin_of(i, smp.root_id.0);
+                if q.origin.is_some_and(|o| o != origin) {
+                    continue;
+                }
+                // The tempo filter is for loops only: a one-shot has none and always passes.
+                let tempo = match (q.bpm, smp.bpm) {
+                    (Some((bpm, tol)), Some(b)) if smp.is_loop() => {
+                        let Some(f) = fit_tempo(f64::from(bpm), b) else { continue };
+                        if (f.speed - 1.).abs() * 100. > f64::from(tol) {
+                            continue;
+                        }
+                        tempo_compat(bpm, Some(b), true)
+                    }
+                    (Some(_), None) if smp.is_loop() => 0.3,
+                    _ => 0.8,
+                };
+                let key_score = match q.key {
+                    Some((scale, _)) => key_compat(scale, smp.key_root, smp.scale_kind),
+                    None => 1.,
+                };
+                let tonal = !matches!(smp.category, Some(Category::Drums | Category::Fx));
+                let hit = SoundHit {
+                    item: item(i, smp),
+                    origin,
+                    tags: smp.genres.iter().chain(smp.user_tags.iter()).cloned().collect(),
+                    bpm_trust: BpmTrust::from_source(None),
+                    unanalysed: (tonal && smp.key_root.is_none()) || (smp.is_loop() && smp.bpm.is_none()),
+                };
+                hits.push((key_score * 0.6 + tempo * 0.4, hit));
+            }
+        }
+        // Closest fit first when the song asks for one; otherwise the library's own order.
+        if q.key.is_some() || q.bpm.is_some() {
+            hits.sort_by(|a, b| b.0.total_cmp(&a.0));
+        }
+        let limit = if q.limit == 0 { 400 } else { q.limit };
+        let more = hits.len() > limit;
+        hits.truncate(limit);
+        let mut tags: HashMap<String, usize> = HashMap::new();
+        for (_, h) in &hits {
+            for t in &h.tags {
+                *tags.entry(t.clone()).or_default() += 1;
+            }
+        }
+        let mut tags: Vec<(String, usize)> = tags.into_iter().collect();
+        tags.sort_by_key(|(t, n)| (std::cmp::Reverse(*n), t.clone()));
+        tags.truncate(12);
+        // A reliable tempo for every hit that is shown (one query each: a few hundred at most).
+        let hits: Vec<SoundHit> = hits.into_iter().map(|(_, mut h)| {
+            if h.item.is_loop && h.item.bpm.is_some() {
+                h.bpm_trust = self.bpm_trust(h.item.id);
+            }
+            h
+        }).collect();
+        SoundPage { hits, more, tags, splice: self.splice_state() }
+    }
+
+    fn plugin_cards(&mut self) -> Vec<aitrack_library::plugins::PluginCard> {
+        let Some(inst) = &self.plugins else { return Vec::new() };
+        let every = if inst.busy() { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(2) };
+        if self.plugin_cards_at.is_none_or(|t| t.elapsed() > every) {
+            self.plugin_cards = inst.cards();
+            self.plugin_cards_at = Some(std::time::Instant::now());
+        }
+        self.plugin_cards.clone()
+    }
+
+    fn install_plugin(&mut self, id: &str) -> Result<(), String> {
+        let inst = self.plugins.as_mut().ok_or("Plugins are installed on macOS and Windows")?;
+        inst.start(id).map_err(|e| e.to_string().trim_start_matches("manifest: ").to_owned())?;
+        self.plugin_cards_at = None;
+        Ok(())
+    }
+
+    fn cancel_plugin_install(&mut self, id: &str) {
+        if let Some(inst) = &mut self.plugins {
+            inst.cancel(id);
+        }
+    }
+
+    fn uninstall_plugin(&mut self, id: &str) -> Result<String, String> {
+        let inst = self.plugins.as_mut().ok_or("Plugins are installed on macOS and Windows")?;
+        let n = inst.uninstall(id).map_err(|e| e.to_string().trim_start_matches("manifest: ").to_owned())?;
+        self.plugin_cards_at = None;
+        Ok(format!("Removed {n} plugin file{}", if n == 1 { "" } else { "s" }))
+    }
+
+    fn take_installed_plugins(&mut self) -> Vec<PathBuf> {
+        self.plugins.as_mut().map(|p| p.take_installed()).unwrap_or_default()
+    }
+
+    fn set_splice_folder(&mut self, folder: Option<PathBuf>) {
+        if folder == self.splice_folder {
+            return;
+        }
+        self.splice_folder = folder;
+        self.sync_splice_root();
     }
 
     fn recommend(&self, scale: Option<Scale>, bpm: f64) -> Vec<LibraryItem> {
@@ -302,7 +542,11 @@ impl LibraryBridge for RealLibrary {
 
     fn add_folder(&mut self, path: &Path) -> Result<(), String> {
         let lib = self.libs[USER].as_ref().ok_or("The user library is not available")?;
-        let root = lib.add_root(path, RootKind::User).map_err(|e| e.to_string())?;
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let kind = if self.splice_folder.as_deref().is_some_and(|f| canon(f) == canon(path)) { RootKind::Splice } else { RootKind::User };
+        let root = lib.add_root(path, kind).map_err(|e| e.to_string())?;
+        self.refresh();
+        self.restart_watcher();
         if self.scan.is_some() {
             return Ok(()); // picked up by the next rescan
         }
@@ -327,6 +571,26 @@ impl LibraryBridge for RealLibrary {
 
     fn poll(&mut self) -> bool {
         let mut changed = false;
+        if let Some(p) = &mut self.plugins
+            && p.poll()
+        {
+            changed = true;
+            // The last install just ended: show its new state now, not in two seconds.
+            if !p.busy() {
+                self.plugin_cards_at = None;
+            }
+        }
+        // Sounds that landed in a watched folder (the Splice one, say) are indexed now.
+        if let Some(w) = &self.watcher {
+            while let Ok(ev) = w.events.try_recv() {
+                if matches!(ev, WatchEvent::Indexed(_) | WatchEvent::Removed(_)) {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.refresh();
+        }
         if let Some(rx) = &self.organize_rx
             && let Ok(r) = rx.try_recv()
         {
@@ -490,6 +754,62 @@ mod tests {
         let _ = std::fs::remove_file(user);
     }
 
+    fn write_wav(path: &Path, seconds: f32) {
+        let spec = hound::WavSpec { channels: 1, sample_rate: 44_100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..(44_100. * seconds) as usize {
+            let env = (-(i as f32) / 6000.).exp();
+            w.write_sample(((i as f32 * 0.02).sin() * env * 16_000.) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn wait(lib: &mut RealLibrary, what: &str, mut done: impl FnMut(&mut RealLibrary) -> bool) {
+        let start = std::time::Instant::now();
+        while !done(lib) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(40), "timed out waiting for {what}");
+            lib.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn the_splice_folder_is_a_collection_and_sounds_added_later_show_up_on_their_own() {
+        let dir = std::env::temp_dir().join(format!("aitrack-test-splice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.join("Splice").join("sounds").join("Some Pack");
+        std::fs::create_dir_all(&folder).unwrap();
+        write_wav(&folder.join("Kick Heavy 01.wav"), 0.3);
+        let mut lib = RealLibrary::open(None, dir.join("user.db"));
+        let query = SoundQuery { text: "kick".into(), ..Default::default() };
+        assert!(lib.search_sounds(&query).hits.is_empty());
+        // A folder that is not there says so instead of failing.
+        lib.set_splice_folder(Some(dir.join("nowhere")));
+        assert_eq!(lib.search_sounds(&query).splice, SpliceState::Missing(dir.join("nowhere")));
+        // The real one becomes a collection of its own, scanned at once.
+        let splice = dir.join("Splice").join("sounds");
+        lib.set_splice_folder(Some(splice.clone()));
+        wait(&mut lib, "the first scan", |l| !l.scan_status().running && !l.search_sounds(&query).hits.is_empty());
+        let page = lib.search_sounds(&query);
+        assert_eq!(page.hits.len(), 1, "{:?}", lib.scan_status());
+        assert_eq!(page.hits[0].origin, SoundOrigin::Splice, "badged with where it comes from");
+        assert!(matches!(page.splice, SpliceState::Indexed { sounds: 1, .. }), "{:?}", page.splice);
+        assert_eq!(lib.search_sounds(&SoundQuery { origin: Some(SoundOrigin::Factory), ..query.clone() }).hits.len(), 0, "a collection filter");
+        assert_eq!(lib.search_sounds(&SoundQuery { origin: Some(SoundOrigin::Splice), ..query.clone() }).hits.len(), 1);
+        // A download lands in the folder later: it appears without asking.
+        write_wav(&folder.join("Kick Sub 02.wav"), 0.3);
+        wait(&mut lib, "the watcher", |l| l.search_sounds(&query).hits.len() == 2);
+        assert!(lib.search_sounds(&query).hits.iter().all(|h| h.origin == SoundOrigin::Splice));
+        // Choosing another folder gives the first one back as an ordinary one.
+        let other = dir.join("Other");
+        std::fs::create_dir_all(&other).unwrap();
+        lib.set_splice_folder(Some(other));
+        wait(&mut lib, "the folders to settle", |l| !l.scan_status().running);
+        assert!(lib.search_sounds(&query).hits.iter().all(|h| h.origin == SoundOrigin::Mine), "{:?}", lib.search_sounds(&query).hits.iter().map(|h| h.origin).collect::<Vec<_>>());
+        drop(lib);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn user_folder_scan_indexes_and_organize_plans() {
         let dir = std::env::temp_dir().join(format!("aitrack-test-lib-{}", std::process::id()));
@@ -512,6 +832,14 @@ mod tests {
         let found = lib.search("kick", None);
         assert_eq!(found.len(), 1, "{:?}", lib.scan_status());
         let ids: Vec<u64> = found.iter().map(|i| i.id).collect();
+        // A tempo guessed from the length is told apart from a measured one.
+        let (l, sample) = lib.lib(ids[0]).unwrap();
+        assert_eq!(lib.bpm_trust(ids[0]), BpmTrust::Reliable);
+        l.connection().execute("UPDATE samples SET bpm = 97, bpm_source = 'estimate' WHERE id = ?1", [sample.0]).unwrap();
+        assert_eq!(lib.bpm_trust(ids[0]), BpmTrust::Estimate);
+        l.connection().execute("UPDATE samples SET bpm_source = 'filename' WHERE id = ?1", [sample.0]).unwrap();
+        assert_eq!(lib.bpm_trust(ids[0]), BpmTrust::Reliable);
+        assert_eq!(lib.bpm_trust(u64::MAX), BpmTrust::Reliable, "unknown ids are not blocked");
         let preview = lib.plan_organize(&ids, &dir.join("Organized"), false, false).unwrap();
         assert_eq!(preview.files, 1);
         drop(lib);

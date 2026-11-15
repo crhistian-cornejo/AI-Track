@@ -1,0 +1,20 @@
+{
+  "name": "Staccato Bass",
+  "plugin": "midi.length",
+  "author": "AI-Track",
+  "tags": [
+    "bass",
+    "staccato",
+    "tight",
+    "fixed"
+  ],
+  "params": {
+    "0": 0.0,
+    "1": 0.49364847,
+    "2": 0.23076923,
+    "3": 0.68364084,
+    "4": 0.14285715,
+    "5": 0.0,
+    "6": 0.0
+  }
+}

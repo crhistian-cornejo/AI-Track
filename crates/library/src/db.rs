@@ -180,6 +180,9 @@ pub struct RootId(pub i64);
 pub enum RootKind {
     User,
     Factory,
+    /// The folder the Splice desktop app downloads the user's licensed sounds
+    /// to: indexed like any folder, badged as coming from Splice.
+    Splice,
 }
 
 impl RootKind {
@@ -187,6 +190,24 @@ impl RootKind {
         match self {
             Self::User => "user",
             Self::Factory => "factory",
+            Self::Splice => "splice",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "factory" => Self::Factory,
+            "splice" => Self::Splice,
+            _ => Self::User,
+        }
+    }
+
+    /// The label of the collection a root of this kind is (shown as a badge).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "Mine",
+            Self::Factory => "Factory",
+            Self::Splice => "Splice",
         }
     }
 }
@@ -555,7 +576,7 @@ impl Library {
                 id: RootId(id),
                 path: self.resolve_root(&stored),
                 stored_path: stored,
-                kind: if kind == "factory" { RootKind::Factory } else { RootKind::User },
+                kind: RootKind::parse(&kind),
                 watch,
                 last_scan,
             });
@@ -1121,6 +1142,21 @@ mod tests {
         let lib = Library::open_in_memory().unwrap();
         let id = lib.add_root(&link, RootKind::User).unwrap();
         assert_eq!(lib.root(id).unwrap().path, real);
+    }
+
+    #[test]
+    fn a_splice_root_keeps_its_kind_and_a_folder_can_be_marked_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().canonicalize().unwrap().join("sounds");
+        std::fs::create_dir_all(&folder).unwrap();
+        let lib = Library::open_in_memory().unwrap();
+        // Added by hand first (as a plain folder), then recognised as the Splice one.
+        let id = lib.add_root(&folder, RootKind::User).unwrap();
+        assert_eq!(lib.root(id).unwrap().kind, RootKind::User);
+        assert_eq!(lib.add_root(&folder, RootKind::Splice).unwrap(), id, "the same root, its kind updated");
+        assert_eq!(lib.root(id).unwrap().kind, RootKind::Splice);
+        assert_eq!(lib.roots().unwrap().len(), 1);
+        assert_eq!((RootKind::Splice.label(), RootKind::User.label(), RootKind::Factory.label()), ("Splice", "Mine", "Factory"));
     }
 
     #[test]

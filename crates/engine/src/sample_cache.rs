@@ -6,10 +6,12 @@
 //! long files is a later step (`creek`); the [`DecodedAudio`] interface is
 //! what the clip player reads, so a streamed source can replace it.
 
+use aitrack_dsp::warp::{detect_transients, warp_audio, WarpAlgorithm};
+use aitrack_model::WarpMode;
 use crossbeam_channel::{unbounded, Sender};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Planar `f32` audio at `sample_rate`.
 #[derive(Debug)]
@@ -187,8 +189,11 @@ fn decode_symphonia(path: &Path) -> Result<(Vec<Vec<f32>>, u32), String> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
+    // Gapless: an MP3 or M4A drops its encoder delay and padding, so the first
+    // hit lands on the grid instead of ~25-50 ms late.
+    let format_opts = FormatOptions { enable_gapless: true, ..Default::default() };
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(&hint, mss, &format_opts, &MetadataOptions::default())
         .map_err(|e| e.to_string())?;
     let mut format = probed.format;
     let track = format
@@ -244,7 +249,9 @@ fn decode_symphonia(path: &Path) -> Result<(Vec<Vec<f32>>, u32), String> {
 /// Resample planar audio with rubato's windowed-sinc resampler at high
 /// quality (256-tap sinc, 256× oversampled table, cubic interpolation,
 /// Blackman-Harris² window). Output length is `ceil(frames · to / from)`
-/// and the filter delay is removed, so the result is time-aligned.
+/// and the result is time-aligned: rubato's sinc resampler starts reading
+/// half a kernel early, so its `output_delay()` is already compensated and
+/// must not be trimmed again (that cut ~3 ms off every attack).
 pub fn resample(channels: &[Vec<f32>], from: u32, to: u32) -> Result<Vec<Vec<f32>>, String> {
     use rubato::{calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
     if from == to || channels.is_empty() {
@@ -265,9 +272,8 @@ pub fn resample(channels: &[Vec<f32>], from: u32, to: u32) -> Result<Vec<Vec<f32
         window,
     };
     let mut rs = SincFixedIn::<f32>::new(to as f64 / from as f64, 1.0, params, chunk, channels.len()).map_err(|e| e.to_string())?;
-    let delay = rs.output_delay();
     let expected = (frames as u64 * to as u64).div_ceil(from as u64) as usize;
-    let mut out = vec![Vec::with_capacity(expected + delay + chunk); channels.len()];
+    let mut out = vec![Vec::with_capacity(expected + chunk); channels.len()];
     let mut pos = 0;
     while pos < frames {
         let need = rs.input_frames_next();
@@ -280,7 +286,7 @@ pub fn resample(channels: &[Vec<f32>], from: u32, to: u32) -> Result<Vec<Vec<f32
         }
         pos = end;
     }
-    while out[0].len() < expected + delay {
+    while out[0].len() < expected {
         let res = rs.process_partial::<&[f32]>(None, None).map_err(|e| e.to_string())?;
         if res[0].is_empty() {
             break;
@@ -290,8 +296,7 @@ pub fn resample(channels: &[Vec<f32>], from: u32, to: u32) -> Result<Vec<Vec<f32
         }
     }
     for o in &mut out {
-        o.drain(..delay.min(o.len()));
-        o.truncate(expected);
+        o.resize(expected, 0.0);
     }
     Ok(out)
 }
@@ -316,14 +321,79 @@ enum Entry {
 
 type Key = (PathBuf, u32);
 
+/// A stretched render and the transients of the stretched audio.
+pub(crate) type Warped = (Arc<DecodedAudio>, Arc<[usize]>);
+
+enum WarpState {
+    Computing,
+    Ready { audio: Arc<DecodedAudio>, transients: Arc<[usize]>, used: u64 },
+    Failed,
+}
+
+/// One stretched render. The source is told apart by its allocation, not by
+/// its content: the weak handle keeps that allocation (not the samples)
+/// alive, so no other file can ever take its address. The stretch is the
+/// exact factor: a render made for a nearby one would drift.
+struct WarpEntry {
+    src: Weak<DecodedAudio>,
+    mode: WarpMode,
+    pitch_cents: i32,
+    time_scale_bits: u64,
+    state: WarpState,
+}
+
+impl WarpEntry {
+    fn same_source(&self, src: *const DecodedAudio, mode: WarpMode, pitch_cents: i32) -> bool {
+        std::ptr::eq(self.src.as_ptr(), src) && self.mode == mode && self.pitch_cents == pitch_cents
+    }
+
+    fn is_for(&self, src: *const DecodedAudio, mode: WarpMode, pitch_cents: i32, time_scale_bits: u64) -> bool {
+        self.same_source(src, mode, pitch_cents) && self.time_scale_bits == time_scale_bits
+    }
+
+    fn bytes(&self) -> usize {
+        match &self.state {
+            WarpState::Ready { audio, transients, .. } => audio.byte_size() + transients.len() * std::mem::size_of::<usize>(),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Default)]
 struct CacheState {
     entries: HashMap<Key, Entry>,
+    warps: Vec<WarpEntry>,
+    /// What went wrong with stretched renders (newest last, a few kept), for
+    /// the UI to tell the user. Those clips play in Re-Pitch.
+    warp_failures: Vec<String>,
     clock: u64,
 }
 
+const MAX_WARP_FAILURES: usize = 16;
+
 impl CacheState {
-    fn total_bytes(&self) -> usize {
+    fn note_warp_failure(&mut self, what: &str) {
+        if self.warp_failures.len() >= MAX_WARP_FAILURES {
+            self.warp_failures.remove(0);
+        }
+        self.warp_failures.push(format!("time-stretching a clip failed ({what}); it plays in Re-Pitch"));
+    }
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into())
+}
+
+/// How a stretched render is made (swapped out in tests).
+type Warper = Arc<dyn Fn(&DecodedAudio, WarpMode, f64, f64) -> Warped + Send + Sync>;
+
+enum Victim {
+    Sample(Key),
+    Warp(usize),
+}
+
+impl CacheState {
+    fn sample_bytes(&self) -> usize {
         self.entries
             .values()
             .filter_map(|e| match e {
@@ -333,39 +403,107 @@ impl CacheState {
             .sum()
     }
 
+    fn warp_bytes(&self) -> usize {
+        self.warps.iter().map(WarpEntry::bytes).sum()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.sample_bytes() + self.warp_bytes()
+    }
+
+    /// Evict, least recently used first and those no compiled graph holds
+    /// before those it does, until the files and their stretched renders fit.
     fn trim(&mut self, budget: usize) {
+        // Renders of a file that is gone are of no use to anyone.
+        self.warps.retain(|w| w.src.strong_count() > 0);
         let mut total = self.total_bytes();
         while total > budget {
-            // Prefer evicting entries no compiled graph currently holds.
-            let candidate = self
-                .entries
-                .iter()
-                .filter_map(|(k, e)| match e {
-                    Entry::Ready { audio, used } => Some((Arc::strong_count(audio) > 1, *used, audio.byte_size(), k.clone())),
-                    _ => None,
-                })
-                .min_by_key(|(in_use, used, _, _)| (*in_use, *used));
-            let Some((_, _, sz, key)) = candidate else { break };
-            self.entries.remove(&key);
-            total = total.saturating_sub(sz);
+            let samples = self.entries.iter().filter_map(|(k, e)| match e {
+                Entry::Ready { audio, used } => Some((Arc::strong_count(audio) > 1, *used, audio.byte_size(), Victim::Sample(k.clone()))),
+                _ => None,
+            });
+            let warps = self.warps.iter().enumerate().filter_map(|(i, w)| match &w.state {
+                WarpState::Ready { audio, used, .. } => Some((Arc::strong_count(audio) > 1, *used, w.bytes(), Victim::Warp(i))),
+                _ => None,
+            });
+            let Some((_, _, size, victim)) = samples.chain(warps).min_by_key(|(in_use, used, _, _)| (*in_use, *used)) else { break };
+            match victim {
+                Victim::Sample(key) => {
+                    self.entries.remove(&key);
+                }
+                Victim::Warp(i) => {
+                    self.warps.swap_remove(i);
+                }
+            }
+            total = total.saturating_sub(size);
         }
     }
 }
 
-/// Shared cache of decoded files keyed by `(path, rate)`, with a background
-/// loader thread and an LRU memory budget. Control-thread / UI side only.
+fn warp_algo(mode: WarpMode) -> WarpAlgorithm {
+    match mode {
+        WarpMode::Beats => WarpAlgorithm::Beats,
+        WarpMode::Tones => WarpAlgorithm::Tones,
+        WarpMode::Texture => WarpAlgorithm::Texture,
+        WarpMode::Complex => WarpAlgorithm::Complex,
+        WarpMode::ComplexPro => WarpAlgorithm::ComplexPro,
+        WarpMode::Repitch => WarpAlgorithm::Repitch,
+    }
+}
+
+/// Stretch and pitch-shift a whole file. Slow (whole seconds for a long
+/// file): never on the control or the audio thread when a loader is running.
+fn render_warp(src: &DecodedAudio, mode: WarpMode, time_scale: f64, pitch_ratio: f64) -> Warped {
+    let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
+    let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
+    let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
+    let mut warped_audio = DecodedAudio::from_planar(warped_channels, src.sample_rate);
+    warped_audio.source_rate = src.source_rate;
+    let warped_arc = Arc::new(warped_audio);
+    let transients: Arc<[usize]> = Arc::from(if mode == WarpMode::Beats {
+        let w_refs: Vec<&[f32]> = warped_arc.channels.iter().map(Vec::as_slice).collect();
+        detect_transients(&w_refs, warped_arc.sample_rate)
+    } else {
+        Vec::new()
+    });
+    (warped_arc, transients)
+}
+
+/// A stretch waiting for the warp worker. It holds its source, so the file
+/// cannot go away mid-render.
+struct WarpJob {
+    src: Arc<DecodedAudio>,
+    mode: WarpMode,
+    time_scale: f64,
+    pitch_ratio: f64,
+    pitch_cents: i32,
+}
+
+/// Shared cache of decoded files keyed by `(path, rate)` and of their
+/// stretched renders, with background loader and warp threads and one LRU
+/// memory budget for both. Control-thread / UI side only.
 #[derive(Clone)]
 pub struct SampleCache {
     state: Arc<Mutex<CacheState>>,
     budget: Arc<std::sync::atomic::AtomicUsize>,
     jobs: Option<Sender<Key>>,
+    warp_jobs: Option<Sender<WarpJob>>,
+    warper: Warper,
 }
 
 impl SampleCache {
     /// A cache whose misses are loaded on a background thread; `on_loaded`
-    /// runs (on that thread) after each file finishes, so the engine can
-    /// recompile.
+    /// runs (on that thread) after each file or stretched render finishes, so
+    /// the engine can recompile.
     pub fn with_loader(on_loaded: impl Fn() + Send + 'static) -> Self {
+        Self::with_loader_and_warper(on_loaded, render_warp)
+    }
+
+    pub(crate) fn with_loader_and_warper(on_loaded: impl Fn() + Send + 'static, warper: impl Fn(&DecodedAudio, WarpMode, f64, f64) -> Warped + Send + Sync + 'static) -> Self {
+        let warper: Warper = Arc::new(warper);
+        let render = warper.clone();
+        let on_loaded = Arc::new(Mutex::new(on_loaded));
+        let notify = on_loaded.clone();
         let state: Arc<Mutex<CacheState>> = Arc::default();
         let budget = Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_CACHE_BUDGET_BYTES));
         let (tx, rx) = unbounded::<Key>();
@@ -392,13 +530,57 @@ impl SampleCache {
                     let limit = budget_bg.load(std::sync::atomic::Ordering::Relaxed);
                     st.trim(limit);
                 }
-                on_loaded();
+                (on_loaded.lock().unwrap_or_else(|p| p.into_inner()))();
             }
         });
         if let Err(e) = spawned {
             log::error!("sample loader thread failed to start: {e}");
         }
-        Self { state, budget, jobs: Some(tx) }
+        // Stretching a whole file takes long: its own thread, so loads never wait behind it.
+        let (warp_tx, warp_rx) = unbounded::<WarpJob>();
+        let map = state.clone();
+        let budget_bg = budget.clone();
+        let spawned = std::thread::Builder::new().name("aitrack-warp-worker".into()).spawn(move || {
+            while let Ok(job) = warp_rx.recv() {
+                let bits = job.time_scale.to_bits();
+                let src_ptr = Arc::as_ptr(&job.src);
+                let wanted = |st: &CacheState| {
+                    st.warps.iter().any(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, bits) && matches!(w.state, WarpState::Computing))
+                };
+                // A newer stretch of the same clip replaced this one while it waited.
+                if !wanted(&map.lock().unwrap_or_else(|p| p.into_inner())) {
+                    continue;
+                }
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(&job.src, job.mode, job.time_scale, job.pitch_ratio)));
+                {
+                    let mut st = map.lock().unwrap_or_else(|p| p.into_inner());
+                    st.clock = st.clock.saturating_add(1);
+                    let used = st.clock;
+                    let state = match rendered {
+                        Ok((audio, transients)) => WarpState::Ready { audio, transients, used },
+                        Err(e) => {
+                            log::warn!("time-stretching a clip panicked; it plays in Re-Pitch");
+                            st.note_warp_failure(&panic_text(&*e));
+                            WarpState::Failed
+                        }
+                    };
+                    if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, bits) && matches!(w.state, WarpState::Computing)) {
+                        w.state = state;
+                    }
+                    let limit = budget_bg.load(std::sync::atomic::Ordering::Relaxed);
+                    st.trim(limit);
+                }
+                (notify.lock().unwrap_or_else(|p| p.into_inner()))();
+            }
+        });
+        let warp_jobs = match spawned {
+            Ok(_) => Some(warp_tx),
+            Err(e) => {
+                log::error!("warp worker thread failed to start: {e}");
+                None
+            }
+        };
+        Self { state, budget, jobs: Some(tx), warp_jobs, warper }
     }
 
     /// A cache without a loader: misses are decoded synchronously (offline
@@ -408,7 +590,15 @@ impl SampleCache {
             state: Arc::default(),
             budget: Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_CACHE_BUDGET_BYTES)),
             jobs: None,
+            warp_jobs: None,
+            warper: Arc::new(render_warp),
         }
+    }
+
+    /// A blocking cache that renders stretches with `warper`.
+    #[cfg(test)]
+    pub(crate) fn with_warper(warper: impl Fn(&DecodedAudio, WarpMode, f64, f64) -> Warped + Send + Sync + 'static) -> Self {
+        Self { warper: Arc::new(warper), ..Self::blocking() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
@@ -425,8 +615,74 @@ impl SampleCache {
         self.budget.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Bytes of decoded files and stretched renders together: what the
+    /// budget limits.
     pub fn used_bytes(&self) -> usize {
         self.lock().total_bytes()
+    }
+
+    /// Bytes of the stretched renders alone (part of [`used_bytes`](Self::used_bytes)).
+    pub fn warp_bytes(&self) -> usize {
+        self.lock().warp_bytes()
+    }
+
+    /// `src` stretched by `time_scale` and shifted by `pitch_ratio`, when
+    /// ready. With a loader running a miss queues the render on the warp
+    /// worker, returns `None` (the clip plays unstretched meanwhile) and the
+    /// loader's callback fires when it is done; the blocking cache renders
+    /// now. A stretch that changes nothing returns `src` itself.
+    pub(crate) fn warped(&self, src: &Arc<DecodedAudio>, mode: WarpMode, time_scale: f64, pitch_ratio: f64, pitch_cents: i32) -> Option<Warped> {
+        if (time_scale - 1.0).abs() < 1e-4 && (pitch_ratio - 1.0).abs() < 1e-4 {
+            return Some((src.clone(), Arc::from([])));
+        }
+        let bits = time_scale.to_bits();
+        let ptr = Arc::as_ptr(src);
+        {
+            let mut st = self.lock();
+            st.clock = st.clock.saturating_add(1);
+            let now = st.clock;
+            if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(ptr, mode, pitch_cents, bits)) {
+                return match &mut w.state {
+                    WarpState::Ready { audio, transients, used } => {
+                        *used = now;
+                        Some((audio.clone(), transients.clone()))
+                    }
+                    WarpState::Computing | WarpState::Failed => None,
+                };
+            }
+            if let Some(tx) = &self.warp_jobs {
+                // Only the latest stretch of a clip is worth rendering: drop
+                // the ones still waiting for the same source and mode.
+                st.warps.retain(|w| !(w.same_source(ptr, mode, pitch_cents) && matches!(w.state, WarpState::Computing)));
+                let state = match tx.send(WarpJob { src: src.clone(), mode, time_scale, pitch_ratio, pitch_cents }) {
+                    Ok(()) => WarpState::Computing,
+                    Err(_) => WarpState::Failed,
+                };
+                st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, time_scale_bits: bits, state });
+                return None;
+            }
+        }
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.warper)(src, mode, time_scale, pitch_ratio)));
+        let mut st = self.lock();
+        st.clock = st.clock.saturating_add(1);
+        let used = st.clock;
+        let (state, out) = match rendered {
+            Ok((audio, transients)) => (WarpState::Ready { audio: audio.clone(), transients: transients.clone(), used }, Some((audio, transients))),
+            Err(e) => {
+                st.note_warp_failure(&panic_text(&*e));
+                (WarpState::Failed, None)
+            }
+        };
+        st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, time_scale_bits: bits, state });
+        let limit = self.budget_bytes();
+        st.trim(limit);
+        out
+    }
+
+    /// Stretched renders that failed (newest last): those clips play in
+    /// Re-Pitch, and the UI can say so.
+    pub fn warp_failures(&self) -> Vec<String> {
+        self.lock().warp_failures.clone()
     }
 
     /// Put already-decoded audio in the cache (tests, recorded takes).
@@ -493,13 +749,16 @@ impl SampleCache {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.lock().entries.values().any(|e| matches!(e, Entry::Loading))
+        let st = self.lock();
+        st.entries.values().any(|e| matches!(e, Entry::Loading)) || st.warps.iter().any(|w| matches!(w.state, WarpState::Computing))
     }
 
     /// Forget everything (e.g. after a device rate change the old entries
     /// are useless).
     pub fn clear(&self) {
-        self.lock().entries.retain(|_, e| matches!(e, Entry::Loading));
+        let mut st = self.lock();
+        st.entries.retain(|_, e| matches!(e, Entry::Loading));
+        st.warps.retain(|w| matches!(w.state, WarpState::Computing));
     }
 }
 
@@ -519,6 +778,24 @@ mod tests {
         let crossings = out[0][1000..47_000].windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
         let expected = 440.0 * 46_000.0 / 48_000.0;
         assert!((crossings as f64 - expected).abs() < 3.0, "{crossings}");
+    }
+
+    /// An impulse must land where it sat in the source, at every ratio: a
+    /// resampler that trims its filter delay twice eats the attack.
+    #[test]
+    fn resample_keeps_an_impulse_in_place() {
+        for (from, to) in [(44_100u32, 48_000u32), (48_000, 44_100), (96_000, 48_000), (22_050, 48_000)] {
+            let at = 1000usize;
+            let mut src = vec![0.0f32; 8000];
+            src[at] = 1.0;
+            let out = resample(&[src], from, to).unwrap();
+            let peak = out[0].iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+            let want = at as f64 * to as f64 / from as f64;
+            // rubato leaves up to about one input sample of residual offset
+            // (measured: +0.1, 0.0, -1.0 and +0.5 for these ratios).
+            let slack = 1.0 + (to as f64 / from as f64).max(1.0);
+            assert!((peak as f64 - want).abs() <= slack, "{from}->{to}: peak at {peak}, want {want:.1}");
+        }
     }
 
     #[test]
@@ -557,5 +834,110 @@ mod tests {
         assert!(st.entries.contains_key(&(PathBuf::from("mem://a.wav"), 48_000)));
         assert!(!st.entries.contains_key(&(PathBuf::from("mem://b.wav"), 48_000)));
         assert!(st.entries.contains_key(&(PathBuf::from("mem://c.wav"), 48_000)));
+    }
+
+    // A 0.2 s mono clip at 22 050 Hz: silence, then a 4 ms burst of 3 kHz
+    // that starts 100 ms in (its energy centroid sits at 102 ms). One copy
+    // coded by LAME at 32 kbps with its gapless tag (an MP3 holds ~50 ms of
+    // encoder delay before the first sample), one as AAC in an M4A.
+    const CLICK_MP3: &str = concat!(
+        "4944330400000000000a00000000000000000000fff370c0000000000000000000496e666f0000000f0000000a000004",
+        "cb003b3b3b3b3b3b3b3b3b51515151515151515151676767676767676767677d7d7d7d7d7d7d7d7d7d92929292929292",
+        "929292a8a8a8a8a8a8a8a8a8a8bebebebebebebebebebed4d4d4d4d4d4d4d4d4d4eaeaeaeaeaeaeaeaeaeaffffffffff",
+        "ffffffffff000000004c617666206c616d6500000000000000000000000024030600000000000004cb4085f595000000",
+        "00000000000000000000fff340c40000000348000000004c414d45342e305555555555555555555555554c414d45342e",
+        "305555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "555555555555555555555555555555555555fff342c45b00000348000000005555555555555555555555555555555555",
+        "55555518f2fefebebfbff45ffe78e1e2cfd4831c270830fb10144160b2ffe4003530b170304e0140c0001a0060580617",
+        "00a01826002060c8790197021806901820194e586071ad758195e4fff340c4a40000034800000000b7ff0300e0143d01",
+        "0790059baae0695446818d812003429c0c0c81d119058410f164163ffffff734cf0d2a030145b64057003f90bfcbc210",
+        "8436b5ad6b5ad6aebfff16b56b5cd6b5ad6d6b5bfc5ad5ad70c45f82f804a00e8b0922fff342c4a30000034801400000",
+        "0128003000a04f28c38403509110a51474e96d27268a1aae7d1b7c440d0340d7cb3f8340d0340cf05445fc454c414d45",
+        "342e305555555555555555555555555555555555555555555555555555555555555555555555555555555555fff340c4",
+        "ff1c8a2e741181b001555555555555555555555555555555555555554c414d45342e3055555555555555555555555555",
+        "555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "55555555fff342c4e716f97a9a57c1780255555555555555555555555555555555555555554c414d45342e3055555555",
+        "555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "55555555555555555555555555fff340c4a40000034800000000555555555555555555555555555555555555554c414d",
+        "45342e305555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "555555555555555555555555555555555555555555fff342c4a300000348000000005555555555555555555555555555",
+        "5555555555554c414d45342e305555555555555555555555555555555555555555555555555555555555555555555555",
+        "555555555555555555555555555555555555555555555555555555555555fff340c4a400000348000000005555555555",
+        "555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "5555555555555555555555555555555555555555555555555555555555555555555555555555fff342c4a30000034800",
+        "000000555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+        "5555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+    );
+
+    const CLICK_M4A: &str = concat!(
+        "0000001c667479704d344120000002004d34412069736f6d69736f3200000008667265650000016a6d64617401182007",
+        "0118400700e89ba43ebfafebf8c3f39f2ff7d7e21f9a77ebecfc7eff7d7ed543edfa3f5fbfea001fdecaa000ffcbfe20",
+        "1f96c82100fffb2a8803212c899a018b6e900f52220000006a3fc87d1f690000728f87f1a496000049d04880b5d22b52",
+        "0000001200edd04fc2fbaf6f70d0000002429a44f18919f9d6064e7910a800000000901590579593934b8312dd2dd43b",
+        "a4183c2c1598f8049e943cabeb15d0b221110fb268215060c87124d2120e6c8e7b7c4b95e208722713c7afb25c151039",
+        "06498f2500f6774ff42c87a8ac70d9a1b101281382758caa0b6a8707d2fc05f5b38cff8fe08032683e18032a83e94019",
+        "5439d8c01828492e20060a7251e9005d22eea00c823ad164a38c8ba680001050c9401f48ac00006752664ca387000049",
+        "a0cec6e45fcb768eea000000230ab6768a4572890611113c90e080000064149213305364e3e4135bc2c824ad80000000",
+        "01c00118e0070118200701182007000002ee6d6f6f760000006c6d766864000000000000000000000000000056220000",
+        "113a00010000010000000000000000000000000100000000000000000000000000000001000000000000000000000000",
+        "000040000000000000000000000000000000000000000000000000000000000000020000023d7472616b0000005c746b",
+        "686400000003000000000000000000000001000000000000113a00000000000000000000000101000000000100000000",
+        "000000000000000000000001000000000000000000000000000040000000000000000000000000000024656474730000",
+        "001c656c737400000000000000010000113a0000040000010000000001b56d646961000000206d646864000000000000",
+        "000000000000000056220000153a55c400000000002d68646c720000000000000000736f756e00000000000000000000",
+        "0000536f756e6448616e646c657200000001606d696e6600000010736d686400000000000000000000002464696e6600",
+        "00001c6472656600000000000000010000000c75726c2000000001000001247374626c0000006a737473640000000000",
+        "0000010000005a6d70346100000000000000010000000000000000000100100000000056220000000000366573647300",
+        "00000003808080250001000480808017401500000000005dc000002ce30580808005138856e500068080800102000000",
+        "207374747300000000000000020000000500000400000000010000013a0000001c737473630000000000000001000000",
+        "0100000006000000010000002c7374737a00000000000000000000000600000004000000040000014e00000004000000",
+        "0400000004000000147374636f00000000000000010000002c0000001a7367706401000000726f6c6c00000002000000",
+        "01ffff0000001c7362677000000000726f6c6c0000000100000006000000010000003d75647461000000356d65746100",
+        "0000000000002168646c7200000000000000006d6469726170706c00000000000000000000000008696c7374"
+    );
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// Where the energy of the file sits, in milliseconds.
+    fn centroid_ms(channels: &[Vec<f32>], rate: u32) -> f64 {
+        let (mut e, mut m) = (0.0, 0.0);
+        for (i, v) in channels[0].iter().enumerate() {
+            e += (*v as f64).powi(2);
+            m += i as f64 * (*v as f64).powi(2);
+        }
+        m / e / rate as f64 * 1000.0
+    }
+
+    fn decode_bytes(name: &str, hex: &str) -> (Vec<Vec<f32>>, u32) {
+        let path = std::env::temp_dir().join(format!("aitrack-{}-{name}", std::process::id()));
+        std::fs::write(&path, unhex(hex)).unwrap();
+        let decoded = decode_file(&path);
+        let _ = std::fs::remove_file(&path);
+        decoded.unwrap()
+    }
+
+    /// The encoder delay and padding of an MP3 are cut: the burst lands where
+    /// it was recorded (±1 ms) and the file keeps its length.
+    #[test]
+    fn mp3_decodes_gapless() {
+        let (ch, rate) = decode_bytes("click.mp3", CLICK_MP3);
+        assert_eq!(rate, 22_050);
+        let at = centroid_ms(&ch, rate);
+        assert!((at - 102.0).abs() < 1.0, "the burst is at {at:.2} ms, not 102");
+        assert!((ch[0].len() as i64 - 4410).abs() <= 2, "{} frames", ch[0].len());
+    }
+
+    /// An M4A (AAC) plays. symphonia 0.5.5 reads its edit list but does not
+    /// apply it, so the encoder's priming (1024 frames) is still in front:
+    /// the burst is that late and no more.
+    #[test]
+    fn m4a_decodes() {
+        let (ch, rate) = decode_bytes("click.m4a", CLICK_M4A);
+        assert_eq!(rate, 22_050);
+        assert!(ch[0].len() > 4000, "{} frames", ch[0].len());
+        let late = centroid_ms(&ch, rate) - 102.0;
+        assert!((0.0..=1024.0 / 22.05 + 3.0).contains(&late), "the burst is {late:.2} ms late");
     }
 }

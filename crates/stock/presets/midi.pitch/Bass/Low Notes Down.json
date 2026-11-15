@@ -1,0 +1,21 @@
+{
+  "name": "Low Notes Down",
+  "plugin": "midi.pitch",
+  "author": "AI-Track",
+  "tags": [
+    "bass",
+    "range",
+    "octave",
+    "low"
+  ],
+  "params": {
+    "0": 0.375,
+    "1": 0.5,
+    "2": 0.0,
+    "3": 0.37007874,
+    "4": 0.0,
+    "5": 0.5,
+    "6": 0.0,
+    "7": 0.5
+  }
+}

@@ -376,6 +376,36 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             });
         }
     }
+    // The clip of a take being played, growing with the playhead on each armed track.
+    let mut rec_clips = Vec::new();
+    if let Some(rv) = &ws.s.rec_view {
+        let end = transport.position.max(rv.start + 1);
+        for r in rows.iter().filter(|r| rv.tracks.contains(&r.track)) {
+            let Some(t) = ws.s.project.track(r.track) else { continue };
+            let ry = r.top - view.scroll_y;
+            let played: Vec<(u8, Tick, Tick)> = ws.s.rec_notes.iter().filter(|n| n.track == r.track).map(|n| (n.key, (n.start_tick - rv.start).max(0), n.length_ticks)).collect();
+            let lo = played.iter().map(|n| n.0).min().unwrap_or(60);
+            let hi = played.iter().map(|n| n.0).max().unwrap_or(60);
+            let clip = Clip::new("Recording…", t.color, SourceId(0), end - rv.start);
+            rec_clips.push(ClipPaint {
+                id: PlacementId(u64::MAX),
+                bx: ClipBox::of(&clip, false, rv.start, ry, r.h, px_per_tick, view.scroll_x),
+                looping: false,
+                x: rv.start as f32 * px_per_tick - view.scroll_x,
+                w: (end - rv.start) as f32 * px_per_tick,
+                y: ry + 2.,
+                h: r.h - 4.,
+                color: t.color,
+                name: clip.name.clone(),
+                selected: true,
+                body: Body::Notes { notes: played, lo, hi, loop_len: (end - rv.start).max(1) },
+                px_per_tick,
+                offset: 0,
+                muted: false,
+                repeats: Vec::new(),
+            });
+        }
+    }
     // The grid, the insert marker and the time selection.
     let lane_rects: Vec<(TrackId, f32, f32)> = rows.iter().map(|r| (r.track, r.top - view.scroll_y, r.h)).collect();
     let overlay = crate::editing::overlay::Overlay::arrange(&ws.s, &lane_rects);
@@ -433,6 +463,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             };
             for (i, c) in clips.iter().enumerate() {
                 paint_clip(window, cx, o, c, w, hot.filter(|h| h.0 == i).map(|h| h.1));
+            }
+            for c in &rec_clips {
+                paint_clip(window, cx, o, c, w, None);
             }
             window.set_cursor_style(arrange_clips::cursor_for(hot.map(|h| h.1), copying), &hitbox);
             if idle {
@@ -515,6 +548,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             // On the grid line nearest to where it was dropped.
             let start = this.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), false);
             this.add_sample_clip(&d.0, row, Some(start), cx);
+        }))
+        // Audio files dropped from Finder / Explorer: clips on the track under
+        // the cursor (a new track when it is not an audio track), in a row.
+        .drag_over::<gpui::ExternalPaths>(|s, _, _, _| s.bg(accent_alpha(0.06)))
+        .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+            let (tick, row) = this.arrange_pos(window.mouse_position());
+            let start = this.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), false);
+            this.drop_audio_files(paths.paths().to_vec(), row, start, cx);
         }))
         .on_scroll_wheel(cx.listener(on_wheel))
         .on_pinch(cx.listener(on_pinch));
@@ -835,6 +876,33 @@ const TALL_HEADER: f32 = 80.;
 /// The track-height handle along the bottom edge of a header.
 const RESIZE_H: f32 = 4.;
 
+/// A track header being dragged to a new place in the track list.
+#[derive(Clone, Debug)]
+pub struct DraggedTrack {
+    pub id: TrackId,
+    pub name: String,
+    pub color: aitrack_model::Color,
+}
+
+impl gpui::Render for DraggedTrack {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pal = p();
+        div()
+            .px(px(SP2))
+            .h(px(TAB_BAR_H))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .rounded(px(r_md()))
+            .bg(pal.raised)
+            .border_1()
+            .border_color(accent())
+            .shadow_lg()
+            .child(div().w(px(4.)).h(px(14.)).bg(track_color(self.color)))
+            .child(label(self.name.clone(), TEXT_SM, pal.text))
+    }
+}
+
 fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let Some(t) = ws.s.project.track(r.track).cloned() else { return div().into_any_element() };
@@ -857,6 +925,16 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
         .border_b_1()
         .border_color(border())
         .cursor_pointer()
+        // Drag a header up or down to reorder (a group takes its tracks along).
+        .on_drag(DraggedTrack { id, name: t.name.clone(), color: t.color }, |d: &DraggedTrack, _, _, cx| gpui::AppContext::new(cx, |_| d.clone()))
+        .drag_over::<DraggedTrack>(|s, _, _, _| s.bg(accent_alpha(0.12)))
+        .on_drop(cx.listener(move |this, d: &DraggedTrack, window, cx| {
+            if let Some((target, after)) = this.track_drop_target(window.mouse_position())
+                && this.s.move_track(d.id, target, after)
+            {
+                cx.notify();
+            }
+        }))
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
             this.focus.focus(window, cx);
             let m = e.modifiers();

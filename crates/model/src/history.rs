@@ -5,7 +5,7 @@
 //! AI agents never edit directly: they submit a [`Proposal`] that the UI can
 //! preview on a clone and the user accepts (one undo step) or discards.
 
-use crate::command::{Command, CommandError};
+use crate::command::{ChainProp, Command, CommandError, TrackProp};
 use crate::project::Project;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,60 @@ impl Proposal {
     pub fn is_destructive(&self) -> bool {
         self.commands.iter().any(Command::is_destructive)
     }
+}
+
+/// What an absolute setter writes to. Two commands with the same slot are the
+/// same write: the later one wins whatever the earlier one did.
+#[derive(PartialEq)]
+enum Slot {
+    Notes(crate::SourceId, Vec<crate::NoteId>),
+    Track(crate::TrackId, std::mem::Discriminant<TrackProp>),
+    Param(crate::DeviceId, u32),
+    Macro(crate::DeviceId, usize),
+    Chain(crate::DeviceId, usize, bool, std::mem::Discriminant<ChainProp>, usize),
+    Mapping(crate::DeviceId, usize, usize),
+    Selector(crate::DeviceId),
+    Tempo,
+    Loop,
+    Clip(crate::ClipId),
+    Warp(crate::SourceId),
+    Automation(crate::TrackId, crate::AutomationTarget),
+}
+
+/// The slot of a command that is a plain "set this to X" whose effect does not
+/// depend on the state before it; `None` for everything else (adds, removes,
+/// moves relative to the current place, batches…).
+fn slot(c: &Command) -> Option<Slot> {
+    Some(match c {
+        Command::UpdateNotes { source, notes } => Slot::Notes(*source, notes.iter().map(|n| n.id).collect()),
+        Command::SetTrack { id, change } => Slot::Track(*id, std::mem::discriminant(change)),
+        Command::SetParam { device, param, .. } => Slot::Param(*device, *param),
+        Command::SetMacro { rack, index, .. } => Slot::Macro(*rack, *index),
+        Command::SetChainProp { rack, chain, prop } => Slot::Chain(*rack, *chain, false, std::mem::discriminant(prop), send_index(prop)),
+        Command::SetReturnProp { rack, index, prop } => Slot::Chain(*rack, *index, true, std::mem::discriminant(prop), send_index(prop)),
+        Command::SetRackSelector { rack, .. } => Slot::Selector(*rack),
+        Command::SetMappingRange { rack, macro_index, index, .. } => Slot::Mapping(*rack, *macro_index, *index),
+        Command::SetTempo { .. } => Slot::Tempo,
+        Command::SetLoop { .. } => Slot::Loop,
+        Command::UpdateClip { id, .. } => Slot::Clip(*id),
+        Command::SetWarp { source, .. } => Slot::Warp(*source),
+        Command::SetAutomation { track, target, .. } => Slot::Automation(*track, *target),
+        _ => return None,
+    })
+}
+
+/// Sends are one slot each (`Send(0, ..)` and `Send(1, ..)` are not the same write).
+fn send_index(prop: &ChainProp) -> usize {
+    match prop {
+        ChainProp::Send(i, _) => *i,
+        _ => 0,
+    }
+}
+
+/// Whether `new` writes exactly the slots `old` wrote, in the same order, so
+/// `new` can take the place of `old` in a coalesced step.
+fn replaces(old: &[Command], new: &[Command]) -> bool {
+    old.len() == new.len() && old.iter().zip(new).all(|(a, b)| matches!((slot(a), slot(b)), (Some(x), Some(y)) if x == y))
 }
 
 #[derive(Debug)]
@@ -97,6 +151,28 @@ impl History {
         self.apply_inner(project, label.into(), Origin::User, commands, Some(key.into()))
     }
 
+    /// Apply `commands` as part of the last undo step: what a finished
+    /// gesture still has to settle (the clips it dropped a clip on, say), so
+    /// one undo takes both back. A step of its own when there is none.
+    pub fn amend(&mut self, project: &mut Project, commands: Vec<Command>) -> Result<(), CommandError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        if self.undo.is_empty() {
+            return self.apply(project, "Edit", Origin::User, commands);
+        }
+        let inverse = Command::Batch { commands: commands.clone() }.apply(project)?;
+        let Command::Batch { commands: mut backward } = inverse else { unreachable!() };
+        self.redo.clear();
+        self.revision += 1;
+        if let Some(last) = self.undo.last_mut() {
+            last.forward.extend(commands);
+            backward.append(&mut last.backward);
+            last.backward = backward;
+        }
+        Ok(())
+    }
+
     /// Break coalescing so the next drag starts a fresh undo step.
     pub fn seal(&mut self) {
         if let Some(t) = self.undo.last_mut() {
@@ -116,10 +192,17 @@ impl History {
         if let (Some(key), Some(last)) = (&coalesce, self.undo.last_mut())
             && last.coalesce.as_ref() == Some(key)
         {
-            last.forward.extend(commands);
-            let mut merged = backward;
-            merged.append(&mut last.backward);
-            last.backward = merged;
+            if replaces(&last.forward, &commands) {
+                // The same absolute setters again (a drag frame): the first
+                // frame's `backward` already restores the start, and the new
+                // frame's `forward` already reaches the end. Keep one copy.
+                last.forward = commands;
+            } else {
+                last.forward.extend(commands);
+                let mut merged = backward;
+                merged.append(&mut last.backward);
+                last.backward = merged;
+            }
             return Ok(());
         }
         self.undo.push(Transaction { label, origin, forward: commands, backward, coalesce });
@@ -212,6 +295,24 @@ mod tests {
     }
 
     #[test]
+    fn amend_joins_the_last_step() {
+        let (mut p, mut h, id) = setup();
+        h.apply_coalesced(&mut p, "vol", "Vol", vec![Command::SetTrack { id, change: TrackProp::VolumeDb(-3.0) }]).unwrap();
+        let steps = h.steps().count();
+        h.amend(&mut p, vec![Command::SetTrack { id, change: TrackProp::Pan(0.5) }]).unwrap();
+        assert_eq!(h.steps().count(), steps, "no step of its own");
+        assert_eq!((p.track(id).unwrap().volume_db, p.track(id).unwrap().pan), (-3.0, 0.5));
+        assert!(h.undo(&mut p).unwrap());
+        assert_eq!((p.track(id).unwrap().volume_db, p.track(id).unwrap().pan), (0.0, 0.0), "one undo takes both back");
+        assert!(h.redo(&mut p).unwrap());
+        assert_eq!((p.track(id).unwrap().volume_db, p.track(id).unwrap().pan), (-3.0, 0.5));
+        // Nothing to amend: nothing changes, not even the revision.
+        let rev = h.revision();
+        h.amend(&mut p, Vec::new()).unwrap();
+        assert_eq!(h.revision(), rev);
+    }
+
+    #[test]
     fn undo_redo() {
         let (mut p, mut h, id) = setup();
         h.apply(&mut p, "Vol", Origin::User, vec![Command::SetTrack { id, change: TrackProp::VolumeDb(-3.0) }]).unwrap();
@@ -230,6 +331,49 @@ mod tests {
         h.undo(&mut p).unwrap();
         assert_eq!(p.track(id).unwrap().volume_db, 0.0);
         assert_eq!(h.undo_label(), Some("Add"));
+    }
+
+    /// A drag of many notes over 120 frames keeps one `forward` and one
+    /// `backward` (the first frame's inverse), not 120 copies of the notes.
+    #[test]
+    fn coalesced_note_drag_keeps_one_copy_each_way() {
+        let mut p = Project::new("t");
+        let source = p.alloc_source_id();
+        let notes: Vec<Note> = (0..500i64).map(|i| Note::new(p.alloc_note_id(), 60, i * 10, 5, 0.8)).collect();
+        let mut h = History::default();
+        h.apply(&mut p, "Add", Origin::User, vec![Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: notes.clone() })) }]).unwrap();
+        for frame in 1..=120i64 {
+            let moved: Vec<Note> = notes.iter().map(|n| Note { start: n.start + frame * 3, ..n.clone() }).collect();
+            h.apply_coalesced(&mut p, "notes-move", "Move notes", vec![Command::UpdateNotes { source, notes: moved }]).unwrap();
+        }
+        let t = h.undo.last().unwrap();
+        assert_eq!(t.forward.len(), 1, "forward is the last frame only");
+        assert_eq!(t.backward.len(), 1, "backward is the first frame's inverse only");
+        assert_eq!(h.steps().count(), 2);
+        let start_of = |p: &Project| match p.sources.get(&source) {
+            Some(Source::Notes(n)) => n.notes[0].start,
+            _ => unreachable!(),
+        };
+        assert_eq!(start_of(&p), 360);
+        h.undo(&mut p).unwrap();
+        assert_eq!(start_of(&p), 0, "undo goes back to before the drag");
+        h.redo(&mut p).unwrap();
+        assert_eq!(start_of(&p), 360, "redo goes to where the drag ended");
+    }
+
+    /// Frames that touch different things cannot replace each other: they merge.
+    #[test]
+    fn coalescing_frames_with_different_targets_still_merges() {
+        let (mut p, mut h, id) = setup();
+        h.apply_coalesced(&mut p, "k", "Edit", vec![Command::SetTrack { id, change: TrackProp::VolumeDb(-1.0) }]).unwrap();
+        h.apply_coalesced(&mut p, "k", "Edit", vec![Command::SetTrack { id, change: TrackProp::Pan(0.5) }]).unwrap();
+        h.apply_coalesced(&mut p, "k", "Edit", vec![Command::SetTrack { id, change: TrackProp::Pan(0.7) }]).unwrap();
+        h.undo(&mut p).unwrap();
+        assert_eq!(p.track(id).unwrap().volume_db, 0.0);
+        assert_eq!(p.track(id).unwrap().pan, 0.0);
+        h.redo(&mut p).unwrap();
+        assert_eq!(p.track(id).unwrap().volume_db, -1.0);
+        assert_eq!(p.track(id).unwrap().pan, 0.7);
     }
 
     #[test]

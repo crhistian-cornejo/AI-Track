@@ -49,6 +49,10 @@ pub fn tempo_to_normalized(bpm: f64) -> f32 {
 /// (−3 dB law compensated): hard left gives `(√2, 0)`.
 #[inline]
 pub fn pan_gains(pan: f32) -> (f32, f32) {
+    // cos(π/4)·√2 is 0.99999994 in f32: centre stays bit-transparent.
+    if pan == 0.0 {
+        return (1.0, 1.0);
+    }
     let theta = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
     (theta.cos() * std::f32::consts::SQRT_2, theta.sin() * std::f32::consts::SQRT_2)
 }
@@ -93,8 +97,9 @@ mod tests {
     #[test]
     fn mappings() {
         assert!((volume_db_from_normalized(volume_normalized_from_db(0.0))).abs() < 1e-4);
-        let (l, r) = pan_gains(0.0);
-        assert!((l - 1.0).abs() < 1e-5 && (r - 1.0).abs() < 1e-5);
+        // Centre is transparent to the bit, not 0.99999994.
+        assert_eq!(pan_gains(0.0), (1.0, 1.0));
+        assert_eq!(pan_gains(-0.0), (1.0, 1.0));
         let (l, r) = pan_gains(-1.0);
         assert!((l - std::f32::consts::SQRT_2).abs() < 1e-5 && r.abs() < 1e-5);
         // Equal power: l² + r² constant.

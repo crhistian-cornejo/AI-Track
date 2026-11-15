@@ -22,7 +22,7 @@ use aitrack_host::sandbox::{SandboxEditor, SandboxedPlugin};
 use aitrack_host::scan::Scanner;
 use aitrack_host::{HostedPlugin, HostedPluginInfo, ParamEdit, ParamEditKind, PluginController};
 use aitrack_model::{Device, DeviceId, DeviceKind};
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, bounded, unbounded};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -359,14 +359,7 @@ impl ProcessorFactory for HostedFactory {
                         i.edits.insert(device.id, (token, q));
                     }
                 }
-                let info = plugin.info().clone();
-                Some(Box::new(MainThreadPlugin {
-                    inner: Some(plugin),
-                    info,
-                    controller,
-                    rt: self.rt.clone(),
-                    key: self.live.then_some((device.id, token)),
-                }))
+                Some(Box::new(MainThreadPlugin::new(plugin, Some(controller), self.rt.clone(), self.live.then_some((device.id, token)))))
             }
             Some(Err(e)) => {
                 let msg = format!("Could not load {name}: {e}");
@@ -439,52 +432,188 @@ impl Processor for Tracked {
 /// An in-process hosted plugin whose main-thread calls (`prepare`, state,
 /// drop) are sent to the UI thread, so it works from the engine's control
 /// thread. Processing stays where the engine calls it (the audio thread).
-struct MainThreadPlugin {
-    inner: Option<HostedPlugin>,
+///
+/// If `prepare` takes longer than the timeout the plugin is still on its way
+/// through the main thread: until it comes back the signal passes through
+/// untouched, parameters set meanwhile are kept and applied on arrival, a
+/// newer `prepare` (other rate or block size) is run by the same job before
+/// it hands the plugin back, and the audio thread picks the instance up the
+/// moment the job finishes. (A plugin that is lost for good is the only case
+/// that mutes.)
+struct MainThreadPlugin<P: Processor + 'static = HostedPlugin> {
+    inner: Option<P>,
+    /// Where a plugin whose `prepare` ran late comes back. Kept for the
+    /// plugin's whole life: the audio thread must not free a channel.
+    returning: Option<Receiver<P>>,
+    /// The job that had the plugin was dropped: it will not come back.
+    lost: bool,
+    /// Talks to the job on the main thread (never touched by the audio thread).
+    job: Arc<Mutex<JobState>>,
+    /// Parameters set while the instance is away, applied when it is back.
+    /// Preallocated for every parameter of the plugin: never grows.
+    pending: Vec<(u32, f32)>,
     info: PluginInfo,
-    controller: PluginController,
+    controller: Option<PluginController>,
     rt: Arc<PluginRuntime>,
     key: Option<(DeviceId, u64)>,
+    prepare_timeout: Duration,
 }
 
-impl Processor for MainThreadPlugin {
+/// The conversation between a late `prepare` job and its owner.
+#[derive(Default)]
+struct JobState {
+    /// A newer `prepare` the job must run before handing the plugin back.
+    wanted: Option<(f64, usize)>,
+    /// The plugin is in the channel (set together with the send).
+    finished: bool,
+    /// The owner is gone: release the plugin on the main thread instead.
+    abandoned: bool,
+}
+
+impl<P: Processor + 'static> MainThreadPlugin<P> {
+    fn new(plugin: P, controller: Option<PluginController>, rt: Arc<PluginRuntime>, key: Option<(DeviceId, u64)>) -> Self {
+        let info = plugin.info().clone();
+        let pending = Vec::with_capacity(info.params.len().max(16));
+        Self {
+            inner: Some(plugin),
+            returning: None,
+            lost: false,
+            job: Arc::default(),
+            pending,
+            info,
+            controller,
+            rt,
+            key,
+            prepare_timeout: LOAD_TIMEOUT,
+        }
+    }
+
+    /// Take the instance back if its late `prepare` has finished, and give it
+    /// the parameters that arrived meanwhile. No locks, no allocation: a
+    /// lock-free `try_recv` and moves.
+    #[inline]
+    fn recover(&mut self) {
+        if self.inner.is_none()
+            && !self.lost
+            && let Some(rx) = &self.returning
+        {
+            match rx.try_recv() {
+                Ok(mut p) => {
+                    for (id, value) in self.pending.drain(..) {
+                        p.set_param(id, value);
+                    }
+                    self.inner = Some(p);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.lost = true,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+    }
+}
+
+impl<P: Processor + 'static> Processor for MainThreadPlugin<P> {
     fn info(&self) -> &PluginInfo {
         &self.info
     }
 
     fn prepare(&mut self, sample_rate: f64, max_frames: usize) {
+        self.recover();
+        if self.inner.is_none() && !self.lost && self.returning.is_some() {
+            // Still away on the main thread. If its job has not handed it
+            // back yet, that job prepares it again for this configuration.
+            let mut job = self.job.lock();
+            if !job.finished {
+                job.wanted = Some((sample_rate, max_frames));
+                return;
+            }
+            drop(job);
+            self.recover();
+        }
         if let Some(mut p) = self.inner.take() {
-            self.inner = self.rt.main.run(LOAD_TIMEOUT, move || {
-                p.prepare(sample_rate, max_frames);
-                p
-            });
-            if self.inner.is_none() {
-                self.rt.message(format!("{} did not activate in time", self.info.name));
+            let (tx, rx) = bounded::<P>(1);
+            let state: Arc<Mutex<JobState>> = Arc::default();
+            self.job = state.clone();
+            self.returning = None;
+            let run = move || {
+                let mut config = (sample_rate, max_frames);
+                p.prepare(config.0, config.1);
+                loop {
+                    let mut s = state.lock();
+                    match s.wanted.take() {
+                        Some(newer) if newer != config => {
+                            drop(s);
+                            config = newer;
+                            p.prepare(config.0, config.1);
+                        }
+                        Some(_) => {}
+                        None if s.abandoned => {
+                            // Nobody wants it any more: release it here, on the main thread.
+                            drop(s);
+                            drop(p);
+                            return;
+                        }
+                        None => {
+                            // Sent while the lock is held, so `finished` means "in the channel".
+                            s.finished = true;
+                            let _ = tx.send(p);
+                            return;
+                        }
+                    }
+                }
+            };
+            match self.rt.main.run_or_later(self.prepare_timeout, run) {
+                Ok(()) => self.inner = rx.try_recv().ok(),
+                Err(_) => {
+                    self.returning = Some(rx);
+                    self.rt.message(format!("{} is slow to activate; its signal passes through until it is ready", self.info.name));
+                }
+            }
+            if self.inner.is_none() && self.returning.is_none() {
+                self.lost = true;
             }
         }
     }
 
     fn reset(&mut self) {
+        self.recover();
         if let Some(p) = &mut self.inner {
             p.reset();
         }
     }
 
     fn process(&mut self, ctx: &mut ProcessContext<'_>) {
+        self.recover();
         match &mut self.inner {
             Some(p) => p.process(ctx),
+            // Still activating: the signal goes by untouched. Only a plugin
+            // that can never come back is silent.
+            None if self.returning.is_some() && !self.lost => {}
             None => ctx.buffer.clear(),
         }
     }
 
     fn set_param(&mut self, id: u32, normalized: f32) {
-        if let Some(p) = &mut self.inner {
-            p.set_param(id, normalized);
+        self.recover();
+        match &mut self.inner {
+            Some(p) => p.set_param(id, normalized),
+            // Away: remember the latest value of each parameter (the list
+            // has room for all of them, so it never reallocates).
+            None if self.returning.is_some() && !self.lost => {
+                if let Some(i) = self.pending.iter().position(|(k, _)| *k == id) {
+                    self.pending[i].1 = normalized;
+                } else if self.pending.len() < self.pending.capacity() {
+                    self.pending.push((id, normalized));
+                }
+            }
+            None => {}
         }
     }
 
     fn get_param(&self, id: u32) -> f32 {
-        self.inner.as_ref().map_or(0.0, |p| p.get_param(id))
+        match &self.inner {
+            Some(p) => p.get_param(id),
+            None => self.pending.iter().find(|(k, _)| *k == id).map_or(0.0, |(_, v)| *v),
+        }
     }
 
     fn latency(&self) -> u32 {
@@ -496,18 +625,20 @@ impl Processor for MainThreadPlugin {
     }
 
     fn save_state(&self) -> Vec<u8> {
-        let c = self.controller.clone();
+        let Some(c) = self.controller.clone() else { return Vec::new() };
         self.rt.main.run(CALL_TIMEOUT, move || c.save_state().unwrap_or_default()).unwrap_or_default()
     }
 
     fn load_state(&mut self, data: &[u8]) {
-        let c = self.controller.clone();
+        // State goes through the controller on the main thread, which does
+        // not need the instance to be here: it is not lost while it is away.
+        let Some(c) = self.controller.clone() else { return };
         let data = data.to_vec();
         let _ = self.rt.main.run(CALL_TIMEOUT, move || c.load_state(&data).is_ok());
     }
 }
 
-impl Drop for MainThreadPlugin {
+impl<P: Processor + 'static> Drop for MainThreadPlugin<P> {
     fn drop(&mut self) {
         if let Some((d, t)) = self.key {
             self.rt.forget(d, t);
@@ -516,6 +647,18 @@ impl Drop for MainThreadPlugin {
         // its main thread instead.
         if let Some(p) = self.inner.take() {
             self.rt.main.post(move || drop(p));
+        }
+        // One that is still away: its job releases it on the main thread, or
+        // (already in the channel) it is taken out and sent there.
+        if let Some(rx) = &self.returning {
+            let mut job = self.job.lock();
+            if job.finished {
+                if let Ok(p) = rx.try_recv() {
+                    self.rt.main.post(move || drop(p));
+                }
+            } else {
+                job.abandoned = true;
+            }
         }
     }
 }
@@ -713,6 +856,186 @@ mod tests {
         assert!(!presets.is_empty());
         let d = Device::stock(DeviceId(1), "fx.reverb", "Reverb");
         assert!(StockFactory.create(&d, 48_000., 256).is_some());
+    }
+
+    /// A processor that needs the main thread to activate and halves the
+    /// signal once it has. It checks the block it is given against the
+    /// configuration it was prepared with, keeps its parameters, and notes
+    /// which thread destroyed it.
+    struct Halver {
+        info: PluginInfo,
+        config: Option<(f64, usize)>,
+        params: std::collections::HashMap<u32, f32>,
+        dropped_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    impl Halver {
+        fn new() -> Self {
+            Self::watched(Arc::default())
+        }
+
+        fn watched(dropped_on: Arc<Mutex<Option<std::thread::ThreadId>>>) -> Self {
+            let info = PluginInfo {
+                id: "test.halver",
+                name: "Halver",
+                vendor: "test",
+                category: Category::Effect,
+                tags: &[],
+                params: (0..8).map(|id| ParamInfo::new(id, "p", 0.0, 1.0, 0.0)).collect(),
+                inputs: 2,
+                outputs: 2,
+                has_sidechain: false,
+            };
+            Self { info, config: None, params: Default::default(), dropped_on }
+        }
+    }
+
+    impl Drop for Halver {
+        fn drop(&mut self) {
+            *self.dropped_on.lock() = Some(std::thread::current().id());
+        }
+    }
+
+    impl Processor for Halver {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+        fn prepare(&mut self, sample_rate: f64, max_frames: usize) {
+            self.config = Some((sample_rate, max_frames));
+        }
+        fn reset(&mut self) {}
+        fn process(&mut self, ctx: &mut ProcessContext<'_>) {
+            let (rate, max) = self.config.expect("processed before activation");
+            assert_eq!(ctx.sample_rate, rate, "processing at a rate it was not prepared for");
+            assert!(ctx.buffer.frames() <= max, "a block of {} frames, prepared for {max}", ctx.buffer.frames());
+            for ch in 0..ctx.buffer.channels() {
+                ctx.buffer.channel_mut(ch).iter_mut().for_each(|s| *s *= 0.5);
+            }
+        }
+        fn set_param(&mut self, id: u32, normalized: f32) {
+            self.params.insert(id, normalized);
+        }
+        fn get_param(&self, id: u32) -> f32 {
+            self.params.get(&id).copied().unwrap_or(0.0)
+        }
+    }
+
+    fn run_block_at(p: &mut dyn Processor, rate: f64, frames: usize) -> f32 {
+        let mut buf = aitrack_dsp::AudioBuffer::new(2, frames);
+        buf.channel_mut(0).fill(1.0);
+        buf.channel_mut(1).fill(1.0);
+        let transport = aitrack_dsp::Transport::default();
+        p.process(&mut ProcessContext { sample_rate: rate, buffer: &mut buf, sidechain: None, events: &[], transport: &transport });
+        buf.channel(0)[10]
+    }
+
+    fn run_block(p: &mut dyn Processor) -> f32 {
+        run_block_at(p, 48_000.0, 64)
+    }
+
+    /// A plugin whose first `prepare` timed out, still waiting for the main thread.
+    fn away(rt: &Arc<PluginRuntime>, plugin: Halver) -> MainThreadPlugin<Halver> {
+        let mut plugin = MainThreadPlugin::new(plugin, None, rt.clone(), None);
+        plugin.prepare_timeout = Duration::from_millis(50);
+        // The control thread prepares; this thread is "main" and does not pump.
+        let control = std::thread::spawn(move || {
+            plugin.prepare(48_000.0, 256);
+            plugin
+        });
+        control.join().unwrap()
+    }
+
+    /// A hosted plugin whose `prepare` outlasts the timeout used to leave its
+    /// track silent for good. The signal now passes through, and the plugin
+    /// takes over once the main thread has run the job.
+    #[test]
+    fn a_slow_prepare_passes_the_signal_through_and_the_plugin_comes_back() {
+        // This thread is "main"; the control thread prepares, the audio thread processes.
+        let rt = PluginRuntime::new(MainThread::new(), false);
+        let started = std::time::Instant::now();
+        let mut plugin = away(&rt, Halver::new());
+        assert!(started.elapsed() >= Duration::from_millis(50) && started.elapsed() < Duration::from_secs(5));
+        assert!(rt.take_messages().iter().any(|m| m.contains("Halver")), "the user is told");
+        // Meanwhile the track keeps sounding, untouched.
+        assert_eq!(run_block(&mut plugin), 1.0, "the signal must pass through, not be silenced");
+        assert_eq!(run_block(&mut plugin), 1.0);
+        // The main thread gets to the job: the plugin is activated and takes over.
+        assert_eq!(rt.main.pump(), 1);
+        assert_eq!(run_block(&mut plugin), 0.5, "the recovered plugin processes");
+        assert_eq!(run_block(&mut plugin), 0.5);
+        // A prepare that is in time is as before.
+        let mut quick = MainThreadPlugin::new(Halver::new(), None, rt.clone(), None);
+        quick.prepare(48_000.0, 256);
+        assert_eq!(run_block(&mut quick), 0.5);
+    }
+
+    /// The engine applies the parameters right after `prepare` and counts
+    /// them as applied: those set while the plugin is away must still arrive.
+    #[test]
+    fn parameters_set_while_the_plugin_is_away_reach_it_on_return() {
+        let rt = PluginRuntime::new(MainThread::new(), false);
+        let mut plugin = away(&rt, Halver::new());
+        let capacity = plugin.pending.capacity();
+        plugin.set_param(3, 0.2);
+        plugin.set_param(4, 0.4);
+        plugin.set_param(3, 0.7);
+        for id in 0..100 {
+            plugin.set_param(id, 0.1); // more than it has room for: dropped, never grown
+        }
+        assert_eq!(plugin.pending.capacity(), capacity, "the list must not reallocate");
+        plugin.set_param(3, 0.7);
+        plugin.set_param(4, 0.4);
+        assert_eq!(rt.main.pump(), 1);
+        assert_eq!(run_block(&mut plugin), 0.5);
+        assert_eq!(plugin.get_param(3), 0.7, "the last value wins");
+        assert_eq!(plugin.get_param(4), 0.4);
+        assert!(plugin.pending.is_empty());
+    }
+
+    /// A second `prepare` (new rate or block size) while the first is still
+    /// pending must not be forgotten: the plugin comes back prepared for it.
+    #[test]
+    fn a_newer_prepare_while_away_is_honoured() {
+        let rt = PluginRuntime::new(MainThread::new(), false);
+        let mut plugin = away(&rt, Halver::new());
+        plugin.prepare(96_000.0, 1024);
+        assert_eq!(rt.main.pump(), 1);
+        // Prepared for 96 kHz and 1024 frames, not the 48 kHz / 256 of the first call.
+        assert_eq!(run_block_at(&mut plugin, 96_000.0, 1024), 0.5);
+
+        // The job may also have finished by the time the new request comes:
+        // the instance is fetched and prepared again.
+        let mut plugin = away(&rt, Halver::new());
+        assert_eq!(rt.main.pump(), 1);
+        plugin.prepare_timeout = Duration::from_secs(10);
+        let control = std::thread::spawn(move || {
+            plugin.prepare(44_100.0, 512);
+            plugin
+        });
+        while rt.main.pump() == 0 && !control.is_finished() {
+            std::thread::yield_now();
+        }
+        let mut plugin = control.join().unwrap();
+        assert_eq!(run_block_at(&mut plugin, 44_100.0, 512), 0.5);
+    }
+
+    /// A wrapper destroyed while its plugin is away releases the instance on
+    /// the main thread, whether the job is still queued or has finished.
+    #[test]
+    fn an_abandoned_plugin_is_released_on_the_main_thread() {
+        let rt = PluginRuntime::new(MainThread::new(), false);
+        let main_id = std::thread::current().id();
+        for job_ran_first in [false, true] {
+            let dropped_on = Arc::new(Mutex::new(None));
+            let plugin = away(&rt, Halver::watched(dropped_on.clone()));
+            if job_ran_first {
+                assert_eq!(rt.main.pump(), 1);
+            }
+            // The engine's graveyard thread drops the wrapper.
+            std::thread::spawn(move || drop(plugin)).join().unwrap();
+            rt.main.pump();
+            assert_eq!(*dropped_on.lock(), Some(main_id), "job_ran_first = {job_ran_first}: released off the main thread");
+        }
     }
 
     #[test]

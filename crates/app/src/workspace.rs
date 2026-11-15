@@ -7,7 +7,7 @@
 //! Frames are requested only while the transport plays, meters fall, or a
 //! drag or animation is in flight; an idle window draws nothing.
 
-use crate::bridge::{AiEvent, AudioAnalysis, Bridges, DrumExtractMode, DrumExtractRequest, JobId, LibraryItem, MidiMode, ModelNotice};
+use crate::bridge::{AiEvent, AudioAnalysis, BpmTrust, Bridges, DrumExtractMode, DrumExtractRequest, JobId, LibraryItem, MidiMode, ModelNotice};
 use crate::icons::Icon;
 use crate::state::*;
 use crate::theme::{self, *};
@@ -40,6 +40,19 @@ pub enum KnobTarget {
     /// the other selected audio clips' with it.
     Transpose { clip: ClipId },
     Detune { clip: ClipId },
+    /// A knob of a rack chain (a pad of a Drum Rack).
+    Chain { rack: DeviceId, index: usize, knob: ChainKnob },
+    /// The volume of one of a Drum Rack's returns.
+    Return { rack: DeviceId, index: usize },
+}
+
+/// Which knob of a rack chain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChainKnob {
+    Volume,
+    Pan,
+    /// The send into return `n`.
+    Send(usize),
 }
 
 /// What a click-to-type value box edits (the device number cells, the tempo box).
@@ -50,6 +63,11 @@ pub enum NumTarget {
     /// An audio clip's transpose (st) and detune (ct), as the knobs edit them.
     Transpose { clip: ClipId },
     Detune { clip: ClipId },
+    /// An audio clip's Seg. BPM (the tempo its sample was recorded at).
+    SegBpm { clip: ClipId },
+    /// A clip's start offset and its length, typed as bars.beats.sixteenths.
+    ClipStart { clip: ClipId },
+    ClipLength { clip: ClipId },
     /// A track's volume in dB (the arrangement header's value box).
     Volume { track: TrackId },
 }
@@ -143,6 +161,13 @@ pub enum Drag {
     Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
     Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
     Audition { track: TrackId, key: Option<u8> },
+    /// A pad of a Drum Rack held down (it sounds until the button is let go).
+    Pad,
+    /// The Sounds panel's edge (its width) and its volume bar.
+    SoundsResize { start_x: f32, start: f32 },
+    SoundsVolume { start_x: f32, start: f32 },
+    /// A handle of a rack panel: a zone, a macro mapping's range.
+    Rack(views::devices::rack_ui::RackDrag),
     Marquee { clip: ClipId, from: Point<Pixels>, to: Point<Pixels>, base: BTreeSet<NoteId> },
     Clip { track: TrackId, placement: PlacementId, start: Tick, grab_tick: Tick, applied: (Tick, TrackId) },
     ClipResize { clip: ClipId, length: Tick, grab_tick: Tick },
@@ -189,6 +214,11 @@ pub enum MenuKind {
     /// Right-click on a device row in the Cmd+K palette (favorite / reassign group).
     PaletteDevice { key: String, name: String, instrument: bool },
     TimeSignature,
+    /// A clip's launch mode and launch quantisation (the Clip View).
+    ClipLaunch(ClipId),
+    ClipQuantize(ClipId),
+    /// Right-click on a Stutter step: copy, paste, clear, fill.
+    StutterStep { device: DeviceId, step: usize },
     /// File: new from a template, open, save.
     File,
 }
@@ -267,6 +297,15 @@ pub struct Workspace {
     pub project_path: Option<std::path::PathBuf>,
     /// Recently opened/saved `.aitrack` project files (most recent first).
     pub recent_projects: Vec<std::path::PathBuf>,
+    /// Periodic copies of the unsaved project (see `autosave.rs`).
+    pub(crate) autosaver: crate::autosave::Autosaver,
+    /// Copies found at start-up, newer than their project: offered on the first frame.
+    pub(crate) recovery: Vec<crate::autosave::Found>,
+    /// Audio files of the project just opened that are not where it says.
+    pub(crate) pending_missing: Vec<aitrack_model::paths::MissingSource>,
+    /// What the engine was last told about each audio track's input and monitor, and where it records.
+    track_io_sent: std::collections::BTreeMap<TrackId, (aitrack_model::InputSource, aitrack_model::Monitor)>,
+    rec_dir: Option<std::path::PathBuf>,
     /// Whether the File → Open Recent cascading submenu is expanded.
     pub file_recent_open: bool,
     /// Hovered group and search box in the Add Device popup menu.
@@ -277,6 +316,7 @@ pub struct Workspace {
     pub bottom_open: bool,
     /// Window height at the last render, for clamping panel resizes.
     pub window_h: f32,
+    pub window_w: f32,
     /// The Cmd+K spotlight palette.
     pub palette: views::palette::PaletteState,
     /// The mixer section between the arrangement and the detail panel.
@@ -294,6 +334,9 @@ pub struct Workspace {
     /// The shortcuts sheet and the Rename field.
     pub ui: crate::commands::EditUi,
     synced_revision: Option<u64>,
+    /// When a drag last went through the engine's fast path: a moment after,
+    /// the engine gets the project itself.
+    fast_at: Option<std::time::Instant>,
     meters_live: bool,
     ai_poll: Option<Task<()>>,
     menu_counter: u64,
@@ -308,6 +351,13 @@ pub struct Workspace {
     pub midi_mode: MidiMode,
     /// Analysis jobs → the audio source they fill in.
     analysis_jobs: std::collections::HashMap<JobId, SourceId>,
+    /// Counts the projects opened in this window: work started for one project
+    /// (a file probe) is dropped if it finishes after another one was opened.
+    pub(crate) project_epoch: u64,
+    /// View state of the rack panels (pads, Map mode, zones…).
+    pub rack_ui: views::devices::rack_ui::RackUi,
+    /// The Sounds panel docked beside the arrangement.
+    pub sounds: views::sounds::Sounds,
     /// Extract-MIDI and stem jobs → where their audio clip sits in the arrangement.
     midi_jobs: std::collections::HashMap<JobId, Option<Tick>>,
     /// Clean drum extraction jobs (from `/drums`) → arrangement placement tick.
@@ -372,7 +422,14 @@ impl Workspace {
         let auto_search = cx.new(|cx| TextInput::new(cx, "Search parameters", Some(Icon::Search)));
         let device_menu_search = cx.new(|cx| TextInput::new(cx, "Search effects & synths…", Some(Icon::Search)));
         let look = views::prefs::Look::load(cx);
+        let sounds = views::sounds::Sounds::new(cx);
         let subs = vec![
+            cx.subscribe(&sounds.query, |this, _, e: &InputEvent, cx| {
+                if let InputEvent::Changed(q) = e {
+                    this.sounds.typed(q.clone());
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&search, |this, _, e: &InputEvent, cx| {
                 let (InputEvent::Changed(q) | InputEvent::Submit(q)) = e;
                 views::palette::set_query(this, q);
@@ -419,12 +476,18 @@ impl Workspace {
             last_frame: Instant::now(),
             project_path: None,
             recent_projects: crate::project_io::load_recent_projects(),
+            autosaver: crate::autosave::Autosaver::new(std::time::Instant::now()),
+            recovery: crate::autosave::find(&crate::autosave::dir()),
+            pending_missing: Vec::new(),
+            track_io_sent: Default::default(),
+            rec_dir: None,
             file_recent_open: false,
             device_menu_hover: None,
             device_menu_search,
             bottom_h: 300.,
             bottom_open: true,
             window_h: 920.,
+            window_w: 1480.,
             palette: Default::default(),
             mixer_open: false,
             mixer_h: 264.,
@@ -437,6 +500,7 @@ impl Workspace {
             toast: None,
             ui: crate::commands::EditUi::new(cx),
             synced_revision: None,
+            fast_at: None,
             meters_live: false,
             ai_poll: None,
             menu_counter: 0,
@@ -449,6 +513,9 @@ impl Workspace {
             export_name,
             midi_mode: MidiMode::default(),
             analysis_jobs: Default::default(),
+            project_epoch: 0,
+            rack_ui: Default::default(),
+            sounds,
             midi_jobs: Default::default(),
             drum_jobs: Default::default(),
             organize: OrganizeUi::default(),
@@ -472,7 +539,7 @@ impl Workspace {
         if let views::ai_panel::state::Backend::Agent(kind) = views::ai_panel::state::Backend::from_pref(&this.look.app.assistant_model) {
             this.b.ai.set_agent(Some(kind));
         }
-        this.apply_dev_view();
+        this.apply_dev_view(cx);
         // `slash` opens the assistant with its action menu showing.
         if std::env::var("AITRACK_DEV_VIEW").is_ok_and(|v| v.split(',').any(|w| w.trim() == "slash")) {
             this.ai_open = true;
@@ -494,7 +561,7 @@ impl Workspace {
         self.s.selected_track.and_then(|t| p.track(t)).and_then(|t| t.devices.iter().find(is_vault).map(|d| d.id)).or_else(|| p.tracks.iter().flat_map(|t| &t.devices).find(is_vault).map(|d| d.id))
     }
 
-    fn apply_dev_view(&mut self) {
+    fn apply_dev_view(&mut self, cx: &mut Context<Self>) {
         let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
         for word in spec.split(',').map(str::trim) {
             match word {
@@ -504,6 +571,7 @@ impl Workspace {
                 "mixer" => self.mixer_open = true,
                 "meters" => self.meters.open = true,
                 "tall" => self.bottom_h = 460.,
+                "taller" => self.bottom_h = 900.,
                 "no-ai" => self.ai_open = false,
                 "ai" => self.ai_open = true,
                 // Open the palette, optionally on a tab: `palette=devices`.
@@ -523,12 +591,108 @@ impl Workspace {
                         views::prefs::PrefsPage::Audio,
                     ))
                 }
+                "prefs=midi" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Midi,
+                    ))
+                }
+                // The Session View.
+                "session" => self.s.view = MainView::Session,
+                // A mixer strip's output / input popover for the selected track (`mixer` first).
+                "route=output" | "route=input" => {
+                    if let Some(t) = self.s.selected_track {
+                        let sel = if word == "route=output" { crate::mixer_routing::Selector::Output } else { crate::mixer_routing::Selector::Input };
+                        crate::mixer_routing::open(t, sel, gpui::point(gpui::px(420.), gpui::px(330.)));
+                    }
+                }
                 "prefs=performance" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Performance,
                     ))
                 }
                 "play" => self.b.engine.play(),
+                // The Content Hub open on its Plugins tab (`hubplugins`), with a mix of states to look at (`hubplugins=demo`).
+                "hubplugins" | "hubplugins=demo" | "hubplugins=confirm" => {
+                    self.modal = Some(views::prefs::Modal::ContentHub);
+                    let u = views::plugins::ui(cx);
+                    u.tab = views::plugins::Tab::Plugins;
+                    u.demo = word != "hubplugins";
+                    if word.ends_with("confirm") {
+                        views::plugins::open_confirm(cx, "tdr-nova");
+                    }
+                }
+                // The Sounds panel open and fitting the song (`sounds`), a first result picked and played (`soundsplay`).
+                "sounds" | "soundsplay" => {
+                    self.sounds.prefs.open = true;
+                    self.sounds.prefs.fit = true;
+                    self.sounds.filters.fit = true;
+                    if word == "soundsplay" {
+                        self.sounds.play_first_pending = true;
+                    }
+                    // Seeded now, so a window that is not repainting still shows the results.
+                    views::sounds::tick(self, cx);
+                }
+                // The selected track's devices into one rack, with a second chain (`rackgroup`).
+                "rackgroup" => {
+                    let ids: Vec<DeviceId> = self.s.selected_track.and_then(|t| self.s.project.track(t)).map(|t| t.devices.iter().map(|d| d.id).collect()).unwrap_or_default();
+                    self.s.ed.devices = ids;
+                    if let Some(rack) = self.s.group_devices() {
+                        let n = self.s.rack_of(rack).map_or(0, |r| r.chains.len());
+                        self.s.edit("chain", vec![Command::AddChain { rack, index: n, chain: Box::new(Chain::new("Layer 2", Color::palette(7))) }]);
+                        self.s.seal();
+                    }
+                }
+                // The first rack of the selected track: Map mode on (`rackmap`), the
+                // zones panel open (`rackzones`), 16 macros (`racksixteen`), the
+                // first chain's first device mapped to macro 1 over 20–80 % (`rackmapped`).
+                "rackmap" | "rackzones" | "racksixteen" | "rackmapped" | "rackreturns" | "rackreturn" | "rackmacros" | "rackselector" => {
+                    let rack = self.s.selected_track.and_then(|t| self.s.project.track(t)).and_then(|t| t.devices.iter().find(|d| matches!(d.kind, DeviceKind::Rack(_))).map(|d| d.id));
+                    if let Some(rack) = rack {
+                        match word {
+                            "rackmap" => self.rack_ui.map = Some((rack, 0)),
+                            "rackzones" => {
+                                self.rack_ui.zones.insert(rack);
+                            }
+                            "racksixteen" => {
+                                self.rack_ui.sixteen.insert(rack);
+                            }
+                            "rackreturns" => {
+                                self.s.add_return(rack);
+                                self.s.add_return(rack);
+                            }
+                            // Return A picked, with an EQ and a reverb in it.
+                            "rackreturn" => {
+                                self.s.add_return(rack);
+                                self.s.add_return(rack);
+                                if let Some(track) = self.s.project.device_track(rack) {
+                                    let into = Some(aitrack_model::racks::Container::Return { rack, index: 0 });
+                                    self.s.add_stock_device_in(track, into, "fx.eq", "EQ");
+                                    self.s.add_stock_device_in(track, into, "fx.reverb", "Reverb");
+                                }
+                                self.rack_ui.ret_sel.insert(rack, 0);
+                            }
+                            "rackmacros" => {
+                                self.fx.macros.insert(rack);
+                            }
+                            // The zones panel on the Chain tab, selector at 40.
+                            "rackselector" => {
+                                self.rack_ui.zones.insert(rack);
+                                self.rack_ui.zone_tab.insert(rack, views::devices::rack_ui::ZoneTab::Chain);
+                                self.s.set_rack_selector(rack, 40);
+                                self.s.seal();
+                            }
+                            _ => {
+                                let device = self.s.rack_of(rack).and_then(|r| r.chains.first()?.devices.first().map(|d| d.id));
+                                if let Some(device) = device
+                                    && self.s.map_macro_param(rack, 0, device, 0, 0.5).is_some()
+                                {
+                                    self.s.set_mapping_range(rack, 0, 0, 0.2, 0.8);
+                                    self.s.seal();
+                                }
+                            }
+                        }
+                    }
+                }
                 // Select bars 3..5 of the first automation lane shown, with the marker there.
                 "autorange" => {
                     let lane = self.s.project.tracks.iter().find(|t| self.s.automation_shown.contains(&t.id)).and_then(|t| Some((t.id, t.automation.first()?.target)));
@@ -675,6 +839,13 @@ impl Workspace {
                     }
                 }
                 "autoarm" => self.s.automation_arm = true,
+                // The Launch / Quantize dropdowns of the selected clip.
+                "menu=launch" | "menu=quantize" => {
+                    if let Some(c) = self.s.selected_clip {
+                        let kind = if word == "menu=launch" { MenuKind::ClipLaunch(c) } else { MenuKind::ClipQuantize(c) };
+                        self.menu = Some(Menu { kind, at: gpui::point(gpui::px(90.), gpui::px(560.)), opened: 0 });
+                    }
+                }
                 "menu=track" => {
                     if let Some(t) = self.s.selected_track {
                         self.menu = Some(Menu {
@@ -726,6 +897,17 @@ impl Workspace {
                         commit_curve(self, id, 0, LfoCurve::pluck(), false);
                         // Osc A on a multi-frame factory table, osc B on another.
                         knob::set_plain(self, "dev", id, &[(p::osc(0, p::WAVE), 2.), (p::osc(0, p::POS), 35.), (p::osc(1, p::WAVE), 4.), (p::osc(1, p::POS), 60.)]);
+                    }
+                }
+                // `set=3:2.5` sets parameter 3 of the selected track's last device (plain value).
+                _ if word.starts_with("set=") => {
+                    let spec = &word["set=".len()..];
+                    let device = self.s.selected_track.and_then(|t| self.s.project.track(t)).and_then(|t| t.devices.last()).map(|d| d.id);
+                    if let (Some(device), Some((id, v))) = (device, spec.split_once(':'))
+                        && let (Ok(id), Ok(v)) = (id.parse::<u32>(), v.parse::<f32>())
+                        && let Some(info) = self.fx.param_info(self.b.plugins.as_ref(), &self.s.project, device, id)
+                    {
+                        views::device_ui::set_now(self, device, id, info.to_normalized(v));
                     }
                 }
                 // Open the selected track's last stock device in its window.
@@ -824,15 +1006,41 @@ impl Workspace {
     // ── Engine sync & frames ──
 
     fn sync_engine(&mut self) {
-        let rev = self.s.revision();
-        if self.synced_revision != Some(rev) {
-            self.b.engine.update_project(&self.s.project);
-            self.synced_revision = Some(rev);
+        // Each audio track's input and monitor mode, where the project changed them.
+        self.s.sync_track_io(&mut self.track_io_sent, &mut *self.b.engine);
+        match self.s.sync_engine(&mut *self.b.engine, &mut self.synced_revision) {
+            crate::state::Synced::Fast => self.fast_at = Some(std::time::Instant::now()),
+            crate::state::Synced::Full => self.fast_at = None,
+            crate::state::Synced::Nothing => {}
         }
     }
 
     /// Timer tick: plugin main-thread work, scan progress, engine messages.
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
+        self.autosave_tick();
+        // A take being played, or one that just ended: clips from the notes.
+        let rec = self.s.poll_recording(&mut *self.b.engine);
+        let clips = rec.committed + rec.audio_clips;
+        if clips > 0 {
+            self.toast(if clips == 1 { "Recorded a clip".to_owned() } else { format!("Recorded {clips} clips") }, cx);
+        }
+        for e in &rec.errors {
+            self.toast(e.clone(), cx);
+        }
+        // Where audio takes are written follows the project's file.
+        let dir = crate::state::recordings_dir(self.project_path.as_deref());
+        if self.rec_dir.as_ref() != Some(&dir) {
+            let _ = std::fs::create_dir_all(&dir);
+            self.b.engine.set_recording_dir(&dir);
+            self.rec_dir = Some(dir);
+        }
+        if rec.changed {
+            cx.notify();
+        }
+        if self.fast_at.is_some_and(|t| t.elapsed() > Duration::from_millis(250)) {
+            self.fast_at = None;
+            self.s.settle_engine(&mut *self.b.engine);
+        }
         self.audition.retry(|t, k, v| self.b.engine.audition_note(t, k, v));
         let mut changed = self.b.engine.idle();
         // Knobs turned in a plugin's own window become undoable SetParam edits.
@@ -845,7 +1053,16 @@ impl Workspace {
         self.usage.tick(self.look.app.low_power);
         changed |= (self.usage.cpu - cpu).abs() >= 0.005 || self.usage.memory.abs_diff(mem) >= 4 * 1024 * 1024;
         changed |= self.b.plugins.poll();
-        changed |= self.b.library.poll();
+        let lib_changed = self.b.library.poll();
+        changed |= lib_changed;
+        if lib_changed {
+            self.sounds.dirty = true;
+        }
+        // Plugins the Plugins tab just installed: the scan skips what it already knows, so only they are read.
+        if !self.b.plugins.scan_status().running && !self.b.library.take_installed_plugins().is_empty() {
+            self.b.plugins.rescan();
+        }
+        changed |= views::sounds::tick(self, cx);
         changed |= self.waves.poll();
         changed |= views::palette::poll(self, cx);
         if let Some(r) = self.b.library.organize_result() {
@@ -901,6 +1118,8 @@ impl Workspace {
             self.menu = None;
         } else {
             if matches!(kind, MenuKind::AddDevice(_)) {
+                // Opened any other way than a rack's "+ Device": the track's chain.
+                self.rack_ui.add_into = None;
                 self.device_menu_search.update(cx, |i, cx| i.set_text("", cx));
             }
             self.menu_counter += 1;
@@ -938,7 +1157,7 @@ impl Workspace {
             KnobTarget::Send { track, index } => {
                 self.open_param_menu(track, AutomationTarget::Send { index: index as u16 }, at, cx);
             }
-            KnobTarget::Transpose { .. } | KnobTarget::Detune { .. } => {}
+            KnobTarget::Transpose { .. } | KnobTarget::Detune { .. } | KnobTarget::Chain { .. } | KnobTarget::Return { .. } => {}
         }
     }
 
@@ -979,7 +1198,11 @@ impl Workspace {
     /// Space. How it, Shift+Space and clicks in the lanes and the ruler
     /// work together (Live's insert marker) is set out at the top of
     /// `editing::gestures`.
-    pub fn play_stop(&mut self, _: &PlayStop, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn play_stop(&mut self, _: &PlayStop, window: &mut Window, cx: &mut Context<Self>) {
+        // Space belongs to the Sounds panel while a preview plays or its list has the keys.
+        if views::sounds::space(self, window, cx) {
+            return;
+        }
         crate::editing::gestures::play_stop(&self.s, self.b.engine.as_mut());
         cx.notify();
     }
@@ -1021,9 +1244,26 @@ impl Workspace {
         self.toggle_arm(cx);
     }
 
+    /// Delete the selected tracks (the Main track stays); undo brings them back.
+    pub fn delete_selected_tracks(&mut self, cx: &mut Context<Self>) {
+        let ids = self.s.selected_tracks();
+        let n = ids.iter().filter(|t| self.s.project.track(**t).is_some_and(|t| t.kind != TrackKind::Main)).count();
+        if self.s.delete_tracks(&ids) {
+            self.toast(if n == 1 { "Track deleted".to_owned() } else { format!("{n} tracks deleted") }, cx);
+        } else {
+            self.toast("The Main track can't be deleted", cx);
+        }
+        cx.notify();
+    }
+
     /// Automation Arm on or off (the arrangement toolbar's button).
     pub fn toggle_arm(&mut self, cx: &mut Context<Self>) {
         self.s.automation_arm = !self.s.automation_arm;
+        // Recording only exists to write automation: without the arm, the
+        // lit Record button would record nothing.
+        if recording_needs_stop(self.b.engine.transport().recording, self.s.automation_arm) {
+            self.b.engine.toggle_record();
+        }
         self.toast(if self.s.automation_arm { "Automation Arm on: moving a plugin control while recording writes its automation" } else { "Automation Arm off" }, cx);
         cx.notify();
     }
@@ -1079,6 +1319,15 @@ impl Workspace {
             }
             return;
         }
+        // In the Session View, Delete empties the slot under the cursor.
+        if self.s.view == MainView::Session {
+            if let (Some(track), Some(scene)) = (self.s.selected_track, self.s.session_scene())
+                && self.s.clear_slot(track, scene)
+            {
+                cx.notify();
+            }
+            return;
+        }
         if self.s.delete_selection() {
             cx.notify();
         }
@@ -1096,6 +1345,10 @@ impl Workspace {
         let on = moved || !self.b.engine.transport().looping;
         self.b.engine.set_looping(on);
         cx.notify();
+    }
+
+    fn toggle_sounds(&mut self, _: &ToggleSounds, _: &mut Window, cx: &mut Context<Self>) {
+        views::sounds::toggle(self, cx);
     }
 
     fn toggle_ai(&mut self, _: &ToggleAssistant, _: &mut Window, cx: &mut Context<Self>) {
@@ -1293,6 +1546,12 @@ impl Workspace {
     }
 
     pub fn begin_drag(&mut self, drag: Drag, cx: &mut Context<Self>) {
+        // Map mode: a press on a knob maps it (or picks a macro) instead of dragging.
+        if let Drag::Knob { target, .. } = &drag
+            && views::devices::rack_ui::map_pick(self, *target, cx)
+        {
+            return;
+        }
         self.s.seal();
         self.drag = Some(drag);
         cx.notify();
@@ -1370,6 +1629,7 @@ impl Workspace {
                     self.fx
                         .param_info(self.b.plugins.as_ref(), &self.s.project, device, param);
                 if let (Some(info), Some(v)) = (info, parse_plain(&edit.text)) {
+                    let v = views::device_ui::typed_to_plain(self, device, param, v);
                     views::device_ui::set_now(self, device, param, info.to_normalized(v));
                 }
             }
@@ -1386,6 +1646,18 @@ impl Workspace {
                     self.s.set_clip_warp("detune-typed", clip, |w| w.detune = v);
                     self.s.seal();
                 }
+            }
+            NumTarget::SegBpm { clip } => {
+                // Parsed as f64: a typed 123.45 must not become 123.4499969….
+                if let Ok(v) = edit.text.trim().replace(',', ".").parse::<f64>() {
+                    crate::views::bottom::edit_seg_bpm(&mut self.s, clip, crate::views::bottom::SegBpm::Set(v));
+                }
+            }
+            NumTarget::ClipStart { clip } => {
+                crate::views::bottom::commit_clip_field(&mut self.s, clip, crate::views::bottom::ClipField::Start, &edit.text);
+            }
+            NumTarget::ClipLength { clip } => {
+                crate::views::bottom::commit_clip_field(&mut self.s, clip, crate::views::bottom::ClipField::Length, &edit.text);
             }
             NumTarget::Volume { track } => {
                 let text = edit.text.trim().to_lowercase();
@@ -1469,8 +1741,21 @@ impl Workspace {
                     KnobTarget::Detune { clip } => {
                         self.s.set_clip_warp(&format!("detune-{}", clip.0), clip, |w| w.detune = v * 100. - 50.);
                     }
+                    KnobTarget::Chain { .. } | KnobTarget::Return { .. } => {
+                        views::devices::rack_ui::knob_drag(self, *target, v);
+                    }
                 }
             }
+            Drag::Pad => {}
+            Drag::SoundsResize { start_x, start } => {
+                self.sounds.prefs.width = views::sounds::width_after_drag(*start, f32::from(e.position.x) - *start_x, self.sounds.prefs.side);
+            }
+            Drag::SoundsVolume { start_x, start } => {
+                let v = views::sounds::volume_after_drag(*start, f32::from(e.position.x) - *start_x);
+                self.sounds.prefs.volume = v;
+                self.b.engine.set_preview_volume(v);
+            }
+            Drag::Rack(d) => views::devices::rack_ui::drag_move(self, d, f32::from(e.position.x), fine),
             Drag::Fader { track, last_y, pos, travel } => {
                 let dy = *last_y - y;
                 *last_y = y;
@@ -1635,9 +1920,10 @@ impl Workspace {
     fn drag_end(&mut self, cx: &mut Context<Self>) {
         if let Some(drag) = self.drag.take() {
             match drag {
-                Drag::Audition { .. } => {
+                Drag::Audition { .. } | Drag::Pad => {
                     self.audition.release(crate::audition::MOUSE, |t, k, v| self.b.engine.audition_note(t, k, v));
                 }
+                Drag::SoundsResize { .. } | Drag::SoundsVolume { .. } => self.sounds.prefs.save(),
                 Drag::Notes { .. } => {
                     self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
                 }
@@ -1685,6 +1971,14 @@ impl Workspace {
         let tick = (x / self.s.arrange.px_per_beat * PPQ as f32) as Tick;
         let row = views::arrangement::rows(&self.s).into_iter().find(|r| y >= r.top && y < r.top + r.total()).map(|r| r.track);
         (tick, row)
+    }
+
+    /// The track under `pos` (a window position over the headers or the lanes)
+    /// and whether the drop is on its lower half: where a dragged header goes.
+    pub fn track_drop_target(&self, pos: Point<Pixels>) -> Option<(TrackId, bool)> {
+        let b = self.regions.arrange.get();
+        let y = f32::from(pos.y - b.origin.y) + self.s.arrange.scroll_y;
+        views::arrangement::rows(&self.s).into_iter().find(|r| y >= r.top && y < r.top + r.total()).map(|r| (r.track, y > r.top + r.h / 2.))
     }
 
     // ── AI ──
@@ -1838,18 +2132,36 @@ impl Workspace {
     }
 
     /// Import an audio file as a new audio track, then analyse it (key/BPM).
+    /// A WAV header gives the real length at once; any other format is probed
+    /// (decoded) on a worker thread first, so a long FLAC does not stall the UI.
     pub fn import_audio(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
-        // A WAV header gives the real length right away; other formats get it from the analysis.
-        let (sample_rate, channels, frames) = hound::WavReader::open(&path)
-            .map(|r| {
-                let s = r.spec();
-                (s.sample_rate, s.channels, r.duration() as u64)
-            })
-            .unwrap_or((48_000, 2, 0));
         let start = Snap::Bar.floor(self.b.engine.transport().position.max(0));
+        if let Some(facts) = wav_header(&path) {
+            self.import_audio_probed(path, Some(facts), start, cx);
+            return;
+        }
+        let probe = path.clone();
+        let epoch = self.project_epoch;
+        let task = cx.background_executor().spawn(async move { probe_audio(&probe) });
+        cx.spawn(async move |this, cx| {
+            let facts = task.await;
+            let _ = this.update(cx, |ws, cx| {
+                // Another project was opened meanwhile: the import is not for it.
+                if probe_is_current(epoch, ws.project_epoch) {
+                    ws.import_audio_probed(path, facts, start, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The second half of [`import_audio`](Self::import_audio), with what the
+    /// file is (`None` when it could not be read: the analysis tries again and
+    /// fixes the clip's provisional length).
+    fn import_audio_probed(&mut self, path: std::path::PathBuf, facts: Option<AudioFacts>, start: Tick, cx: &mut Context<Self>) {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
         let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
-        let cmds = audio_track_commands(&mut self.s, &name, Color::palette(4), &path, (sample_rate, channels, frames), start, index);
+        let cmds = audio_track_commands(&mut self.s, &name, Color::palette(4), &path, facts.unwrap_or((48_000, 2, 0)), start, index);
         let source = cmds.iter().find_map(|c| match c {
             Command::AddSource { id, .. } => Some(*id),
             _ => None,
@@ -1860,6 +2172,65 @@ impl Workspace {
         self.chat_log.push(ChatEntry::Job { id, label: format!("Analysing {name} (key, BPM)"), fraction: 0., done: false });
         self.ensure_ai_poll(cx);
         self.toast(format!("Imported {name}"), cx);
+        cx.notify();
+    }
+
+    /// Audio files dropped from Finder or Explorer onto the arrangement: one
+    /// clip per file on `track` (an audio track; otherwise one new track holds
+    /// them), one after another from `start`, as one undo step.
+    pub fn drop_audio_files(&mut self, paths: Vec<std::path::PathBuf>, track: Option<TrackId>, start: Tick, cx: &mut Context<Self>) {
+        let files: Vec<std::path::PathBuf> = paths.into_iter().filter(|p| is_audio_file(p)).collect();
+        if files.is_empty() {
+            self.toast("Drop audio files: WAV, AIFF, FLAC, MP3 or OGG", cx);
+            return;
+        }
+        let target = track.filter(|t| self.s.project.track(*t).is_some_and(|t| t.kind == TrackKind::Audio));
+        // A WAV header gives its length at once; any other format is decoded to
+        // count its frames, on a worker thread.
+        if files.iter().all(|f| wav_header(f).is_some()) {
+            let facts = files.into_iter().map(|f| (wav_header(&f), f)).collect();
+            self.drop_audio_probed(facts, target, start, cx);
+            return;
+        }
+        let epoch = self.project_epoch;
+        let task = cx.background_executor().spawn(async move { files.into_iter().map(|f| (probe_audio(&f), f)).collect::<Vec<_>>() });
+        cx.spawn(async move |this, cx| {
+            let facts = task.await;
+            let _ = this.update(cx, |ws, cx| {
+                if probe_is_current(epoch, ws.project_epoch) {
+                    ws.drop_audio_probed(facts, target, start, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn drop_audio_probed(&mut self, files: Vec<(Option<AudioFacts>, std::path::PathBuf)>, target: Option<TrackId>, start: Tick, cx: &mut Context<Self>) {
+        // A track that was deleted while the files were read is a new track after all.
+        let target = target.filter(|t| self.s.project.track(*t).is_some());
+        let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
+        let cmds = drop_audio_commands(&mut self.s, &files, target, start, index);
+        let sources: Vec<(SourceId, std::path::PathBuf)> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::AddSource { id, source } => match source.as_ref() {
+                    Source::Audio(a) => Some((*id, a.path.clone())),
+                    Source::Notes(_) => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let n = sources.len();
+        if !self.s.edit("Drop audio", cmds) {
+            return;
+        }
+        for (source, path) in sources {
+            let id = self.b.ai.analyze(&path);
+            self.analysis_jobs.insert(id, source);
+        }
+        self.ensure_ai_poll(cx);
+        self.toast(if n == 1 { "Added 1 audio file".to_owned() } else { format!("Added {n} audio files") }, cx);
+        cx.notify();
     }
 
     pub fn pick_audio_file(&mut self, cx: &mut Context<Self>) {
@@ -1880,49 +2251,23 @@ impl Workspace {
         let target = track
             .or(self.s.selected_track)
             .filter(|t| self.s.project.track(*t).is_some_and(|t| t.kind == TrackKind::Audio));
-        let (sample_rate, channels, frames) = hound::WavReader::open(&item.path)
-            .map(|r| (r.spec().sample_rate, r.spec().channels, r.duration() as u64))
-            .unwrap_or((48_000, 2, (item.duration.max(0.) as f64 * 48_000.) as u64));
+        let trust = if item.is_loop && item.bpm.is_some() { self.b.library.bpm_trust(item.id) } else { BpmTrust::Reliable };
+        let fit = self.drop_fit(item, trust);
+        let cmds = sample_clip_commands(&mut self.s, item, target, start, trust, fit.as_ref());
         let name = item.name.clone();
-        let mut cmds = match target {
-            Some(_) => Vec::new(),
-            None => {
-                let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
-                audio_track_commands(&mut self.s, &name, Color::palette(4), &item.path, (sample_rate, channels, frames), start, index)
-            }
-        };
-        if let Some(track) = target {
-            let mut one = audio_track_commands(&mut self.s, &name, Color::palette(4), &item.path, (sample_rate, channels, frames), start, 0);
-            // Keep the source, clip and placement; place on the existing track.
-            one.retain(|c| !matches!(c, Command::AddTrack { .. }));
-            for c in &mut one {
-                if let Command::PlaceClip { track: t, .. } = c {
-                    *t = track;
-                }
-            }
-            cmds = one;
-        }
-        // The library's key and tempo travel with the clip.
-        for c in &mut cmds {
-            if let Command::AddSource { source, .. } = c
-                && let Source::Audio(a) = source.as_mut()
-            {
-                a.key = item.key;
-                if item.is_loop {
-                    a.warp.original_bpm = item.bpm.map(f64::from);
-                    a.warp.enabled = item.bpm.is_some();
-                }
-            }
-            if let Command::AddClip { clip, .. } = c
-                && let Some(color) = target.and_then(|t| self.s.project.track(t)).map(|t| t.color)
-            {
-                clip.color = color;
-            }
-        }
         if self.s.edit("Add sample", cmds) {
             self.b.library.mark_used(item.id);
-            self.toast(format!("Added {name}"), cx);
+            let note = if trust.allows_auto_warp() { "" } else { " · tempo only guessed from its length, warp off" };
+            self.toast(format!("Added {name}{note}"), cx);
         }
+    }
+
+    /// How `item` is fitted to the song when it lands: only a sound that comes
+    /// out of the Sounds panel with "Fit to song" on, once. The Session slots
+    /// ask the same way before they build their sample.
+    pub fn drop_fit(&mut self, item: &LibraryItem, trust: BpmTrust) -> Option<views::sounds::logic::DropFit> {
+        let carried = self.sounds.carrying.take() == Some(item.id);
+        (carried && self.sounds.fits_song()).then(|| views::sounds::logic::drop_fit(item, trust, self.s.project.scale, self.s.project.tempo.initial_bpm()))
     }
 
     pub fn pick_library_folder(&mut self, cx: &mut Context<Self>) {
@@ -1949,24 +2294,9 @@ impl Workspace {
     }
 
     fn apply_analysis(&mut self, source: SourceId, a: &AudioAnalysis) {
-        let Some(Source::Audio(old)) = self.s.project.sources.get(&source).cloned() else { return };
-        let mut new = old.clone();
-        if a.key.is_some() {
-            new.key = a.key;
-        }
-        if let Some(bpm) = a.bpm {
-            new.warp.original_bpm = Some(bpm);
-        }
-        if a.frames > 0 {
-            new.sample_rate = a.sample_rate;
-            new.channels = a.channels;
-            new.frames = a.frames;
-        }
-        if new != old {
-            self.s.edit_as("Analyse audio", Origin::Feature("analysis".into()), vec![
-                Command::RemoveSource { id: source },
-                Command::AddSource { id: source, source: Box::new(Source::Audio(new)) },
-            ]);
+        let cmds = analysis_commands(&self.s.project, source, a);
+        if !cmds.is_empty() {
+            self.s.edit_as("Analyse audio", Origin::Feature("analysis".into()), cmds);
         }
     }
 
@@ -2178,6 +2508,7 @@ impl Workspace {
         let tempo = self.s.project.tempo.initial_bpm();
         let scale = self.s.project.scale.map_or("No key".into(), |s| s.display());
         let pending = self.s.history.proposals().len();
+        let health = self.render_engine_health();
         div()
             .h(px(STATUS_BAR_H))
             .flex_none()
@@ -2190,6 +2521,11 @@ impl Workspace {
             .border_color(border())
             .text_size(px(fs(TEXT_SM)))
             .text_color(pal.muted)
+            .child(
+                crate::widgets::icon_chip("sounds-toggle", Icon::Waveform, self.sounds.prefs.open, pal.accent)
+                    .tooltip(crate::widgets::tip("Sounds panel: search, hear sounds fitted to the song, drag them in", Some("Ctrl+Shift+K")))
+                    .on_click(cx.listener(|this, _, _, cx| views::sounds::toggle(this, cx))),
+            )
             .child(crate::icons::icon(Icon::Undo, 12., pal.faint))
             .child(crate::widgets::label(undo, TEXT_SM, pal.muted))
             .when_some(err, |d, e| {
@@ -2207,6 +2543,7 @@ impl Workspace {
                         })),
                 )
             })
+            .when_some(health, |d, h| d.child(h))
             .child(div().flex_1())
             .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
             .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))
@@ -2214,6 +2551,38 @@ impl Workspace {
             .child(self.render_usage())
             .child(self.render_zoom(cx))
             .into_any_element()
+    }
+
+    /// The engine's report in the status bar, only when something is off: red
+    /// for a fault (a crash, a silenced device, a failed compile), amber for
+    /// warnings about the project and repaired samples. The tooltip lists every problem.
+    fn render_engine_health(&self) -> Option<AnyElement> {
+        let h = self.b.engine.health();
+        if h.is_clean() {
+            return None;
+        }
+        let pal = p();
+        let color = if h.is_fault() { pal.record } else { pal.meter_mid };
+        let lines = h.lines(|d| self.s.project.device(d).map(|d| d.name.clone()));
+        let label = if h.is_fault() {
+            "Audio fault".to_owned()
+        } else if h.warning_count() == 0 {
+            "Audio repaired".to_owned()
+        } else {
+            format!("{} engine warning{}", h.warning_count(), if h.warning_count() == 1 { "" } else { "s" })
+        };
+        Some(
+            div()
+                .id("engine-health")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .child(crate::icons::icon(Icon::Gauge, 12., color))
+                .child(crate::widgets::label(label, TEXT_SM, color))
+                .tooltip(crate::widgets::tip_owned(lines.join("\n")))
+                .into_any_element(),
+        )
     }
 
     /// What AI-Track is using: audio engine load, process CPU and memory.
@@ -2279,7 +2648,14 @@ impl Workspace {
     pub fn replace_project(&mut self, project: Project, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
         self.b.engine.stop();
         self.b.engine.locate(0);
+        // The autosaved copy of the project being left stays: it goes when that
+        // project is saved or the user gives it up ("Don't save", Discard).
         self.s = AppState::new(project);
+        self.autosaver.reset(std::time::Instant::now());
+        self.track_io_sent.clear();
+        self.project_epoch += 1;
+        // An analysis of the old project's audio has nothing to apply to now.
+        self.analysis_jobs.clear();
         self.project_path = path;
         self.drag = None;
         self.menu = None;
@@ -2501,6 +2877,211 @@ fn stem_commands(s: &mut AppState, stems: &[(String, std::path::PathBuf)], start
     cmds
 }
 
+/// Recording is on while Automation Arm goes off: it must stop with it.
+fn recording_needs_stop(recording: bool, automation_arm: bool) -> bool {
+    recording && !automation_arm
+}
+
+/// Whether a probe started at project `started` still belongs to the open project.
+fn probe_is_current(started: u64, now: u64) -> bool {
+    started == now
+}
+
+/// Whether a dropped file looks like audio the engine can play.
+fn is_audio_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["wav", "wave", "aif", "aiff", "flac", "mp3", "ogg", "oga"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// The commands that put dropped `files` one after another from `start`: on
+/// `target` when it is an audio track, else on one new audio track at `index`.
+/// Each clip starts where the one before it ends.
+fn drop_audio_commands(s: &mut AppState, files: &[(Option<AudioFacts>, std::path::PathBuf)], target: Option<TrackId>, start: Tick, index: usize) -> Vec<Command> {
+    let color = target.and_then(|t| s.project.track(t)).map(|t| t.color);
+    let mut out = Vec::new();
+    let mut track = target;
+    let mut at = start;
+    for (facts, path) in files {
+        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
+        let mut one = audio_track_commands(s, &name, color.unwrap_or(Color::palette(4)), path, facts.unwrap_or((48_000, 2, 0)), at, index);
+        // The first file of a drop on empty space makes the track; the rest join it.
+        let made = one.iter().find_map(|c| if let Command::AddTrack { track, .. } = c { Some(track.id) } else { None });
+        if track.is_some() || out.iter().any(|c| matches!(c, Command::AddTrack { .. })) {
+            one.retain(|c| !matches!(c, Command::AddTrack { .. }));
+        } else {
+            track = made;
+        }
+        let mut length = PROVISIONAL_LENGTH;
+        for c in &mut one {
+            match c {
+                Command::PlaceClip { track: t, .. } => {
+                    if let Some(track) = track {
+                        *t = track;
+                    }
+                }
+                Command::AddClip { clip, .. } => length = clip.length,
+                _ => {}
+            }
+        }
+        at += length;
+        out.extend(one);
+    }
+    out
+}
+
+/// A file's `(sample rate, channels, frames)`.
+pub type AudioFacts = (u32, u16, u64);
+
+/// What a clip is given as its length until the file's real length is known.
+const PROVISIONAL_LENGTH: Tick = 4 * BAR;
+
+/// A clip's length for a file of `frames` at the project tempo (at least a
+/// quarter note); [`PROVISIONAL_LENGTH`] when the length is unknown.
+fn clip_length(bpm: f64, sample_rate: u32, frames: u64) -> Tick {
+    if frames > 0 && sample_rate > 0 {
+        let secs = frames as f64 / sample_rate as f64;
+        ((secs * bpm / 60. * PPQ as f64).round() as Tick).max(PPQ)
+    } else {
+        PROVISIONAL_LENGTH
+    }
+}
+
+/// Rate, channels and length from a WAV header (no decoding).
+fn wav_header(path: &std::path::Path) -> Option<AudioFacts> {
+    let r = hound::WavReader::open(path).ok()?;
+    Some((r.spec().sample_rate, r.spec().channels, r.duration() as u64))
+}
+
+/// The same for any format the engine plays: a WAV header, else a decode
+/// pass (symphonia) that counts the frames. Slow for long files: not for the UI thread.
+fn probe_audio(path: &std::path::Path) -> Option<AudioFacts> {
+    if let Some(facts) = wav_header(path) {
+        return Some(facts);
+    }
+    let info = aitrack_library::analyze::read_audio_info(path).ok()?;
+    (info.frames > 0 && info.sample_rate > 0).then_some((info.sample_rate, info.channels.max(1), info.frames))
+}
+
+/// How far clip `id` can run from each place it is on before the next clip of
+/// that track and lane starts (the least over its placements). `unbounded`
+/// when nothing follows it, `fallback` when a clip already starts at or under it.
+fn room_after(project: &Project, id: ClipId, fallback: Tick) -> Tick {
+    let mut room = Tick::MAX;
+    for t in &project.tracks {
+        for p in t.arrangement.iter().filter(|p| p.clip == id) {
+            let next = t.arrangement.iter().filter(|q| q.lane == p.lane && q.id != p.id && q.start > p.start).map(|q| q.start).min();
+            if let Some(next) = next {
+                room = room.min(next - p.start);
+            }
+        }
+    }
+    if room <= 0 { fallback } else { room }
+}
+
+/// The commands that fold an analysis into the project. A clip that was given
+/// the provisional length (the file's length was unknown at import) gets its real one.
+fn analysis_commands(project: &Project, source: SourceId, a: &AudioAnalysis) -> Vec<Command> {
+    let Some(Source::Audio(old)) = project.sources.get(&source) else { return Vec::new() };
+    let mut new = old.clone();
+    if a.key.is_some() {
+        new.key = a.key;
+    }
+    if let Some(bpm) = a.bpm {
+        new.warp.original_bpm = Some(bpm);
+    }
+    if a.frames > 0 {
+        new.sample_rate = a.sample_rate;
+        new.channels = a.channels;
+        new.frames = a.frames;
+    }
+    if new == *old {
+        return Vec::new();
+    }
+    let learned_length = old.frames == 0 && new.frames > 0;
+    let real = clip_length(project.tempo.initial_bpm(), new.sample_rate, new.frames);
+    let mut cmds = vec![Command::RemoveSource { id: source }, Command::AddSource { id: source, source: Box::new(Source::Audio(new)) }];
+    if learned_length {
+        for (&id, clip) in &project.clips {
+            if clip.source == source && clip.offset == 0 && clip.looping.is_none() && clip.length == PROVISIONAL_LENGTH {
+                // Never longer than the room it has: the clips the user placed
+                // after it on the same track and lane stay untouched.
+                let length = real.min(room_after(project, id, clip.length));
+                if length != clip.length {
+                    cmds.push(Command::UpdateClip { id, clip: Box::new(Clip { length, ..clip.clone() }) });
+                }
+            }
+        }
+    }
+    cmds
+}
+
+/// The commands that put a library sample on `target` (or on a new audio
+/// track) at `start`. The library's key travels with the clip. A loop with a
+/// BPM gets it as `original_bpm`, and warp turns on only when that BPM is
+/// [`BpmTrust::Reliable`]: a tempo guessed from the file's length would stretch
+/// the loop to the wrong grid, so there the user switches warp on by choice.
+fn sample_clip_commands(s: &mut AppState, item: &LibraryItem, target: Option<TrackId>, start: Tick, trust: BpmTrust, fit: Option<&views::sounds::logic::DropFit>) -> Vec<Command> {
+    let facts = wav_header(&item.path).unwrap_or((48_000, 2, (item.duration.max(0.) as f64 * 48_000.) as u64));
+    let name = item.name.clone();
+    let mut cmds = match target {
+        Some(_) => Vec::new(),
+        None => {
+            let index = s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(0);
+            audio_track_commands(s, &name, Color::palette(4), &item.path, facts, start, index)
+        }
+    };
+    if let Some(track) = target {
+        let mut one = audio_track_commands(s, &name, Color::palette(4), &item.path, facts, start, 0);
+        // Keep the source, clip and placement; place on the existing track.
+        one.retain(|c| !matches!(c, Command::AddTrack { .. }));
+        for c in &mut one {
+            if let Command::PlaceClip { track: t, .. } = c {
+                *t = track;
+            }
+        }
+        cmds = one;
+    }
+    // Fitted to the song, or as the file is: the warp the source is born with.
+    let mut warp = Warp::default();
+    if item.is_loop {
+        warp.original_bpm = item.bpm.map(f64::from);
+        warp.enabled = item.bpm.is_some() && trust.allows_auto_warp();
+    }
+    if let Some(f) = fit {
+        warp.transpose = f.transpose;
+        if f.original_bpm.is_some() {
+            warp.original_bpm = f.original_bpm;
+            warp.enabled = f.warp;
+        }
+        if warp.enabled || f.transpose != 0. {
+            warp.mode = f.mode;
+        }
+    }
+    // Warped, the loop spans its beats at the song's tempo; unwarped and transposed it plays faster or slower.
+    let secs = facts.2 as f64 / f64::from(facts.0.max(1));
+    let span = match (warp.enabled, warp.original_bpm) {
+        (true, Some(orig)) => Some((secs * orig / 60. * PPQ as f64).round() as Tick),
+        _ if warp.transpose != 0. && secs > 0. => Some((secs * s.project.tempo.initial_bpm() / 60. * PPQ as f64 / warp.speed_ratio()).round() as Tick),
+        _ => None,
+    };
+    for c in &mut cmds {
+        if let Command::AddSource { source, .. } = c
+            && let Source::Audio(a) = source.as_mut()
+        {
+            a.key = item.key;
+            a.warp = warp.clone();
+        }
+        if let Command::AddClip { clip, .. } = c {
+            if let Some(color) = target.and_then(|t| s.project.track(t)).map(|t| t.color) {
+                clip.color = color;
+            }
+            if let Some(span) = span.filter(|_| facts.2 > 0) {
+                clip.length = span.max(PPQ);
+            }
+        }
+    }
+    cmds
+}
+
 /// Commands adding an audio track at `index` with one clip of `path` placed at `start`.
 pub fn audio_track_commands(
     s: &mut AppState,
@@ -2514,13 +3095,7 @@ pub fn audio_track_commands(
     let track = s.project.alloc_track_id();
     let src = s.project.alloc_source_id();
     let clip = s.project.alloc_clip_id();
-    // Clip length at the project tempo (4 bars until the length is known).
-    let length = if frames > 0 && sample_rate > 0 {
-        let secs = frames as f64 / sample_rate as f64;
-        ((secs * s.project.tempo.initial_bpm() / 60. * PPQ as f64).round() as Tick).max(PPQ)
-    } else {
-        4 * BAR
-    };
+    let length = clip_length(s.project.tempo.initial_bpm(), sample_rate, frames);
     vec![
         Command::AddTrack { track: Box::new(Track::new(track, TrackKind::Audio, name, color)), index },
         Command::AddSource {
@@ -2551,7 +3126,15 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let audition_track = if self.bottom_open && self.s.bottom_tab == BottomTab::PianoRoll && self.modal.is_none() {
+        if !self.recovery.is_empty() {
+            self.offer_recovery(window, cx);
+        } else if !self.pending_missing.is_empty() {
+            self.offer_relink(window, cx);
+        }
+        let audition_track = if matches!(self.drag, Some(Drag::Pad)) {
+            // A drum pad held down: the track of the rack whose pad it is.
+            self.s.selected_track
+        } else if self.bottom_open && self.s.bottom_tab == BottomTab::PianoRoll && self.modal.is_none() {
             self.audition_track()
         } else {
             None
@@ -2566,6 +3149,7 @@ impl Render for Workspace {
         }
         self.meters.tick(self.b.engine.as_mut(), self.s.selected_track);
         self.window_h = f32::from(window.viewport_size().height);
+        self.window_w = f32::from(window.viewport_size().width);
         // The dev view asks for the palette before there is a window.
         if std::mem::take(&mut self.palette_pending) && !self.palette.open {
             views::palette::open(self, window, cx);
@@ -2576,7 +3160,7 @@ impl Render for Workspace {
         }
         let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
         let animate = window.is_visible()
-            && (self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self));
+            && (self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self) || views::sounds::wants_frames(self));
         let throttle_ok = !self.look.app.low_power || self.drag.is_some() || self.last_frame.elapsed() >= Duration::from_millis(50);
         if animate && throttle_ok {
             self.last_frame = Instant::now();
@@ -2609,12 +3193,16 @@ impl Render for Workspace {
             .border_color(border())
             .child(motion::slide_in(switch_id, div().size_full().child(center), if self.view_switch == 0 { 0. } else { dx }));
 
+        let sounds_left = views::sounds::render(self, views::sounds::logic::Side::Left, cx);
+        let sounds_right = views::sounds::render(self, views::sounds::logic::Side::Right, cx);
         let middle = div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .gap(px(SP1))
+            .children(sounds_left)
             .child(center)
+            .children(sounds_right)
             .child(views::ai_panel::render(self, window, cx));
 
         let bottom = views::bottom::render(self, window, cx);
@@ -2669,6 +3257,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_draw))
             .on_action(cx.listener(Self::toggle_loop))
             .on_action(cx.listener(Self::toggle_ai))
+            .on_action(cx.listener(Self::toggle_sounds))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(|this, _: &NewProject, window, cx| this.file_new(crate::project_io::Template::Empty, window, cx)))
             .on_action(cx.listener(|this, _: &OpenProject, window, cx| this.file_open(window, cx)))
@@ -2677,6 +3266,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SplitClip, _, cx| this.split_clips(cx)))
             .on_action(cx.listener(|this, _: &GroupTracks, _, cx| crate::editing::group_selection(this, cx)))
             .on_action(cx.listener(|this, _: &UngroupTracks, _, cx| crate::editing::ungroup_selection(this, cx)))
+            .on_action(cx.listener(|this, _: &DeleteTrack, _, cx| this.delete_selected_tracks(cx)))
+            .on_action(cx.listener(|this, _: &CollectAndSave, _, cx| this.collect_and_save(cx)))
+            .on_action(cx.listener(|this, _: &FindMissingFiles, _, cx| this.find_missing_files(cx)))
             .on_action(cx.listener(|this, _: &ToggleGroupFold, _, cx| crate::editing::toggle_group_fold(this, cx)))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| views::palette::toggle(this, window, cx)))
             .on_action(cx.listener(|this, _: &AddLibraryFolder, window, cx| views::palette::open_add_library(this, window, cx)))
@@ -2875,6 +3467,286 @@ fn menu_overlay(
 #[cfg(test)]
 mod tests {
     use super::{bottom_h_clamped, mixer_h_fitted};
+
+    fn loop_item(bpm: Option<f32>, is_loop: bool) -> crate::bridge::LibraryItem {
+        crate::bridge::LibraryItem {
+            id: 1,
+            name: "Groove".into(),
+            path: std::path::PathBuf::from("/no/such/groove.flac"),
+            category: "Loop".into(),
+            key: None,
+            bpm,
+            duration: 4.0,
+            is_loop,
+            favorite: false,
+        }
+    }
+
+    fn dropped_warp(item: &crate::bridge::LibraryItem, trust: crate::bridge::BpmTrust) -> aitrack_model::Warp {
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let cmds = super::sample_clip_commands(&mut s, item, None, 0, trust, None);
+        cmds.iter()
+            .find_map(|c| match c {
+                aitrack_model::Command::AddSource { source, .. } => match source.as_ref() {
+                    aitrack_model::Source::Audio(a) => Some(a.warp.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("an audio source")
+    }
+
+    #[test]
+    fn a_loop_with_a_guessed_bpm_is_dropped_without_warp() {
+        use crate::bridge::BpmTrust;
+        let item = loop_item(Some(97.0), true);
+        let guessed = dropped_warp(&item, BpmTrust::Estimate);
+        assert!(!guessed.enabled, "no warp to a tempo guessed from the length");
+        assert_eq!(guessed.original_bpm, Some(97.0), "but the BPM is there for when the user turns warp on");
+        let measured = dropped_warp(&item, BpmTrust::Reliable);
+        assert!(measured.enabled);
+        assert_eq!(measured.original_bpm, Some(97.0));
+        // One-shots and loops without a BPM never warp.
+        assert!(!dropped_warp(&loop_item(None, true), BpmTrust::Reliable).enabled);
+        let one_shot = dropped_warp(&loop_item(Some(97.0), false), BpmTrust::Reliable);
+        assert!(!one_shot.enabled && one_shot.original_bpm.is_none());
+    }
+
+    fn dropped_clip(item: &crate::bridge::LibraryItem, fit: Option<&crate::views::sounds::logic::DropFit>) -> (aitrack_model::Warp, aitrack_model::Tick) {
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let cmds = super::sample_clip_commands(&mut s, item, None, 0, crate::bridge::BpmTrust::Reliable, fit);
+        let warp = cmds
+            .iter()
+            .find_map(|c| match c {
+                aitrack_model::Command::AddSource { source, .. } => match source.as_ref() {
+                    aitrack_model::Source::Audio(a) => Some(a.warp.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("an audio source");
+        let length = cmds.iter().find_map(|c| if let aitrack_model::Command::AddClip { clip, .. } = c { Some(clip.length) } else { None }).expect("a clip");
+        (warp, length)
+    }
+
+    #[test]
+    fn a_sound_dropped_with_fit_leaves_the_clip_transposed_warped_and_the_right_length() {
+        use aitrack_model::{Key, PPQ, Scale, ScaleKind, WarpMode};
+        let mut item = loop_item(Some(64.0), true);
+        item.key = Some(Scale::new(Key(2), ScaleKind::Minor));
+        item.duration = 7.5; // 8 beats at 64 BPM; read at 128 it is 16 beats of the song
+        let fit = crate::views::sounds::logic::drop_fit(&item, crate::bridge::BpmTrust::Reliable, Some(Scale::new(Key(9), ScaleKind::Minor)), 128.);
+        let (warp, length) = dropped_clip(&item, Some(&fit));
+        assert!(warp.enabled);
+        assert_eq!(warp.original_bpm, Some(128.));
+        assert_eq!(warp.mode, WarpMode::Complex);
+        assert_ne!(warp.transpose, 0., "D minor into A minor moves");
+        // Its beats at the tempo it is read at: 7.5 s x 128 BPM = 16 beats.
+        assert_eq!(length, 16 * PPQ);
+        // Without fit nothing is transposed and the tempo is the file's own.
+        let (plain, _) = dropped_clip(&item, None);
+        assert_eq!((plain.transpose, plain.original_bpm), (0., Some(64.)));
+    }
+
+    #[test]
+    fn a_transposed_one_shot_gets_a_clip_as_long_as_its_slowed_or_sped_up_sound() {
+        use aitrack_model::{PPQ, Scale, Key, ScaleKind};
+        let mut item = loop_item(None, false);
+        item.key = Some(Scale::new(Key(9), ScaleKind::Minor));
+        item.duration = 1.0;
+        let flat = crate::views::sounds::logic::DropFit { transpose: -12., original_bpm: None, warp: false, mode: aitrack_model::WarpMode::Beats };
+        let (warp, length) = dropped_clip(&item, Some(&flat));
+        assert!(!warp.enabled && warp.transpose == -12.);
+        // An octave down plays at half speed: the clip is twice as long.
+        let plain = crate::state::AppState::new(aitrack_model::Project::new("t")).project.tempo.initial_bpm();
+        let one_second = (plain / 60. * PPQ as f64).round() as aitrack_model::Tick;
+        assert!(length >= one_second * 2 - 2 && length <= one_second * 2 + 2, "got {length}");
+    }
+
+    /// An AIFF (which `hound` cannot read, `symphonia` can) of mono 16-bit silence.
+    fn write_aiff(path: &std::path::Path, rate: u32, frames: u32) {
+        let mut comm = Vec::new();
+        comm.extend(1i16.to_be_bytes());
+        comm.extend(frames.to_be_bytes());
+        comm.extend(16i16.to_be_bytes());
+        let exp = 31 - rate.leading_zeros();
+        comm.extend((16383u16 + exp as u16).to_be_bytes());
+        comm.extend(((rate as u64) << (63 - exp)).to_be_bytes());
+        let data = frames * 2;
+        let mut out = Vec::new();
+        out.extend(b"FORM");
+        out.extend((4 + 8 + comm.len() as u32 + 8 + 8 + data).to_be_bytes());
+        out.extend(b"AIFF");
+        out.extend(b"COMM");
+        out.extend((comm.len() as u32).to_be_bytes());
+        out.extend(comm);
+        out.extend(b"SSND");
+        out.extend((8 + data).to_be_bytes());
+        out.extend([0u8; 8]);
+        out.extend(std::iter::repeat_n(0u8, data as usize));
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn a_three_minute_file_that_is_not_a_wav_enters_with_its_real_length() {
+        use crate::state::BAR;
+        use aitrack_model::{Command, PPQ, Source};
+        let dir = std::env::temp_dir().join(format!("aitrack-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.aiff");
+        write_aiff(&path, 8_000, 8_000 * 180);
+        assert!(super::wav_header(&path).is_none(), "not a WAV: the header says nothing");
+        let facts = super::probe_audio(&path).expect("symphonia reads it");
+        assert_eq!(facts, (8_000, 1, 8_000 * 180));
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let cmds = super::audio_track_commands(&mut s, "long", aitrack_model::Color::palette(4), &path, facts, 0, 0);
+        let len = cmds.iter().find_map(|c| if let Command::AddClip { clip, .. } = c { Some(clip.length) } else { None }).unwrap();
+        // 180 s at 120 BPM is 360 beats, not the 4 bars of a file of unknown length.
+        assert_eq!(len, 360 * PPQ);
+        assert_ne!(len, 4 * BAR);
+        assert!(cmds.iter().any(|c| matches!(c, Command::AddSource { source, .. } if matches!(source.as_ref(), Source::Audio(a) if a.frames == 8_000 * 180))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_corrected_length_stops_where_the_next_clip_starts() {
+        use crate::bridge::AudioAnalysis;
+        use aitrack_model::{Clip, Color, Command, PPQ, Placement};
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let path = std::path::Path::new("/no/such/song.mp3");
+        let cmds = super::audio_track_commands(&mut s, "song", aitrack_model::Color::palette(4), path, (48_000, 2, 0), 0, 0);
+        let source = cmds.iter().find_map(|c| if let Command::AddSource { id, .. } = c { Some(*id) } else { None }).unwrap();
+        let clip = cmds.iter().find_map(|c| if let Command::AddClip { id, .. } = c { Some(*id) } else { None }).unwrap();
+        let track = cmds.iter().find_map(|c| if let Command::AddTrack { track, .. } = c { Some(track.id) } else { None }).unwrap();
+        assert!(s.edit("Import audio", cmds));
+        // The user drops another clip 20 beats in (after the 4 provisional bars), while the analysis runs.
+        let (c2, p2) = (s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        assert!(s.edit("Place", vec![
+            Command::AddClip { id: c2, clip: Box::new(Clip::new("next", Color::palette(1), source, 4 * PPQ)) },
+            Command::PlaceClip { track, placement: Placement { id: p2, clip: c2, start: 20 * PPQ, lane: 0 } },
+        ]));
+        assert_eq!(s.project.track(track).unwrap().arrangement.len(), 2);
+        let analysis = AudioAnalysis { key: None, bpm: None, sample_rate: 44_100, channels: 2, frames: 44_100 * 30 };
+        let fix = super::analysis_commands(&s.project, source, &analysis);
+        assert!(s.edit_as("Analyse audio", aitrack_model::Origin::Feature("analysis".into()), fix));
+        assert_eq!(s.project.clips[&clip].length, 20 * PPQ, "30 s would run over the next clip: it stops there");
+        assert_eq!(s.project.clips[&c2].length, 4 * PPQ);
+        assert_eq!(s.project.track(track).unwrap().arrangement.len(), 2, "nothing was replaced");
+    }
+
+    #[test]
+    fn turning_automation_arm_off_stops_a_recording() {
+        assert!(super::recording_needs_stop(true, false));
+        assert!(!super::recording_needs_stop(true, true));
+        assert!(!super::recording_needs_stop(false, false), "nothing recording: nothing to stop");
+        // The stub engine's Record button goes dark when it is toggled off.
+        use crate::bridge::EngineBridge;
+        let mut e = crate::bridge::StubEngine::default();
+        e.toggle_record();
+        assert!(e.transport().recording);
+        if super::recording_needs_stop(e.transport().recording, false) {
+            e.toggle_record();
+        }
+        assert!(!e.transport().recording);
+    }
+
+    fn wav(dir: &std::path::Path, name: &str, seconds: u32) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let spec = hound::WavSpec { channels: 1, sample_rate: 8_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..8_000 * seconds {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn dropped_files_land_one_after_another_on_the_track_they_were_dropped_on() {
+        use aitrack_model::{Color, Command, PPQ, Track, TrackKind};
+        let dir = std::env::temp_dir().join(format!("aitrack-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<_> = [("a.wav", 1), ("b.wav", 2), ("c.wav", 1)].iter().map(|(n, s)| wav(&dir, n, *s)).collect();
+        let facts: Vec<_> = files.iter().map(|f| (super::wav_header(f), f.clone())).collect();
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let id = s.project.alloc_track_id();
+        assert!(s.edit("Add", vec![Command::AddTrack { track: Box::new(Track::new(id, TrackKind::Audio, "Audio", Color::palette(2))), index: 0 }]));
+        let tracks = s.project.tracks.len();
+        let cmds = super::drop_audio_commands(&mut s, &facts, Some(id), 4 * PPQ, 0);
+        assert!(!cmds.iter().any(|c| matches!(c, Command::AddTrack { .. })), "no new track");
+        assert!(s.edit("Drop audio", cmds));
+        assert_eq!(s.project.tracks.len(), tracks);
+        let t = s.project.track(id).unwrap();
+        let mut starts: Vec<_> = t.arrangement.iter().map(|p| (p.start, s.project.clips[&p.clip].length)).collect();
+        starts.sort();
+        // 1 s, 2 s and 1 s at 120 BPM are 2, 4 and 2 beats, back to back from beat 4.
+        assert_eq!(starts, [(4 * PPQ, 2 * PPQ), (6 * PPQ, 4 * PPQ), (10 * PPQ, 2 * PPQ)]);
+        // One undo step takes them all away.
+        s.undo();
+        assert!(s.project.track(id).unwrap().arrangement.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_dropped_on_empty_space_make_one_new_audio_track() {
+        use aitrack_model::{Command, PPQ, TrackKind};
+        let dir = std::env::temp_dir().join(format!("aitrack-drop2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let facts: Vec<_> = ["x.wav", "y.wav", "z.wav"].iter().map(|n| wav(&dir, n, 1)).map(|f| (super::wav_header(&f), f)).collect();
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let before = s.project.tracks.len();
+        let cmds = super::drop_audio_commands(&mut s, &facts, None, 0, 0);
+        assert_eq!(cmds.iter().filter(|c| matches!(c, Command::AddTrack { .. })).count(), 1);
+        assert!(s.edit("Drop audio", cmds));
+        assert_eq!(s.project.tracks.len(), before + 1);
+        let t = s.project.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap();
+        let mut starts: Vec<_> = t.arrangement.iter().map(|p| p.start).collect();
+        starts.sort();
+        assert_eq!(starts, [0, 2 * PPQ, 4 * PPQ], "side by side, not stacked");
+        assert!(super::is_audio_file(std::path::Path::new("/a/Kick.WAV")) && !super::is_audio_file(std::path::Path::new("/a/notes.txt")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_probe_that_finishes_in_another_project_is_dropped() {
+        assert!(super::probe_is_current(3, 3));
+        assert!(!super::probe_is_current(3, 4), "a project was opened while the file was probed");
+    }
+
+    #[test]
+    fn the_analysis_corrects_a_provisional_clip_length() {
+        use crate::bridge::AudioAnalysis;
+        use crate::state::BAR;
+        use aitrack_model::{Command, PPQ};
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        // Imported without a readable header: 4 bars until the analysis knows better.
+        let path = std::path::Path::new("/no/such/song.mp3");
+        let cmds = super::audio_track_commands(&mut s, "song", aitrack_model::Color::palette(4), path, (48_000, 2, 0), 0, 0);
+        let (source, clip) = cmds
+            .iter()
+            .find_map(|c| if let Command::AddClip { clip, .. } = c { Some(clip.source) } else { None })
+            .map(|src| (src, cmds.iter().find_map(|c| if let Command::AddClip { id, .. } = c { Some(*id) } else { None }).unwrap()))
+            .unwrap();
+        assert!(s.edit("Import audio", cmds));
+        assert_eq!(s.project.clips[&clip].length, 4 * BAR);
+        // 30 s at 120 BPM = 60 beats.
+        let analysis = AudioAnalysis { key: None, bpm: Some(100.0), sample_rate: 44_100, channels: 2, frames: 44_100 * 30 };
+        let fix = super::analysis_commands(&s.project, source, &analysis);
+        assert!(s.edit_as("Analyse audio", aitrack_model::Origin::Feature("analysis".into()), fix));
+        assert_eq!(s.project.clips[&clip].length, 60 * PPQ, "the clip is as long as the file");
+        // A clip the user already shortened keeps its length.
+        let mut s2 = crate::state::AppState::new(aitrack_model::Project::new("t"));
+        let cmds = super::audio_track_commands(&mut s2, "song", aitrack_model::Color::palette(4), path, (48_000, 2, 0), 0, 0);
+        let clip2 = cmds.iter().find_map(|c| if let Command::AddClip { id, .. } = c { Some(*id) } else { None }).unwrap();
+        let src2 = cmds.iter().find_map(|c| if let Command::AddSource { id, .. } = c { Some(*id) } else { None }).unwrap();
+        assert!(s2.edit("Import audio", cmds));
+        let mut shorter = s2.project.clips[&clip2].clone();
+        shorter.length = BAR;
+        assert!(s2.edit("Trim", vec![Command::UpdateClip { id: clip2, clip: Box::new(shorter) }]));
+        let fix = super::analysis_commands(&s2.project, src2, &analysis);
+        assert!(s2.edit_as("Analyse audio", aitrack_model::Origin::Feature("analysis".into()), fix));
+        assert_eq!(s2.project.clips[&clip2].length, BAR);
+    }
 
     #[test]
     fn mixer_gives_way_to_the_arrangement_on_short_windows() {

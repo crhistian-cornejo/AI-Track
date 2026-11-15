@@ -30,6 +30,9 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::DeviceContext(device) => crate::editing::menus::device_menu(ws, *device, cx),
         MenuKind::PaletteDevice { key, name, instrument } => palette_device_menu(ws, key, name, *instrument, cx),
         MenuKind::TimeSignature => sig_menu(ws, cx),
+        MenuKind::ClipLaunch(clip) => launch_menu(ws, *clip, cx),
+        MenuKind::ClipQuantize(clip) => quantize_menu(ws, *clip, cx),
+        MenuKind::StutterStep { device, step } => crate::views::device_ui::stutter::step_menu(ws, *device, *step, cx),
         MenuKind::File => file_menu(ws, window, cx),
     })
 }
@@ -209,6 +212,20 @@ fn file_menu(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace
             menu_item("file-save-as", Some(Icon::File), "Save as…", key("Ctrl+Shift+S", "⇧⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
                 this.file_save_as(None, cx);
+            })),
+            cx,
+        ))
+        .child(close_recent(
+            menu_item("file-collect", Some(Icon::Package), "Collect all and save", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.close_menu(cx);
+                this.collect_and_save(cx);
+            })),
+            cx,
+        ))
+        .child(close_recent(
+            menu_item("file-find-missing", Some(Icon::Search), "Find missing files…", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.close_menu(cx);
+                this.find_missing_files(cx);
             })),
             cx,
         ))
@@ -545,6 +562,7 @@ fn group_icon(g: DeviceGroup) -> Icon {
         DeviceGroup::FxCreative => Icon::Sparkles,
         DeviceGroup::FxStereoUtility => Icon::Device,
         DeviceGroup::FxAnalysis => Icon::Dashboard,
+        DeviceGroup::MidiEffects => Icon::Keyboard,
     }
 }
 
@@ -722,7 +740,8 @@ fn render_device_entry_row(
                 .child(star_btn)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.close_menu(cx);
-                    if this.s.add_stock_device(track, id, name).is_some() {
+                    let into = this.rack_ui.add_into.take();
+                    if this.s.add_stock_device_in(track, into, id, name).is_some() {
                         this.palette.plugin_prefs.note_recent(&stock_key(id));
                         this.toast(format!("Added {name}"), cx);
                     }
@@ -760,7 +779,8 @@ fn render_device_entry_row(
                     this.close_menu(cx);
                     let name = plugin.name.clone();
                     let key = external_key(plugin.format, &plugin.uid);
-                    if this.s.add_plugin_device(track, &plugin).is_some() {
+                    let into = this.rack_ui.add_into.take();
+                    if this.s.add_plugin_device_in(track, into, &plugin).is_some() {
                         this.palette.plugin_prefs.note_recent(&key);
                         this.toast(format!("Added {name}"), cx);
                     }
@@ -1211,6 +1231,38 @@ fn sig_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             move |this, _, _, cx| {
                 this.menu = None;
                 this.s.set_time_signature(sig);
+                cx.notify();
+            },
+        )));
+    }
+    card.into_any_element()
+}
+
+/// The launch modes of a clip, as a menu.
+fn launch_menu(ws: &mut Workspace, clip: aitrack_model::ClipId, cx: &mut Context<Workspace>) -> AnyElement {
+    let current = ws.s.project.clips.get(&clip).map(|c| c.launch.mode);
+    let mut card = widgets::menu_card("launch-menu", 140.).child(menu_header("LAUNCH MODE"));
+    for (i, mode) in crate::views::bottom::LAUNCH_MODES.into_iter().enumerate() {
+        card = card.child(menu_item(("launch-mode", i), None, crate::views::bottom::launch_mode_name(mode), None, Some(mode) == current).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                crate::views::bottom::set_launch_mode(&mut this.s, clip, mode);
+                cx.notify();
+            },
+        )));
+    }
+    card.into_any_element()
+}
+
+/// The launch quantisations of a clip, as a menu.
+fn quantize_menu(ws: &mut Workspace, clip: aitrack_model::ClipId, cx: &mut Context<Workspace>) -> AnyElement {
+    let current = ws.s.project.clips.get(&clip).map(|c| c.launch.quantize);
+    let mut card = widgets::menu_card("quantize-menu", 140.).child(menu_header("LAUNCH QUANTISATION"));
+    for (i, q) in crate::views::bottom::QUANTIZES.into_iter().enumerate() {
+        card = card.child(menu_item(("launch-quant", i), None, crate::views::bottom::quantize_name(q), None, Some(q) == current).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                crate::views::bottom::set_launch_quantize(&mut this.s, clip, q);
                 cx.notify();
             },
         )));

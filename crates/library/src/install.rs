@@ -220,29 +220,138 @@ pub fn unpack(archive: &Path, format: ArchiveFormat, out: &Path, stop: &AtomicBo
     }
 }
 
+/// What an archive may expand to before it is refused as a bomb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Entries (files, folders and links).
+    pub files: usize,
+    /// Bytes once expanded.
+    pub bytes: u64,
+    /// Expanded bytes per archive byte; 0 = not checked (sample packs are already compressed audio).
+    pub ratio: u64,
+}
+
+impl Limits {
+    /// Sample packs: many large files.
+    pub const PACK: Self = Self { files: 200_000, bytes: 16 << 30, ratio: 0 };
+    /// Plugins: a few bundles, and nothing that expands 100 times over.
+    pub const PLUGIN: Self = Self { files: 20_000, bytes: 2 << 30, ratio: 100 };
+}
+
+/// The path a symlink at `link` (relative to the extraction root) resolves to,
+/// computed without touching the disk; `None` when it is absolute or climbs out
+/// of the root.
+pub(crate) fn link_stays_inside(link: &Path, target: &str) -> bool {
+    use std::path::Component;
+    let target = Path::new(target);
+    if target.has_root() || target.components().any(|c| matches!(c, Component::Prefix(_))) {
+        return false;
+    }
+    let mut depth: i64 = link.parent().map_or(0, |p| p.components().filter(|c| matches!(c, Component::Normal(_))).count() as i64);
+    for c in target.components() {
+        match c {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn unpack_zip(archive: &Path, out: &Path, stop: &AtomicBool) -> Result<()> {
+    unpack_zip_limited(archive, out, stop, Limits::PACK)
+}
+
+/// Unpack a zip keeping what bundles need: Unix permission bits (without
+/// setuid/setgid/sticky) and symbolic links that stay inside `out`. A link
+/// that points outside, too many entries, or more bytes than `limits` allow
+/// (counted as they are written, not as the headers claim) abort the whole
+/// unpacking.
+pub fn unpack_zip_limited(archive: &Path, out: &Path, stop: &AtomicBool, limits: Limits) -> Result<()> {
+    let archive_bytes = fs::metadata(archive).map_err(io)?.len().max(1);
     let mut z = zip::ZipArchive::new(BufReader::new(File::open(archive).map_err(io)?)).map_err(|e| err(format!("zip: {e}")))?;
+    if z.len() > limits.files {
+        return Err(err(format!("the archive has too many entries ({} > {})", z.len(), limits.files)));
+    }
+    fs::create_dir_all(out).map_err(io)?;
+    let root = out.canonicalize().map_err(io)?;
+    let mut written = 0u64;
+    let mut budget = limits.bytes;
+    if limits.ratio > 0 {
+        budget = budget.min(archive_bytes.saturating_mul(limits.ratio));
+    }
     for i in 0..z.len() {
         if stop.load(Ordering::Relaxed) {
             return Err(err("cancelled"));
         }
         let mut f = z.by_index(i).map_err(|e| err(format!("zip: {e}")))?;
         let Some(rel) = f.enclosed_name() else { continue };
-        let target = out.join(rel);
+        let target = out.join(&rel);
+        let mode = f.unix_mode().map(|m| m & 0o777);
         if f.is_dir() {
             fs::create_dir_all(&target).map_err(io)?;
+            set_mode(&target, mode.map(|m| m | 0o700));
             continue;
         }
         if let Some(p) = target.parent() {
             fs::create_dir_all(p).map_err(io)?;
+            // Nothing is written through a link that leads out of the folder.
+            if !p.canonicalize().is_ok_and(|c| c.starts_with(&root)) {
+                return Err(err("the archive tried to write outside its folder"));
+            }
         }
-        std::io::copy(&mut f, &mut BufWriter::new(File::create(&target).map_err(io)?)).map_err(io)?;
+        if f.is_symlink() {
+            let mut link = String::new();
+            f.by_ref().take(4096).read_to_string(&mut link).map_err(io)?;
+            if !link_stays_inside(&rel, &link) {
+                return Err(err(format!("the archive has a link that leaves its folder ({})", rel.display())));
+            }
+            make_symlink(&link, &target)?;
+            continue;
+        }
+        let mut dest = BufWriter::new(File::create(&target).map_err(io)?);
+        let n = std::io::copy(&mut f.by_ref().take(budget.saturating_sub(written) + 1), &mut dest).map_err(io)?;
+        written += n;
+        if written > budget {
+            return Err(err("the archive expands to more than it is allowed to (zip bomb?)"));
+        }
+        dest.flush().map_err(io)?;
+        drop(dest);
+        set_mode(&target, mode.map(|m| m | 0o600));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(m) = mode {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(m));
+    }
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: Option<u32>) {}
+
+#[cfg(unix)]
+fn make_symlink(target: &str, at: &Path) -> Result<()> {
+    let _ = fs::remove_file(at);
+    std::os::unix::fs::symlink(target, at).map_err(io)
+}
+
+/// Windows cannot make links without a privilege; a plugin that needs them is macOS-only anyway.
+#[cfg(not(unix))]
+fn make_symlink(_: &str, _: &Path) -> Result<()> {
     Ok(())
 }
 
 fn unpack_tar<R: Read>(r: R, out: &Path, stop: &AtomicBool) -> Result<()> {
     let mut a = tar::Archive::new(r);
+    a.set_preserve_permissions(true);
+    a.set_unpack_xattrs(false);
     for entry in a.entries().map_err(io)? {
         if stop.load(Ordering::Relaxed) {
             return Err(err("cancelled"));
@@ -404,5 +513,104 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(matches!(ev.last(), Some(InstallEvent::Failed(_))), "{ev:?}");
+    }
+
+    fn zip_with(path: &Path, f: impl FnOnce(&mut zip::ZipWriter<File>)) {
+        let mut z = zip::ZipWriter::new(File::create(path).unwrap());
+        f(&mut z);
+        z.finish().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plugin_bundle_keeps_its_permissions_and_its_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("b.zip");
+        zip_with(&archive, |z| {
+            let exe = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+            let plain = zip::write::SimpleFileOptions::default().unix_permissions(0o644);
+            z.start_file("X.vst3/Contents/MacOS/X", exe).unwrap();
+            z.write_all(b"\xcf\xfa").unwrap();
+            z.start_file("X.vst3/Contents/Resources/a.txt", plain).unwrap();
+            z.write_all(b"a").unwrap();
+            z.add_symlink("X.vst3/Contents/Resources/latest", "a.txt", plain).unwrap();
+            z.add_symlink("X.vst3/Contents/Current", "../Contents/MacOS", plain).unwrap();
+        });
+        let out = dir.path().join("out");
+        unpack(&archive, ArchiveFormat::Zip, &out, &AtomicBool::new(false)).unwrap();
+        let exe = out.join("X.vst3/Contents/MacOS/X");
+        assert_eq!(fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755, "the executable bit survives");
+        assert_eq!(fs::metadata(out.join("X.vst3/Contents/Resources/a.txt")).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(fs::read_link(out.join("X.vst3/Contents/Resources/latest")).unwrap(), Path::new("a.txt"));
+        assert_eq!(fs::read(out.join("X.vst3/Contents/Resources/latest")).unwrap(), b"a", "and the link works");
+        assert!(fs::symlink_metadata(out.join("X.vst3/Contents/Current")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setuid_bits_are_dropped_and_links_that_leave_the_folder_abort() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("s.zip");
+        zip_with(&archive, |z| {
+            z.start_file("a/tool", zip::write::SimpleFileOptions::default().unix_permissions(0o4755)).unwrap();
+            z.write_all(b"x").unwrap();
+        });
+        let out = dir.path().join("out");
+        unpack(&archive, ArchiveFormat::Zip, &out, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fs::metadata(out.join("a/tool")).unwrap().permissions().mode() & 0o7777, 0o755);
+        for target in ["../../etc/passwd", "/etc/passwd", "a/../../../x"] {
+            let bad = dir.path().join("bad.zip");
+            zip_with(&bad, |z| {
+                z.add_symlink("a/link", target, zip::write::SimpleFileOptions::default()).unwrap();
+            });
+            let o2 = dir.path().join(format!("o-{}", target.len()));
+            assert!(unpack(&bad, ArchiveFormat::Zip, &o2, &AtomicBool::new(false)).is_err(), "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_written_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("t.zip");
+        // `d` points at `.` (inside), then `d/../..` style paths are refused by enclosed_name; a link to a
+        // sibling folder is fine, but a file cannot be placed through a link that left the root.
+        zip_with(&archive, |z| {
+            let o = zip::write::SimpleFileOptions::default();
+            z.add_symlink("d", ".", o).unwrap();
+            z.start_file("d/f.txt", o).unwrap();
+            z.write_all(b"ok").unwrap();
+        });
+        let out = dir.path().join("out");
+        unpack(&archive, ArchiveFormat::Zip, &out, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fs::read(out.join("f.txt")).unwrap(), b"ok", "a link to the root is inside the root");
+    }
+
+    #[test]
+    fn a_zip_bomb_is_stopped_by_entries_bytes_and_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        // Many entries.
+        let many = dir.path().join("many.zip");
+        zip_with(&many, |z| {
+            for i in 0..30 {
+                z.start_file(format!("f{i}"), zip::write::SimpleFileOptions::default()).unwrap();
+            }
+        });
+        let small = Limits { files: 10, bytes: 1 << 20, ratio: 0 };
+        assert!(unpack_zip_limited(&many, &dir.path().join("o1"), &AtomicBool::new(false), small).is_err());
+        // Zeros compress hugely: 8 MB of nothing in a few KB.
+        let bomb = dir.path().join("bomb.zip");
+        zip_with(&bomb, |z| {
+            z.start_file("zeros", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).unwrap();
+            z.write_all(&vec![0u8; 8 << 20]).unwrap();
+        });
+        let bytes = Limits { files: 10, bytes: 1 << 20, ratio: 0 };
+        assert!(unpack_zip_limited(&bomb, &dir.path().join("o2"), &AtomicBool::new(false), bytes).is_err(), "over the byte limit");
+        let ratio = Limits { files: 10, bytes: 1 << 30, ratio: 100 };
+        assert!(unpack_zip_limited(&bomb, &dir.path().join("o3"), &AtomicBool::new(false), ratio).is_err(), "over the ratio");
+        let fine = Limits { files: 10, bytes: 1 << 30, ratio: 0 };
+        assert!(unpack_zip_limited(&bomb, &dir.path().join("o4"), &AtomicBool::new(false), fine).is_ok());
     }
 }

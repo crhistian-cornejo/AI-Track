@@ -16,18 +16,19 @@
 //!   control threads.
 //! * **audio** — the cpal callback running [`AudioProcessor`].
 
-use crate::audio_io::{self, ActiveAudio, AudioConfig, AudioDeviceInfo, OpenStream};
+use crate::audio_io::{self, ActiveAudio, AudioConfig, AudioDeviceInfo, ChannelSelection, OpenStream};
 use crate::compile::{compile, CompileContext};
 use crate::factory::ProcessorFactory;
 use crate::graph::CompiledGraph;
-use crate::midi_io::{self, MidiConnection, MidiPortInfo};
-use crate::rt::{AudioProcessor, InputQueue, MidiMessage, RtCommand, RtQueues, TransportInit};
+use crate::record::{AudioTake, MidiCollector, MidiTake, RecordedNote, RecordingInfo, Recorder, AUDIO_QUEUE, MIDI_QUEUE as REC_MIDI_QUEUE};
+use crate::midi_io::{self, MidiConnection, MidiPortInfo, MidiPortStatus};
+use crate::rt::{AudioProcessor, InputQueue, InputSink, InputStamp, MidiMessage, RtCommand, RtQueues, TimedMidi, TransportInit};
 use crate::sample_cache::SampleCache;
 use crate::shared::{ProcessorPool, SharedProcessor};
-use crate::status::{ClipSlotStatus, LatencyReport, MeterReading, PlayheadAnchor, SharedStatus};
+use crate::status::{AudioHealth, ClipSlotStatus, LatencyReport, MeterReading, PlayheadAnchor, SharedStatus};
 use crate::tap::{DeviceMeter, TapReader};
 use crate::EngineError;
-use aitrack_model::{DeviceId, Project, Quantize, SceneId, Tick, TrackId};
+use aitrack_model::{DeviceId, Monitor, Project, Quantize, SceneId, Tick, TrackId};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,19 +89,67 @@ enum Msg {
     OpenMidi(String, Sender<Result<(), EngineError>>),
     CloseMidi(String),
     Flush(Sender<()>),
+    /// An audio track's input channels (`None` = default input).
+    TrackInput(TrackId, Option<(u16, u16)>),
+    /// An audio track's monitor mode (`None` = the project's).
+    TrackMonitor(TrackId, Option<Monitor>),
+    /// An audio track without any input.
+    TrackNoInput(TrackId, bool),
+    /// Tests: rebuild the audio thread as a device reopen does (headless).
+    #[cfg(test)]
+    TestRebuild(Sender<AudioProcessor>),
+    /// A macro moved: `(rack, index, value)`.
+    Macro(DeviceId, u16, f32),
+    /// A fast-path edit also made to the control thread's copy of the project.
+    Patch(crate::compile::Patch),
     Shutdown,
 }
 
 /// State shared between the handle and the control thread.
 struct HandleShared {
     commands: Mutex<Option<Producer<RtCommand>>>,
-    virtual_midi: Mutex<Option<Producer<MidiMessage>>>,
+    virtual_midi: Mutex<Option<Producer<TimedMidi>>>,
     last_error: Mutex<Option<String>>,
     warnings: Mutex<Vec<String>>,
     active_audio: Mutex<Option<ActiveAudio>>,
     config: Mutex<Option<AudioConfig>>,
     /// Bumped every time the device is opened, reopened or closed.
     generation: AtomicU64,
+    /// Bumped every time a compile finishes (with a graph or with an error),
+    /// after `warnings` and `last_error` have been updated.
+    compile_generation: AtomicU64,
+    /// Graphs compiled so far (successful or not).
+    compile_count: AtomicU64,
+    /// Project snapshots absorbed as parameter patches, without a compile.
+    patch_count: AtomicU64,
+    /// Ids of the MIDI inputs that are open.
+    midi_open: Mutex<Vec<String>>,
+    /// MIDI notes recorded by the audio thread, paired up for the app.
+    rec_midi: Mutex<MidiCollector>,
+    /// Takes already handed out by `finish_midi_recording`.
+    rec_midi_taken: AtomicU64,
+    /// Writes the WAV files of audio takes.
+    recorder: Arc<Recorder>,
+    /// Headless engines: where `feed_input` puts the synthetic input.
+    virtual_input: Mutex<Option<InputSink>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrackIo {
+    input: Option<(u16, u16)>,
+    monitor: Option<Monitor>,
+    none: bool,
+}
+
+/// The input queue of a runner: samples, their capture stamps, channels, selection.
+type InputLink = (Consumer<f32>, Consumer<InputStamp>, usize, usize, usize);
+
+/// An input queue for `ch` interleaved channels: about half a second of
+/// samples and room for a stamp per callback.
+fn input_ring(rate: usize, ch: usize) -> (InputSink, Consumer<f32>, Consumer<InputStamp>) {
+    let (samples, rx) = RingBuffer::new((rate / 2).max(4096) * ch);
+    let (stamps_tx, stamps) = RingBuffer::new(256);
+    (InputSink { samples, stamps: stamps_tx, written: 0 }, rx, stamps)
 }
 
 /// Engine entry point.
@@ -124,6 +173,14 @@ impl Engine {
             active_audio: Mutex::new(None),
             config: Mutex::new(config.audio.clone()),
             generation: AtomicU64::new(0),
+            compile_generation: AtomicU64::new(0),
+            compile_count: AtomicU64::new(0),
+            patch_count: AtomicU64::new(0),
+            midi_open: Mutex::new(Vec::new()),
+            rec_midi: Mutex::new(MidiCollector::default()),
+            rec_midi_taken: AtomicU64::new(0),
+            recorder: Arc::new(Recorder::spawn().map_err(EngineError::Io)?),
+            virtual_input: Mutex::new(None),
         });
         let (tx, rx) = unbounded::<Msg>();
         let (grave_tx, grave_rx) = unbounded::<Box<CompiledGraph>>();
@@ -159,10 +216,15 @@ impl Engine {
             midi_ports: config.midi_inputs.clone(),
             midi_conns: Vec::new(),
             midi_spare: Vec::new(),
+            compile_gen: 0,
+            compiled: None,
+            track_io: std::collections::HashMap::new(),
             assumed_latency: Vec::new(),
             dirty: false,
             count_in: config.count_in_bars,
             watch: DeviceWatch::default(),
+            seen_callback_panics: 0,
+            panic_seen_at: None,
         };
         let manual = match &config.audio {
             // `check_device` opens it on the control thread's first tick.
@@ -174,7 +236,7 @@ impl Engine {
                 }
                 None
             }
-            None => Some(control.new_runner(config.headless_sample_rate, None)),
+            None => Some(control.headless_runner(config.headless_sample_rate)),
         };
         let thread = std::thread::Builder::new()
             .name("aitrack-engine-control".into())
@@ -209,6 +271,11 @@ impl EngineHandle {
 
     /// Hand the engine a new project snapshot. Compiled off this thread;
     /// devices whose id and kind did not change keep their processors.
+    /// When the snapshot differs from the running graph only by device
+    /// parameters, track volume / pan, send levels or fields the engine does
+    /// not read (names, colours, heights…), it is applied as parameter
+    /// updates to the running graph and nothing is compiled
+    /// ([`compile_count`](Self::compile_count) does not move).
     pub fn update_project(&self, project: &Project) {
         let _ = self.tx.send(Msg::Project(Arc::new(project.clone())));
     }
@@ -302,13 +369,250 @@ impl EngineHandle {
 
     /// Route live MIDI to one track; `None` = every armed instrument track.
     pub fn set_midi_target(&self, track: Option<TrackId>) {
+        self.status.midi_target.store(track.map_or(u64::MAX, |t| t.0), Ordering::Relaxed);
         self.send_rt(RtCommand::SetMidiTarget(track));
     }
 
-    /// Inject live MIDI (on-screen keyboard, tests). Real MIDI ports bypass
-    /// this and feed the audio thread directly.
+    /// The track live MIDI goes to (`None` = every armed instrument track).
+    pub fn midi_target(&self) -> Option<TrackId> {
+        Some(self.status.midi_target.load(Ordering::Relaxed)).filter(|v| *v != u64::MAX).map(TrackId)
+    }
+
+    /// Live MIDI messages the audio thread has read since the engine
+    /// started (every port and the on-screen keyboard): an activity light
+    /// for the MIDI preferences.
+    pub fn midi_message_count(&self) -> u64 {
+        self.status.midi_messages.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the sample cache held by warp renders (part of its total).
+    pub fn sample_cache_warp_bytes(&self) -> usize {
+        self.samples.warp_bytes()
+    }
+
+    /// The warp renders that failed (their clips keep playing in Re-Pitch).
+    pub fn sample_cache_warp_failures(&self) -> Vec<String> {
+        self.samples.warp_failures()
+    }
+
+    /// Every MIDI input port of the system, with whether it is open.
+    pub fn midi_ports(&self) -> Vec<MidiPortStatus> {
+        let open = lock(&self.shared.midi_open).clone();
+        midi_io::midi_inputs().into_iter().map(|p| MidiPortStatus { open: open.contains(&p.id), id: p.id, name: p.name }).collect()
+    }
+
+    /// Ids of the MIDI inputs that are open (even if the port has since
+    /// disappeared from the system).
+    pub fn open_midi_inputs(&self) -> Vec<String> {
+        lock(&self.shared.midi_open).clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rebuild(&self) -> AudioProcessor {
+        let (tx, rx) = bounded(1);
+        self.tx.send(Msg::TestRebuild(tx)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_status(&self) -> &Arc<SharedStatus> {
+        &self.status
+    }
+
+    // ───────────── Recording ─────────────
+
+    /// Where recording stands.
+    pub fn recording_info(&self) -> RecordingInfo {
+        let st = &self.status;
+        RecordingInfo {
+            armed: st.recording.load(Ordering::Relaxed),
+            capturing: st.rec_capturing.load(Ordering::Acquire),
+            start_tick: f64::from_bits(st.rec_start_tick.load(Ordering::Relaxed)),
+            pass: st.rec_pass.load(Ordering::Relaxed),
+            takes_started: st.rec_sessions.load(Ordering::Acquire),
+            takes_finished: st.rec_ended.load(Ordering::Acquire),
+            midi_tracks: lock(&st.armed_midi).clone(),
+            audio_tracks: lock(&st.armed_audio).clone(),
+            dropped: st.rec_dropped.load(Ordering::Relaxed),
+            input_dropped_frames: st.input_dropped.load(Ordering::Relaxed),
+            input_underrun_frames: st.input_underruns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The notes of the take that are complete so far (note-on and note-off
+    /// both seen), in start order; the take goes on and each note is handed
+    /// out once. Call it now and then during a take so the queue never fills
+    /// (it holds thousands of events, minutes of playing).
+    pub fn take_recorded_notes(&self) -> Vec<RecordedNote> {
+        lock(&self.shared.rec_midi).take_closed()
+    }
+
+    /// The finished MIDI take: the notes not handed out yet (notes still held
+    /// when it stopped end there), its start and end tick and how many loop
+    /// passes it went through. `None` while a take is still being captured
+    /// or draining, or when no new take ended since the last call.
+    pub fn finish_midi_recording(&self) -> Option<MidiTake> {
+        let st = &self.status;
+        let (started, ended) = (st.rec_sessions.load(Ordering::Acquire), st.rec_ended.load(Ordering::Acquire));
+        let taken = self.shared.rec_midi_taken.load(Ordering::Relaxed);
+        if started != ended || ended <= taken {
+            return None;
+        }
+        self.shared.rec_midi_taken.store(ended, Ordering::Relaxed);
+        let end = f64::from_bits(st.rec_end_tick.load(Ordering::Relaxed));
+        let (ls, le) = (st.loop_start.load(Ordering::Relaxed), st.loop_end.load(Ordering::Relaxed));
+        let hi = if ls >= 0 { le as f64 } else { f64::NAN };
+        let notes = lock(&self.shared.rec_midi).take_all(end, st.rec_pass.load(Ordering::Relaxed), hi);
+        Some(MidiTake {
+            notes,
+            start_tick: f64::from_bits(st.rec_start_tick.load(Ordering::Relaxed)).round() as Tick,
+            end_tick: end.round() as Tick,
+            passes: st.rec_pass.load(Ordering::Relaxed) + 1,
+        })
+    }
+
+    /// The WAV files that finished since the last call, one per armed audio
+    /// track of each take: path, track and the tick of the first frame. The
+    /// files are written by a background thread a moment after the take
+    /// ends: poll until `recording_info().takes_finished` has caught up and
+    /// the files you expect are in.
+    pub fn finish_audio_recording(&self) -> Vec<AudioTake> {
+        std::mem::take(&mut *lock(&self.shared.recorder.results))
+    }
+
+    /// Folder the audio takes are written to (default: a folder under the
+    /// system temp directory).
+    pub fn set_recording_dir(&self, dir: impl Into<std::path::PathBuf>) {
+        self.shared.recorder.set_dir(dir.into());
+    }
+
+    /// Pick the device channels an audio track records and monitors
+    /// (`None` = the engine's default input).
+    pub fn set_track_input(&self, track: TrackId, input: Option<ChannelSelection>) {
+        let sel = input.map(|c| (c.first, c.count.clamp(1, 2)));
+        let _ = self.tx.send(Msg::TrackInput(track, sel));
+        self.send_rt(RtCommand::SetTrackInput(track, sel.map_or(0, |s| s.0), sel.map_or(0, |s| s.1)));
+    }
+
+    /// Say that an audio track has no input at all (`true`): it is not
+    /// recorded (no WAV, not in `recording_info().audio_tracks`) and not
+    /// monitored, whatever its armed state, channels or monitor mode.
+    /// `false` gives it its input back (the channels from
+    /// [`set_track_input`](Self::set_track_input), or the default).
+    pub fn set_track_input_none(&self, track: TrackId, none: bool) {
+        let _ = self.tx.send(Msg::TrackNoInput(track, none));
+        self.send_rt(RtCommand::SetTrackNoInput(track, none));
+    }
+
+    /// Set an audio track's monitor mode (In: always; Auto: unless the
+    /// transport plays back without recording; Off: never; all only while
+    /// the track is armed). `None` goes back to the project's mode.
+    pub fn set_track_monitor(&self, track: TrackId, mode: Option<Monitor>) {
+        let _ = self.tx.send(Msg::TrackMonitor(track, mode));
+        if let Some(m) = mode {
+            self.send_rt(RtCommand::SetTrackMonitor(track, m));
+        }
+    }
+
+    /// Headless engines (no audio device) only: queue interleaved stereo
+    /// input frames, as a device's input callback would. Returns how many
+    /// samples were accepted (0 with a real device).
+    pub fn feed_input(&self, interleaved: &[f32]) -> usize {
+        self.feed_input_at(interleaved, self.engine_nanos())
+    }
+
+    /// Like [`feed_input`](Self::feed_input) for frames whose first one was
+    /// captured at `capture_nanos` on the engine clock
+    /// ([`engine_nanos`](Self::engine_nanos)): input that waited, or came
+    /// from a microphone with latency. Only whole frames are queued.
+    pub fn feed_input_at(&self, interleaved: &[f32], capture_nanos: u64) -> usize {
+        let mut guard = lock(&self.shared.virtual_input);
+        let Some(sink) = guard.as_mut() else { return 0 };
+        sink.push_with(interleaved.len() / 2, 2, capture_nanos, |i| interleaved[i]) * 2
+    }
+
+    /// Fast path for a knob: set a device parameter (normalised 0..=1) on
+    /// the running graph at once, without compiling. Returns `false` if the
+    /// command queue is full. Does not touch the project: the caller still
+    /// applies its `Command` and hands the project over (which then costs no
+    /// compile either, see [`update_project`](Self::update_project)).
+    pub fn set_device_param(&self, device: DeviceId, param: u32, normalized: f32) -> bool {
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::Param { device, param, value: normalized }));
+        self.send_rt(RtCommand::SetParam(device, param, normalized))
+    }
+
+    /// Fast path for a fader: a track's volume in dB.
+    pub fn set_track_volume(&self, track: TrackId, db: f32) -> bool {
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::Volume { track, db }));
+        self.send_rt(RtCommand::SetTrackVolume(track, db))
+    }
+
+    pub fn set_track_pan(&self, track: TrackId, pan: f32) -> bool {
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::Pan { track, pan }));
+        self.send_rt(RtCommand::SetTrackPan(track, pan))
+    }
+
+    /// Fast path for a send knob: the level in dB of send `index` of the
+    /// track (its position in `Track::sends`).
+    pub fn set_send_level(&self, track: TrackId, index: usize, db: f32) -> bool {
+        let index = index.min(u16::MAX as usize) as u16;
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::Send { track, index, db }));
+        self.send_rt(RtCommand::SetSend(track, index, db))
+    }
+
+    /// Fast path for a macro knob: move macro `index` of the rack device
+    /// `rack` to `value` (0..=1). Every parameter mapped to it follows
+    /// (`min + (max - min) * value`) on the running graph at once, and no
+    /// graph is compiled. Returns `false` if the engine is gone. The
+    /// project's `Macro::value` still needs its `Command`; handing the project
+    /// over afterwards costs no compile either.
+    pub fn set_macro(&self, rack: DeviceId, index: usize, value: f32) -> bool {
+        self.tx.send(Msg::Macro(rack, index.min(u16::MAX as usize) as u16, value)).is_ok()
+    }
+
+    /// Fast path for a rack's Chain Select: the selector value (0..=127) the
+    /// chains' zones are read at. No compile; the chains' gains glide to
+    /// their new zone gains within the block. The project's value still
+    /// needs its `Command`.
+    pub fn set_rack_selector(&self, rack: DeviceId, value: u8) -> bool {
+        let value = value.min(127);
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::Selector { rack, value }));
+        self.send_rt(RtCommand::SetRackSelector(rack, value))
+    }
+
+    /// Graphs compiled since the engine started. A drag of a knob or fader
+    /// must not move this.
+    pub fn compile_count(&self) -> u64 {
+        self.shared.compile_count.load(Ordering::Acquire)
+    }
+
+    /// Project snapshots absorbed without a compile because only
+    /// parameters, volumes, pans, send levels or display-only fields
+    /// differed from the running graph.
+    pub fn patch_count(&self) -> u64 {
+        self.shared.patch_count.load(Ordering::Acquire)
+    }
+
+    /// Inject live MIDI (on-screen keyboard, tests), stamped with the
+    /// current time. Real MIDI ports bypass this and feed the audio thread
+    /// directly, stamped when the driver delivers each message.
     pub fn send_midi(&self, msg: MidiMessage) -> bool {
-        lock(&self.shared.virtual_midi).as_mut().is_some_and(|p| p.push(msg).is_ok())
+        self.send_midi_at(msg, self.engine_nanos().max(1))
+    }
+
+    /// Like [`send_midi`](Self::send_midi) for a message that happened at
+    /// `nanos` on the engine clock ([`engine_nanos`](Self::engine_nanos)).
+    /// The audio thread plays it one block after the block it arrived in,
+    /// at the sample offset its time corresponds to, so messages keep their
+    /// spacing; a time in the past plays at the start of the next block.
+    pub fn send_midi_at(&self, msg: MidiMessage, nanos: u64) -> bool {
+        lock(&self.shared.virtual_midi).as_mut().is_some_and(|p| p.push(TimedMidi { msg, nanos }).is_ok())
+    }
+
+    /// The engine clock live MIDI is stamped with: nanoseconds since the
+    /// engine started.
+    pub fn engine_nanos(&self) -> u64 {
+        self.status.now_nanos()
     }
 
     pub fn send_midi_to(&self, track: TrackId, msg: MidiMessage) -> bool {
@@ -391,14 +695,32 @@ impl EngineHandle {
         (self.samples.used_bytes(), self.samples.budget_bytes())
     }
 
-    /// Last compile or device error.
+    /// Last compile or device error. A compile that fails (only a project
+    /// without a Main track does) leaves the previous graph running and sets
+    /// this; the next successful compile clears it.
     pub fn last_error(&self) -> Option<String> {
         lock(&self.shared.last_error).clone()
     }
 
-    /// Non-fatal problems of the last compile (missing plugins, bad sends…).
+    /// Non-fatal problems of the last compile (missing plugins, bad sends,
+    /// an invalid output sent to Main instead, a routing cycle cut open…).
+    /// Replaced by every compile, so an empty list means the project is
+    /// being played as written.
     pub fn warnings(&self) -> Vec<String> {
         lock(&self.shared.warnings).clone()
+    }
+
+    /// Changes whenever a compile finishes and [`warnings`](Self::warnings) /
+    /// [`last_error`](Self::last_error) may have changed: poll this and
+    /// re-read them only when it moves.
+    pub fn compile_generation(&self) -> u64 {
+        self.shared.compile_generation.load(Ordering::Acquire)
+    }
+
+    /// Panics the audio path contained and non-finite samples it repaired
+    /// since the engine started, and the devices a panic silenced.
+    pub fn audio_health(&self) -> AudioHealth {
+        self.status.health()
     }
 
     /// Audio hosts available on this machine.
@@ -621,12 +943,22 @@ struct Control {
     audio: Option<AudioConfig>,
     midi_ports: Vec<String>,
     midi_conns: Vec<MidiConnection>,
-    midi_spare: Vec<Producer<MidiMessage>>,
+    midi_spare: Vec<Producer<TimedMidi>>,
+    /// Compiles so far, and the generation of the newest graph.
+    compile_gen: u64,
+    /// The project the running graph was compiled from (updated by patches).
+    compiled: Option<Arc<Project>>,
+    /// Per-track input / monitor choices made through the API, reapplied to every graph.
+    track_io: std::collections::HashMap<TrackId, TrackIo>,
     /// Latency each processor had when the current graph was compiled.
     assumed_latency: Vec<(Arc<SharedProcessor>, u32)>,
     dirty: bool,
     count_in: u32,
     watch: DeviceWatch,
+    /// Callback panics seen so far, and when the latest one was noticed: a
+    /// graph is rebuilt shortly after, so the halted callback can restart.
+    seen_callback_panics: u64,
+    panic_seen_at: Option<Instant>,
 }
 
 impl Control {
@@ -662,9 +994,25 @@ impl Control {
                     self.dirty = true;
                 }
                 self.check_device();
+                self.retry_after_callback_panic();
             }
         }
         self.shutdown();
+    }
+
+    /// A callback that panicked stays silent until a new graph is queued:
+    /// build one (half a second after the panic, so a deterministic fault
+    /// retries at most twice a second).
+    fn retry_after_callback_panic(&mut self) {
+        let panics = self.status.callback_panics.load(Ordering::Relaxed);
+        if panics != self.seen_callback_panics {
+            self.seen_callback_panics = panics;
+            self.panic_seen_at = Some(Instant::now());
+        }
+        if self.panic_seen_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(500)) {
+            self.panic_seen_at = None;
+            self.dirty = true;
+        }
     }
 
     fn shutdown(&mut self) {
@@ -678,8 +1026,13 @@ impl Control {
     fn handle(&mut self, msg: Msg) -> bool {
         match msg {
             Msg::Project(p) => {
-                self.project = Some(p);
-                self.dirty = true;
+                if self.try_patch(&p) {
+                    self.project = Some(p.clone());
+                    self.compiled = Some(p);
+                } else {
+                    self.project = Some(p);
+                    self.dirty = true;
+                }
             }
             Msg::Recompile => self.dirty = true,
             Msg::Flush(reply) => {
@@ -712,11 +1065,141 @@ impl Control {
             }
             Msg::CloseMidi(id) => {
                 self.midi_ports.retain(|p| *p != id);
-                self.midi_conns.retain(|c| c.id != id);
+                if let Some(i) = self.midi_conns.iter().position(|c| c.id == id) {
+                    // The queue comes back, so a port can be toggled forever.
+                    self.midi_spare.push(self.midi_conns.remove(i).close());
+                }
+                self.publish_open_midi();
+            }
+            Msg::TrackInput(track, input) => {
+                self.track_io.entry(track).or_default().input = input;
+                // A graph compiled before this message must not outlive it.
+                self.dirty = true;
+            }
+            Msg::TrackMonitor(track, monitor) => {
+                self.track_io.entry(track).or_default().monitor = monitor;
+                // (None: back to the project's mode, which only a rebuild knows.)
+                self.dirty = true;
+            }
+            #[cfg(test)]
+            Msg::TestRebuild(reply) => {
+                let rate = self.sample_rate;
+                let runner = self.headless_runner(rate);
+                let _ = reply.send(runner);
+            }
+            Msg::Patch(patch) => {
+                // Keep the copies recompiles start from in step with the fast
+                // path, or the next compile would undo the drag.
+                if let Some(p) = self.project.as_mut() {
+                    crate::compile::apply_patch(Arc::make_mut(p), &patch);
+                }
+                if let Some(c) = self.compiled.as_mut()
+                    && self.project.as_ref().is_none_or(|p| !Arc::ptr_eq(p, c))
+                {
+                    crate::compile::apply_patch(Arc::make_mut(c), &patch);
+                }
+                if let crate::compile::Patch::Param { device, param, value } = patch {
+                    self.pool.note_applied(device, param, value);
+                }
+                // The command may have reached a graph about to be replaced:
+                // build the next one from the patched project.
+                if self.status.graph_gen.load(Ordering::Acquire) != self.compile_gen {
+                    self.dirty = true;
+                }
+            }
+            Msg::Macro(rack, index, value) => self.move_macro(rack, index, value),
+            Msg::TrackNoInput(track, none) => {
+                self.track_io.entry(track).or_default().none = none;
+                // (The list of tracks that would record changes with it.)
+                self.dirty = true;
             }
             Msg::Shutdown => return false,
         }
         true
+    }
+
+    /// Apply `new` to the running graph as parameter updates instead of
+    /// compiling, when that is all that changed (see
+    /// [`crate::compile::param_patches`]). `false` = compile.
+    fn try_patch(&mut self, new: &Arc<Project>) -> bool {
+        // A graph not yet installed (or an install waiting on a full retire
+        // queue) would miss the updates: compile.
+        // The newest graph must be the one the audio thread runs: a patch
+        // sent while a newer graph is still on its way would reach the old
+        // one, and the new one would install the values it was compiled with.
+        let installed = self.pending.is_none()
+            && self.retire_rx.as_ref().is_some_and(|r| r.slots() < GRAPH_QUEUE / 2)
+            && self.status.graph_gen.load(Ordering::Acquire) == self.compile_gen;
+        if self.dirty || !installed {
+            return false;
+        }
+        let Some(old) = self.compiled.clone() else { return false };
+        let Some(patches) = crate::compile::param_patches(&old, new) else { return false };
+        let mut commands = lock(&self.shared.commands);
+        let Some(tx) = commands.as_mut() else { return false };
+        if tx.slots() < patches.len() {
+            return false;
+        }
+        for patch in patches {
+            use crate::compile::Patch;
+            let cmd = match patch {
+                Patch::Param { device, param, value } => {
+                    self.pool.note_applied(device, param, value);
+                    RtCommand::SetParam(device, param, value)
+                }
+                Patch::Volume { track, db } => RtCommand::SetTrackVolume(track, db),
+                Patch::Pan { track, pan } => RtCommand::SetTrackPan(track, pan),
+                Patch::Send { track, index, db } => RtCommand::SetSend(track, index, db),
+                Patch::MacroValue { .. } => continue,
+                Patch::Selector { rack, value } => RtCommand::SetRackSelector(rack, value),
+            };
+            let _ = tx.push(cmd);
+        }
+        self.shared.patch_count.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// Move a macro on the running graph: every mapped parameter gets
+    /// `min + (max - min) * value` as a parameter command, and the control
+    /// thread's project copies keep the macro's value so a recompile starts
+    /// from it. No compile.
+    fn move_macro(&mut self, rack: DeviceId, index: u16, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        let mappings = self
+            .compiled
+            .as_deref()
+            .or(self.project.as_deref())
+            .and_then(|p| p.tracks.iter().find_map(|t| crate::compile::find_rack(&t.devices, rack)))
+            .and_then(|r| r.macros.get(index as usize))
+            .map(|m| m.mappings.clone())
+            .unwrap_or_default();
+        let patch = crate::compile::Patch::MacroValue { rack, index, value };
+        if let Some(p) = self.project.as_mut() {
+            crate::compile::apply_patch(Arc::make_mut(p), &patch);
+        }
+        if let Some(c) = self.compiled.as_mut()
+            && self.project.as_ref().is_none_or(|p| !Arc::ptr_eq(p, c))
+        {
+            crate::compile::apply_patch(Arc::make_mut(c), &patch);
+        }
+        {
+            let mut commands = lock(&self.shared.commands);
+            if let Some(tx) = commands.as_mut() {
+                for m in crate::compile::macro_patches(&mappings, value) {
+                    if let crate::compile::Patch::Param { device, param, value } = m {
+                        self.pool.note_applied(device, param, value);
+                        let _ = tx.push(RtCommand::SetParam(device, param, value));
+                    }
+                }
+            }
+        }
+        if self.status.graph_gen.load(Ordering::Acquire) != self.compile_gen {
+            self.dirty = true;
+        }
+    }
+
+    fn publish_open_midi(&self) {
+        *lock(&self.shared.midi_open) = self.midi_conns.iter().map(|c| c.id.clone()).collect();
     }
 
     fn collect_retired(&mut self) {
@@ -753,8 +1236,23 @@ impl Control {
             taps: Vec::new(),
             analysis: Some(self.status.tap.clone()),
         };
+        self.shared.compile_count.fetch_add(1, Ordering::Release);
         match compile(&project, &mut cx) {
-            Ok(g) => {
+            Ok(mut g) => {
+                self.compiled = Some(project.clone());
+                self.compile_gen += 1;
+                g.generation = self.compile_gen;
+                for t in &mut g.tracks {
+                    if let Some(io) = self.track_io.get(&t.id) {
+                        t.input_sel = io.input;
+                        t.no_input = io.none;
+                        if let Some(m) = io.monitor {
+                            t.monitor = m;
+                        }
+                    }
+                }
+                *lock(&self.status.armed_midi) = g.tracks.iter().filter(|t| t.arm && t.kind == aitrack_model::TrackKind::Instrument).map(|t| t.id).collect();
+                *lock(&self.status.armed_audio) = g.tracks.iter().filter(|t| t.arm && t.kind == aitrack_model::TrackKind::Audio && !t.no_input).map(|t| t.id).collect();
                 *lock(&self.status.meters) = g.meters.clone();
                 let mut device_meters = Vec::new();
                 for t in &g.tracks {
@@ -762,10 +1260,17 @@ impl Control {
                 }
                 device_meters.sort_by_key(|(id, _)| *id);
                 *lock(&self.status.device_meters) = device_meters;
+                let mut crash_flags = Vec::new();
+                for t in &g.tracks {
+                    crate::graph::for_each_proc(&t.devices, &mut |p| crash_flags.push((p.id, p.proc.crash_flag())));
+                }
+                crash_flags.sort_by_key(|(id, _)| *id);
+                *lock(&self.status.crash_flags) = crash_flags;
                 *lock(&self.status.session) = g.session_status.clone();
                 *lock(&self.status.track_latency) = g.track_latency.clone();
                 *lock(&self.shared.warnings) = g.warnings.clone();
                 *lock(&self.shared.last_error) = None;
+                self.shared.compile_generation.fetch_add(1, Ordering::Release);
                 self.assumed_latency.clear();
                 for t in &g.tracks {
                     collect_latency(&t.devices, &mut self.assumed_latency);
@@ -783,13 +1288,14 @@ impl Control {
             Err(e) => {
                 log::warn!("graph compile failed: {e}");
                 *lock(&self.shared.last_error) = Some(e.to_string());
+                self.shared.compile_generation.fetch_add(1, Ordering::Release);
             }
         }
     }
 
     /// Fresh queues and a new [`AudioProcessor`]; the handle's command and
     /// virtual-MIDI producers and every MIDI port are re-wired to it.
-    fn new_runner(&mut self, sample_rate: f64, input: Option<(Consumer<f32>, usize, usize, usize)>) -> AudioProcessor {
+    fn new_runner(&mut self, sample_rate: f64, input: Option<InputLink>) -> AudioProcessor {
         let (graph_tx, graph_rx) = RingBuffer::new(GRAPH_QUEUE);
         let (retire_tx, retire_rx) = RingBuffer::new(GRAPH_QUEUE);
         let (cmd_tx, cmd_rx) = RingBuffer::new(COMMAND_QUEUE);
@@ -813,6 +1319,7 @@ impl Control {
                 log::warn!("MIDI input {id}: {e}");
             }
         }
+        self.publish_open_midi();
         let loop_start = self.status.loop_start.load(Ordering::Relaxed);
         let init = TransportInit {
             playing: self.status.playing.load(Ordering::Relaxed),
@@ -827,22 +1334,49 @@ impl Control {
             retire_tx,
             cmd_rx,
             midi_rx,
-            input_rx: input.map(|(rx, channels, first, count)| InputQueue { rx, channels, first, count }),
+            input_rx: input.map(|(rx, stamps, channels, first, count)| InputQueue { rx, stamps, channels, first, count }),
         };
-        let runner = AudioProcessor::new(q, self.status.clone(), sample_rate, self.max_frames, init);
+        let mut runner = AudioProcessor::new(q, self.status.clone(), sample_rate, self.max_frames, init);
+        let (rec_midi_tx, rec_midi_rx) = RingBuffer::new(REC_MIDI_QUEUE);
+        let (rec_audio_tx, rec_audio_rx) = RingBuffer::new(AUDIO_QUEUE);
+        runner.attach_recorder(rec_midi_tx, rec_audio_tx);
+        // The old audio thread is gone. A take it was recording ends here, so
+        // the app gets what was captured and the next take can start: the
+        // notes still in the old queue are collected, the files are closed.
+        let st = &self.status;
+        let mid_take = st.rec_sessions.load(Ordering::Acquire) != st.rec_ended.load(Ordering::Acquire);
+        {
+            let mut notes = lock(&self.shared.rec_midi);
+            notes.drain();
+            notes.rx = Some(rec_midi_rx);
+        }
+        self.shared.recorder.attach(rec_audio_rx);
+        if mid_take {
+            st.rec_end_tick.store(st.position_ticks().to_bits(), Ordering::Relaxed);
+            st.rec_capturing.store(false, Ordering::Release);
+            st.rec_ended.store(st.rec_sessions.load(Ordering::Acquire), Ordering::Release);
+            self.shared.recorder.close_open();
+        }
         // Compile right away so the first callback already has a graph.
         self.dirty = true;
         self.recompile();
         runner
     }
 
+    /// A runner with no device: a stereo input queue the caller feeds by hand.
+    fn headless_runner(&mut self, rate: f64) -> AudioProcessor {
+        let (sink, rx, stamps) = input_ring(rate as usize, 2);
+        *lock(&self.shared.virtual_input) = Some(sink);
+        self.new_runner(rate, Some((rx, stamps, 2, 0, 2)))
+    }
+
     fn open_midi(&mut self, id: &str) -> Result<(), EngineError> {
         if self.midi_conns.iter().any(|c| c.id == id) {
             return Ok(());
         }
-        let producer = self.midi_spare.pop().ok_or_else(|| EngineError::Midi("too many MIDI inputs open".into()))?;
-        let conn = midi_io::connect(id, producer)?;
+        let conn = midi_io::connect(id, &mut self.midi_spare, self.status.epoch)?;
         self.midi_conns.push(conn);
+        self.publish_open_midi();
         Ok(())
     }
 
@@ -872,8 +1406,8 @@ impl Control {
         self.pool.forget_applied();
         let (input_tx, input_rx) = if prepared.active.input_channels > 0 {
             let ch = prepared.active.input_channels as usize;
-            let (t, r) = RingBuffer::new((sr as usize / 2).max(4096) * ch);
-            (Some(t), Some((r, ch, prepared.in_first, prepared.in_count)))
+            let (sink, r, stamps) = input_ring(sr as usize, ch);
+            (Some(sink), Some((r, stamps, ch, prepared.in_first, prepared.in_count)))
         } else {
             (None, None)
         };
@@ -937,7 +1471,7 @@ fn collect_latency(devs: &[crate::graph::DeviceNode], out: &mut Vec<(Arc<SharedP
         match d {
             crate::graph::DeviceNode::Proc(p) => out.push((p.proc.clone(), p.proc.reported_latency())),
             crate::graph::DeviceNode::Rack(r) => {
-                for c in &r.chains {
+                for c in r.chains.iter().chain(&r.returns) {
                     collect_latency(&c.devices, out);
                 }
             }

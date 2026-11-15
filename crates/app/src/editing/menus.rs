@@ -8,7 +8,7 @@ use crate::keys::{self, Cmd};
 use crate::theme::*;
 use crate::widgets::{self, menu_item, mono};
 use crate::workspace::{MenuKind, Workspace};
-use aitrack_model::{DeviceId, TrackId, TrackKind};
+use aitrack_model::{Color, DeviceId, TrackId, TrackKind};
 use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window};
 
 /// A menu row with its shortcut on the right.
@@ -45,6 +45,39 @@ fn action(
     }))
 }
 
+/// The palette as two rows of swatches; `current` is ringed. Picking one
+/// closes the menu and runs `pick`.
+fn swatches(id: &'static str, current: Option<Color>, cx: &mut Context<Workspace>, pick: impl Fn(&mut Workspace, Color, &mut Context<Workspace>) + Clone + 'static) -> gpui::Div {
+    use gpui::{div, px, InteractiveElement, Styled};
+    let row = |range: std::ops::Range<usize>, cx: &mut Context<Workspace>| {
+        let mut r = div().flex().gap(px(SP1));
+        for i in range {
+            let color = Color::palette(i);
+            let pick = pick.clone();
+            r = r.child(
+                div()
+                    .id(ElementId::Name(format!("{id}-{i}").into()))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .rounded(px(r_sm()))
+                    .bg(track_color(color))
+                    .border_1()
+                    .border_color(if current == Some(color) { p().text } else { border() })
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(p().text))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.menu = None;
+                        pick(this, color, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        r
+    };
+    let half = Color::PALETTE.len() / 2;
+    div().px(px(SP2)).py(px(SP1)).flex().flex_col().gap(px(SP1)).child(row(0..half, cx)).child(row(half..Color::PALETTE.len(), cx))
+}
+
 /// Right-click on a clip. It acts on the selected clips (the clip under
 /// the mouse joined the selection when the menu opened).
 pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
@@ -53,6 +86,7 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
     let looping = state(|c| c.looping.is_some());
     let muted = !clips.is_empty() && !state(|c| !c.muted);
     // The clip under the mouse, when it is audio and other clips play its file too.
+    let clip_color = clips.first().and_then(|(_, pl, _)| ws.s.project.clips.get(&pl.clip)).map(|c| c.color).filter(|c| clips.iter().all(|(_, pl, _)| ws.s.project.clips.get(&pl.clip).is_some_and(|x| x.color == *c)));
     let sample = ws.s.selected_placement.and_then(|(_, id)| ws.s.placement(id)).map(|(_, pl, _)| pl.clip).filter(|c| ws.s.sample_targets(*c).len() > 1);
     let card = widgets::menu_card("clip-menu", 232.)
         .child(command("clip-cut", Icon::Scissors, "Cut", Cmd::Cut, cx))
@@ -63,6 +97,10 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         }))
         .child(action("clip-delete", Icon::Trash, "Delete", keys::action_hint("DeleteSelection"), false, cx, |this, _, _| {
             this.s.delete_selection();
+        }))
+        .child(widgets::divider_h())
+        .child(swatches("clip-color", clip_color, cx, |this, color, _| {
+            this.s.set_clips_color(color);
         }))
         .child(widgets::divider_h())
         .child(action("clip-split", Icon::Split, "Split at Marker", keys::action_hint("SplitClip"), false, cx, |this, _, cx| this.split_clips(cx)))
@@ -206,6 +244,32 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
                 );
             })),
         )
+        .child(widgets::divider_h())
+        .child(swatches("track-color", Some(t.color), cx, move |this, color, _| {
+            let ids = this.s.selected_tracks();
+            this.s.set_tracks_color(&ids, color);
+        }))
+        .child(action(
+            "track-duplicate",
+            Icon::Layers,
+            if many { "Duplicate Tracks" } else { "Duplicate Track" },
+            keys::action_hint("Duplicate"),
+            false,
+            cx,
+            |this, _, _| {
+                let ids = this.s.selected_tracks();
+                this.s.duplicate_tracks(&ids);
+            },
+        ))
+        .child(action(
+            "track-delete",
+            Icon::Trash,
+            if many { "Delete Tracks" } else { "Delete Track" },
+            keys::action_hint("DeleteTrack"),
+            false,
+            cx,
+            |this, _, cx| this.delete_selected_tracks(cx),
+        ))
         .child(widgets::divider_h())
         .child(action(
             "track-audio",

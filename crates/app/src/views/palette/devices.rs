@@ -52,6 +52,8 @@ pub enum DeviceGroup {
     FxMastering,
     FxCreative,
     FxAnalysis,
+    // MIDI Effects (they run before the instrument)
+    MidiEffects,
 }
 
 impl DeviceGroup {
@@ -64,7 +66,7 @@ impl DeviceGroup {
         Self::InstMulti,
     ];
 
-    pub const EFFECTS: [Self; 13] = [
+    pub const EFFECTS: [Self; 14] = [
         Self::FxEq,
         Self::FxDynamics,
         Self::FxLimiter,
@@ -78,9 +80,10 @@ impl DeviceGroup {
         Self::FxCreative,
         Self::FxStereoUtility,
         Self::FxAnalysis,
+        Self::MidiEffects,
     ];
 
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::InstAnalog,
         Self::InstWavetable,
         Self::InstFm,
@@ -100,6 +103,7 @@ impl DeviceGroup {
         Self::FxCreative,
         Self::FxStereoUtility,
         Self::FxAnalysis,
+        Self::MidiEffects,
     ];
 
     pub fn is_instrument(self) -> bool {
@@ -135,6 +139,7 @@ impl DeviceGroup {
             Self::FxMastering => "fx.mastering",
             Self::FxCreative => "fx.creative",
             Self::FxAnalysis => "fx.analysis",
+            Self::MidiEffects => "midi.effects",
         }
     }
 
@@ -164,6 +169,7 @@ impl DeviceGroup {
             Self::FxMastering => "Multiband & Mastering",
             Self::FxCreative => "Creative",
             Self::FxAnalysis => "Analysis",
+            Self::MidiEffects => "MIDI Effects",
         }
     }
 
@@ -189,6 +195,7 @@ impl DeviceGroup {
             Self::FxMastering => "Audio Effects · Multiband & Mastering",
             Self::FxCreative => "Audio Effects · Creative",
             Self::FxAnalysis => "Audio Effects · Analysis",
+            Self::MidiEffects => "MIDI Effects",
         }
     }
 }
@@ -310,15 +317,18 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "rack.drum" => DeviceGroup::InstDrums,
         "fx.eq" => DeviceGroup::FxEq,
         "fx.compressor" | "fx.gate" | "fx.transient" => DeviceGroup::FxDynamics,
+        "fx.drumbus" => DeviceGroup::FxDynamics,
         "fx.limiter" => DeviceGroup::FxLimiter,
-        "fx.saturator" | "fx.tape" | "fx.amp" | "fx.console" | "fx.clipper" => DeviceGroup::FxSaturation,
+        "fx.saturator" | "fx.tape" | "fx.amp" | "fx.console" | "fx.clipper" | "fx.crusher" => DeviceGroup::FxSaturation,
         "fx.shaper" => DeviceGroup::FxCreative,
         "fx.reverb" => DeviceGroup::FxReverb,
         "fx.delay" => DeviceGroup::FxDelay,
-        "fx.chorus" => DeviceGroup::FxModulation,
+        "fx.chorus" | "fx.autopan" => DeviceGroup::FxModulation,
+        "fx.stutter" => DeviceGroup::FxCreative,
         "fx.filter" => DeviceGroup::FxFilter,
         "fx.multiband" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,
+        id if id.starts_with("midi.") => DeviceGroup::MidiEffects,
         "fx.midside" | "fx.utility" | "rack.audio" => DeviceGroup::FxStereoUtility,
         _ => DeviceGroup::FxStereoUtility,
     }
@@ -440,5 +450,16 @@ mod tests {
             classify_external(PluginFormat::Vst3, "u-eq", "ZL Equalizer", "ZL", "Fx|EQ", false, &prefs),
             DeviceGroup::FxCreative
         );
+    }
+
+    #[test]
+    fn midi_effects_have_their_own_group_among_the_effects() {
+        let prefs = PluginPrefs::default();
+        for id in ["midi.arp", "midi.chord", "midi.scale", "midi.velocity"] {
+            assert_eq!(classify_stock(id, &prefs), DeviceGroup::MidiEffects, "{id}");
+        }
+        assert!(!DeviceGroup::MidiEffects.is_instrument());
+        assert!(DeviceGroup::EFFECTS.contains(&DeviceGroup::MidiEffects) && DeviceGroup::ALL.contains(&DeviceGroup::MidiEffects));
+        assert_eq!(DeviceGroup::from_key(DeviceGroup::MidiEffects.key()), Some(DeviceGroup::MidiEffects));
     }
 }

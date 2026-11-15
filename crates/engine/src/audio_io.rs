@@ -18,12 +18,11 @@
 //! CoreAudio already include the device latency and safety offset and on
 //! Bluetooth the link delay, and publishes them in [`SharedStatus::io`].
 
-use crate::rt::AudioProcessor;
+use crate::rt::{AudioProcessor, InputSink};
 use crate::status::SharedStatus;
 use crate::EngineError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use rtrb::Producer;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -499,7 +498,8 @@ where
                 runner.begin_callback();
                 for chunk in data.chunks_mut(scratch.len()) {
                     let s = &mut scratch[..chunk.len()];
-                    runner.process_interleaved_at(s, channels, first);
+                    // A panic must not unwind into the driver's C callback.
+                    runner.process_interleaved_guarded(s, channels, first);
                     for (d, x) in chunk.iter_mut().zip(s.iter()) {
                         *d = T::from_sample(*x);
                     }
@@ -518,7 +518,7 @@ where
 fn build_input<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    tx: &mut Option<Producer<f32>>,
+    tx: &mut Option<InputSink>,
     flags: &Flags,
 ) -> Result<cpal::Stream, EngineError>
 where
@@ -527,7 +527,7 @@ where
 {
     let slot = Arc::new(Handoff::new(tx.take()));
     let cb_slot = slot.clone();
-    let mut producer: Option<Box<Producer<f32>>> = None;
+    let mut producer: Option<Box<InputSink>> = None;
     let status = flags.status.clone();
     let flags_err = flags.clone();
     let channels = config.channels.max(1) as usize;
@@ -544,11 +544,15 @@ where
                     }
                 };
                 let ts = info.timestamp();
-                status.io.publish_input((data.len() / channels) as u32, frames_between(ts.callback, ts.capture, rate));
-                for s in data {
-                    if tx.push(f32::from_sample(*s)).is_err() {
-                        break;
-                    }
+                let frames = data.len() / channels;
+                let delay = frames_between(ts.callback, ts.capture, rate);
+                status.io.publish_input(frames as u32, delay);
+                // When the first frame was captured, on the engine clock.
+                let captured = status.now_nanos().saturating_sub((delay as f64 / rate as f64 * 1e9) as u64);
+                // Whole frames only: a frame cut in two would swap the channels for good.
+                let kept = tx.push_with(frames, channels, captured, |i| f32::from_sample(data[i]));
+                if kept < frames {
+                    status.input_dropped.fetch_add((frames - kept) as u64, Ordering::Relaxed);
                 }
             },
             move |err| {
@@ -582,7 +586,7 @@ fn build_input_any(
     dev: &cpal::Device,
     conf: cpal::StreamConfig,
     fmt: SampleFormat,
-    tx: &mut Option<Producer<f32>>,
+    tx: &mut Option<InputSink>,
     flags: &Flags,
 ) -> Result<cpal::Stream, EngineError> {
     match fmt {
@@ -597,7 +601,7 @@ fn build_input_any(
 pub(crate) fn start(
     p: Prepared,
     runner: AudioProcessor,
-    input_tx: Option<Producer<f32>>,
+    input_tx: Option<InputSink>,
     status: Arc<SharedStatus>,
 ) -> Result<OpenStream, EngineError> {
     let flags = Flags { status: status.clone(), lost: Arc::new(AtomicBool::new(false)), rerouted: Arc::new(AtomicBool::new(false)) };

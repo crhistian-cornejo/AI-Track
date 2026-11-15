@@ -7,7 +7,9 @@
 //!                                                    rebuild content/soundbank/factory.db, then
 //!                                                    detect missing key/BPM from audio (cached)
 //! `cargo xtask soundbank attribution`                regenerate ATTRIBUTION.md
+//! `cargo xtask plugins <list|pin|verify>`            free-plugin catalog: pin sha256 and size (downloads), check pinned ones
 
+mod plugins;
 mod soundbank;
 
 use anyhow::{Result, bail};
@@ -16,9 +18,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("soundbank") => soundbank::run(&args[1..]),
+        Some("plugins") => plugins::run(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask soundbank <list|fetch|verify|index|attribution> [options]\n\
+                "usage: cargo xtask soundbank <list|fetch|verify|index|attribution> [options]\n       cargo xtask plugins <list|pin [id...]|verify>\n\
                  \n  fetch options: --only <id> (repeatable)  --max-size-mb <N>  --with-optional  --write-manifest  --no-index\n\
                  \n  index options: --no-analyse (skip key/BPM from audio)  --threads <N>"
             );

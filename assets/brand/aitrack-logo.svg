@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="t">
+  <title id="t">AI-Track</title>
+  <!-- Tile: Midnight theme panel. Bars: seven level meters that spell an "A";
+       the peak bar is the playhead, in the theme accent. -->
+  <rect width="256" height="256" rx="56" fill="#141518"/>
+  <g fill="#E9EAED">
+    <rect x="35"  y="160" width="18" height="48" rx="9"/>
+    <rect x="63"  y="112" width="18" height="96" rx="9"/>
+    <rect x="91"  y="80"  width="18" height="72" rx="9"/>
+    <rect x="147" y="80"  width="18" height="72" rx="9"/>
+    <rect x="175" y="112" width="18" height="96" rx="9"/>
+    <rect x="203" y="160" width="18" height="48" rx="9"/>
+  </g>
+  <rect x="119" y="48" width="18" height="104" rx="9" fill="#F0783C"/>
+</svg>

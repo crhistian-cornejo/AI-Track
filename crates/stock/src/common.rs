@@ -196,6 +196,69 @@ pub fn sanitize(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
+/// A short duck that hides discrete parameter changes (mode switches, filter
+/// on/off, big rate jumps): the wet path fades to zero, the change is applied
+/// at the silent sample, and the path fades back. No allocation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dip {
+    len: u32,
+    pos: u32,
+    /// 0 idle, 1 fading down, 2 fading up.
+    stage: u8,
+}
+
+impl Dip {
+    /// Duration of each half in milliseconds.
+    pub fn set_time(&mut self, ms: f32, sample_rate: f64) {
+        self.len = ((ms as f64 * 0.001 * sample_rate) as u32).max(1);
+    }
+
+    /// Begin a dip (no effect while one is running).
+    pub fn start(&mut self) {
+        if self.stage == 0 {
+            self.stage = 1;
+            self.pos = 0;
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.stage != 0
+    }
+
+    pub fn reset(&mut self) {
+        self.stage = 0;
+        self.pos = 0;
+    }
+
+    /// One sample: `(gain, apply)`. `apply` is true on the silent sample
+    /// where the pending change must be swapped in.
+    #[inline]
+    pub fn tick(&mut self) -> (f32, bool) {
+        match self.stage {
+            1 => {
+                self.pos += 1;
+                if self.pos >= self.len {
+                    self.stage = 2;
+                    self.pos = 0;
+                    (0.0, true)
+                } else {
+                    (1.0 - self.pos as f32 / self.len as f32, false)
+                }
+            }
+            2 => {
+                self.pos += 1;
+                if self.pos >= self.len {
+                    self.stage = 0;
+                    (1.0, false)
+                } else {
+                    (self.pos as f32 / self.len as f32, false)
+                }
+            }
+            _ => (1.0, false),
+        }
+    }
+}
+
 /// Write `values` into `out` from `offset`; returns the new offset.
 #[inline]
 pub fn write_meter(out: &mut [f32], offset: usize, values: &[f32]) -> usize {

@@ -27,6 +27,8 @@ pub enum PrefsPage {
     Appearance,
     /// Sample sources for the palette: Content Hub, Splice (opt-in).
     Sounds,
+    /// MIDI input ports and the track live MIDI goes to.
+    Midi,
     Performance,
 }
 
@@ -260,6 +262,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
         PrefsPage::Audio => audio_page(ws, cx),
         PrefsPage::Appearance => appearance_page(ws, window, cx),
         PrefsPage::Sounds => sounds_page(ws, cx),
+        PrefsPage::Midi => midi_page(ws, window, cx),
         PrefsPage::Performance => performance_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
@@ -295,6 +298,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .child(nav("nav-audio", Icon::Volume, "Audio", PrefsPage::Audio))
                 .child(nav("nav-look", Icon::Sparkles, "Appearance", PrefsPage::Appearance))
                 .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds))
+                .child(nav("nav-midi", Icon::Piano, "MIDI", PrefsPage::Midi))
                 .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance)),
         )
         .child(
@@ -303,6 +307,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                     PrefsPage::Audio => "audio-scroll",
                     PrefsPage::Appearance => "look-scroll",
                     PrefsPage::Sounds => "sounds-scroll",
+                    PrefsPage::Midi => "midi-scroll",
                     PrefsPage::Performance => "perf-scroll",
                 })
                 .flex_1()
@@ -740,20 +745,146 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 
 const CACHE_BUDGET_MB: &[usize] = &[128, 256, 512, 1024, 2048];
 
+// ───────────────────────────── MIDI ─────────────────────────────
+
+/// How long the activity light stays on after a MIDI message.
+const MIDI_LIGHT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Turns the engine's running message count into a light that stays on for
+/// a moment after each change.
+#[derive(Clone, Copy, Debug, Default)]
+struct MidiLight {
+    count: u64,
+    changed: Option<std::time::Instant>,
+}
+
+impl MidiLight {
+    fn update(&mut self, count: u64, now: std::time::Instant) -> bool {
+        if count != self.count {
+            self.count = count;
+            self.changed = Some(now);
+        }
+        self.changed.is_some_and(|at| now.duration_since(at) < MIDI_LIGHT)
+    }
+}
+
+thread_local! {
+    static LIGHT: Cell<MidiLight> = const { Cell::new(MidiLight { count: 0, changed: None }) };
+}
+
+/// What a port row says: on and open (messages arrive), on but not open
+/// yet (or it refused to open), or switched off.
+fn midi_status(port: &crate::bridge::MidiPortState) -> &'static str {
+    match (port.enabled, port.open) {
+        (true, true) => "Connected",
+        (true, false) => "Waiting",
+        (false, _) => "Off",
+    }
+}
+
+/// The choices for the track live MIDI goes to: every armed instrument
+/// track, or one instrument track. `(text, track, selected)`.
+fn midi_targets(project: &aitrack_model::Project, current: Option<aitrack_model::TrackId>) -> Vec<(String, Option<aitrack_model::TrackId>, bool)> {
+    let mut out = vec![("Armed tracks".to_owned(), None, current.is_none())];
+    out.extend(project.tracks.iter().filter(|t| t.kind == aitrack_model::TrackKind::Instrument).map(|t| (t.name.clone(), Some(t.id), current == Some(t.id))));
+    out
+}
+
+fn midi_page(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let ports = ws.b.engine.midi_ports();
+    let target = ws.b.engine.midi_target();
+    let lit = LIGHT.with(|l| {
+        let mut light = l.get();
+        let on = light.update(ws.b.engine.midi_message_count(), std::time::Instant::now());
+        l.set(light);
+        on
+    });
+    // The light fades on its own clock: keep painting while it is on.
+    if lit {
+        window.request_animation_frame();
+    }
+    let dot = |color: gpui::Hsla| div().size(px(8.)).flex_none().rounded_full().bg(color);
+
+    let mut list = div().flex().flex_col();
+    for (i, port) in ports.iter().enumerate() {
+        let id = port.id.clone();
+        let on = port.enabled;
+        list = list.child(setting_row(
+            port.name.clone(),
+            Some(midi_status(port).into()),
+            div().flex().items_center().gap(px(SP3)).child(dot(if port.open { pal.play } else { pal.faint })).child(
+                switch(("midi-port", i), on).on_click(cx.listener(move |this, _, _, cx| {
+                    this.b.engine.set_midi_port_enabled(&id, !on);
+                    cx.notify();
+                })),
+            ),
+        ));
+    }
+    if ports.is_empty() {
+        list = list.child(setting_row("No MIDI inputs found", Some("Plug a keyboard or controller in: it opens by itself within a few seconds".into()), div()));
+    }
+
+    let choices = midi_targets(&ws.s.project, target);
+    let tracks: Vec<Option<aitrack_model::TrackId>> = choices.iter().map(|c| c.1).collect();
+    let items: Vec<(String, bool, bool)> = choices.into_iter().map(|(text, _, selected)| (text, selected, true)).collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .child(section_title("INPUT PORTS"))
+        .child(setting_row(
+            "Activity",
+            Some("Lights up when a note, controller or other message arrives from any port".into()),
+            dot(if lit { pal.accent } else { pal.faint }),
+        ))
+        .child(list)
+        .child(section_title("LIVE MIDI GOES TO"))
+        .child(setting_row(
+            "Track",
+            Some("Armed tracks, or one instrument track".into()),
+            chip_row("midi-target", items, cx, move |this, i, cx| {
+                this.b.engine.set_midi_target(tracks.get(i).copied().flatten());
+                cx.notify();
+            }),
+        ))
+        .into_any_element()
+}
+
+/// The memory tile's detail line: the cache's use of its budget, split into
+/// decoded files and warp renders when the renders' share is known (two
+/// lines, so it fits a tile).
+fn cache_detail(used_bytes: usize, budget_mb: usize, warp_bytes: Option<usize>) -> String {
+    const MB: f64 = 1024. * 1024.;
+    let used = used_bytes as f64 / MB;
+    match warp_bytes {
+        Some(warp) => {
+            let warp = warp.min(used_bytes);
+            format!("Sample cache: {used:.1} / {budget_mb} MB\n{:.1} decoded + {:.1} warp renders", (used_bytes - warp) as f64 / MB, warp as f64 / MB)
+        }
+        None => format!("Sample cache: {used:.1} / {budget_mb} MB"),
+    }
+}
+
 fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let dsp_pct = ws.b.engine.cpu_load() * 100.;
     let app_pct = ws.usage.cpu * 100.;
     let ram = ws.usage.memory_label();
     let (used_bytes, budget_bytes) = ws.b.engine.sample_cache_stats();
-    let used_mb = used_bytes as f64 / (1024. * 1024.);
     let budget_mb = (budget_bytes / (1024 * 1024)).max(1);
+    let cache_text = cache_detail(used_bytes, budget_mb, Some(ws.b.engine.sample_cache_warp_bytes()));
     let low_power = ws.look.app.low_power;
     let sandbox = ws.b.engine.sandbox_plugins();
 
     let tile = |caption: &'static str, value: String, detail: String| {
+        let mut lines = div().flex().flex_col();
+        for line in detail.lines() {
+            lines = lines.child(label(line.to_owned(), TEXT_XS, pal.muted).whitespace_normal());
+        }
         div()
             .flex_1()
+            .min_w(px(0.))
             .p(px(SP2))
             .rounded(px(r_md()))
             .bg(content(0.03))
@@ -764,7 +895,7 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
             .gap(px(SP1))
             .child(label(caption, TEXT_XS, pal.faint))
             .child(mono(value, TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-            .child(label(detail, TEXT_XS, pal.muted).whitespace_normal())
+            .child(lines)
     };
     let tiles = div()
         .py(px(SP2))
@@ -772,7 +903,7 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
         .gap(px(SP2))
         .child(tile("AUDIO DSP", format!("{dsp_pct:.1}%"), "Audio callback load relative to buffer window".into()))
         .child(tile("PROCESS CPU", format!("{app_pct:.1}%"), "Total share across host & UI threads".into()))
-        .child(tile("MEMORY", ram, format!("Sample cache: {used_mb:.1} / {budget_mb} MB")));
+        .child(tile("MEMORY", ram, cache_text));
 
     let cache_items: Vec<(String, bool, bool)> = CACHE_BUDGET_MB
         .iter()
@@ -1433,6 +1564,43 @@ pub fn backdrop(ws: &Workspace) -> Option<AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_line_splits_decoded_files_from_warp_renders() {
+        const MB: usize = 1024 * 1024;
+        assert_eq!(cache_detail(30 * MB, 512, None), "Sample cache: 30.0 / 512 MB");
+        assert_eq!(cache_detail(30 * MB, 512, Some(10 * MB)), "Sample cache: 30.0 / 512 MB\n20.0 decoded + 10.0 warp renders");
+        // The renders are part of the total, never more than it.
+        assert_eq!(cache_detail(MB, 64, Some(5 * MB)), "Sample cache: 1.0 / 64 MB\n0.0 decoded + 1.0 warp renders");
+    }
+
+    #[test]
+    fn the_midi_light_stays_on_a_moment_after_each_message() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut light = MidiLight::default();
+        assert!(!light.update(0, t0), "no messages yet");
+        assert!(light.update(3, t0 + Duration::from_millis(10)));
+        assert!(light.update(3, t0 + Duration::from_millis(200)), "still on");
+        assert!(!light.update(3, t0 + Duration::from_millis(400)), "faded");
+        assert!(light.update(4, t0 + Duration::from_millis(500)), "a new message lights it again");
+    }
+
+    #[test]
+    fn midi_ports_say_what_they_are_doing_and_targets_list_instruments() {
+        let port = |enabled, open| crate::bridge::MidiPortState { id: "p".into(), name: "Keys".into(), enabled, open };
+        assert_eq!(midi_status(&port(true, true)), "Connected");
+        assert_eq!(midi_status(&port(true, false)), "Waiting");
+        assert_eq!(midi_status(&port(false, true)), "Off");
+        let mut s = crate::state::AppState::new(aitrack_model::Project::new("Midi"));
+        let synth = s.add_track(aitrack_model::TrackKind::Instrument).unwrap();
+        s.add_track(aitrack_model::TrackKind::Audio).unwrap();
+        let none = midi_targets(&s.project, None);
+        assert_eq!(none.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["Armed tracks", "MIDI 1"]);
+        assert!(none[0].2 && !none[1].2);
+        let picked = midi_targets(&s.project, Some(synth));
+        assert!(!picked[0].2 && picked[1].2 && picked[1].1 == Some(synth));
+    }
 
     #[test]
     fn latency_tiles_show_measured_figures() {

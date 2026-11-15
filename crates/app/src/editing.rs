@@ -20,6 +20,7 @@ mod groups;
 mod racks;
 pub mod menus;
 pub mod overlay;
+mod overwrite;
 mod timeline;
 
 #[cfg(test)]
@@ -98,6 +99,9 @@ pub struct EditState {
     /// The devices picked with Cmd/Ctrl/Shift+click on their title bars, all
     /// in one chain. Read it through [`AppState::selected_devices`].
     pub devices: Vec<DeviceId>,
+    /// The clips the gesture in flight moved or made longer: when it ends
+    /// they replace what they cover (see [`overwrite`]).
+    pub(crate) landed: Vec<PlacementId>,
 }
 
 impl Default for EditState {
@@ -118,6 +122,7 @@ impl Default for EditState {
             pressed: None,
             tracks: BTreeSet::new(),
             devices: Vec::new(),
+            landed: Vec::new(),
         }
     }
 }

@@ -103,3 +103,55 @@ pub fn sine(freq: f32, amp: f32) -> impl FnMut(usize) -> (f32, f32) {
         (v, v)
     }
 }
+
+/// Largest step between contiguous output samples (left channel) of a
+/// steady 100 Hz sine when parameter `id` jumps from the plain value `from`
+/// to `to` by an event in the middle of a block, after everything settled
+/// at `from`. `setup` holds `(id, plain)` pairs applied first. Returns
+/// `(step with the change, step without)`; the second is the larger of the
+/// clean outputs at `from` and at `to`, the reference for "no click".
+pub fn param_change_step(make: fn() -> Box<dyn Processor>, setup: &[(u32, f32)], id: u32, from: f32, to: f32, amp: f32) -> (f32, f32) {
+    let run = |start: f32, change: Option<f32>| -> f32 {
+        let mut p = make();
+        p.prepare(SR, BLOCK);
+        let norm = |p: &dyn Processor, id: u32, plain: f32| p.info().params.iter().find(|i| i.id == id).map(|i| i.to_normalized(plain)).unwrap_or_else(|| panic!("no param {id}"));
+        for &(sid, v) in setup {
+            let n = norm(p.as_ref(), sid, v);
+            p.set_param(sid, n);
+        }
+        let n = norm(p.as_ref(), id, start);
+        p.set_param(id, n);
+        let mut buf = AudioBuffer::new(2, BLOCK);
+        let tr = Transport::default();
+        let mut pos = 0usize;
+        let mut out = Vec::new();
+        let blocks = 375 + 40;
+        for b in 0..blocks {
+            buf.set_frames(BLOCK);
+            {
+                let (l, r) = buf.stereo_mut();
+                for i in 0..BLOCK {
+                    let v = amp * (std::f64::consts::TAU * 100.0 * (pos + i) as f64 / SR).sin() as f32;
+                    l[i] = v;
+                    r[i] = v;
+                }
+            }
+            let ev = match change {
+                Some(to) if b == 375 + 10 => Some(Event { offset: (BLOCK / 2) as u32, kind: EventKind::Param { id, value: norm(p.as_ref(), id, to) } }),
+                _ => None,
+            };
+            let events: &[Event] = match &ev {
+                Some(e) => std::slice::from_ref(e),
+                None => &[],
+            };
+            let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events, transport: &tr };
+            p.process(&mut ctx);
+            if b >= 375 + 8 {
+                out.extend_from_slice(buf.channel(0));
+            }
+            pos += BLOCK;
+        }
+        out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
+    };
+    (run(from, Some(to)), run(from, None).max(run(to, None)))
+}

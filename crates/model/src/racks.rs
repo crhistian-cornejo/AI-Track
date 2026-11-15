@@ -16,6 +16,8 @@ use crate::project::*;
 pub enum Container {
     Track(crate::ids::TrackId),
     Rack { rack: DeviceId, chain: usize },
+    /// A Drum Rack's internal return.
+    Return { rack: DeviceId, index: usize },
 }
 
 impl Container {
@@ -23,6 +25,7 @@ impl Container {
         match slot {
             DeviceSlot::Track { track, .. } => Self::Track(track),
             DeviceSlot::Rack { rack, chain, .. } => Self::Rack { rack, chain },
+            DeviceSlot::Return { rack, index, .. } => Self::Return { rack, index },
         }
     }
 
@@ -30,6 +33,7 @@ impl Container {
         match self {
             Self::Track(track) => DeviceSlot::Track { track, index },
             Self::Rack { rack, chain } => DeviceSlot::Rack { rack, chain, index },
+            Self::Return { rack, index: ret } => DeviceSlot::Return { rack, index: ret, pos: index },
         }
     }
 }
@@ -37,6 +41,7 @@ impl Container {
 fn index_of(slot: DeviceSlot) -> usize {
     match slot {
         DeviceSlot::Track { index, .. } | DeviceSlot::Rack { index, .. } => index,
+        DeviceSlot::Return { pos, .. } => pos,
     }
 }
 
@@ -47,10 +52,16 @@ pub fn device_slot(p: &Project, id: DeviceId) -> Option<DeviceSlot> {
             return Some(here(i));
         }
         chain.iter().find_map(|d| match &d.kind {
-            DeviceKind::Rack(r) => r.chains.iter().enumerate().find_map(|(ci, c)| {
+            DeviceKind::Rack(r) => {
                 let rack = d.id;
-                find(&c.devices, id, &move |index| DeviceSlot::Rack { rack, chain: ci, index })
-            }),
+                r.chains
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ci, c)| find(&c.devices, id, &move |index| DeviceSlot::Rack { rack, chain: ci, index }))
+                    .or_else(|| {
+                        r.returns.iter().enumerate().find_map(|(ri, c)| find(&c.devices, id, &move |pos| DeviceSlot::Return { rack, index: ri, pos }))
+                    })
+            }
             _ => None,
         })
     }
@@ -66,6 +77,10 @@ pub fn chain(p: &Project, c: Container) -> Option<&[Device]> {
         Container::Track(t) => p.track(t).map(|t| t.devices.as_slice()),
         Container::Rack { rack, chain } => match &p.device(rack)?.kind {
             DeviceKind::Rack(r) => r.chains.get(chain).map(|c| c.devices.as_slice()),
+            _ => None,
+        },
+        Container::Return { rack, index } => match &p.device(rack)?.kind {
+            DeviceKind::Rack(r) => r.returns.get(index).map(|c| c.devices.as_slice()),
             _ => None,
         },
     }

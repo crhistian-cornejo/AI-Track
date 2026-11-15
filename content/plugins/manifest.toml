@@ -1,0 +1,803 @@
+# Free plugins catalog (docs/research/17-plugins-gratuitos-instalador.md).
+#
+# lane = "direct": the maker lets anyone download it from their own server. The app
+#   downloads on request, only from allowed_hosts (redirects included), and installs
+#   it when the sha256 matches. Until `cargo xtask plugins pin` fills sha256 and size
+#   (it downloads each file once, on the maintainer's machine), the entry behaves as
+#   a guided link: nothing is installed from an unpinned artifact.
+# lane = "link": an account, the maker's manager, a form, or only an installer program.
+#   The tab opens the official page and recognises the plugin once it is installed.
+#
+# Nothing here is ever mirrored on our servers. [V] URLs were read on the maker's page
+# during the research; entries marked "check" in notes need the real file in hand.
+
+[meta]
+version = 1
+updated = "2026-11-15"
+notes = "Free plugins only. Pin hashes with `cargo xtask plugins pin`; verify them in CI with `cargo xtask plugins verify`."
+
+
+[[plugin]]
+id = "tdr-nova"
+name = "TDR Nova"
+vendor = "Tokyo Dawn Labs"
+category = "eq"
+version = "2.2.3"
+tags = ["dynamic eq", "eq"]
+homepage = "https://www.tokyodawn.net/tdr-nova/"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from www.tokyodawn.net, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://www.tokyodawn.net/tdr-nova/."
+lane = "direct"
+formats = ["vst3"]
+bundle_ids = ["TDR Nova"]
+allowed_hosts = ["www.tokyodawn.net"]
+description = "Parallel dynamic equaliser: four bands with a compressor each."
+notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribution, so only a download from tokyodawn.net."
+[[plugin.artifact]]
+os = "macos"
+url = "https://www.tokyodawn.net/labs/Nova/2.2.3/TDR%20Nova.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://www.tokyodawn.net/labs/Nova/2.2.3/TDR%20Nova%20(no%20installer).zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "tdr-kotelnikov"
+name = "TDR Kotelnikov"
+vendor = "Tokyo Dawn Labs"
+category = "dynamics"
+version = "1.6.7"
+tags = ["compressor", "glue", "bus"]
+homepage = "https://www.tokyodawn.net/tdr-kotelnikov/"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from www.tokyodawn.net, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://www.tokyodawn.net/tdr-kotelnikov/."
+lane = "direct"
+formats = ["vst3"]
+bundle_ids = ["TDR Kotelnikov"]
+allowed_hosts = ["www.tokyodawn.net"]
+description = "Transparent mastering compressor, good on the stereo bus."
+notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribution, so only a download from tokyodawn.net."
+[[plugin.artifact]]
+os = "macos"
+url = "https://www.tokyodawn.net/labs/Kotelnikov/1.6.7/TDR%20Kotelnikov.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://www.tokyodawn.net/labs/Kotelnikov/1.6.7/TDR%20Kotelnikov%20(no%20installer).zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "tdr-slickeq"
+name = "TDR VOS SlickEQ"
+vendor = "Tokyo Dawn Labs"
+category = "eq"
+version = "1.3.9"
+tags = ["eq", "colour"]
+homepage = "https://www.tokyodawn.net/tdr-vos-slickeq/"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from www.tokyodawn.net, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://www.tokyodawn.net/tdr-vos-slickeq/."
+lane = "direct"
+formats = ["vst3"]
+bundle_ids = ["TDR VOS SlickEQ"]
+allowed_hosts = ["www.tokyodawn.net"]
+description = "Three-band equaliser with analogue character."
+notes = "[V] zip URLs read on the maker's page; the site terms forbid redistribution, so only a download from tokyodawn.net."
+[[plugin.artifact]]
+os = "macos"
+url = "https://www.tokyodawn.net/labs/SlickEQ/1.3.9/TDR%20VOS%20SlickEQ.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://www.tokyodawn.net/labs/SlickEQ/1.3.9/TDR%20VOS%20SlickEQ%20(no%20installer).zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "youlean-loudness-meter-2"
+name = "Youlean Loudness Meter 2 (Free)"
+vendor = "Youlean"
+category = "utility"
+version = "2.5.15"
+tags = ["loudness", "lufs", "meter"]
+homepage = "https://youlean.co/download-youlean-loudness-meter/"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from cdn.youlean.co, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://youlean.co/download-youlean-loudness-meter/."
+lane = "direct"
+formats = ["vst3"]
+bundle_ids = ["Youlean Loudness Meter 2"]
+allowed_hosts = ["cdn.youlean.co"]
+description = "LUFS loudness meter; the free version has fewer views than the paid one."
+notes = "[V] The URLs change with each version (they carry the upload month): check before pinning."
+[[plugin.artifact]]
+os = "macos"
+url = "https://cdn.youlean.co/wp-content/uploads/2026/09/Youlean-Loudness-Meter-2-V2.5.15-macOS.dmg"
+sha256 = ""
+size = 0
+container = "dmg"
+[[plugin.artifact]]
+os = "windows"
+url = "https://cdn.youlean.co/wp-content/uploads/2026/09/Youlean-Loudness-Meter-2-V2.5.15-Windows.zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "tal-noisemaker"
+name = "TAL-NoiseMaker"
+vendor = "TAL Software"
+category = "synth"
+version = "5.0.6"
+tags = ["analogue", "synth"]
+homepage = "https://tal-software.com/products/tal-noisemaker"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from tal-software.com, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://tal-software.com/products/tal-noisemaker."
+lane = "direct"
+formats = ["vst3", "clap"]
+bundle_ids = ["TAL-NoiseMaker"]
+allowed_hosts = ["tal-software.com"]
+description = "Virtual analogue synthesizer."
+notes = "[V] The macOS zip holds the maker's installer package, which is expanded, never run. The Windows download is an installer program, so Windows is a guided link."
+[[plugin.artifact]]
+os = "macos"
+url = "https://tal-software.com/downloads/plugins/TAL-NoiseMaker-installer_macos.zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "sforzando"
+name = "sforzando"
+vendor = "Plogue"
+category = "sampler"
+version = "1.982"
+tags = ["sfz", "sampler"]
+homepage = "https://www.plogue.com/downloads.html"
+license = "Proprietary-Freeware"
+license_notice = "Free to use. AI-Track downloads it from s3.amazonaws.com, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://www.plogue.com/downloads.html."
+lane = "direct"
+formats = ["vst3", "clap"]
+bundle_ids = ["sforzando"]
+allowed_hosts = ["s3.amazonaws.com"]
+description = "Player for SFZ instruments."
+notes = "[V] Hosted on the maker's S3 bucket. Windows is an installer program (guided link)."
+[[plugin.artifact]]
+os = "macos"
+url = "https://s3.amazonaws.com/sforzando/MAC_sforzando_v1.982.dmg"
+sha256 = ""
+size = 0
+container = "dmg"
+
+[[plugin]]
+id = "zebralette-3"
+name = "Zebralette 3"
+vendor = "u-he"
+category = "synth"
+version = "3.0.0"
+tags = ["wavetable", "synth"]
+homepage = "https://u-he.com/products/"
+license = "u-he-EULA"
+license_url = "https://u-he.com/about/eula/"
+license_notice = "Free to use. AI-Track downloads it from dl.u-he.com, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://u-he.com/products/."
+lane = "direct"
+formats = ["vst3", "clap"]
+bundle_ids = ["Zebralette3"]
+allowed_hosts = ["dl.u-he.com"]
+description = "Wavetable synthesizer, the free sibling of Zebra."
+notes = "[V] The EULA lets anyone distribute it free of charge; we still only download from the maker."
+[[plugin.artifact]]
+os = "macos"
+url = "https://dl.u-he.com/releases/Zebralette3_300_20399__Mac.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://dl.u-he.com/releases/Zebralette3_300_20399_Win.zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "podolski"
+name = "Podolski"
+vendor = "u-he"
+category = "synth"
+version = "1.2.3"
+tags = ["synth", "light on cpu"]
+homepage = "https://u-he.com/products/"
+license = "u-he-EULA"
+license_url = "https://u-he.com/about/eula/"
+license_notice = "Free to use. AI-Track downloads it from dl.u-he.com, the maker's own server, only when you ask; it does not redistribute it. Read the maker's terms at https://u-he.com/products/."
+lane = "direct"
+formats = ["vst3"]
+bundle_ids = ["Podolski"]
+allowed_hosts = ["dl.u-he.com"]
+description = "Light, fast synthesizer."
+notes = "[V] VST3 only, no CLAP."
+[[plugin.artifact]]
+os = "macos"
+url = "https://dl.u-he.com/releases/Podolski_123_12092_Mac.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://dl.u-he.com/releases/Podolski_123_12092_Win.zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "surge-xt"
+name = "Surge XT"
+vendor = "Surge Synth Team"
+category = "synth"
+version = "1.3.4"
+tags = ["hybrid", "presets", "open source"]
+homepage = "https://surge-synthesizer.github.io/"
+license = "GPL-3.0"
+license_url = "https://github.com/surge-synthesizer/surge/blob/main/LICENSE"
+license_notice = "Open source (GPL-3.0). AI-Track downloads it from the project's GitHub release only when you ask; it is a separate program, not part of AI-Track. Source: https://surge-synthesizer.github.io/."
+lane = "direct"
+formats = ["vst3", "clap"]
+bundle_ids = ["Surge XT", "Surge XT Effects"]
+allowed_hosts = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
+description = "Open source hybrid synthesizer with a huge preset library."
+notes = "[V] Asset names read through the GitHub API; the plugins-only zips are the portable ones."
+[[plugin.artifact]]
+os = "macos"
+url = "https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-macos-1.3.4-pluginsonly.zip"
+sha256 = ""
+size = 0
+[[plugin.artifact]]
+os = "windows"
+url = "https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-win64-1.3.4-pluginsonly.zip"
+sha256 = ""
+size = 0
+
+[[plugin]]
+id = "dexed"
+name = "Dexed"
+vendor = "Pascal Gauthier"
+category = "synth"
+version = "1.1.0"
+tags = ["fm", "dx7"]
+homepage = "https://github.com/asb2m10/dexed"
+license = "GPL-3.0"
+license_notice = "Open source (GPL-3.0). AI-Track downloads it from the project's GitHub release only when you ask; it is a separate program, not part of AI-Track. Source: https://github.com/asb2m10/dexed."
+lane = "direct"
+formats = ["vst3", "clap"]
+bundle_ids = ["Dexed"]
+allowed_hosts = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
+description = "FM synthesizer compatible with the DX7."
+notes = "[V] The dmg URL is the one on the project's release page; formats inside need checking (CLAP confirmed since 0.9.7)."
+[[plugin.artifact]]
+os = "macos"
+url = "https://github.com/asb2m10/dexed/releases/download/v1.1.0/Dexed-1.1.0-macOS.dmg"
+sha256 = ""
+size = 0
+container = "dmg"
+
+[[plugin]]
+id = "xfer-ott"
+name = "OTT"
+vendor = "Xfer Records"
+category = "dynamics"
+tags = ["multiband", "upward compression"]
+homepage = "https://www.xferrecords.com/freeware"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["OTT"]
+description = "Multiband upward/downward compressor, a dance-music classic."
+notes = "Check: the macOS list says VST, AU and AAX; a VST3 is only mentioned in the changelog."
+
+[[plugin]]
+id = "klanghelm-dc1a"
+name = "Klanghelm DC1A"
+vendor = "Klanghelm"
+category = "dynamics"
+tags = ["compressor"]
+homepage = "https://klanghelm.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["DC1A"]
+description = "Simple, punchy compressor."
+notes = "Freeware. VST3 support to check."
+
+[[plugin]]
+id = "klanghelm-ivgi"
+name = "Klanghelm IVGI"
+vendor = "Klanghelm"
+category = "saturation"
+tags = ["saturation"]
+homepage = "https://klanghelm.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["IVGI"]
+description = "Tape-style saturator."
+notes = "Freeware. VST3 support to check."
+
+[[plugin]]
+id = "klanghelm-mjuc-jr"
+name = "Klanghelm MJUC jr."
+vendor = "Klanghelm"
+category = "dynamics"
+tags = ["variable-mu", "glue"]
+homepage = "https://klanghelm.com/MJUC"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["MJUC jr"]
+description = "Variable-mu compressor."
+notes = "Free. VST3 support to check."
+
+[[plugin]]
+id = "analogobsession"
+name = "Analog Obsession (BUSTERse, LALA)"
+vendor = "Analog Obsession"
+category = "dynamics"
+tags = ["bus compressor", "eq"]
+homepage = "https://www.analogobsession.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3"]
+description = "Free bus compressors and equalisers modelled on classics."
+notes = "Free to use. Recent macOS and Apple Silicon support not confirmed."
+
+[[plugin]]
+id = "loudmax"
+name = "LoudMax"
+vendor = "Thomas Mundt"
+category = "dynamics"
+tags = ["limiter"]
+homepage = "https://loudmax.blogspot.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3"]
+bundle_ids = ["LoudMax"]
+description = "Look-ahead limiter."
+notes = "Freeware for non-commercial use; the maker hosts it on Dropbox, outside his own domain, so it stays a link."
+
+[[plugin]]
+id = "voxengo-span"
+name = "Voxengo SPAN"
+vendor = "Voxengo"
+category = "utility"
+tags = ["analyser", "spectrum"]
+homepage = "https://www.voxengo.com/product/span/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3"]
+bundle_ids = ["SPAN"]
+description = "Spectrum analyser."
+notes = "VST3 only in the Windows build; the macOS disk image has AU and VST2 only."
+
+[[plugin]]
+id = "valhalla-supermassive"
+name = "Valhalla Supermassive"
+vendor = "Valhalla DSP"
+category = "reverb"
+tags = ["reverb", "delay"]
+homepage = "https://valhalladsp.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["ValhallaSupermassive"]
+description = "Huge reverb and delay that is free."
+notes = "Check: EULA and formats (the maker's site refused automated reading)."
+
+[[plugin]]
+id = "valhalla-freqecho"
+name = "Valhalla FreqEcho"
+vendor = "Valhalla DSP"
+category = "delay"
+tags = ["frequency shifter"]
+homepage = "https://valhalladsp.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["ValhallaFreqEcho"]
+description = "Echo with a frequency shifter in the feedback."
+notes = "Check that it is still free."
+
+[[plugin]]
+id = "valhalla-spacemodulator"
+name = "Valhalla Space Modulator"
+vendor = "Valhalla DSP"
+category = "modulation"
+tags = ["chorus", "flanger"]
+homepage = "https://valhalladsp.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["ValhallaSpaceModulator"]
+description = "Chorus, flanger and phaser."
+notes = "Check that it is still free."
+
+[[plugin]]
+id = "tal-reverb-4"
+name = "TAL-Reverb-4"
+vendor = "TAL Software"
+category = "reverb"
+tags = ["plate"]
+homepage = "https://tal-software.com/products/tal-reverb-4"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3", "clap"]
+bundle_ids = ["TAL-Reverb-4"]
+description = "Plate reverb."
+notes = "[V] formats; the zip URL still has to be read from the page."
+
+[[plugin]]
+id = "tal-chorus-lx"
+name = "TAL-Chorus-LX"
+vendor = "TAL Software"
+category = "modulation"
+tags = ["chorus", "juno"]
+homepage = "https://tal-software.com/products/tal-chorus-lx"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3", "clap"]
+bundle_ids = ["TAL-Chorus-LX"]
+description = "Juno-60 style chorus."
+notes = "[V] formats; the zip URL still has to be read from the page."
+
+[[plugin]]
+id = "tal-filter-2"
+name = "TAL-Filter-2"
+vendor = "TAL Software"
+category = "modulation"
+tags = ["filter", "trance gate"]
+homepage = "https://tal-software.com/products/tal-filter"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3", "clap"]
+bundle_ids = ["TAL-Filter-2"]
+description = "Tempo-synced filter and trance gate."
+notes = "[V] formats; the zip URL still has to be read from the page."
+
+[[plugin]]
+id = "tal-vocoder"
+name = "TAL-Vocoder-2"
+vendor = "TAL Software"
+category = "vocal"
+tags = ["vocoder"]
+homepage = "https://tal-software.com/products/tal-vocoder"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3", "clap"]
+bundle_ids = ["TAL-Vocoder-2"]
+description = "Vocoder."
+notes = "[V] formats; the zip URL still has to be read from the page."
+
+[[plugin]]
+id = "auburn-graillon-free"
+name = "Graillon 3 Free"
+vendor = "Auburn Sounds"
+category = "vocal"
+tags = ["pitch", "formant"]
+homepage = "https://www.auburnsounds.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = []
+bundle_ids = ["Graillon 3 Free"]
+description = "Voice pitch and formant changer, free edition."
+notes = "The free edition's terms forbid redistribution. Formats to check (VST3 and CLAP not confirmed)."
+
+[[plugin]]
+id = "illformed-glitch2"
+name = "Glitch 2"
+vendor = "illformed"
+category = "glitch"
+tags = ["stutter", "glitch"]
+homepage = "https://illformed.com/glitch/"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3"]
+bundle_ids = ["Glitch2"]
+description = "Glitch and stutter multi-effect, free since August 2026."
+notes = "Check that the licence is permanent."
+
+[[plugin]]
+id = "obxd"
+name = "OB-Xd"
+vendor = "reales / discoDSP"
+category = "synth"
+tags = ["oberheim", "analogue"]
+homepage = "https://github.com/reales/OB-Xd"
+license = "Proprietary-Freeware"
+lane = "link"
+account_hint = "Free, no account: download it from the maker's page."
+formats = ["vst3"]
+bundle_ids = ["OB-Xd"]
+description = "Oberheim OB-X style synthesizer."
+notes = "The README says free for any use; redistribution not stated. The exact release file still has to be read."
+
+[[plugin]]
+id = "audiodamage-evil-otto"
+name = "Evil Otto"
+vendor = "Audio Damage"
+category = "dynamics"
+tags = ["multiband", "otto"]
+homepage = "https://www.audiodamage.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free for the mailing list: the link arrives by email."
+formats = ["vst3", "clap"]
+description = "Free for the mailing list: the link arrives by email."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "softube-saturation-knob"
+name = "Saturation Knob"
+vendor = "Softube"
+category = "saturation"
+tags = ["saturation"]
+homepage = "https://www.softube.com/saturationknob"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Softube account and iLok account, installed with Softube Central."
+formats = ["vst3"]
+description = "Softube account and iLok account, installed with Softube Central."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "slate-free-collection"
+name = "Slate Digital Free Collection"
+vendor = "Slate Digital"
+category = "multi"
+tags = ["fresh air", "vbc"]
+homepage = "https://www.slatedigital.com/free-collection/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free Slate account and the maker's installer."
+formats = ["vst3"]
+description = "Free Slate account and the maker's installer."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "waves-free-pack"
+name = "Waves Free Plugin Pack"
+vendor = "Waves"
+category = "multi"
+tags = ["eq", "comp"]
+homepage = "https://www.waves.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Waves account and Waves Central."
+formats = ["vst3"]
+description = "Waves account and Waves Central."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "melda-mfreefxbundle"
+name = "MFreeFXBundle"
+vendor = "MeldaProduction"
+category = "multi"
+tags = ["38 effects"]
+homepage = "https://www.meldaproduction.com/MFreeFXBundle"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "The maker's own installer."
+formats = ["vst3"]
+description = "The maker's own installer."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "polyverse-wider"
+name = "Wider"
+vendor = "Polyverse Music"
+category = "utility"
+tags = ["stereo", "width"]
+homepage = "https://polyversemusic.com/products/wider/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Name and email; the link arrives by mail."
+formats = ["vst3"]
+description = "Name and email; the link arrives by mail."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "izotope-imager"
+name = "Ozone Imager 2"
+vendor = "iZotope"
+category = "utility"
+tags = ["stereo", "imager"]
+homepage = "https://www.izotope.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "iZotope account and Product Portal."
+formats = ["vst3"]
+description = "iZotope account and Product Portal."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "kilohearts-essentials"
+name = "Kilohearts Essentials"
+vendor = "Kilohearts"
+category = "multi"
+tags = ["34 effects", "tape stop", "trance gate"]
+homepage = "https://kilohearts.com/products/kilohearts_essentials"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free Kilohearts account and the Kilohearts Installer."
+formats = ["vst3"]
+description = "Free Kilohearts account and the Kilohearts Installer."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "babyaudio-freebies"
+name = "Baby Audio freebies"
+vendor = "Baby Audio"
+category = "multi"
+tags = ["magic switch", "pitch drift"]
+homepage = "https://babyaud.io/freebies"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free Baby Audio account."
+formats = []
+description = "Free Baby Audio account."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "izotope-vinyl"
+name = "Vinyl"
+vendor = "iZotope"
+category = "glitch"
+tags = ["lo-fi", "vinyl"]
+homepage = "https://www.izotope.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "iZotope account and Product Portal."
+formats = ["vst3"]
+description = "iZotope account and Product Portal."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "xaudio-faultline"
+name = "FAULTLINE"
+vendor = "X-Audio"
+category = "glitch"
+tags = ["beat repeat", "stutter", "glitch"]
+homepage = "https://xaudio.store/faultline.html"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Name and email; the download is a zip with an installer package."
+formats = ["vst3"]
+description = "Name and email; the download is a zip with an installer package."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "glitchmachines-hysteresis"
+name = "Hysteresis"
+vendor = "Glitchmachines"
+category = "glitch"
+tags = ["glitch delay"]
+homepage = "https://glitchmachines.com/products/hysteresis/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free through the maker's shop cart."
+formats = ["vst3"]
+description = "Free through the maker's shop cart."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "wavesfactory-free"
+name = "Wavesfactory free plugins"
+vendor = "Wavesfactory"
+category = "glitch"
+tags = ["tape stop", "cassette"]
+homepage = "https://www.wavesfactory.com/free-plugins/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Email; the links arrive by mail."
+formats = ["vst3"]
+description = "Email; the links arrive by mail."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "cymatics-free"
+name = "Cymatics free plugins"
+vendor = "Cymatics"
+category = "multi"
+tags = ["diablo lite", "origin"]
+homepage = "https://cymatics.fm/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Email address."
+formats = []
+description = "Email address."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "vital"
+name = "Vital (Basic)"
+vendor = "Vital Audio"
+category = "synth"
+tags = ["wavetable", "edm"]
+homepage = "https://vital.audio/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Free Vital account."
+formats = ["vst3", "clap"]
+description = "Free Vital account."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "decent-sampler"
+name = "Decent Sampler"
+vendor = "Decent Samples"
+category = "sampler"
+tags = ["sampler", "pianobook"]
+homepage = "https://www.decentsamples.com/product/decent-sampler-plugin/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "A form with your email."
+formats = ["vst3"]
+description = "A form with your email."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "splice-instrument"
+name = "Splice INSTRUMENT"
+vendor = "Splice"
+category = "sampler"
+tags = ["instruments"]
+homepage = "https://splice.com/instrument"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Splice account."
+formats = ["vst3"]
+description = "Splice account."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."
+
+[[plugin]]
+id = "ni-komplete-start"
+name = "Komplete Start"
+vendor = "Native Instruments"
+category = "multi"
+tags = ["kontakt player", "synths"]
+homepage = "https://www.native-instruments.com/"
+license = "Proprietary-Freeware"
+lane = "link"
+requires_account = true
+account_hint = "Native Access and a Native Instruments account (about 17 GB)."
+formats = ["vst3"]
+description = "Native Access and a Native Instruments account (about 17 GB)."
+notes = "Guided link: the app only opens the page and recognises the plugin once it is installed."

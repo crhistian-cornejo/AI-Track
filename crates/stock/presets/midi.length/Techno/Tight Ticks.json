@@ -1,0 +1,20 @@
+{
+  "name": "Tight Ticks",
+  "plugin": "midi.length",
+  "author": "AI-Track",
+  "tags": [
+    "techno",
+    "tick",
+    "short",
+    "percussive"
+  ],
+  "params": {
+    "0": 0.33333334,
+    "1": 0.58214194,
+    "2": 0.0,
+    "3": 0.68364084,
+    "4": 0.14285715,
+    "5": 0.0,
+    "6": 0.0
+  }
+}

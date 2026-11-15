@@ -1,0 +1,20 @@
+{
+  "name": "Long Tails",
+  "plugin": "midi.length",
+  "author": "AI-Track",
+  "tags": [
+    "bass",
+    "sustain",
+    "stretch",
+    "tail"
+  ],
+  "params": {
+    "0": 0.6666667,
+    "1": 0.58214194,
+    "2": 0.23076923,
+    "3": 0.68364084,
+    "4": 0.2857143,
+    "5": 0.0,
+    "6": 0.5
+  }
+}

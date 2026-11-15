@@ -29,7 +29,7 @@ cpal = "0.18"
 midir = "0.11"
 hound = "3.5"
 rubato = "0.16"
-symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis", "aiff"] }
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis", "aac", "isomp4", "alac", "adpcm", "aiff"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation"] }
@@ -39,6 +39,8 @@ name = "play_demo"
 
 [dev-dependencies]
 serde_json.workspace = true
+# The real MIDI effects, to run them through the real engine (tests only).
+aitrack-stock.workspace = true
 
 [lints]
 workspace = true

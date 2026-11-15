@@ -26,12 +26,12 @@
 //! beginning of the file), so a sample that does not loop perfectly does not
 //! click.
 
-use crate::sample_cache::DecodedAudio;
+use crate::sample_cache::{DecodedAudio, SampleCache};
 use aitrack_dsp::event::Expression;
-use aitrack_dsp::warp::{detect_transients, sample_warped_beats, sample_warped_grain, warp_audio, WarpAlgorithm};
+use aitrack_dsp::warp::{sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
 use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 /// Musical-time context of one processing segment.
 pub(crate) struct TimeCtx<'a> {
@@ -80,6 +80,12 @@ impl EventList {
         self.events.clear();
     }
 
+    /// Slots left before the list is full.
+    #[inline]
+    pub fn free(&self) -> usize {
+        self.events.capacity() - self.events.len()
+    }
+
     /// Sort by offset; at equal offsets note-offs come before note-ons so a
     /// retriggered key is not cut. In place, no allocation.
     pub fn sort(&mut self) {
@@ -117,6 +123,11 @@ impl ActiveNotes {
         Self { notes: Vec::with_capacity(512) }
     }
 
+    #[cfg(test)]
+    fn with_capacity(n: usize) -> Self {
+        Self { notes: Vec::with_capacity(n) }
+    }
+
     /// Emit note-offs whose time falls before `hi` (stale ones at offset 0).
     pub fn release_due(&mut self, ctx: &TimeCtx<'_>, hi: i64, out: &mut EventList) {
         let mut i = 0;
@@ -140,15 +151,29 @@ impl ActiveNotes {
         }
     }
 
-    fn push(&mut self, note: ActiveNote, out: &mut EventList, offset: u32) {
+    /// Register a note that is about to sound and, when it overlaps a held note
+    /// on its key, end the old one. `events` is how many events the caller
+    /// will push for the new note (its note-on and expressions).
+    ///
+    /// Returns `false`, touching nothing, when the note must not sound: the
+    /// list of held notes is full, or the event list could not take the
+    /// note's events *and* still have a slot for the note-off of every held
+    /// note. That reserve (`len + held ≤ capacity` at all times) is what lets
+    /// a note-off always be written, so a note-on is never left hanging.
+    #[must_use]
+    fn start(&mut self, note: ActiveNote, out: &mut EventList, offset: u32, events: usize) -> bool {
+        let old = self.notes.iter().position(|n| n.key == note.key);
+        if self.notes.len() - usize::from(old.is_some()) >= self.notes.capacity() || out.free() < events + self.notes.len() + 1 {
+            out.dropped += 1;
+            return false;
+        }
         // A new note on a key that is still held (overlap): end the old one.
-        if let Some(i) = self.notes.iter().position(|n| n.key == note.key) {
+        if let Some(i) = old {
             let old = self.notes.swap_remove(i);
             out.push(offset, EventKind::NoteOff { channel: 0, key: old.key, velocity: old.release, note_id: old.note_id });
         }
-        if self.notes.len() < self.notes.capacity() {
-            self.notes.push(note);
-        }
+        self.notes.push(note);
+        true
     }
 }
 
@@ -228,98 +253,10 @@ pub(crate) struct AudioClipData {
     pub transients: Arc<[usize]>,
     /// Read the source backwards.
     pub reverse: bool,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct WarpKey {
-    frames: usize,
-    sample_rate: u32,
-    channels: usize,
-    fingerprint: u64,
-    mode: WarpMode,
-    pitch_cents: i32,
-    time_scale_milli: i32,
-}
-
-struct CachedWarp {
-    key: WarpKey,
-    audio: Arc<DecodedAudio>,
-    transients: Arc<[usize]>,
-}
-
-fn audio_fingerprint(a: &DecodedAudio) -> u64 {
-    let mut h = 0xCBF2_9CE4_8422_2325u64;
-    for ch in &a.channels {
-        let len = ch.len();
-        if len == 0 {
-            continue;
-        }
-        for step in 0..8 {
-            let idx = (step * len) / 8;
-            let bits = ch[idx].to_bits() as u64;
-            h = (h ^ bits).wrapping_mul(0x1000_0000_01B3);
-        }
-        h = (h ^ ch[len - 1].to_bits() as u64).wrapping_mul(0x1000_0000_01B3);
-    }
-    h
-}
-
-fn warp_algo(mode: WarpMode) -> WarpAlgorithm {
-    match mode {
-        WarpMode::Beats => WarpAlgorithm::Beats,
-        WarpMode::Tones => WarpAlgorithm::Tones,
-        WarpMode::Texture => WarpAlgorithm::Texture,
-        WarpMode::Complex => WarpAlgorithm::Complex,
-        WarpMode::ComplexPro => WarpAlgorithm::ComplexPro,
-        WarpMode::Repitch => WarpAlgorithm::Repitch,
-    }
-}
-
-fn cached_warp(src: &Arc<DecodedAudio>, mode: WarpMode, time_scale: f64, pitch_ratio: f64, pitch_cents: i32) -> (Arc<DecodedAudio>, Arc<[usize]>) {
-    static CACHE: OnceLock<Mutex<Vec<CachedWarp>>> = OnceLock::new();
-    let time_scale_milli = (time_scale * 1000.0).round() as i32;
-    if (time_scale - 1.0).abs() < 1e-4 && (pitch_ratio - 1.0).abs() < 1e-4 {
-        return (src.clone(), Arc::from([]));
-    }
-    let key = WarpKey {
-        frames: src.frames,
-        sample_rate: src.sample_rate,
-        channels: src.channels.len(),
-        fingerprint: audio_fingerprint(src),
-        mode,
-        pitch_cents,
-        time_scale_milli,
-    };
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut guard) = cache.lock()
-        && let Some(pos) = guard.iter().position(|e| e.key == key)
-    {
-        let entry = guard.remove(pos);
-        let pair = (entry.audio.clone(), entry.transients.clone());
-        guard.push(entry);
-        return pair;
-    }
-
-    let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
-    let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
-    let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
-    let mut warped_audio = DecodedAudio::from_planar(warped_channels, src.sample_rate);
-    warped_audio.source_rate = src.source_rate;
-    let warped_arc = Arc::new(warped_audio);
-    let trans_arc: Arc<[usize]> = Arc::from(if mode == WarpMode::Beats {
-        let w_refs: Vec<&[f32]> = warped_arc.channels.iter().map(Vec::as_slice).collect();
-        detect_transients(&w_refs, warped_arc.sample_rate)
-    } else {
-        Vec::new()
-    });
-
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= 32 {
-            guard.remove(0);
-        }
-        guard.push(CachedWarp { key, audio: warped_arc.clone(), transients: trans_arc.clone() });
-    }
-    (warped_arc, trans_arc)
+    /// Warped at the very tempo of the project, at the source's own speed: it
+    /// plays whole frames like an unwarped clip, as long as the tempo does
+    /// not move under it (see [`tempo_is_steady`]).
+    pub unity: bool,
 }
 
 impl AudioClipData {
@@ -329,14 +266,27 @@ impl AudioClipData {
         Self::of_bpm(warp, audio, warp.original_bpm.unwrap_or(120.0))
     }
 
+    /// [`of_bpm_in`](Self::of_bpm_in) with stretches rendered on the spot.
+    #[cfg(test)]
+    pub fn of_bpm(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>, project_bpm: f64) -> Self {
+        Self::of_bpm_in(warp, audio, project_bpm, &SampleCache::blocking())
+    }
+
     /// How a file with `warp` plays against `project_bpm`. Pitch-preserving
     /// warp modes pre-render off the audio thread (with caching) at `project_bpm`
     /// and the requested transpose/detune so timeline duration stays independent
     /// of pitch and playback needs zero real-time allocations.
-    pub fn of_bpm(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>, project_bpm: f64) -> Self {
+    ///
+    /// With a background `warps` cache the render takes a while: until it is
+    /// ready the clip plays the file as it is, unstretched, and the cache
+    /// asks for a recompile when it lands.
+    pub fn of_bpm_in(warp: &aitrack_model::Warp, audio: Option<Arc<DecodedAudio>>, project_bpm: f64, warps: &SampleCache) -> Self {
         let warped = warp.enabled && warp.original_bpm.is_some_and(|b| b > 0.0);
         let original_bpm = warp.original_bpm.unwrap_or(120.0);
         let pitch_preserving = warped && warp.mode.preserves_pitch();
+        // Only the very same tempo: any difference, however small, drifts
+        // when the file is read frame by frame instead of by the grid.
+        let at_tempo = warped && project_bpm > 0.0 && original_bpm == project_bpm;
         if pitch_preserving
             && let Some(ref src) = audio
             && src.frames > 0
@@ -345,16 +295,32 @@ impl AudioClipData {
             let time_scale = (original_bpm / project_bpm).clamp(0.125, 8.0);
             let pitch_ratio = warp.pitch_ratio();
             let pitch_cents = (warp.pitch() * 100.0).round() as i32;
-            let (warped_audio, transients) = cached_warp(src, warp.mode, time_scale, pitch_ratio, pitch_cents);
+            if let Some((warped_audio, transients)) = warps.warped(src, warp.mode, time_scale, pitch_ratio, pitch_cents) {
+                return Self {
+                    audio: Some(warped_audio),
+                    warped: true,
+                    original_bpm: project_bpm,
+                    ratio: 1.0,
+                    mode: warp.mode,
+                    pitch_preserving: true,
+                    transients,
+                    reverse: warp.reverse,
+                    unity: at_tempo,
+                };
+            }
+            // Still rendering, or the render failed: Re-Pitch, which follows
+            // the grid (the pitch moves with the tempo) and needs no render.
+            // The render takes over at the same position when it lands.
             return Self {
-                audio: Some(warped_audio),
+                audio,
                 warped: true,
-                original_bpm: project_bpm,
-                ratio: 1.0,
-                mode: warp.mode,
-                pitch_preserving: true,
-                transients,
+                original_bpm,
+                ratio: warp.pitch_ratio(),
+                mode: WarpMode::Repitch,
+                pitch_preserving: false,
+                transients: Arc::from([]),
                 reverse: warp.reverse,
+                unity: false,
             };
         }
         Self {
@@ -366,6 +332,7 @@ impl AudioClipData {
             pitch_preserving: false,
             transients: Arc::from([]),
             reverse: warp.reverse,
+            unity: at_tempo && warp.pitch_ratio() == 1.0,
         }
     }
 
@@ -401,6 +368,27 @@ impl AudioClipData {
             source_tick * unwarped_spt
         }
     }
+}
+
+/// Whether the tempo stays at `bpm` from tick `from` up to tick `to`: no
+/// tempo point inside the span differs from it and no ramp crosses it. Reads
+/// the point list in place, no allocation.
+fn tempo_is_steady(tempo: &TempoMap, from: Tick, to: Tick, bpm: f64) -> bool {
+    let tol = bpm * 1e-9;
+    let points = tempo.points();
+    for (i, p) in points.iter().enumerate() {
+        if p.start >= to {
+            break;
+        }
+        let next = points.get(i + 1);
+        if next.is_some_and(|n| n.start <= from) {
+            continue;
+        }
+        if (p.bpm - bpm).abs() > tol || (p.ramp && next.is_some_and(|n| (n.bpm - p.bpm).abs() > tol)) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) enum ClipContent {
@@ -664,11 +652,11 @@ impl CompiledClip {
                 if let Some(l) = limit {
                     off = off.min(l);
                 }
-                active.push(
-                    ActiveNote { key: n.key, note_id: n.note_id, off_tick: start + off, min_off: at + 1, release: n.release },
-                    out,
-                    offset,
-                );
+                let events = 1 + usize::from(n.fine_pitch != 0.0) + usize::from(n.pan != 0.0);
+                let note = ActiveNote { key: n.key, note_id: n.note_id, off_tick: start + off, min_off: at + 1, release: n.release };
+                if !active.start(note, out, offset, events) {
+                    continue;
+                }
                 out.push(offset, EventKind::NoteOn { channel: 0, key: n.key, velocity: n.velocity, note_id: n.note_id });
                 if n.fine_pitch != 0.0 {
                     out.push(
@@ -696,6 +684,19 @@ impl CompiledClip {
         }
     }
 
+    /// Whether the end of the clip falls inside the material it plays, so that
+    /// the cut needs the anti-click ramp. Looping clips are always cut; a clip
+    /// that never ends (`limit` `None`) has no end to ramp. Only a clip that
+    /// reaches the last sample of the file (within one sample) is not cut.
+    fn cuts_tail(&self, data: &AudioClipData, audio: &DecodedAudio, offset: Tick, looping: bool, limit: Option<Tick>, spt: f64) -> bool {
+        let Some(limit) = limit else { return false };
+        if looping {
+            return true;
+        }
+        let end = data.source_frame(offset as f64 + limit as f64 * data.ratio, spt);
+        end < audio.frames as f64 - 1.0
+    }
+
     /// Mix the audio of this clip instance for samples `[lo, hi)` into `buf`
     /// (whose sample 0 is `ctx.seg_start`). The instance starts at `start`
     /// (timeline tick) and ends at clip time `limit`; `None` plays on forever
@@ -703,9 +704,10 @@ impl CompiledClip {
     ///
     /// Gain is the clip gain × fades × volume envelope at the clip time of
     /// each sample (timeline ticks since `start`). An edge without a fade
-    /// keeps its 64-sample anti-click ramp: always at the end, and at the
-    /// start when the clip is trimmed (a clip that starts at the very
-    /// beginning of its file keeps the transient the file starts with).
+    /// keeps its 64-sample anti-click ramp: at the end when the clip cuts the
+    /// material off, and at the start when the clip is trimmed (a clip that
+    /// starts at the very beginning of its file keeps the transient the file
+    /// starts with).
     #[allow(clippy::too_many_arguments)]
     pub fn render_audio(&self, start: Tick, limit: Option<Tick>, lo: i64, hi: i64, ctx: &TimeCtx<'_>, buf: &mut AudioBuffer) {
         let ClipContent::Audio(data) = &self.content else { return };
@@ -719,8 +721,18 @@ impl CompiledClip {
         let stereo = audio.channels.len() >= 2;
         let shape = &self.shape;
         let shaped = shape.active();
+        // A clip that starts past its loop end starts inside the loop, at the
+        // position playback would have wrapped to.
+        let looping = self.looping.filter(|(ls, le)| le > ls);
+        let offset = match looping {
+            Some((ls, le)) if self.offset >= le => ls + self.offset.saturating_sub(ls).rem_euclid(le - ls),
+            _ => self.offset,
+        };
+        // The end ramps down only where the clip cuts the material off: a clip
+        // that plays its file to the end (or is followed by the rest of it)
+        // would otherwise leave a notch at every join of contiguous clips.
+        let ramp_out = shape.fade_out.length == 0 && self.cuts_tail(data, audio, offset, looping.is_some(), limit, spt);
         let ramp_in = self.offset != 0 && shape.fade_in.length == 0;
-        let ramp_out = shape.fade_out.length == 0;
         // Clip gain with the anti-click ramps, `since` samples into the clip.
         let edge_gain = |k: i64, since: f64| -> f32 {
             let mut g = self.gain;
@@ -737,20 +749,16 @@ impl CompiledClip {
             }
             g
         };
-        // A clip that starts past its loop end starts inside the loop, at the
-        // position playback would have wrapped to.
-        let looping = self.looping.filter(|(ls, le)| le > ls);
-        let offset = match looping {
-            Some((ls, le)) if self.offset >= le => ls + self.offset.saturating_sub(ls).rem_euclid(le - ls),
-            _ => self.offset,
-        };
         let mut seg = 0usize;
         let (l, r) = buf.stereo_mut();
 
         // A clip at its native speed reads whole frames: playback is
         // bit-identical to the file instead of an interpolated copy of it.
-        if data.exact() {
-            let start_i = start_exact.round() as i64;
+        let whole_frames = data.exact() || (data.unity && tempo_is_steady(ctx.tempo, start, limit.map_or(Tick::MAX, |l| start.saturating_add(l)), data.original_bpm));
+        if whole_frames {
+            // The first sample at or after the clip start, as the caller's
+            // range counts it: rounding down would put frame 0 before it.
+            let start_i = ctx.sample_of(start);
             let stop = end_sample.map_or(hi, |e| hi.min(e.ceil() as i64));
             let frames = looping.map(|(ls, le)| FrameLoop::new(offset, ls, le, spt, ctx.sr));
             let loop_start = frames.as_ref().map_or(0, |f| f.start);
@@ -896,6 +904,7 @@ impl CompiledClip {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample_cache::SampleCache;
     use aitrack_model::{Color, LoopRegion, Note, NoteId, SourceId};
 
     fn clip(offset: Tick, length: Tick, looping: Option<(Tick, Tick)>) -> Clip {
@@ -945,6 +954,69 @@ mod tests {
         assert_eq!(ons[1].0, 480);
     }
 
+    /// Run a clip block by block the way the track does (events cleared, clip
+    /// scheduled, due releases) and list the note ids that sounded and the
+    /// ones that were released. `cap` is the event list capacity.
+    fn run_notes(c: &CompiledClip, limit: Tick, cap: usize, blocks: i64) -> (Vec<i32>, Vec<i32>, ActiveNotes, u32) {
+        let tempo = TempoMap::constant(120.0);
+        let (mut ons, mut offs) = (Vec::new(), Vec::new());
+        let mut active = ActiveNotes::new();
+        let mut rng = Rng(1);
+        let mut dropped = 0;
+        for b in 0..blocks {
+            let (lo, hi) = (b * 100, b * 100 + 100);
+            let ctx = TimeCtx { tempo: &tempo, sr: 960.0, seg_start: lo };
+            let mut ev = EventList::with_capacity(cap);
+            c.schedule_midi(0, Some(limit), lo, hi, &ctx, &mut ev, &mut active, &mut rng);
+            active.release_due(&ctx, hi, &mut ev);
+            dropped += ev.dropped;
+            for e in &ev.events {
+                match e.kind {
+                    EventKind::NoteOn { note_id, .. } => ons.push(note_id),
+                    EventKind::NoteOff { note_id, .. } => offs.push(note_id),
+                    _ => {}
+                }
+            }
+        }
+        (ons, offs, active, dropped)
+    }
+
+    /// More simultaneous notes than the event list holds: what sounds must
+    /// stop. A note-on is only emitted when its note-off is certain to fit.
+    #[test]
+    fn every_note_on_gets_its_note_off_when_the_event_list_is_short() {
+        let many = NoteSource { notes: (0..3000).map(|i| Note::new(NoteId(i as u64 + 1), (i % 128) as u8, 0, PPQ / 4, 1.0)).collect() };
+        let c = CompiledClip::midi(ClipId(1), &clip(0, PPQ, None), &many);
+        let (ons, offs, active, dropped) = run_notes(&c, PPQ, 2048, 20);
+        assert!(!ons.is_empty());
+        assert!(active.notes.is_empty(), "{} notes still held", active.notes.len());
+        let mut hung: Vec<i32> = ons.iter().copied().filter(|id| ons.iter().filter(|o| *o == id).count() != offs.iter().filter(|o| *o == id).count()).collect();
+        hung.dedup();
+        assert!(hung.is_empty(), "{} of {} note-ons never stopped", hung.len(), ons.len());
+        // The notes that did not fit were refused, and counted as such.
+        assert_eq!(ons.len() + dropped as usize, 3000, "refused notes are counted");
+        // A roomy list plays all of the notes that fit the keyboard.
+        let (ons, ..) = run_notes(&c, PPQ, 16_384, 20);
+        assert_eq!(ons.len(), 3000);
+    }
+
+    /// A note-on that the active list cannot hold would never be released.
+    #[test]
+    fn a_note_the_active_list_cannot_hold_is_not_started() {
+        let mut active = ActiveNotes::with_capacity(4);
+        let cap = active.notes.capacity();
+        let mut out = EventList::with_capacity(64);
+        for key in 0..(cap as u8 + 3) {
+            let note = ActiveNote { key, note_id: key as i32, off_tick: PPQ, min_off: 1, release: 0.0 };
+            if active.start(note, &mut out, 0, 1) {
+                out.push(0, EventKind::NoteOn { channel: 0, key, velocity: 1.0, note_id: key as i32 });
+            }
+        }
+        let started = out.events.iter().filter(|e| matches!(e.kind, EventKind::NoteOn { .. })).count();
+        assert_eq!(started, cap);
+        assert_eq!(active.notes.len(), cap);
+    }
+
     // ───────────────────────────── Audio ─────────────────────────────
 
     use aitrack_model::{AutomationLane, AutomationTarget};
@@ -960,6 +1032,7 @@ mod tests {
             pitch_preserving: false,
             transients: Arc::from([]),
             reverse: false,
+            unity: false,
         };
         CompiledClip::audio(ClipId(1), clip, data)
     }
@@ -994,6 +1067,7 @@ mod tests {
                 pitch_preserving: false,
                 transients: Arc::from([]),
                 reverse,
+                unity: false,
             },
         )
     }
@@ -1201,6 +1275,354 @@ mod tests {
             assert!((out[25 * t as usize] - faded.gain_at(t)).abs() < 1e-3, "tick {t}: {} vs {}", out[25 * t as usize], faded.gain_at(t));
         }
         assert!(out[48_000].abs() < 1e-6);
+    }
+
+    /// Two files of one length that agree at a handful of sample points (two
+    /// stems silent in the same places) must not share a stretched render,
+    /// and a slightly different stretch gets its own.
+    #[test]
+    fn warp_cache_tells_sources_and_stretches_apart() {
+        let n = 24_000usize;
+        let tone = |hz: f32| {
+            let mut d: Vec<f32> = (0..n).map(|i| (i as f32 * hz * std::f32::consts::TAU / 48_000.0).sin() * 0.5).collect();
+            for step in 0..8 {
+                d[step * n / 8] = 0.0;
+            }
+            d[n - 1] = 0.0;
+            Arc::new(DecodedAudio::from_planar(vec![d], 48_000))
+        };
+        let (a, b) = (tone(220.0), tone(1760.0));
+        let cache = SampleCache::blocking();
+        let cached_warp = |src: &Arc<DecodedAudio>, mode, scale, pitch, cents| cache.warped(src, mode, scale, pitch, cents).expect("blocking cache renders now");
+        let (wa, _) = cached_warp(&a, WarpMode::Complex, 1.25, 1.0, 0);
+        let (wb, _) = cached_warp(&b, WarpMode::Complex, 1.25, 1.0, 0);
+        assert!(!Arc::ptr_eq(&wa, &wb), "another file's render was reused");
+        let (again, _) = cached_warp(&a, WarpMode::Complex, 1.25, 1.0, 0);
+        assert!(Arc::ptr_eq(&wa, &again), "the same file and stretch missed the cache");
+        let (near, _) = cached_warp(&a, WarpMode::Complex, 1.2504, 1.0, 0);
+        assert!(!Arc::ptr_eq(&wa, &near), "a different stretch was reused");
+    }
+
+    /// One second of a 440 Hz sine: a whole number of cycles, so copies laid
+    /// end to end are one continuous tone.
+    fn whole_cycle_sine() -> Vec<f32> {
+        (0..48_000).map(|i| 0.5 * (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() as f32).collect()
+    }
+
+    /// Three clips that each play a whole file, back to back, are one tone:
+    /// the end of a clip that cuts nothing is not ramped down.
+    #[test]
+    fn contiguous_clips_that_cut_nothing_join_without_a_notch() {
+        let sine = whole_cycle_sine();
+        // 120 BPM, 48 kHz: 1 s = 2 beats = 1920 ticks.
+        let c = clip(0, 2 * PPQ, None);
+        let compiled = audio_clip(&c, sine.clone(), None);
+        let mut mix = vec![0.0f32; 144_000];
+        for k in 0..3 {
+            let out = play(&compiled, 120.0, k * 2 * PPQ, Some(2 * PPQ), 144_000);
+            for (m, o) in mix.iter_mut().zip(&out) {
+                *m += o;
+            }
+        }
+        let worst = mix.iter().enumerate().map(|(n, v)| (v - sine[n % 48_000]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-6, "deviation from the continuous sine: {worst}");
+    }
+
+    /// A clip that ends before its file does still ramps down at its end, on
+    /// both the whole-frame path and the interpolated one.
+    #[test]
+    fn a_clip_that_cuts_material_keeps_its_end_ramp() {
+        let tone = vec![1.0f32; 192_000];
+        let c = clip(0, 2 * PPQ, None);
+        let out = play(&audio_clip(&c, tone.clone(), None), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((out[48_000 - 32] - 0.5).abs() < 1e-3 && (out[48_000 - 64] - 1.0).abs() < 1e-3, "{}", out[48_000 - 32]);
+        assert!(out[47_999] < 0.02);
+        // Twice as fast: the same second consumes two seconds of the file.
+        let fast = play(&pitched_clip(&c, tone.clone(), 2.0, false), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((fast[48_000 - 32] - 0.5).abs() < 1e-3, "{}", fast[48_000 - 32]);
+        // ...and when the file ends exactly where the clip does, there is no cut.
+        let whole = play(&pitched_clip(&c, vec![1.0; 96_000], 2.0, false), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((whole[48_000 - 42] - 1.0).abs() < 1e-3, "{}", whole[48_000 - 42]);
+        // A looping clip is cut wherever it ends.
+        let looped = play(&audio_clip(&clip(0, 2 * PPQ, Some((0, PPQ))), vec![1.0; 24_000], None), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((looped[48_000 - 32] - 0.5).abs() < 0.05, "{}", looped[48_000 - 32]);
+    }
+
+    /// With a fractional start (a beat at 126 BPM is 22 857.14 samples) the
+    /// first frame of the file used to fall one sample before the range the
+    /// arrangement hands over, and was lost.
+    #[test]
+    fn frame_zero_is_played_at_a_fractional_start() {
+        let file: Vec<f32> = (0..60_000).map(|i| (i + 1) as f32 / 60_000.0).collect();
+        let c = audio_clip(&clip(0, 2 * PPQ, None), file.clone(), None);
+        let tempo = TempoMap::constant(126.0);
+        for half_beats in 0..8 {
+            let start = half_beats * PPQ / 2;
+            let out = play(&c, 126.0, start, Some(2 * PPQ), 100_000);
+            let at = (tempo.tick_to_samples(start, 48_000.0) - 1e-6).ceil() as usize;
+            let first = out.iter().position(|v| *v != 0.0).expect("the clip sounds");
+            assert_eq!(first, at, "start tick {start}");
+            assert_eq!(out[first], file[0], "start tick {start}: frame 0 is missing");
+            assert_eq!(out[first + 1000], file[1000], "start tick {start}");
+        }
+    }
+
+    /// A warp that happens to sit at the project's tempo plays the file as it
+    /// is, not through the 16-tap interpolator.
+    #[test]
+    fn warp_at_the_project_tempo_is_bit_exact() {
+        use aitrack_model::Warp;
+        let mut seed = 0x2545_F491u32;
+        let noise: Vec<f32> = (0..48_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as f32 / u32::MAX as f32 - 0.5
+            })
+            .collect();
+        let audio = Arc::new(DecodedAudio::from_planar(vec![noise.clone()], 48_000));
+        let c = clip(0, 2 * PPQ, None);
+        for mode in [WarpMode::Repitch, WarpMode::Beats, WarpMode::Complex] {
+            let warp = Warp { enabled: true, mode, original_bpm: Some(120.0), ..Warp::default() };
+            let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&warp, Some(audio.clone()), 120.0));
+            let out = play(&compiled, 120.0, 0, Some(2 * PPQ), 48_000);
+            let residual: f64 = out.iter().zip(&noise).take(47_900).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+            let signal: f64 = noise.iter().take(47_900).map(|b| (*b as f64).powi(2)).sum();
+            let db = 10.0 * (residual / signal).max(1e-30).log10();
+            assert!(db < -120.0, "{mode:?}: residual {db:.1} dB");
+        }
+        // A real stretch is not taken for it, and neither is a clip whose
+        // tempo moves while it plays.
+        let warp = Warp { enabled: true, mode: WarpMode::Repitch, original_bpm: Some(60.0), ..Warp::default() };
+        assert!(!AudioClipData::of_bpm(&warp, Some(audio.clone()), 120.0).unity);
+        let warp = Warp { enabled: true, mode: WarpMode::Repitch, original_bpm: Some(120.0), transpose: 1.0, ..Warp::default() };
+        assert!(!AudioClipData::of_bpm(&warp, Some(audio), 120.0).unity);
+        let mut moving = TempoMap::constant(120.0);
+        moving.set_point(aitrack_model::time::TempoPoint { start: 4 * PPQ, bpm: 140.0, ramp: false });
+        assert!(tempo_is_steady(&moving, 0, 4 * PPQ, 120.0));
+        assert!(!tempo_is_steady(&moving, 0, 5 * PPQ, 120.0));
+        assert!(!tempo_is_steady(&moving, 5 * PPQ, 6 * PPQ, 120.0), "starts in a 140 BPM region");
+        assert!(!tempo_is_steady(&moving, 0, Tick::MAX, 120.0));
+        moving.set_point(aitrack_model::time::TempoPoint { start: 0, bpm: 120.0, ramp: true });
+        assert!(!tempo_is_steady(&moving, 0, PPQ, 120.0), "a ramp is not steady");
+    }
+
+    /// A warp that is only close to the project's tempo must keep following
+    /// the grid: reading it frame by frame would drift (120.01 against 120 is
+    /// 1200 samples after five minutes).
+    #[test]
+    fn a_nearly_matching_warp_still_follows_the_grid() {
+        use aitrack_model::Warp;
+        let warp = |bpm: f64| Warp { enabled: true, mode: WarpMode::Repitch, original_bpm: Some(bpm), ..Warp::default() };
+        let sawtooth: Vec<f32> = (0..14_450_000usize).map(|i| (i % 1000) as f32 / 1000.0).collect();
+        let audio = Arc::new(DecodedAudio::from_planar(vec![sawtooth], 48_000));
+        assert!(!AudioClipData::of_bpm(&warp(120.01), Some(audio.clone()), 120.0).unity);
+        assert!(!AudioClipData::of_bpm(&warp(120.0 + 1e-6), Some(audio.clone()), 120.0).unity);
+        assert!(AudioClipData::of_bpm(&warp(120.0), Some(audio.clone()), 120.0).unity);
+        // Five minutes in: 600 beats.
+        let length = 600 * PPQ;
+        let c = CompiledClip::audio(ClipId(1), &clip(0, length, None), AudioClipData::of_bpm(&warp(120.01), Some(audio), 120.0));
+        let tempo = TempoMap::constant(120.0);
+        let at_frame = |n: i64| n as f64 * 120.0 / 120.01;
+        // A sample where the source is mid-tooth, so the value tells the frame.
+        let n = (14_300_000i64..).find(|n| (400.0..600.0).contains(&(at_frame(*n) % 1000.0))).unwrap();
+        let mut buf = AudioBuffer::new(2, 1);
+        let ctx = TimeCtx { tempo: &tempo, sr: 48_000.0, seg_start: n };
+        c.render_audio(0, Some(length), n, n + 1, &ctx, &mut buf);
+        let got = buf.channel(0)[0] as f64 * 1000.0;
+        let want = at_frame(n) % 1000.0;
+        assert!((got - want).abs() < 1.0, "sample {n}: source frame {got:.2} (mod 1000), the grid says {want:.2}");
+    }
+
+    /// A clip that ends a few samples before its file does cuts material,
+    /// however small the rest: only an end at the end of the file skips the ramp.
+    #[test]
+    fn the_end_ramp_goes_by_samples_not_ticks() {
+        let ends_short = play(&audio_clip(&clip(0, 2 * PPQ, None), vec![1.0; 48_020], None), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((ends_short[48_000 - 32] - 0.5).abs() < 1e-3, "20 samples short: {}", ends_short[48_000 - 32]);
+        let ends_at = play(&audio_clip(&clip(0, 2 * PPQ, None), vec![1.0; 48_000], None), 120.0, 0, Some(2 * PPQ), 48_100);
+        assert!((ends_at[48_000 - 32] - 1.0).abs() < 1e-6, "at the end: {}", ends_at[48_000 - 32]);
+    }
+
+    /// A project with an audio track that holds `n` warped clips, each over a
+    /// file of its own (2 s of a tone) recorded at 100 BPM, in a 120 BPM project.
+    fn warped_project(n: usize, samples: &SampleCache) -> aitrack_model::Project {
+        use aitrack_model::{AudioSource, Color, Placement, Project, Source, Track, TrackKind, Warp};
+        let mut p = Project::new("warps");
+        p.tempo = TempoMap::constant(120.0);
+        let tid = p.alloc_track_id();
+        p.tracks.push(Track::new(tid, TrackKind::Audio, "audio", Color(0)));
+        for i in 0..n {
+            let path = std::path::PathBuf::from(format!("mem://warp{i}.wav"));
+            let tone: Vec<f32> = (0..96_000).map(|k| 0.4 * (k as f32 * (200.0 + i as f32) * std::f32::consts::TAU / 48_000.0).sin()).collect();
+            samples.insert(path.clone(), Arc::new(DecodedAudio::from_planar(vec![tone], 48_000)));
+            let sid = p.alloc_source_id();
+            let warp = Warp { enabled: true, mode: WarpMode::Complex, original_bpm: Some(100.0), ..Warp::default() };
+            p.sources.insert(sid, Source::Audio(AudioSource { path, hash: None, sample_rate: 48_000, channels: 1, frames: 96_000, warp, key: None }));
+            let cid = p.alloc_clip_id();
+            p.clips.insert(cid, clip_for(sid));
+            let pid = p.alloc_placement_id();
+            p.tracks.last_mut().unwrap().arrangement.push(Placement { id: pid, clip: cid, start: i as Tick * 4 * PPQ, lane: 0 });
+        }
+        p
+    }
+
+    fn clip_for(source: aitrack_model::SourceId) -> Clip {
+        Clip::new("c", aitrack_model::Color(0), source, 4 * PPQ)
+    }
+
+    fn compile_timed(p: &aitrack_model::Project, samples: &SampleCache) -> (std::time::Duration, crate::CompiledGraph) {
+        let mut pool = crate::shared::ProcessorPool::new();
+        let mut cx = crate::compile::CompileContext {
+            factory: &crate::fallback::FallbackFactory,
+            pool: &mut pool,
+            samples,
+            sample_rate: 48_000.0,
+            max_frames: 256,
+            prev_meters: None,
+            taps: Vec::new(),
+            analysis: None,
+        };
+        let t = std::time::Instant::now();
+        let graph = crate::compile::compile(p, &mut cx).expect("compiles");
+        (t.elapsed(), graph)
+    }
+
+    /// Wait (up to 30 s) until the loader has nothing left to render.
+    fn wait_idle(samples: &SampleCache) {
+        let t = std::time::Instant::now();
+        while samples.is_loading() && t.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!samples.is_loading(), "the warp worker did not finish");
+    }
+
+    /// Stretching a file no longer happens while the graph compiles: the
+    /// clip plays unstretched, the worker renders, and a recompile picks the
+    /// render up. Compiling 40 warped clips took 289 ms (the 32-entry cache
+    /// thrashed, so even a warm compile redid the lot).
+    #[test]
+    fn warps_render_off_the_control_thread() {
+        use aitrack_model::Warp;
+        let notified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = notified.clone();
+        let samples = SampleCache::with_loader(move || {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let p = warped_project(40, &samples);
+        // Cold: nothing is rendered yet and the compile does not wait for it.
+        // (The first compile is the one that queues the renders.)
+        let cold = compile_timed(&p, &samples).0;
+        assert!(cold < std::time::Duration::from_millis(5), "compile with 40 warped clips took {cold:?}");
+        assert_eq!(samples.warp_bytes(), 0, "nothing finished yet or it was counted twice");
+        wait_idle(&samples);
+        assert!(notified.load(std::sync::atomic::Ordering::SeqCst) >= 1, "no recompile was asked for");
+        // The renders count against the budget and show in the memory use.
+        let warp_bytes = samples.warp_bytes();
+        assert!(warp_bytes > 40 * 96_000, "{warp_bytes} bytes of renders");
+        assert!(samples.used_bytes() >= warp_bytes + 40 * 96_000 * 4);
+        // Warm: every render is there, the compile stays fast.
+        let warm = compile_timed(&p, &samples).0;
+        assert!(warm < std::time::Duration::from_millis(5), "warm compile took {warm:?}");
+        println!("compile, 40 warped clips: cold {cold:?}, warm {warm:?}");
+
+        // One clip, step by step: Re-Pitch while rendering, stretched after.
+        let tone: Vec<f32> = (0..96_000).map(|k| 0.4 * (k as f32 * 300.0 * std::f32::consts::TAU / 48_000.0).sin()).collect();
+        let src = Arc::new(DecodedAudio::from_planar(vec![tone], 48_000));
+        let warp = Warp { enabled: true, mode: WarpMode::Tones, original_bpm: Some(100.0), ..Warp::default() };
+        let first = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(first.warped && !first.pitch_preserving, "it should play in Re-Pitch meanwhile");
+        assert!(Arc::ptr_eq(first.audio.as_ref().unwrap(), &src));
+        wait_idle(&samples);
+        let then = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(then.warped && then.pitch_preserving);
+        // 100 -> 120 BPM: shorter by 100/120.
+        let frames = then.audio.as_ref().unwrap().frames as f64;
+        assert!((frames / 96_000.0 - 100.0 / 120.0).abs() < 0.01, "{frames} frames");
+        // The same render is found again, by identity and exact factor.
+        let again = AudioClipData::of_bpm_in(&warp, Some(src), 120.0, &samples);
+        assert!(Arc::ptr_eq(then.audio.as_ref().unwrap(), again.audio.as_ref().unwrap()));
+    }
+
+    /// While a stretch renders (and for good if it fails) the clip plays in
+    /// Re-Pitch: on the grid, pitch shifted by the tempo ratio. The render
+    /// then takes over at the same position, and a failure is recorded.
+    #[test]
+    fn a_clip_waiting_for_its_warp_stays_on_the_grid() {
+        use aitrack_model::Warp;
+        // The file is a ramp: the value read says which frame plays.
+        let ramp: Vec<f32> = (0..96_000).map(|i| i as f32 / 96_000.0).collect();
+        let src = Arc::new(DecodedAudio::from_planar(vec![ramp], 48_000));
+        // 100 BPM material in a 120 BPM project.
+        let warp = Warp { enabled: true, mode: WarpMode::Tones, original_bpm: Some(100.0), ..Warp::default() };
+        let c = clip(0, 4 * PPQ, None);
+        let samples = SampleCache::with_loader(|| {});
+        let pending = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(pending.warped && !pending.pitch_preserving, "Re-Pitch meanwhile");
+        // On the grid: sample n reads frame n * 120 / 100 (6000 samples = tick 120).
+        let out = play(&CompiledClip::audio(ClipId(1), &c, pending), 120.0, 0, Some(4 * PPQ), 30_000);
+        for n in [1_000usize, 5_000, 20_000, 29_000] {
+            let frame = (out[n] * 96_000.0) as f64;
+            assert!((frame - n as f64 * 1.2).abs() <= 1.0, "sample {n}: frame {frame}");
+        }
+        // The render arrives: the same tick maps to the same place in the file.
+        wait_idle(&samples);
+        let ready = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(ready.pitch_preserving);
+        let (before, after) = (AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &SampleCache::with_loader(|| {})), ready);
+        let spt = 25.0;
+        for tick in [0.0, 100.0, 777.0, 1500.0, 3000.0, 3839.0] {
+            let was = before.source_frame(tick, spt) / before.audio.as_ref().unwrap().frames as f64;
+            let now = after.source_frame(tick, spt) / after.audio.as_ref().unwrap().frames as f64;
+            let drift = (was - now) * after.audio.as_ref().unwrap().frames as f64;
+            assert!(drift.abs() <= 1.0, "tick {tick}: {drift:.2} samples apart after the switch");
+        }
+    }
+
+    #[test]
+    fn a_failed_warp_stays_in_repitch_and_is_recorded() {
+        use aitrack_model::Warp;
+        let src = Arc::new(DecodedAudio::from_planar(vec![vec![0.5; 48_000]], 48_000));
+        let warp = Warp { enabled: true, mode: WarpMode::Complex, original_bpm: Some(100.0), ..Warp::default() };
+        let samples = SampleCache::with_loader_and_warper(|| {}, |_, _, _, _| panic!("boom"));
+        let first = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(first.warped && !first.pitch_preserving);
+        wait_idle(&samples);
+        let after = AudioClipData::of_bpm_in(&warp, Some(src.clone()), 120.0, &samples);
+        assert!(after.warped && !after.pitch_preserving, "a failed render leaves the clip in Re-Pitch");
+        assert!((after.source_frame(960.0, 25.0) - 960.0 * 25.0 * 1.2).abs() < 1.0, "still on the grid");
+        let failures = samples.warp_failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        // The blocking cache (offline renders) behaves the same.
+        let blocking = SampleCache::with_warper(|_, _, _, _| panic!("boom"));
+        let data = AudioClipData::of_bpm_in(&warp, Some(src), 120.0, &blocking);
+        assert!(data.warped && !data.pitch_preserving);
+        assert_eq!(blocking.warp_failures().len(), 1);
+    }
+
+    /// Renders are evicted with the files when the budget is short, and a
+    /// render of a file that is gone goes with it.
+    #[test]
+    fn warp_renders_obey_the_budget() {
+        let samples = SampleCache::blocking();
+        let make = |hz: f32| Arc::new(DecodedAudio::from_planar(vec![(0..48_000).map(|i| (i as f32 * hz * 0.01).sin()).collect()], 48_000));
+        let (a, b) = (make(1.0), make(2.0));
+        let (wa, _) = samples.warped(&a, WarpMode::Complex, 1.25, 1.0, 0).unwrap();
+        let (_wb, _) = samples.warped(&b, WarpMode::Complex, 1.25, 1.0, 0).unwrap();
+        let both = samples.warp_bytes();
+        assert!(both >= 2 * wa.byte_size());
+        // Room for one render: the older one that nobody holds is dropped.
+        drop(wa);
+        samples.set_budget_bytes(both - 1);
+        assert!(samples.warp_bytes() < both);
+        assert!(samples.used_bytes() < both || samples.warp_bytes() == 0);
+        // A render whose source is gone is forgotten.
+        drop(a);
+        drop(b);
+        samples.set_budget_bytes(usize::MAX / 2);
+        samples.insert("mem://x.wav", make(3.0));
+        assert_eq!(samples.warp_bytes(), 0, "{} bytes of renders of vanished files", samples.warp_bytes());
     }
 
     #[test]

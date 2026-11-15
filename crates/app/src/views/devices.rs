@@ -12,21 +12,21 @@
 //! right-click opens the device menu.
 
 use crate::icons::{Icon, icon};
-use crate::state::drum_pads;
 use crate::theme::*;
 use crate::views::menus::device_icon;
-use crate::widgets::{self, badge, icon_chip, knob, knob_cell, label, mono};
+use crate::widgets::{self, badge, icon_chip, knob, label};
 use crate::workspace::{Drag, KnobTarget, MenuKind, Workspace};
 use aitrack_model::racks::{self, Container};
 use aitrack_model::{
-    Chain, Command, Device, DeviceId, DeviceKind, MACRO_COUNT, PluginFormat, Rack, RackKind,
+    Chain, Command, Device, DeviceId, DeviceKind, PluginFormat, Rack, RackKind,
 };
 use gpui::{
     AnyElement, AppContext, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     Stateful, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 
-const CELL_W: f32 = 56.;
+pub mod rack_ui;
+
 const KNOB: f32 = 32.;
 /// Height of a device's title bar.
 const TITLE_H: f32 = 28.;
@@ -128,6 +128,7 @@ fn insertion(
     let key = match home {
         Container::Track(_) => slot,
         Container::Rack { rack, chain } => (rack.0 as usize) << 16 | chain << 8 | slot,
+        Container::Return { rack, index } => 1 << 40 | (rack.0 as usize) << 16 | index << 8 | slot,
     };
     div()
         .id(("insert-device", key))
@@ -191,7 +192,8 @@ fn droppable(
 fn is_inside(p: &aitrack_model::Project, home: Container, id: DeviceId) -> bool {
     let mut at = home;
     for _ in 0..64 {
-        let Container::Rack { rack, .. } = at else {
+        // A return is inside its rack as much as a chain is.
+        let (Container::Rack { rack, .. } | Container::Return { rack, .. }) = at else {
             return false;
         };
         if rack == id {
@@ -528,8 +530,20 @@ pub fn knob_control(
     target: KnobTarget,
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
+    knob_control_sized(id, value, bipolar, enabled, KNOB, target, cx)
+}
+
+pub fn knob_control_sized(
+    id: impl Into<gpui::ElementId>,
+    value: f32,
+    bipolar: bool,
+    enabled: bool,
+    side: f32,
+    target: KnobTarget,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
     let color = if enabled { accent() } else { p().faint };
-    knob(id, value, bipolar, KNOB, color).on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+    knob(id, value, bipolar, side, color).on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
         cx.stop_propagation();
         if e.click_count >= 2 {
             match target {
@@ -551,6 +565,9 @@ pub fn knob_control(
                 KnobTarget::Detune { clip } => {
                     this.s.set_clip_warp("detune-reset", clip, |w| w.detune = 0.);
                 }
+                KnobTarget::Chain { .. } | KnobTarget::Return { .. } => {
+                    rack_ui::reset_knob(this, target);
+                }
             }
             this.s.seal();
             cx.notify();
@@ -564,279 +581,8 @@ pub fn knob_control(
     }))
 }
 
-fn rack_body(
-    ws: &mut Workspace,
-    id: DeviceId,
-    rack: &Rack,
-    enabled: bool,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let pal = p();
-    let mut macros = div().w(px(8. * CELL_W)).flex().flex_wrap().gap_y(px(SP3));
-    for i in 0..MACRO_COUNT.min(rack.macros.len()) {
-        let m = &rack.macros[i];
-        let k = knob_control(("macro", (id.0 as usize) << 8 | i), m.value, false, enabled, KnobTarget::Macro { rack: id, index: i }, cx);
-        macros = macros.child(knob_cell(k, &m.name, format!("{:.0}%", m.value * 100.), CELL_W));
-    }
-    let mut var_row = div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap(px(SP1))
-        .child(label("VARIATIONS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD));
-    for (vi, var) in rack.variations.iter().enumerate() {
-        let chip_id = ("rack-var", (id.0 as usize) << 8 | vi);
-        var_row = var_row.child(
-            div()
-                .id(chip_id)
-                .h(px(20.))
-                .px(px(SP2))
-                .gap(px(SP1))
-                .flex()
-                .items_center()
-                .rounded(px(r_sm()))
-                .bg(content(0.06))
-                .border_1()
-                .border_color(border())
-                .cursor_pointer()
-                .hover(|s| s.bg(content(0.12)).border_color(accent()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.s.recall_rack_variation(id, vi);
-                    cx.notify();
-                }))
-                .child(label(var.name.clone(), TEXT_XS, pal.text))
-                .child(
-                    div()
-                        .id(("rack-var-del", (id.0 as usize) << 8 | vi))
-                        .px(px(2.))
-                        .rounded(px(2.))
-                        .hover(|s| s.bg(with_alpha(pal.record, 0.25)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.s.delete_rack_variation(id, vi);
-                            cx.notify();
-                        }))
-                        .child(icon(Icon::X, 10., pal.faint)),
-                ),
-        );
-    }
-    var_row = var_row.child(
-        div()
-            .id(("rack-var-save", id.0 as usize))
-            .h(px(20.))
-            .px(px(SP2))
-            .gap(px(SP1))
-            .flex()
-            .items_center()
-            .rounded(px(r_sm()))
-            .bg(accent_alpha(0.14))
-            .border_1()
-            .border_color(accent_alpha(0.4))
-            .cursor_pointer()
-            .hover(|s| s.bg(accent_alpha(0.24)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.s.save_rack_variation(id, None);
-                cx.notify();
-            }))
-            .child(icon(Icon::Add, 10., pal.accent))
-            .child(label("Save", TEXT_XS, pal.accent)),
-    );
-    let macros = div()
-        .flex_none()
-        .p(px(SP2))
-        .flex()
-        .flex_col()
-        .gap(px(SP2))
-        .child(label("MACROS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
-        .child(macros)
-        .child(var_row);
-    if rack.kind != RackKind::Drum {
-        let show_macros = ws.fx.macros.contains(&id);
-        return div()
-            .h_full()
-            .flex()
-            .child(chains(ws, id, rack, cx))
-            .when(show_macros, |d| {
-                d.child(div().border_l_1().border_color(border()).child(macros))
-            })
-            .into_any_element();
-    }
-    let pads =
-        ws.s.project
-            .device_track(id)
-            .and_then(|t| ws.s.project.track(t))
-            .map(drum_pads)
-            .unwrap_or_default();
-    let mut grid = div()
-        .w(px(4. * 40. + 3. * SP1))
-        .flex()
-        .flex_wrap()
-        .gap(px(SP1));
-    // 4×4 pads, bottom-left first like hardware.
-    for row in (0..4).rev() {
-        for col in 0..4 {
-            let i = row * 4 + col;
-            let pad = pads.get(i).cloned();
-            grid = grid.child(
-                div()
-                    .id(("pad", (id.0 as usize) << 8 | i))
-                    .size(px(40.))
-                    .rounded(px(r_md()))
-                    .p(px(SP1))
-                    .flex()
-                    .flex_col()
-                    .justify_between()
-                    .cursor_pointer()
-                    .map(|d| match &pad {
-                        Some((name, color, note)) => d
-                            .bg(with_alpha(track_color(*color), 0.22))
-                            .border_1()
-                            .border_color(with_alpha(track_color(*color), 0.5))
-                            .hover(|s| s.bg(with_alpha(track_color(*color), 0.32)))
-                            .child(label(
-                                crate::paint::fit(name, 36., TEXT_XS),
-                                TEXT_XS,
-                                pal.text,
-                            ))
-                            .child(mono(format!("{note}"), TEXT_XS, pal.muted)),
-                        None => d.bg(content(0.04)).border_1().border_color(border()),
-                    }),
-            );
-        }
-    }
-    let side = div()
-        .p(px(SP2))
-        .flex()
-        .flex_col()
-        .gap(px(SP2))
-        .border_r_1()
-        .border_color(border())
-        .child(label("PADS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
-        .child(grid);
-    div().flex().child(side).child(macros).into_any_element()
-}
-
-/// An instrument or audio rack (Live): its chains on the left, and the
-/// devices of the picked one as a chain of their own, which takes drops
-/// like the track's. Dropping on a chain's name sends the device to its end.
-fn chains(
-    ws: &mut Workspace,
-    id: DeviceId,
-    rack: &Rack,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let pal = p();
-    let sel = ws
-        .fx
-        .selected
-        .get(&id)
-        .copied()
-        .unwrap_or(0)
-        .min(rack.chains.len().saturating_sub(1));
-    let mut list = div()
-        .flex_none()
-        .w(px(144.))
-        .h_full()
-        .p(px(SP2))
-        .flex()
-        .flex_col()
-        .gap(px(SP1))
-        .border_r_1()
-        .border_color(border())
-        .child(label("CHAINS", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD));
-    for (i, c) in rack.chains.iter().enumerate() {
-        let home = Container::Rack { rack: id, chain: i };
-        list = list.child(
-            div()
-                .id(("rack-chain", (id.0 as usize) << 8 | i))
-                .h(px(24.))
-                .px(px(SP2))
-                .gap(px(SP2))
-                .flex()
-                .items_center()
-                .rounded(px(r_sm()))
-                .border_1()
-                .border_color(if i == sel {
-                    accent()
-                } else {
-                    gpui::transparent_black()
-                })
-                .bg(if i == sel {
-                    content(0.08)
-                } else {
-                    content(0.04)
-                })
-                .cursor_pointer()
-                .hover(|s| s.bg(content(0.10)))
-                .drag_over::<DraggedDevice>(|s, _, _, _| s.border_color(accent()))
-                .on_drop(cx.listener(move |this, d: &DraggedDevice, _, cx| {
-                    move_device(this, d.id, home, usize::MAX);
-                    this.fx.selected.insert(id, i);
-                    cx.notify();
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.fx.selected.insert(id, i);
-                    cx.notify();
-                }))
-                .child(div().size(px(8.)).rounded_full().bg(track_color(c.color)))
-                .child(label(
-                    crate::paint::fit(&c.name, 100., TEXT_SM),
-                    TEXT_SM,
-                    pal.text,
-                )),
-        );
-    }
-    let home = Container::Rack {
-        rack: id,
-        chain: sel,
-    };
-    let devices = rack
-        .chains
-        .get(sel)
-        .map(|c| c.devices.clone())
-        .unwrap_or_default();
-    let empty = devices.is_empty();
-    let drop = div()
-        .id(("rack-drop", id.0 as usize))
-        .flex_none()
-        .w(px(if empty { 176. } else { 96. }))
-        .h_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px(px(SP2))
-        .rounded(px(r_md()))
-        .border_1()
-        .border_dashed()
-        .border_color(border_strong())
-        .drag_over::<DraggedDevice>(|s, _, _, _| s.border_color(accent()).bg(accent_alpha(0.08)))
-        .on_drop(cx.listener(move |this, d: &DraggedDevice, _, cx| {
-            move_device(this, d.id, home, usize::MAX);
-            cx.notify();
-        }))
-        .child(label(
-            if empty {
-                "Drop devices here"
-            } else {
-                "Drop here"
-            },
-            TEXT_SM,
-            pal.faint,
-        ));
-    div()
-        .h_full()
-        .flex()
-        .child(list)
-        .child(
-            div()
-                .h_full()
-                .flex()
-                .px(px(SP1))
-                .py(px(SP1))
-                .children(chain_items(ws, home, &devices, cx))
-                .child(drop),
-        )
-        .into_any_element()
+fn rack_body(ws: &mut Workspace, id: DeviceId, rack: &Rack, enabled: bool, cx: &mut Context<Workspace>) -> AnyElement {
+    rack_ui::rack_body(ws, id, rack, enabled, cx)
 }
 
 fn step_preset_index(len: usize, current: Option<usize>, dir: i32) -> Option<usize> {

@@ -4,11 +4,15 @@
 //! Routing rules:
 //! * `Output::Main` goes to the nearest enclosing **Group** (walking up
 //!   through Folders), else to Main. Folders and VCAs carry no audio.
-//! * `Output::Track(id)` must name an audio-carrying track other than itself.
+//! * `Output::Track(id)` must name an audio-carrying track other than itself;
+//!   anything else is sent to Main instead, with a warning.
 //! * `Output::Hardware(_)` goes straight to the device output bus (aligned
 //!   with Main by PDC); Main itself always goes there.
 //! * Sends go to any audio-carrying track (normally Returns).
-//! * Any routing cycle (outputs + sends) is rejected with [`CompileError::Cycle`].
+//! * A routing cycle (outputs + sends) is cut open at the connection that
+//!   closes it (found by a depth-first walk in project order), which is
+//!   silenced, with a warning. The compile only fails for a project without
+//!   a Main track.
 //!
 //! Solo: with any track soloed (a soloed VCA solos its members), a track is
 //! audible if it is soloed, feeds a soloed track through output routing
@@ -31,9 +35,9 @@ use crate::shared::{ProcessorPool, SharedProcessor};
 use crate::status::{MeterBank, SessionStatus};
 use aitrack_dsp::{db_to_gain, AudioBuffer};
 use aitrack_model::{
-    AutomationLane, AutomationTarget, ClipId, Device, DeviceId, DeviceKind, Output, Project, Source, Track, TrackId, TrackKind,
+    AutomationLane, AutomationTarget, Chain, ClipId, Device, DeviceId, DeviceKind, Macro, MacroMapping, Output, Project, Rack, Source, Track, TrackId, TrackKind,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -115,6 +119,112 @@ fn resolve_output(tracks: &[Track], index: &HashMap<TrackId, usize>, i: usize, m
     })
 }
 
+/// A connection of the audio routing, from a track to another.
+#[derive(Clone, Copy)]
+enum Edge {
+    /// The track's output.
+    Output,
+    /// Entry `n` of the track's send list.
+    Send(usize),
+}
+
+/// The first connection, walking depth-first from the tracks in project
+/// order, that points back at a track still being walked: `(from, to, edge,
+/// the tracks of the loop in order)`.
+fn find_back_edge(dest: &[Dest], sends: &[Vec<(usize, usize)>]) -> Option<(usize, usize, Edge, Vec<usize>)> {
+    let n = dest.len();
+    let adj: Vec<Vec<(usize, Edge)>> = (0..n)
+        .map(|i| {
+            let out = match dest[i] {
+                Dest::Track(j) => Some((j, Edge::Output)),
+                _ => None,
+            };
+            out.into_iter().chain(sends[i].iter().enumerate().map(|(k, &(_, j))| (j, Edge::Send(k)))).collect()
+        })
+        .collect();
+    // 0 = not seen, 1 = on the walk, 2 = done.
+    let mut color = vec![0u8; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for root in 0..n {
+        if color[root] != 0 {
+            continue;
+        }
+        color[root] = 1;
+        stack.push((root, 0));
+        while let Some(&(node, idx)) = stack.last() {
+            let Some(&(to, edge)) = adj[node].get(idx) else {
+                color[node] = 2;
+                stack.pop();
+                continue;
+            };
+            if let Some(top) = stack.last_mut() {
+                top.1 += 1;
+            }
+            match color[to] {
+                0 => {
+                    color[to] = 1;
+                    stack.push((to, 0));
+                }
+                1 => {
+                    let start = stack.iter().position(|(v, _)| *v == to).unwrap_or(0);
+                    return Some((node, to, edge, stack[start..].iter().map(|(v, _)| *v).collect()));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Make the routing acyclic: silence, one at a time, the connection that
+/// closes each loop (an output goes nowhere, a send is dropped) and say so.
+fn break_cycles(tracks: &[Track], dest: &mut [Dest], sends: &mut [Vec<(usize, usize)>], warnings: &mut Vec<String>) {
+    while let Some((from, to, edge, path)) = find_back_edge(dest, sends) {
+        let names: Vec<String> = path.iter().chain(std::iter::once(&path[0])).map(|&i| format!("'{}'", tracks[i].name)).collect();
+        let kind = match edge {
+            Edge::Output => {
+                dest[from] = Dest::None;
+                "output"
+            }
+            Edge::Send(k) => {
+                sends[from].remove(k);
+                "send"
+            }
+        };
+        warnings.push(format!(
+            "routing cycle {}: the {kind} from '{}' to '{}' closes it and is silenced",
+            names.join(" -> "),
+            tracks[from].name,
+            tracks[to].name
+        ));
+    }
+}
+
+/// A chain's volume × pan, zero when muted or silenced by another's solo.
+fn chain_gain(c: &aitrack_model::Chain, any_solo: bool) -> (f32, f32) {
+    let silent = c.mute || (any_solo && !c.solo);
+    let (l, r) = pan_gains(c.pan);
+    let g = if silent { 0.0 } else { db_to_gain(c.volume_db) };
+    (l * g, r * g)
+}
+
+/// A send level in dB as a gain; at or below the model's "off" level, none.
+fn send_gain(db: f32) -> f32 {
+    if db <= aitrack_model::SEND_OFF_DB { 0.0 } else { db_to_gain(db) }
+}
+
+/// Every device of `devs`, racks' chains and returns included.
+fn visit_all(devs: &[Device], f: &mut impl FnMut(&Device)) {
+    for d in devs {
+        f(d);
+        if let DeviceKind::Rack(r) = &d.kind {
+            for c in r.chains.iter().chain(&r.returns) {
+                visit_all(&c.devices, f);
+            }
+        }
+    }
+}
+
 /// Normalised params of `d` with every macro mapping that targets it applied.
 fn effective_params(d: &Device, overrides: &HashMap<DeviceId, BTreeMap<u32, f32>>) -> BTreeMap<u32, f32> {
     let mut p = d.params.clone();
@@ -134,7 +244,7 @@ fn collect_macro_overrides(chain: &[Device], out: &mut HashMap<DeviceId, BTreeMa
                     out.entry(map.device).or_default().insert(map.param, map.min + (map.max - map.min) * m.value.clamp(0.0, 1.0));
                 }
             }
-            for c in &rack.chains {
+            for c in rack.chains.iter().chain(&rack.returns) {
                 collect_macro_overrides(&c.devices, out);
             }
         }
@@ -160,33 +270,69 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
         match &d.kind {
             DeviceKind::Rack(rack) => {
                 let compiled: Vec<(Vec<DeviceNode>, u32)> = rack.chains.iter().map(|c| compile_devices(&c.devices, dc)).collect();
+                let compiled_returns: Vec<(Vec<DeviceNode>, u32)> = rack.returns.iter().map(|c| compile_devices(&c.devices, dc)).collect();
                 let max_lat = compiled.iter().map(|c| c.1).max().unwrap_or(0);
+                let max_ret = compiled_returns.iter().map(|c| c.1).max().unwrap_or(0);
+                let n_returns = rack.returns.len();
+                let node = |c: &aitrack_model::Chain, devices: Vec<DeviceNode>, delay: u32, gain: (f32, f32)| ChainNode {
+                    devices,
+                    gain,
+                    note: c.note,
+                    play_note: c.play_note.unwrap_or(60),
+                    key_range: c.key_range,
+                    velocity_range: c.velocity_range,
+                    selector_range: c.selector_range,
+                    key_fade: c.key_fade,
+                    vel_fade: c.vel_fade,
+                    sel_fade: c.sel_fade,
+                    choke: c.choke,
+                    sends: (0..n_returns).map(|j| c.sends.get(j).copied().map_or(0.0, send_gain)).collect(),
+                    to_return: match c.output {
+                        aitrack_model::ChainOut::Return(j) if (j as usize) < n_returns => Some(j as usize),
+                        _ => None,
+                    },
+                    buf: AudioBuffer::new(2, max),
+                    events: EventList::with_capacity(EVENT_CAPACITY),
+                    delay: DelayLine::new(2, delay as usize),
+                    cur_gain: [0.0; 2],
+                    primed: false,
+                    held: [0; 2],
+                    played: [0; 128],
+                    choke_gain: 1.0,
+                    choking: false,
+                    choke_at: u32::MAX,
+                    all_off: false,
+                    asleep: false,
+                    target: gain,
+                };
                 let any_solo = rack.chains.iter().any(|c| c.solo);
                 let chains = rack
                     .chains
                     .iter()
                     .zip(compiled)
-                    .map(|(c, (devices, lat))| {
-                        let silent = c.mute || (any_solo && !c.solo);
-                        let (l, r) = pan_gains(c.pan);
-                        let g = if silent { 0.0 } else { db_to_gain(c.volume_db) };
-                        ChainNode {
-                            devices,
-                            gain: (l * g, r * g),
-                            note: c.note,
-                            key_range: c.key_range,
-                            velocity_range: c.velocity_range,
-                            buf: AudioBuffer::new(2, max),
-                            events: EventList::with_capacity(EVENT_CAPACITY),
-                            delay: DelayLine::new(2, (max_lat - lat) as usize),
-                        }
-                    })
+                    .map(|(c, (devices, lat))| node(c, devices, max_lat - lat, chain_gain(c, any_solo)))
+                    .collect();
+                let any_ret_solo = rack.returns.iter().any(|c| c.solo);
+                let returns = rack
+                    .returns
+                    .iter()
+                    .zip(compiled_returns)
+                    .map(|(c, (devices, lat))| node(c, devices, max_ret - lat, chain_gain(c, any_ret_solo)))
                     .collect();
                 if d.enabled {
-                    latency += max_lat;
+                    latency += max_lat + max_ret;
                 }
                 dc.handles.insert(d.id, Handle { proc: None, enabled: enabled.clone() });
-                nodes.push(DeviceNode::Rack(RackNode { id: d.id, kind: rack.kind, enabled, chains, input: AudioBuffer::new(2, max) }));
+                nodes.push(DeviceNode::Rack(RackNode {
+                    id: d.id,
+                    kind: rack.kind,
+                    enabled,
+                    chains,
+                    returns,
+                    selector: rack.chain_selector,
+                    dry_delay: DelayLine::new(2, max_ret as usize),
+                    input: AudioBuffer::new(2, max),
+                }));
             }
             _ => {
                 let params = effective_params(d, &dc.overrides);
@@ -208,6 +354,9 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                             merged: EventList::with_capacity(0),
                             silent_samples: 0,
                             sleeping: false,
+                            chunk: None,
+                            is_midi: r.is_midi,
+                            midi: r.is_midi.then(|| Box::new(MidiState::new())),
                         }));
                     }
                     None => {
@@ -218,16 +367,19 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
             }
         }
     }
+    // MIDI effects run before everything else, in the order they were put in:
+    // each hands its events to the next, and the instrument gets the result.
+    nodes.sort_by_key(|n| !matches!(n, DeviceNode::Proc(p) if p.is_midi));
     (nodes, latency)
 }
 
-fn find_rack(chain: &[Device], id: DeviceId) -> Option<&aitrack_model::Rack> {
+pub(crate) fn find_rack(chain: &[Device], id: DeviceId) -> Option<&aitrack_model::Rack> {
     for d in chain {
         if let DeviceKind::Rack(r) = &d.kind {
             if d.id == id {
                 return Some(r);
             }
-            for c in &r.chains {
+            for c in r.chains.iter().chain(&r.returns) {
                 if let Some(found) = find_rack(&c.devices, id) {
                     return Some(found);
                 }
@@ -253,7 +405,14 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
     // Routing.
     let mut dest = Vec::with_capacity(tracks.len());
     for i in 0..tracks.len() {
-        dest.push(resolve_output(tracks, &index, i, main)?);
+        match resolve_output(tracks, &index, i, main) {
+            Ok(d) => dest.push(d),
+            Err(CompileError::InvalidRoute { reason, .. }) => {
+                warnings.push(format!("track '{}': invalid output ({reason}); sent to Main instead", tracks[i].name));
+                dest.push(Dest::Track(main));
+            }
+            Err(e) => return Err(e),
+        }
     }
     let mut sends: Vec<Vec<(usize, usize)>> = vec![Vec::new(); tracks.len()]; // (send index, target)
     for (i, t) in tracks.iter().enumerate() {
@@ -267,6 +426,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             }
         }
     }
+    break_cycles(tracks, &mut dest, &mut sends, &mut warnings);
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); tracks.len()];
     let mut out_pred: Vec<Vec<usize>> = vec![Vec::new(); tracks.len()];
     for i in 0..tracks.len() {
@@ -288,7 +448,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             continue;
         }
         let mut sources = Vec::new();
-        aitrack_model::visit_devices(&t.devices, &mut |d| {
+        visit_all(&t.devices, &mut |d| {
             if let Some(&j) = d.sidechain.and_then(|s| index.get(&s))
                 && j != i
                 && tracks[j].kind.carries_audio()
@@ -338,6 +498,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         // to something it feeds) cannot be ordered: it hears the previous block.
         let (routed, indeg) = topo(&succ);
         if routed.len() != tracks.len() {
+            // (`break_cycles` made the routing acyclic: not reachable.)
             let cyc: Vec<TrackId> = (0..tracks.len()).filter(|&i| indeg[i] > 0).map(|i| tracks[i].id).collect();
             return Err(CompileError::Cycle(cyc));
         }
@@ -459,6 +620,16 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
     let mut nodes: Vec<Option<TrackNode>> = (0..tracks.len()).map(|_| None).collect();
     let mut chains: Vec<Option<Vec<DeviceNode>>> = chains.into_iter().map(Some).collect();
     let mut session_tracks = Vec::new();
+    let mut hosted_devices: std::collections::HashSet<DeviceId> = std::collections::HashSet::new();
+    for t in tracks {
+        visit_all(&t.devices, &mut |d| {
+            if matches!(d.kind, DeviceKind::Plugin { .. }) {
+                hosted_devices.insert(d.id);
+            }
+        });
+    }
+    // Parameters some lane drives in this graph (see `ProcessorPool::sync_automation`).
+    let mut automated: BTreeSet<(DeviceId, u32)> = BTreeSet::new();
     for &i in &order {
         let t = &tracks[i];
         let handles = &handles_per_track[i];
@@ -481,7 +652,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                         }
                     // Each clip reads the warp of its own source: a clip transposed
                     // or stretched alone has a copy of the file's source.
-                    CompiledClip::audio(id, clip, AudioClipData::of_bpm(&a.warp, audio, project.tempo.initial_bpm()))
+                    CompiledClip::audio(id, clip, AudioClipData::of_bpm_in(&a.warp, audio, project.tempo.initial_bpm(), cx.samples))
                 }
                 _ => return None,
             };
@@ -525,50 +696,58 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                 AutomationTarget::Send { index } => {
                     send_lanes.insert(index, lane.clone());
                 }
-                AutomationTarget::DeviceParam { device, param } => {
-                    let hosted = project.device(device).is_some_and(|d| matches!(d.kind, DeviceKind::Plugin { .. }));
-                    match handles.get(&device).and_then(|h| h.proc.clone()) {
-                        // Hosted plugins take sample-accurate parameter events.
-                        Some(_) if hosted => param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Timed(device, param), last: f32::NAN }),
-                        Some(p) => param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Param(p, param), last: f32::NAN }),
-                        None => warnings.push(format!("track '{}': automation targets unknown device {device}", t.name)),
+                AutomationTarget::DeviceParam { device, param } => match handles.get(&device).and_then(|h| h.proc.as_ref()) {
+                    // Hosted and stock alike: timed events in the device's node.
+                    Some(_) => {
+                        automated.insert((device, param));
+                        param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Timed(device, param), last: f32::NAN });
                     }
-                }
+                    None => warnings.push(format!("track '{}': automation targets unknown device {device}", t.name)),
+                },
                 AutomationTarget::DeviceEnabled { device } => {
                     if let Some(h) = handles.get(&device) {
                         param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Enabled(h.enabled.clone()), last: f32::NAN });
                     }
                 }
                 AutomationTarget::Macro { device, index } => {
-                    let maps = find_rack(&t.devices, device)
-                        .and_then(|r| r.macros.get(index as usize))
-                        .map(|m| {
-                            m.mappings
-                                .iter()
-                                .filter_map(|mm| handles.get(&mm.device).and_then(|h| h.proc.clone()).map(|p| (p, mm.param, mm.min, mm.max)))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let mappings = find_rack(&t.devices, device).and_then(|r| r.macros.get(index as usize)).map(|m| m.mappings.as_slice()).unwrap_or_default();
+                    let maps = mappings
+                        .iter()
+                        .filter(|mm| handles.get(&mm.device).is_some_and(|h| h.proc.is_some()))
+                        .map(|mm| (mm.device, mm.param, mm.min, mm.max))
+                        .collect::<Vec<_>>();
                     if !maps.is_empty() {
-                        param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::Macro(maps), last: f32::NAN });
+                        automated.extend(maps.iter().map(|m| (m.0, m.1)));
+                        param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::TimedMacro(maps), last: f32::NAN });
                     }
                 }
                 AutomationTarget::Tempo => {}
             }
         }
 
-        // Room for the timed automation events of each hosted plugin it
-        // reaches: one per control block and per breakpoint in a block.
+        // Room for the timed automation events of each device a lane reaches:
+        // one per control block and per breakpoint in a block. A hosted plugin
+        // also gets the buffer its events are merged with the block's; a stock
+        // device, the scratch it is processed in pieces with.
         if let Some(devices) = chains[i].as_mut() {
             let per_lane = max / CONTROL_BLOCK + 2;
             for pa in &param_autos {
-                if let ParamTarget::Timed(device, _) = pa.target
-                    && let Some(node) = crate::graph::find_proc_mut(devices, device)
-                {
-                    let breaks = pa.lane.points.len().min(max);
-                    let cap = node.auto_events.events.capacity() + per_lane + breaks;
-                    node.auto_events = EventList::with_capacity(cap);
-                    node.merged = EventList::with_capacity(cap + EVENT_CAPACITY);
+                let breaks = pa.lane.points.len().min(max);
+                let mut reach = |device: DeviceId| {
+                    if let Some(node) = crate::graph::find_proc_mut(devices, device) {
+                        let cap = node.auto_events.events.capacity() + per_lane + breaks;
+                        node.auto_events = EventList::with_capacity(cap);
+                        if hosted_devices.contains(&device) {
+                            node.merged = EventList::with_capacity(cap + EVENT_CAPACITY);
+                        } else if node.chunk.is_none() {
+                            node.chunk = Some(Box::new(ChunkScratch { buf: AudioBuffer::new(2, max), events: EventList::with_capacity(EVENT_CAPACITY) }));
+                        }
+                    }
+                };
+                match &pa.target {
+                    ParamTarget::Timed(device, _) => reach(*device),
+                    ParamTarget::TimedMacro(maps) => maps.iter().for_each(|m| reach(m.0)),
+                    ParamTarget::Enabled(_) => {}
                 }
             }
         }
@@ -579,11 +758,14 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             .map(|&(k, j)| {
                 let s = &t.sends[k];
                 SendNode {
+                    index: k as u16,
                     target: gpos[j],
+                    target_id: tracks[j].id,
                     level_db: s.level_db,
                     pre_fader: s.pre_fader,
                     lane: send_lanes.remove(&(k as u16)),
                     cur: 0.0,
+                    primed: false,
                     delay: DelayLine::new(2, (in_lat[j] - out_lat[i]) as usize),
                     buf: AudioBuffer::new(2, max),
                 }
@@ -602,6 +784,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             kind: t.kind,
             arm: t.arm,
             monitor: t.monitor,
+            input_sel: None,
+            no_input: false,
+            in_buf: AudioBuffer::new(2, if t.kind == TrackKind::Audio { max } else { 0 }),
             has_input: has_input[i],
             devices: chains[i].take().unwrap_or_default(),
             param_autos,
@@ -620,6 +805,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             active: ActiveNotes::new(),
             rng: Rng(0x9E37_79B9 ^ (t.id.0 as u32).wrapping_mul(2_654_435_761) | 1),
             release_all: false,
+            panic_notes: false,
             volume_db: t.volume_db,
             pan: t.pan,
             mute: t.mute,
@@ -631,6 +817,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             vca_out: (0.0, 0.0, false),
             vca_in: (0.0, 0.0, false),
             cur_gain: [0.0; 2],
+            gain_primed: false,
             sends: send_nodes,
             output,
             out_delay: DelayLine::new(2, out_delay),
@@ -650,7 +837,17 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             side_scratch: AudioBuffer::new(2, if side_src[i].is_empty() { 0 } else { max }),
         });
     }
-    let tracks_out: Vec<TrackNode> = nodes.into_iter().map(|n| n.expect("every track placed")).collect();
+    let mut tracks_out: Vec<TrackNode> = nodes.into_iter().map(|n| n.expect("every track placed")).collect();
+    // A parameter whose automation is gone goes back to the knob's value.
+    for (device, param, value) in cx.pool.sync_automation(automated) {
+        for t in &mut tracks_out {
+            if let Some(node) = find_proc_mut(&mut t.devices, device) {
+                node.init_params.retain(|(id, _)| *id != param);
+                node.init_params.push((param, value));
+                break;
+            }
+        }
+    }
     let inputs = tracks_out.iter().map(|t| AudioBuffer::new(2, if t.has_input { max } else { 0 })).collect();
     let mut track_lookup: Vec<_> = tracks_out.iter().enumerate().map(|(g, t)| (t.id, g)).collect();
     track_lookup.sort();
@@ -674,5 +871,258 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         session_status: Arc::new(SessionStatus::new(project.scenes.iter().map(|s| s.id).collect(), session_tracks)),
         warnings: warnings_out,
         track_latency: tracks.iter().enumerate().map(|(i, t)| (t.id, chain_lat[i])).collect(),
+        new_crashes: 0,
+        midi_dropped: 0,
+        sanitized: 0,
+        generation: 0,
     })
+}
+
+// ───────────────────────────── Parameter patches ─────────────────────────────
+
+/// One change of a running graph that needs no compile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Patch {
+    /// A device parameter (normalised).
+    Param { device: DeviceId, param: u32, value: f32 },
+    Volume { track: TrackId, db: f32 },
+    Pan { track: TrackId, pan: f32 },
+    Send { track: TrackId, index: u16, db: f32 },
+    /// A macro's value, for the control thread's copy of the project only
+    /// (its mapped parameters are separate `Param` patches).
+    MacroValue { rack: DeviceId, index: u16, value: f32 },
+    /// A rack's Chain Select value.
+    Selector { rack: DeviceId, value: u8 },
+}
+
+/// If `new` differs from `old` only in device parameters, track volume and
+/// pan, send levels and fields the compiler never reads (names, colours,
+/// heights, reported latency…), the changes as [`Patch`]es to apply to the
+/// graph compiled from `old`; `None` when anything else changed (structure,
+/// routing, clips, automation, mute / solo, states, macros…) or a change
+/// cannot be expressed as a patch.
+///
+/// Every struct is destructured without `..`, so adding a field to the model
+/// stops this from compiling until it is decided here whether the compiler
+/// reads it.
+pub(crate) fn param_patches(old: &Project, new: &Project) -> Option<Vec<Patch>> {
+    let Project { format_version: _, name: _, tempo, scale: _, sample_rate_hint: _, tracks, scenes, clips, sources, loop_region: _, ids: _ } = old;
+    let Project { format_version: _, name: _, tempo: tempo_b, scale: _, sample_rate_hint: _, tracks: tracks_b, scenes: scenes_b, clips: clips_b, sources: sources_b, loop_region: _, ids: _ } = new;
+    if tempo != tempo_b || scenes != scenes_b || clips != clips_b || sources != sources_b || tracks.len() != tracks_b.len() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (a, b) in tracks.iter().zip(tracks_b) {
+        if a == b {
+            continue;
+        }
+        let Track {
+            id, kind, name: _, color: _, volume_db, pan, mute, solo, arm, monitor, input, output, sends, parent, vca, collapsed: _, height: _, devices, session_slots, arrangement, automation,
+            reported_latency: _, scale: _, keyboard_input: _,
+        } = a;
+        let Track {
+            id: id_b, kind: kind_b, name: _, color: _, volume_db: volume_b, pan: pan_b, mute: mute_b, solo: solo_b, arm: arm_b, monitor: monitor_b, input: input_b, output: output_b, sends: sends_b,
+            parent: parent_b, vca: vca_b, collapsed: _, height: _, devices: devices_b, session_slots: session_b, arrangement: arrangement_b, automation: automation_b,
+            reported_latency: _, scale: _, keyboard_input: _,
+        } = b;
+        if id != id_b
+            || kind != kind_b
+            || mute != mute_b
+            || solo != solo_b
+            || arm != arm_b
+            || monitor != monitor_b
+            || input != input_b
+            || output != output_b
+            || parent != parent_b
+            || vca != vca_b
+            || session_slots != session_b
+            || arrangement != arrangement_b
+            || automation != automation_b
+            || sends.len() != sends_b.len()
+        {
+            return None;
+        }
+        if volume_db != volume_b {
+            out.push(Patch::Volume { track: *id, db: *volume_b });
+        }
+        if pan != pan_b {
+            out.push(Patch::Pan { track: *id, pan: *pan_b });
+        }
+        for (k, (sa, sb)) in sends.iter().zip(sends_b).enumerate() {
+            if sa.target != sb.target || sa.pre_fader != sb.pre_fader {
+                return None;
+            }
+            if sa.level_db != sb.level_db {
+                out.push(Patch::Send { track: *id, index: k as u16, db: sb.level_db });
+            }
+        }
+        let mut overrides = HashMap::new();
+        collect_macro_overrides(devices_b, &mut overrides);
+        if !diff_devices(devices, devices_b, &overrides, &mut out) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Two rack chains (or returns) that differ at most by device parameters.
+fn chain_diff(ca: &Chain, cb: &Chain, overrides: &HashMap<DeviceId, BTreeMap<u32, f32>>, out: &mut Vec<Patch>) -> bool {
+    let Chain { name: _, color: _, devices, volume_db, pan, mute, solo, note, key_range, velocity_range, selector_range, key_fade, vel_fade, sel_fade, choke, play_note, sends, output } = ca;
+    let Chain {
+        name: _, color: _, devices: devices_b, volume_db: volume_b, pan: pan_b, mute: mute_b, solo: solo_b, note: note_b, key_range: key_b, velocity_range: velocity_b,
+        selector_range: selector_b, key_fade: key_fade_b, vel_fade: vel_fade_b, sel_fade: sel_fade_b, choke: choke_b, play_note: play_note_b, sends: sends_b, output: output_b,
+    } = cb;
+    volume_db == volume_b
+        && pan == pan_b
+        && mute == mute_b
+        && solo == solo_b
+        && note == note_b
+        && key_range == key_b
+        && velocity_range == velocity_b
+        && selector_range == selector_b
+        && (key_fade, vel_fade, sel_fade, choke, play_note, sends, output) == (key_fade_b, vel_fade_b, sel_fade_b, choke_b, play_note_b, sends_b, output_b)
+        && diff_devices(devices, devices_b, overrides, out)
+}
+
+/// Compare two device chains: `true` when they differ only by parameters
+/// (collected into `out`).
+fn diff_devices(a: &[Device], b: &[Device], overrides: &HashMap<DeviceId, BTreeMap<u32, f32>>, out: &mut Vec<Patch>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(da, db)| {
+        let Device { id, name: _, kind, enabled, params, state, preset: _, collapsed: _, sidechain } = da;
+        let Device { id: id_b, name: _, kind: kind_b, enabled: enabled_b, params: params_b, state: state_b, preset: _, collapsed: _, sidechain: sidechain_b } = db;
+        if id != id_b || enabled != enabled_b || state != state_b || sidechain != sidechain_b {
+            return false;
+        }
+        match (kind, kind_b) {
+            (DeviceKind::Rack(ra), DeviceKind::Rack(rb)) => {
+                let Rack { kind, chains, macros, variations: _, chain_selector, returns } = ra;
+                let Rack { kind: kind_b, chains: chains_b, macros: macros_b, variations: _, chain_selector: selector_b, returns: returns_b } = rb;
+                // (A chain's zones, fades, choke, notes, sends and output shape the compiled rack: any change recompiles.)
+                if kind != kind_b || chains.len() != chains_b.len() || macros.len() != macros_b.len() {
+                    return false;
+                }
+                if chain_selector != selector_b {
+                    out.push(Patch::Selector { rack: *id, value: *selector_b });
+                }
+                // A macro that only moved: its mapped parameters follow it.
+                for (ma, mb) in macros.iter().zip(macros_b) {
+                    let Macro { name: _, value, mappings } = ma;
+                    let Macro { name: _, value: value_b, mappings: mappings_b } = mb;
+                    if mappings != mappings_b {
+                        return false;
+                    }
+                    if value != value_b {
+                        out.extend(macro_patches(mappings_b, *value_b));
+                    }
+                }
+                let chains_ok = returns.len() == returns_b.len()
+                    && chains.iter().zip(chains_b).chain(returns.iter().zip(returns_b)).all(|(ca, cb)| chain_diff(ca, cb, overrides, out));
+                if !chains_ok {
+                    return false;
+                }
+            }
+            (DeviceKind::Rack(_), _) | (_, DeviceKind::Rack(_)) => return false,
+            _ if kind != kind_b => return false,
+            _ => {}
+        }
+        if params.keys().any(|k| !params_b.contains_key(k)) {
+            return false;
+        }
+        for (&param, &value) in params_b {
+            if params.get(&param) != Some(&value) {
+                // A macro drives this parameter: its value is not the knob's.
+                if overrides.get(id).is_some_and(|m| m.contains_key(&param)) {
+                    return false;
+                }
+                out.push(Patch::Param { device: *id, param, value });
+            }
+        }
+        true
+    })
+}
+
+/// The parameter values a macro at `value` (0..=1) puts on its mapped
+/// parameters: `min + (max - min) * value`, the range inverted when
+/// `min > max`.
+pub(crate) fn macro_patches(mappings: &[MacroMapping], value: f32) -> impl Iterator<Item = Patch> + '_ {
+    let v = value.clamp(0.0, 1.0);
+    mappings.iter().map(move |m| Patch::Param { device: m.device, param: m.param, value: m.min + (m.max - m.min) * v })
+}
+
+/// Apply a [`Patch`] to a project snapshot (the control thread keeps its copy
+/// in step with the fast path).
+pub(crate) fn apply_patch(project: &mut Project, patch: &Patch) {
+    fn param(devices: &mut [Device], device: DeviceId, p: u32, v: f32) -> bool {
+        for d in devices {
+            if d.id == device {
+                d.params.insert(p, v);
+                return true;
+            }
+            if let DeviceKind::Rack(r) = &mut d.kind
+                && r.chains.iter_mut().chain(r.returns.iter_mut()).any(|c| param(&mut c.devices, device, p, v))
+            {
+                return true;
+            }
+        }
+        false
+    }
+    match *patch {
+        Patch::Param { device, param: p, value } => {
+            project.tracks.iter_mut().any(|t| param(&mut t.devices, device, p, value));
+        }
+        Patch::Volume { track, db } => {
+            if let Some(t) = project.track_mut(track) {
+                t.volume_db = db;
+            }
+        }
+        Patch::Pan { track, pan } => {
+            if let Some(t) = project.track_mut(track) {
+                t.pan = pan;
+            }
+        }
+        Patch::Send { track, index, db } => {
+            if let Some(s) = project.track_mut(track).and_then(|t| t.sends.get_mut(index as usize)) {
+                s.level_db = db;
+            }
+        }
+        Patch::Selector { rack, value } => {
+            fn set(devices: &mut [Device], rack: DeviceId, value: u8) -> bool {
+                for d in devices {
+                    if let DeviceKind::Rack(r) = &mut d.kind {
+                        if d.id == rack {
+                            r.chain_selector = value;
+                            return true;
+                        }
+                        if r.chains.iter_mut().chain(r.returns.iter_mut()).any(|c| set(&mut c.devices, rack, value)) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            project.tracks.iter_mut().any(|t| set(&mut t.devices, rack, value));
+        }
+        Patch::MacroValue { rack, index, value } => {
+            fn set(devices: &mut [Device], rack: DeviceId, index: usize, value: f32) -> bool {
+                for d in devices {
+                    if let DeviceKind::Rack(r) = &mut d.kind {
+                        if d.id == rack {
+                            if let Some(m) = r.macros.get_mut(index) {
+                                m.value = value;
+                            }
+                            return true;
+                        }
+                        if r.chains.iter_mut().chain(r.returns.iter_mut()).any(|c| set(&mut c.devices, rack, index, value)) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            project.tracks.iter_mut().any(|t| set(&mut t.devices, rack, index as usize, value));
+        }
+    }
 }

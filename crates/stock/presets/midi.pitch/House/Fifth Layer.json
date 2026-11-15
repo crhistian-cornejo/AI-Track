@@ -1,0 +1,21 @@
+{
+  "name": "Fifth Layer",
+  "plugin": "midi.pitch",
+  "author": "AI-Track",
+  "tags": [
+    "house",
+    "chords",
+    "fifth",
+    "layer"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.7916667,
+    "2": 0.0,
+    "3": 1.0,
+    "4": 0.0,
+    "5": 0.5,
+    "6": 1.0,
+    "7": 0.3
+  }
+}

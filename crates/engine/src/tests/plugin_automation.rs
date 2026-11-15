@@ -193,9 +193,10 @@ fn a_plugin_inside_a_rack_gets_its_events() {
 }
 
 #[test]
-fn next_to_control_block_automation_the_events_keep_their_offsets() {
-    // A stock parameter lane on the same track cuts the chain into control
-    // blocks; the plugin's events are cut with it and still land exactly.
+fn next_to_stock_automation_the_plugin_keeps_whole_blocks_and_its_events_their_offsets() {
+    // A stock parameter lane on the same track is applied inside the stock
+    // device alone (processed in pieces); the plugin still gets whole blocks
+    // and its events land exactly.
     let f = Probes::default();
     let (stock, d) = (DeviceId(9_003), DeviceId(9_004));
     let other = AutomationLane { points: vec![pt(0, 0.5)], ..AutomationLane::new(AutomationTarget::DeviceParam { device: stock, param: 0 }) };
@@ -203,5 +204,5 @@ fn next_to_control_block_automation_the_events_keep_their_offsets() {
     let l = render(&p, &f).channel(0).to_vec();
     assert!(close(l[JUMP_AT - 1], 0.25), "{}", l[JUMP_AT - 1]);
     assert!(close(l[JUMP_AT], 0.75), "{}", l[JUMP_AT]);
-    assert!(f.seen.lock().unwrap().frames.contains(&CONTROL_BLOCK), "this track is cut into control blocks");
+    assert!(!f.seen.lock().unwrap().frames.contains(&CONTROL_BLOCK), "the plugin is not cut into control blocks");
 }

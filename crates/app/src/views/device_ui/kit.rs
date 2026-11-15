@@ -434,6 +434,20 @@ pub fn num_w(
     width: f32,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
+    num_shown(ws, dev, id, width, None, cx)
+}
+
+/// As [`num_w`], showing `shown` instead of the parameter's own text (a
+/// value another unit describes better, such as a spin as a percentage).
+/// Typing still enters the parameter's plain value.
+pub fn num_shown(
+    ws: &mut Workspace,
+    dev: &Dev,
+    id: u32,
+    width: f32,
+    shown: Option<String>,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let pal = p();
     let Some(info) = dev.info(id).cloned() else { return div().into_any_element() };
     let value = dev.norm(id);
@@ -503,7 +517,7 @@ pub fn num_w(
         .overflow_hidden()
         .tooltip(widgets::tip(info.name, None))
         .child(label(paint::fit(info.short, width - 8., TEXT_XS), TEXT_XS, pal.faint))
-        .child(mono(paint::fit(&info.format(value), width - 6., TEXT_XS), TEXT_XS, if dev.enabled { pal.text } else { pal.muted }))
+        .child(mono(paint::fit(&shown.unwrap_or_else(|| info.format(value)), width - 6., TEXT_XS), TEXT_XS, if dev.enabled { pal.text } else { pal.muted }))
         .child(div().absolute().left_0().bottom_0().h(px(2.)).w(px((width * fill).max(0.))).bg(with_alpha(if dev.enabled { pal.accent } else { pal.faint }, 0.7)))
         .on_mouse_down(
             MouseButton::Left,
@@ -542,7 +556,8 @@ pub fn num_w(
                     this.focus.focus(window, cx);
                 }
                 let plain = info.to_plain(current(this, device, &info));
-                this.begin_num_edit(NumTarget::Param { device, param: id }, plain_text(plain as f64), cx);
+                let typed = super::plain_to_typed(this, device, id, plain);
+                this.begin_num_edit(NumTarget::Param { device, param: id }, plain_text(typed as f64), cx);
             })
         })
         .into_any_element()
@@ -726,6 +741,43 @@ pub fn paint_wave(window: &mut Window, r: Rect, wave: &[(f32, f32)], color: Hsla
     }
 }
 
+
+/// A card of related controls under a title, with an optional on/off switch
+/// (a stage of a chain). A card that is switched off dims its controls.
+pub fn section(dev: &Dev, title: impl Into<gpui::SharedString>, switch: Option<u32>, body: Vec<AnyElement>, cx: &mut Context<Workspace>) -> Div {
+    let pal = p();
+    let device = dev.id;
+    let on = switch.is_none_or(|id| dev.on(id));
+    let header = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(SP2))
+        .child(label(title, TEXT_XS, if on { pal.text } else { pal.faint }).font_weight(FontWeight::SEMIBOLD))
+        .when_some(switch, |d, id| {
+            d.child(
+                widgets::switch(("sec-on", dev.key(id as usize)), on)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        set_now(this, device, id, if on { 0. } else { 1. });
+                        cx.notify();
+                    })),
+            )
+        });
+    div()
+        .flex_none()
+        .max_w(gpui::relative(1.))
+        .p(px(SP2))
+        .gap(px(SP1))
+        .flex()
+        .flex_col()
+        .rounded(px(r_md()))
+        .bg(content(0.03))
+        .border_1()
+        .border_color(if on { border_strong() } else { border() })
+        .child(header)
+        .child(div().flex().flex_wrap().items_center().gap(px(SP1)).when(!on, |d| d.opacity(0.45)).children(body))
+}
 
 #[cfg(test)]
 mod tests {

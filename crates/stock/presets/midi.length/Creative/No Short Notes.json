@@ -1,0 +1,20 @@
+{
+  "name": "No Short Notes",
+  "plugin": "midi.length",
+  "author": "AI-Track",
+  "tags": [
+    "creative",
+    "clean",
+    "minimum",
+    "length"
+  ],
+  "params": {
+    "0": 0.6666667,
+    "1": 0.58214194,
+    "2": 0.23076923,
+    "3": 0.68364084,
+    "4": 0.0,
+    "5": 0.2,
+    "6": 0.0
+  }
+}

@@ -17,6 +17,7 @@ use gpui::{AppContext as _, Context, Entity, Focusable, Subscription, Window};
 pub enum RenameTarget {
     Clip(ClipId),
     Track(TrackId),
+    Scene(SceneId),
 }
 
 /// View state of the shortcuts sheet and the Rename field.
@@ -73,6 +74,15 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             Err(why) => ws.toast(why, cx),
         },
         Cmd::Rename => open_rename(ws, window, cx),
+        Cmd::HoldStutter => crate::views::device_ui::stutter::toggle_hold(ws, cx),
+        Cmd::LaunchSlot => {
+            // Enter launches in the Session View and does nothing elsewhere.
+            if ws.s.view == MainView::Session {
+                ws.launch_session_cursor(cx);
+            } else {
+                cx.propagate();
+            }
+        }
         Cmd::DuplicateTime => {
             if !ws.s.duplicate_time() {
                 ws.toast("Drag in an empty lane to select the time to duplicate", cx);
@@ -226,6 +236,7 @@ pub fn open_rename_for(
     let name = match target {
         Some(RenameTarget::Clip(c)) => ws.s.project.clips.get(&c).map(|c| c.name.clone()),
         Some(RenameTarget::Track(t)) => ws.s.project.track(t).map(|t| t.name.clone()),
+        Some(RenameTarget::Scene(s)) => ws.s.project.scenes.iter().find(|x| x.id == s).map(|x| x.name.clone()),
         None => None,
     };
     let (Some(target), Some(name)) = (target, name) else {
@@ -245,6 +256,7 @@ pub fn apply_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
     match ws.ui.rename_target.take() {
         Some(RenameTarget::Clip(c)) => ws.s.rename_clip(c, &name),
         Some(RenameTarget::Track(t)) => ws.s.rename_track(t, &name),
+        Some(RenameTarget::Scene(s)) => ws.s.rename_scene(s, &name),
         None => false,
     };
     ws.modal = None;

@@ -59,6 +59,10 @@ actions!(
         ToggleGroupFold,
         ToggleAutomationMode,
         ToggleAutomationArm,
+        DeleteTrack,
+        CollectAndSave,
+        FindMissingFiles,
+        ToggleSounds,
         Quit,
     ]
 );
@@ -80,6 +84,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-l"), ToggleLoop, Some("Workspace")),
         KeyBinding::new(&format!("{m}-i"), ToggleAssistant, Some("Workspace")),
         KeyBinding::new(&format!("{m}-k"), TogglePalette, Some("Workspace")),
+        KeyBinding::new(&format!("{m}-shift-k"), ToggleSounds, Some("Workspace")),
         KeyBinding::new(&format!("{m}-a"), SelectAll, Some(CTX)),
         KeyBinding::new("1", TabDevices, Some(CTX)),
         KeyBinding::new("2", TabPianoRoll, Some(CTX)),
@@ -117,6 +122,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-e"), SplitClip, Some(CTX)),
         KeyBinding::new(&format!("{m}-g"), GroupTracks, Some(CTX)),
         KeyBinding::new(&format!("{m}-shift-g"), UngroupTracks, Some(CTX)),
+        KeyBinding::new(&format!("{m}-backspace"), DeleteTrack, Some(CTX)),
         KeyBinding::new(&format!("{m}-t"), AddAudioTrack, Some("Workspace")),
         KeyBinding::new(&format!("{m}-shift-t"), AddMidiTrack, Some("Workspace")),
         KeyBinding::new(&format!("{m}-alt-t"), AddReturnTrack, Some("Workspace")),

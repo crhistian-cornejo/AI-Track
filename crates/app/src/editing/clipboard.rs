@@ -167,8 +167,13 @@ impl Plan {
         }
     }
 
+    /// Whether one of the plan's steps did not apply.
+    pub(super) fn failed(&self) -> bool {
+        self.failed
+    }
+
     /// Remove the clips (and then the sources) the plan left without a user.
-    fn sweep(&mut self) {
+    pub(super) fn sweep(&mut self) {
         let mut sources = BTreeSet::new();
         for id in std::mem::take(&mut self.freed) {
             let Some(clip) = self.p.clips.get(&id) else { continue };

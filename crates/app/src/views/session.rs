@@ -8,11 +8,12 @@ use crate::state::is_drum_track;
 use crate::theme::*;
 use crate::views::browser::kind_icon;
 use crate::widgets::{self, chip, label, mono};
-use crate::workspace::Workspace;
+use crate::session_edit::DraggedSlot;
+use crate::workspace::{DraggedSample, Workspace};
 use aitrack_model::{ClipId, SceneId, Tick, TrackId, TrackKind, TrackProp};
 use gpui::{
-    AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, Window, canvas, div, point, prelude::FluentBuilder, px,
+    AnyElement, AppContext as _, Context, Div, ExternalPaths, FontWeight, InteractiveElement, IntoElement, ParentElement, Stateful,
+    StatefulInteractiveElement, Styled, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 
 const HEADER_H: f32 = 36.;
@@ -56,11 +57,17 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .child(icon(Icon::Play, 12., pal.muted))
                 .child(label("Scenes", TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM)),
         );
+    let cursor_scene = ws.s.session_scene();
+    let scene_count = scenes.len();
     for (i, (sid, name)) in scenes.iter().enumerate() {
         let sid = *sid;
+        let at_cursor = cursor_scene == Some(sid);
+        let group = format!("scene-row-{i}");
         scene_col = scene_col.child(
             div()
                 .id(("scene", i))
+                .group(group.clone())
+                .relative()
                 .h(px(session_row_h()))
                 .px(px(SP1))
                 .flex()
@@ -68,16 +75,93 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .gap(px(SP2))
                 .rounded(px(r_md()))
                 .bg(pal.surface)
+                .border_1()
+                .border_color(if at_cursor { accent_alpha(0.5) } else { content(0.0) })
                 .cursor_pointer()
                 .hover(|s| s.bg(pal.raised))
-                .tooltip(widgets::tip("Launch scene", None))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.b.engine.launch_scene(sid);
+                .tooltip(widgets::tip("Click to select, double-click to rename", None))
+                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                    this.s.set_session_scene(sid);
+                    if e.click_count() >= 2 {
+                        crate::commands::open_rename_for(this, Some(crate::commands::RenameTarget::Scene(sid)), window, cx);
+                    }
                     cx.notify();
                 }))
-                .child(div().size(px(20.)).flex().items_center().justify_center().rounded(px(r_sm())).bg(content(0.06)).child(icon(Icon::Play, 10., pal.text)))
-                .child(label(name.clone(), TEXT_SM, pal.muted).flex_1())
-                .child(mono(format!("{}", i + 1), TEXT_XS, pal.faint)),
+                .child(
+                    div()
+                        .id(("scene-launch", i))
+                        .size(px(20.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(r_sm()))
+                        .bg(content(0.06))
+                        .hover(|s| s.bg(content(0.14)))
+                        .tooltip(widgets::tip("Launch scene", Some("Enter")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.s.set_session_scene(sid);
+                            this.b.engine.launch_scene(sid);
+                            cx.notify();
+                        }))
+                        .child(icon(Icon::Play, 10., pal.text)),
+                )
+                .child(label(paint::fit(name, SESSION_COL_W - 88., TEXT_SM), TEXT_SM, pal.muted).flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP1))
+                        .child(div().group_hover(group.clone(), |s| s.invisible()).child(mono(format!("{}", i + 1), TEXT_XS, pal.faint)))
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(SP1))
+                                .top_0()
+                                .h_full()
+                                .items_center()
+                                .flex()
+                                .gap(px(SP1))
+                                .invisible()
+                                .group_hover(group, |s| s.visible())
+                                .child(
+                                    div()
+                                        .id(("scene-dup", i))
+                                        .size(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(r_sm()))
+                                        .hover(|s| s.bg(content(0.14)))
+                                        .tooltip(widgets::tip("Duplicate scene", None))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.s.duplicate_scene(sid);
+                                            cx.notify();
+                                        }))
+                                        .child(icon(Icon::Copy, 12., pal.muted)),
+                                )
+                                .child(
+                                    div()
+                                        .id(("scene-del", i))
+                                        .size(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(r_sm()))
+                                        .hover(|s| s.bg(content(0.14)))
+                                        .tooltip(widgets::tip(if scene_count > 1 { "Delete scene" } else { "The last scene stays" }, None))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.s.remove_scene(sid);
+                                            cx.notify();
+                                        }))
+                                        .child(icon(Icon::Trash, 12., pal.muted)),
+                                ),
+                        ),
+                ),
         );
     }
     scene_col = scene_col.child(
@@ -100,6 +184,28 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 for t in ids {
                     this.b.engine.stop_track(t);
                 }
+                cx.notify();
+            })),
+    );
+    scene_col = scene_col.child(
+        div()
+            .id("add-scene")
+            .h(px(session_row_h()))
+            .px(px(SP2))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .rounded(px(r_md()))
+            .cursor_pointer()
+            .border_1()
+            .border_color(border())
+            .hover(|s| s.bg(hover()))
+            .tooltip(widgets::tip("Add a scene below the selected one", None))
+            .child(icon(Icon::Add, 12., pal.muted))
+            .child(label("Add scene", TEXT_SM, pal.muted))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let after = this.s.session_scene();
+                this.s.add_scene(after);
                 cx.notify();
             })),
     );
@@ -222,28 +328,62 @@ fn slot(
 ) -> AnyElement {
     let pal = p();
     let key = tid.0 as usize * 1000 + si;
+    let at_cursor = ws.s.selected_track == Some(tid) && ws.s.session_scene() == Some(sid);
+    let instrument = ws.s.project.track(tid).is_some_and(|t| t.kind == TrackKind::Instrument);
     let Some(cid) = clip else {
-        return div()
+        let empty = div()
             .id(("slot-empty", key))
             .h(px(session_row_h()))
             .rounded(px(r_md()))
             .bg(content(if has_clips { 0.035 } else { 0.015 }))
             .border_1()
-            .border_color(border())
+            .border_color(if at_cursor { accent_alpha(0.6) } else { border() })
             .flex()
             .items_center()
             .justify_center()
+            .gap(px(SP2))
             .when(has_clips, |d| {
-                d.group("slot").cursor_pointer().hover(|s| s.bg(content(0.06))).child(
-                    div().invisible().group_hover("slot", |s| s.visible()).child(icon(Icon::Stop, 10., pal.faint)),
-                )
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.b.engine.stop_track(tid);
-                this.s.selected_track = Some(tid);
-                cx.notify();
-            }))
-            .into_any_element();
+                d.group(format!("slot-{key}"))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.06)))
+                    .child(
+                        div()
+                            .id(("slot-stop", key))
+                            .invisible()
+                            .group_hover(format!("slot-{key}"), |s| s.visible())
+                            .tooltip(widgets::tip("Stop the track's clip", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.b.engine.stop_track(tid);
+                                this.s.select_slot(tid, sid);
+                                cx.notify();
+                            }))
+                            .child(icon(Icon::Stop, 10., pal.faint)),
+                    )
+                    .when(instrument, |d| {
+                        d.child(
+                            div()
+                                .id(("slot-new", key))
+                                .invisible()
+                                .group_hover(format!("slot-{key}"), |s| s.visible())
+                                .tooltip(widgets::tip("New MIDI clip (or double-click the slot)", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.s.create_midi_clip_in_slot(tid, sid);
+                                    cx.notify();
+                                }))
+                                .child(icon(Icon::Add, 10., pal.faint)),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                        this.s.select_slot(tid, sid);
+                        if e.click_count() >= 2 {
+                            this.s.create_midi_clip_in_slot(tid, sid);
+                        }
+                        cx.notify();
+                    }))
+            });
+        return accept_drops(empty, has_clips, tid, sid, cx).into_any_element();
     };
     let Some(c) = ws.s.project.clips.get(&cid).cloned() else { return div().into_any_element() };
     let selected = ws.s.selected_clip == Some(cid);
@@ -288,7 +428,8 @@ fn slot(
         } else {
             icon(Icon::Play, 10., if queued { pal.accent } else { fg }).into_any_element()
         });
-    div()
+    let dragged = DraggedSlot { track: tid, scene: sid, name: c.name.clone(), color: c.color };
+    let filled = div()
         .id(("slot", key))
         .h(px(session_row_h()))
         .pl(px(SP1))
@@ -299,11 +440,12 @@ fn slot(
         .rounded(px(r_md()))
         .bg(clip_fill(c.color))
         .border_1()
-        .border_color(if selected { pal.accent } else if is_playing { with_alpha(fg, 0.6) } else { shadow(0.2) })
+        .border_color(if selected || at_cursor { pal.accent } else if is_playing { with_alpha(fg, 0.6) } else { shadow(0.2) })
         .cursor_pointer()
         .hover(|s| s.opacity(0.92))
+        .on_drag(dragged, |d: &DraggedSlot, _, _, cx| cx.new(|_| d.clone()))
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-            this.s.select_clip(Some(cid));
+            this.s.select_slot(tid, sid);
             if e.click_count() >= 2 {
                 this.set_tab(crate::state::BottomTab::PianoRoll, cx);
             }
@@ -311,6 +453,23 @@ fn slot(
         }))
         .child(launch)
         .child(label(paint::fit(&c.name, SESSION_COL_W - 48., TEXT_SM), TEXT_SM, fg).font_weight(FontWeight::MEDIUM).flex_1())
-        .when(c.looping.is_some(), |d| d.child(icon(Icon::Loop, 10., with_alpha(fg, 0.7))))
-        .into_any_element()
+        .when(c.looping.is_some(), |d| d.child(icon(Icon::Loop, 10., with_alpha(fg, 0.7))));
+    accept_drops(filled, true, tid, sid, cx).into_any_element()
+}
+
+/// What a slot takes when something is dropped on it: a library sample, audio
+/// files from Finder, or another slot's clip (moved; copied with Alt/Option).
+fn accept_drops(slot: Stateful<Div>, enabled: bool, tid: TrackId, sid: SceneId, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    if !enabled {
+        return slot;
+    }
+    slot.drag_over::<DraggedSample>(|s, _, _, _| s.border_color(accent()).bg(accent_alpha(0.12)))
+        .drag_over::<ExternalPaths>(|s, _, _, _| s.border_color(accent()).bg(accent_alpha(0.12)))
+        .drag_over::<DraggedSlot>(|s, _, _, _| s.border_color(accent()).bg(accent_alpha(0.12)))
+        .on_drop(cx.listener(move |this, d: &DraggedSample, _, cx| this.drop_sample_in_slot(d, tid, sid, cx)))
+        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| this.drop_files_in_slot(paths.paths().to_vec(), tid, sid, cx)))
+        .on_drop(cx.listener(move |this, d: &DraggedSlot, window, cx| {
+            let copy = window.modifiers().alt;
+            this.drop_slot(d, (tid, sid), copy, cx);
+        }))
 }

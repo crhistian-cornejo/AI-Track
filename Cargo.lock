@@ -153,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
+ "aitrack-stock",
  "cpal",
  "crossbeam-channel",
  "hound",
@@ -251,6 +252,7 @@ name = "aitrack-stock"
 version = "0.1.0"
 dependencies = [
  "aitrack-dsp",
+ "aitrack-model",
  "hound",
  "realfft",
  "serde",

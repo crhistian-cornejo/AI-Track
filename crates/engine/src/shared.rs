@@ -32,7 +32,7 @@ use crate::tap::DeviceMeter;
 use aitrack_dsp::Processor;
 use aitrack_model::{Device, DeviceId, DeviceKind};
 use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,6 +55,13 @@ pub struct SharedProcessor {
     /// Set by the control thread when a parameter or state edit happens so a
     /// sleeping processor wakes on the next audio block.
     wake: std::sync::atomic::AtomicBool,
+    /// Raised by the audio thread when this processor panicked inside a
+    /// block. The processor's state is then unknown, so every graph that
+    /// holds it keeps it silent until the pool replaces it (a new state or
+    /// kind). Shared so the UI can show which devices fell.
+    crashed: Arc<std::sync::atomic::AtomicBool>,
+    /// The fall has been added to the status counters.
+    crash_counted: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: access is serialised by the contract above; `Box<dyn Processor>`
@@ -69,7 +76,33 @@ impl SharedProcessor {
             inner: UnsafeCell::new(processor),
             latency: AtomicU32::new(latency),
             wake: std::sync::atomic::AtomicBool::new(true),
+            crashed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crash_counted: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// True once the processor panicked in `process` (or a call made with
+    /// it): it is skipped, and its output is silent, from then on.
+    #[inline]
+    pub fn is_crashed(&self) -> bool {
+        self.crashed.load(Ordering::Relaxed)
+    }
+
+    /// Audio thread: take the processor out of the graph's signal path.
+    #[inline]
+    pub(crate) fn mark_crashed(&self) {
+        self.crashed.store(true, Ordering::Relaxed);
+    }
+
+    /// True once per fallen processor: the audio thread's turn to count it.
+    #[inline]
+    pub(crate) fn take_unreported_crash(&self) -> bool {
+        self.is_crashed() && !self.crash_counted.swap(true, Ordering::Relaxed)
+    }
+
+    /// The flag itself, for the status the UI reads.
+    pub(crate) fn crash_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.crashed.clone()
     }
 
     pub(crate) fn wake(&self) {
@@ -162,6 +195,10 @@ struct PoolEntry {
     meter: Arc<DeviceMeter>,
     /// Parameter values already applied to (or scheduled for) the processor.
     applied: BTreeMap<u32, f32>,
+    /// Each parameter's default (normalised), read once from the processor:
+    /// where a parameter the project never set returns to.
+    defaults: BTreeMap<u32, f32>,
+    is_midi: bool,
     used: bool,
 }
 
@@ -172,6 +209,8 @@ pub(crate) struct Resolved {
     /// (empty for brand-new processors, which get everything up front).
     pub init_params: Vec<(u32, f32)>,
     pub is_instrument: bool,
+    /// A MIDI effect: it transforms events and is not given audio.
+    pub is_midi: bool,
     pub meter: Arc<DeviceMeter>,
 }
 
@@ -181,6 +220,10 @@ pub struct ProcessorPool {
     echoes: Arc<StateEchoes>,
     /// Echoes taken from `echoes` for the compile in progress.
     pending_echoes: HashMap<DeviceId, StateMark>,
+    /// Parameters an automation lane drove in the last compile. The audio
+    /// thread writes their values straight into the processor, so the pool's
+    /// record of what it applied is stale for them (see [`Self::sync_automation`]).
+    automated: BTreeSet<(DeviceId, u32)>,
 }
 
 impl Default for ProcessorPool {
@@ -207,7 +250,7 @@ impl ProcessorPool {
     /// A pool reading its state echoes from `echoes` instead of the global
     /// ledger (tests, or an engine that hands its own ledger to the app).
     pub fn with_echoes(echoes: Arc<StateEchoes>) -> Self {
-        Self { entries: HashMap::new(), echoes, pending_echoes: HashMap::new() }
+        Self { entries: HashMap::new(), echoes, pending_echoes: HashMap::new(), automated: BTreeSet::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -276,7 +319,7 @@ impl ProcessorPool {
                         }
                     }
                     entry.applied.clone_from(params);
-                    return Some(Resolved { proc: entry.proc.clone(), init_params: init, is_instrument: device.is_instrument(), meter: entry.meter.clone() });
+                    return Some(Resolved { proc: entry.proc.clone(), init_params: init, is_instrument: device.is_instrument(), is_midi: entry.is_midi, meter: entry.meter.clone() });
                 }
                 // New state: rebuild below, keeping the meter the UI reads.
                 meter = Some(entry.meter.clone());
@@ -287,7 +330,7 @@ impl ProcessorPool {
             // retry on every compile.
             let entry = self.entries.get_mut(&device.id).filter(|e| e.kind_key == key)?;
             entry.state = state;
-            return Some(Resolved { proc: entry.proc.clone(), init_params: Vec::new(), is_instrument: device.is_instrument(), meter: entry.meter.clone() });
+            return Some(Resolved { proc: entry.proc.clone(), init_params: Vec::new(), is_instrument: device.is_instrument(), is_midi: entry.is_midi, meter: entry.meter.clone() });
         };
         processor.prepare(sample_rate, max_frames);
         if let Some(state) = &device.state {
@@ -297,15 +340,45 @@ impl ProcessorPool {
             processor.set_param(id, v);
         }
         let is_instrument = device.is_instrument() || processor.info().category == aitrack_dsp::Category::Instrument;
+        let is_midi = processor.info().category == aitrack_dsp::Category::MidiEffect;
+        let defaults = processor.info().params.iter().map(|p| (p.id, p.default_normalized())).collect();
         let proc = Arc::new(SharedProcessor::new(processor));
         let meter = meter.unwrap_or_default();
         // Replacing an entry drops only the pool's clone: the graph that
         // still runs the old processor frees it when it is retired.
         self.entries.insert(
             device.id,
-            PoolEntry { kind_key: key, state, proc: proc.clone(), meter: meter.clone(), applied: params.clone(), used: true },
+            PoolEntry { kind_key: key, state, proc: proc.clone(), meter: meter.clone(), applied: params.clone(), defaults, is_midi, used: true },
         );
-        Some(Resolved { proc, init_params: Vec::new(), is_instrument, meter })
+        Some(Resolved { proc, init_params: Vec::new(), is_instrument, is_midi, meter })
+    }
+
+    /// A parameter was set on the running processor directly (the fast
+    /// path): the next compile must not think it still has the old value.
+    pub(crate) fn note_applied(&mut self, device: DeviceId, param: u32, value: f32) {
+        if let Some(e) = self.entries.get_mut(&device) {
+            e.applied.insert(param, value);
+        }
+    }
+
+    /// Tell the pool which parameters automation drives in the compile that
+    /// just resolved its devices. Returns `(device, param, value)` for each
+    /// one that was driven by the previous compile and no longer is (its lane
+    /// was deleted or disabled): the value is the model's (the knob), or the
+    /// processor's default when the project never set it, and the caller
+    /// sends it to the processor with the graph's `init_params`. Without
+    /// this the processor would keep the last automated value while the knob
+    /// shows another.
+    pub(crate) fn sync_automation(&mut self, now: BTreeSet<(DeviceId, u32)>) -> Vec<(DeviceId, u32, f32)> {
+        let mut restore = Vec::new();
+        for &(device, param) in self.automated.difference(&now) {
+            let Some(entry) = self.entries.get(&device) else { continue };
+            if let Some(&v) = entry.applied.get(&param).or_else(|| entry.defaults.get(&param)) {
+                restore.push((device, param, v));
+            }
+        }
+        self.automated = now;
+        restore
     }
 
     /// Re-prepare every pooled processor for a new sample rate / block size.

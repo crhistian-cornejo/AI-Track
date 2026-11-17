@@ -8,6 +8,8 @@
 //! feed-forward / feedback switch and, in the device window, a sidechain
 //! column (high-pass, bell, low-pass, listen) next to the history.
 
+pub mod win;
+
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::{Dev, HISTORY, caption, set_many};
 use crate::theme::*;
@@ -133,7 +135,7 @@ fn style_bar(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
                 .cursor_pointer()
                 .bg(if on { accent_alpha(0.24) } else { gpui::transparent_black() })
                 .hover(|d| d.bg(if on { accent_alpha(0.3) } else { content(0.08) }))
-                .child(crate::widgets::label(*name, TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
+                .child(crate::widgets::label(*name, TEXT_SM, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     set_many(this, "Compressor style", device, &values);
@@ -144,14 +146,18 @@ fn style_bar(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     row.into_any_element()
 }
 
-/// The device window's sidechain column of the compressor.
+/// The large card's sidechain column of the compressor (the window arranges
+/// the same controls as a group of knobs, see [`window_view`]).
 fn sidechain_column(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     use compressor::p;
     let pal = p();
-    let grid = |ws: &mut Workspace, ids: [u32; 2], cx: &mut Context<Workspace>| div().flex().gap(px(SP1)).child(kit::ctl(ws, dev, ids[0], cx)).child(kit::ctl(ws, dev, ids[1], cx));
+    // Wide enough for "20.00 kHz" and "Feed-Forward": two 76 px numbers side by side.
+    let grid = |ws: &mut Workspace, ids: [u32; 2], cx: &mut Context<Workspace>| {
+        div().flex().gap(px(SP1)).child(kit::num_w(ws, dev, ids[0], 76., cx)).child(kit::num_w(ws, dev, ids[1], 76., cx))
+    };
     div()
         .flex_none()
-        .w(px(132.))
+        .w(px(176.))
         .h_full()
         .p(px(SP2))
         .gap(px(SP1))
@@ -165,8 +171,20 @@ fn sidechain_column(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
         .child(super::sidechain_chip(ws, dev, p::SIDECHAIN, cx))
         .child(grid(ws, [p::SC_HPF, p::SC_LPF], cx))
         .child(grid(ws, [p::SC_EQ_FREQ, p::SC_EQ_GAIN], cx))
-        .child(div().flex().gap(px(SP1)).child(kit::pick(dev, p::SC_LISTEN, cx)).child(kit::pick(dev, p::TOPOLOGY, cx)))
+        .child(div().flex().flex_wrap().gap(px(SP1)).child(kit::pick(dev, p::SC_LISTEN, cx)).child(kit::pick(dev, p::TOPOLOGY, cx)))
         .into_any_element()
+}
+
+/// What the compressor's detector is doing, when it is not the plain case.
+fn compressor_badge(dev: &Dev) -> Option<String> {
+    use compressor::p;
+    let fb = dev.m(69) > 0.5 || (dev.meter.len() < 70 && dev.choice(p::TOPOLOGY) == 1 && dev.choice(p::SIDECHAIN) == 0);
+    let look = dev.plain(p::LOOKAHEAD);
+    match (fb, look > 0.05) {
+        (true, _) => Some("feedback".to_owned()),
+        (false, true) => Some(format!("lookahead {look:.1} ms")),
+        _ => None,
+    }
 }
 
 /// A history trace as points across `r`, newest at the right edge.
@@ -195,7 +213,7 @@ fn paint_transfer(t: &Transfer, level: f32, r: Rect, window: &mut Window, cx: &m
     if t.kind == Kind::Gate && t.hysteresis > 0.05 && t.mode == 0 {
         kit::vline(window, r, r.px(t.frac(t.threshold - t.hysteresis)), with_alpha(pal.accent2, 0.25));
     }
-    kit::txt(window, cx, &format!("{:.1} dB", t.threshold), tx + 4., r.y + 3., TEXT_XS, pal.muted, TextAlign::Left);
+    kit::txt(window, cx, &format!("{:.1} dB", t.threshold), tx + 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Left);
     // Where the signal is on the curve right now.
     if level > t.floor + 0.5 {
         kit::dot(window, r.pt(t.frac(level), 1. - t.frac(t.out(level))), 3.5, pal.text, None);
@@ -220,8 +238,8 @@ fn paint_transient(attack: f32, sustain: f32, r: Rect, window: &mut Window, cx: 
     let wet = kit::sample_curve(r, 96, |fx| y(shaped(fx)));
     kit::fill_to(window, &wet, r.py(0.92), accent_alpha(0.14));
     kit::line(window, &wet, 2., pal.accent);
-    kit::txt(window, cx, "attack", r.px(0.12), r.y + 3., TEXT_XS, pal.faint, TextAlign::Center);
-    kit::txt(window, cx, "sustain", r.px(0.62), r.y + 3., TEXT_XS, pal.faint, TextAlign::Center);
+    kit::txt(window, cx, "attack", r.px(0.12), r.y + 3., TEXT_SM, pal.faint, TextAlign::Center);
+    kit::txt(window, cx, "sustain", r.px(0.62), r.y + 3., TEXT_SM, pal.faint, TextAlign::Center);
     kit::dot(window, r.pt(0.12, y(shaped(0.12))), 7., series(0), Some(pal.text));
     kit::dot(window, r.pt(0.62, y(shaped(0.62))), 7., series(1), Some(pal.text));
 }
@@ -318,6 +336,7 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
 
     // Middle: level and gain change over the last four seconds.
     let hist = dev.hist.clone();
+    let windowed = win::in_window(dev);
     let region = ws.fx.region(dev.id, 1);
     let history = div().flex_1().min_w(px(0.)).min_h(px(0.)).rounded(px(r_md())).bg(pal.well).border_1().border_color(border()).overflow_hidden().child(
         gpui::canvas(
@@ -333,7 +352,7 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
                         let pts = trace(r, &h.traces[0], |db| 0.5 - db / 24.);
                         kit::fill_to(window, &pts, r.py(0.5), accent_alpha(0.25));
                         kit::line(window, &pts, 1.5, pal.accent);
-                        kit::txt(window, cx, "gain ±12 dB", r.x + 4., r.y + 3., TEXT_XS, pal.faint, TextAlign::Left);
+                        kit::txt(window, cx, "gain ±12 dB", r.x + 4., r.y + 3., TEXT_SM, pal.faint, TextAlign::Left);
                     }
                     _ => {
                         let t = transfer.unwrap_or(Transfer { kind, threshold: 0., ratio: 1., knee: 0., range: 0., makeup: 0., mode: 0, hysteresis: 0., floor: -60. });
@@ -351,12 +370,29 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
                         let gr = trace(r, &h.traces[0], |db| (-db / 48.).min(0.5));
                         kit::fill_to(window, &gr, r.y, with_alpha(pal.record, 0.35));
                         kit::line(window, &gr, 1.5, pal.record);
+                        if windowed {
+                            // What each trace is, bottom right (gain reduction hangs from the top).
+                            let mut y = r.bottom() - 14.;
+                            let tags: &[(&str, gpui::Hsla)] = if kind == Kind::Compressor {
+                                &[("gain reduction", pal.record), ("output", pal.accent2), ("input", pal.muted)]
+                            } else {
+                                &[("gain reduction", pal.record), ("detector", pal.muted)]
+                            };
+                            for (name, color) in tags {
+                                kit::txt(window, cx, name, r.right() - 6., y, TEXT_SM, *color, TextAlign::Right);
+                                y -= 13.;
+                            }
+                        }
                     }
                 }
             },
         )
         .size_full(),
     );
+
+    if win::in_window(dev) {
+        return window_view(ws, kind, dev, curve, history, cx);
+    }
 
     // Right: the gain change right now.
     let now = dev.m(0);
@@ -379,8 +415,8 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
             .size_full(),
         ),
     )
-    .child(crate::widgets::mono(format!("{now:+.1}"), TEXT_XS, if now.abs() > 0.05 { pal.text } else { pal.faint }))
-    .child(crate::widgets::label(if kind == Kind::Transient { "gain" } else { "GR" }, TEXT_XS, pal.faint));
+    .child(crate::widgets::mono(format!("{now:+.1}"), TEXT_SM, if now.abs() > 0.05 { pal.text } else { pal.faint }))
+    .child(crate::widgets::label(if kind == Kind::Transient { "gain" } else { "GR" }, TEXT_SM, pal.faint));
 
     // Compressor and gate can listen to another track.
     let sidechain = match plugin {
@@ -391,14 +427,7 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
     // The compressor's middle column: style above the history, with what the
     // detector is doing (feedback, lookahead) as a badge.
     let middle = if kind == Kind::Compressor {
-        use compressor::p;
-        let fb = dev.m(69) > 0.5 || (dev.meter.len() < 70 && dev.choice(p::TOPOLOGY) == 1 && dev.choice(p::SIDECHAIN) == 0);
-        let look = dev.plain(p::LOOKAHEAD);
-        let badge = match (fb, look > 0.05) {
-            (true, _) => Some("feedback".to_owned()),
-            (false, true) => Some(format!("lookahead {look:.1} ms")),
-            _ => None,
-        };
+        let badge = compressor_badge(dev);
         div()
             .flex_1()
             .min_w(px(0.))
@@ -406,7 +435,7 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
             .flex()
             .flex_col()
             .gap(px(SP1))
-            .child(div().flex_none().flex().items_center().gap(px(SP2)).child(style_bar(dev, cx)).child(div().flex_1()).when_some(badge, |d, b| d.child(crate::widgets::mono(b, TEXT_XS, pal.faint))))
+            .child(div().flex_none().flex().items_center().gap(px(SP2)).child(style_bar(dev, cx)).child(div().flex_1()).when_some(badge, |d, b| d.child(crate::widgets::mono(b, TEXT_SM, pal.faint))))
             .child(history)
             .into_any_element()
     } else {
@@ -436,6 +465,79 @@ pub fn render(ws: &mut Workspace, plugin: &str, dev: &Dev, cx: &mut Context<Work
                 .children(sidechain),
         )
         .into_any_element()
+}
+
+/// The compressor, gate and transient shaper in a device window: the transfer
+/// curve and the history side by side at the size the window gives them, the
+/// controls grouped by what they do underneath. The levels and the gain
+/// reduction are in the frame's meters, so there is no meter in here.
+fn window_view(ws: &mut Workspace, kind: Kind, dev: &Dev, curve: gpui::Stateful<gpui::Div>, history: gpui::Div, cx: &mut Context<Workspace>) -> AnyElement {
+    use win::{arrange, captioned, chip_row, group, group_of};
+    let pal = p();
+    // The primary groups are always in view; the "More" drawer holds the rest.
+    let (top, primary, more) = match kind {
+        Kind::Compressor => {
+            use compressor::p;
+            let badge = compressor_badge(dev);
+            let top = div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(SP3))
+                .child(captioned("Style", style_bar(dev, cx)))
+                .child(div().flex_1())
+                .when_some(badge, |d, b| d.child(crate::widgets::mono(b, TEXT_SM, pal.muted)));
+            let sidechain = group_of(
+                dev,
+                "Sidechain",
+                None,
+                vec![
+                    chip_row(vec![super::sidechain_chip(ws, dev, p::SIDECHAIN, cx), kit::pick(dev, p::SC_LISTEN, cx)]),
+                    win::knob(dev, p::SC_HPF, cx),
+                    win::knob(dev, p::SC_LPF, cx),
+                    win::knob(dev, p::SC_EQ_FREQ, cx),
+                    win::knob(dev, p::SC_EQ_GAIN, cx),
+                ],
+                cx,
+            );
+            (
+                top,
+                vec![group(dev, "Compression", None, &[p::THRESHOLD, p::RATIO, p::ATTACK, p::RELEASE], cx), group(dev, "Level", None, &[p::MAKEUP, p::MIX], cx)],
+                vec![
+                    group(dev, "Shape", None, &[p::KNEE, p::RANGE, p::LOOKAHEAD, p::AUTO_RELEASE], cx),
+                    group(dev, "Output", None, &[p::OUTPUT, p::AUTO_MAKEUP], cx),
+                    group(dev, "Detector", None, &[p::RMS, p::LINK, p::TOPOLOGY], cx),
+                    sidechain,
+                ],
+            )
+        }
+        Kind::Gate => {
+            use gate::p;
+            let top = div().flex_none().flex().items_center().gap(px(SP3)).child(captioned("Mode", super::reverb::window::parts::choice_row(dev, p::MODE, true, cx).into_any_element()));
+            let sidechain = group_of(
+                dev,
+                "Sidechain",
+                None,
+                vec![chip_row(vec![super::sidechain_chip(ws, dev, p::SIDECHAIN, cx)]), win::knob(dev, p::SC_HPF, cx), win::knob(dev, p::SC_LPF, cx)],
+                cx,
+            );
+            (
+                top,
+                vec![group(dev, "Gate", None, &[p::THRESHOLD, p::RANGE, p::ATTACK, p::HOLD, p::RELEASE], cx)],
+                vec![group(dev, "Detection", None, &[p::RATIO, p::HYSTERESIS, p::LOOKAHEAD], cx), sidechain],
+            )
+        }
+        Kind::Transient => {
+            use transient::p;
+            (
+                div().flex_none().flex().items_center().child(win::legend(&[("original hit", pal.muted), ("shaped", pal.accent)])),
+                vec![group(dev, "Shape", None, &[p::ATTACK, p::SUSTAIN], cx), group(dev, "Level", None, &[p::MIX], cx)],
+                vec![group(dev, "Detector", None, &[p::WINDOW, p::LENGTH], cx), group(dev, "Output", None, &[p::OUTPUT, p::CLIP], cx)],
+            )
+        }
+    };
+    let displays = div().child(win::square(ws, dev, 0, curve)).child(history.flex_1().min_w(px(0.)).h_full());
+    arrange(ws, dev, 720., Some(top), displays, primary, more, cx).into_any_element()
 }
 
 #[cfg(test)]
@@ -507,6 +609,33 @@ mod tests {
         assert_eq!(duck.out(-50.), -50.);
         assert_eq!(gate.frac(-80.), 0.);
         assert_eq!(gate.frac(0.), 1.);
+    }
+
+    #[test]
+    fn the_window_groups_use_parameters_the_plugins_have() {
+        let has = |plugin: &str, ids: &[u32]| {
+            let d = dev(plugin, &[]);
+            for id in ids {
+                assert!(d.info(*id).is_some(), "{plugin} has no parameter {id}");
+            }
+        };
+        {
+            use compressor::p;
+            has("fx.compressor", &[p::THRESHOLD, p::RATIO, p::KNEE, p::RANGE, p::ATTACK, p::RELEASE, p::AUTO_RELEASE, p::LOOKAHEAD, p::MAKEUP, p::AUTO_MAKEUP, p::OUTPUT, p::MIX, p::RMS, p::LINK, p::TOPOLOGY, p::SC_HPF, p::SC_LPF, p::SC_EQ_FREQ, p::SC_EQ_GAIN, p::SC_LISTEN, p::SIDECHAIN]);
+        }
+        {
+            use gate::p;
+            has("fx.gate", &[p::THRESHOLD, p::RANGE, p::RATIO, p::HYSTERESIS, p::ATTACK, p::HOLD, p::RELEASE, p::LOOKAHEAD, p::MODE, p::SC_HPF, p::SC_LPF, p::SIDECHAIN]);
+        }
+        {
+            use transient::p;
+            has("fx.transient", &[p::ATTACK, p::SUSTAIN, p::WINDOW, p::LENGTH, p::MIX, p::OUTPUT, p::CLIP]);
+        }
+        // The window arranges its controls for the window layout only.
+        let mut d = dev("fx.compressor", &[]);
+        assert!(!win::in_window(&d));
+        d.layout = super::super::Layout::Window;
+        assert!(win::in_window(&d));
     }
 
     #[test]

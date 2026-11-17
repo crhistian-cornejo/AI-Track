@@ -99,7 +99,7 @@ impl Default for Appearance {
             overrides: BTreeMap::new(),
             background: None,
             ui_scale: 1.,
-            density: Density::Comfortable,
+            density: Density::Compact,
             radius: 1.,
             font_size: 12.,
             waveform: WaveformStyle::Filled,

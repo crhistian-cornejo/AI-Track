@@ -19,11 +19,12 @@ use crate::workspace::Workspace;
 use aitrack_dsp::loudness::{LoudnessReading, LufsMeter};
 use aitrack_dsp::spectrum::SpectrumAnalyzer;
 use gpui::{
-    AnyElement, Bounds, Context, DispatchPhase, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    AnyElement, Bounds, Context, RenderImage, DispatchPhase, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, TextAlign, Window, anchored, canvas, deferred, div, point,
     px,
 };
 use std::cell::Cell;
+use std::sync::Arc;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -117,6 +118,11 @@ struct WaveCol {
     high: f32,
 }
 
+fn next_gram_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 struct Analysis {
     sr: u32,
     lufs: LufsMeter,
@@ -125,6 +131,9 @@ struct Analysis {
     gram: SpectrumAnalyzer,
     hold: Vec<f32>,
     gram_cols: VecDeque<[u8; GRAM_BANDS]>,
+    /// Changes whenever a column is added (unique across analyses), so the
+    /// painted image is rebuilt only when there is something new.
+    gram_ver: u64,
     gram_acc: usize,
     scope: VecDeque<f32>,
     stereo: VecDeque<(f32, f32)>,
@@ -160,6 +169,7 @@ impl Analysis {
             gram,
             hold: vec![FLOOR_DB; SPEC_BANDS],
             gram_cols: VecDeque::with_capacity(GRAM_COLS),
+            gram_ver: next_gram_version(),
             gram_acc: 0,
             scope: VecDeque::with_capacity(SCOPE_LEN),
             stereo: VecDeque::with_capacity(STEREO_PTS),
@@ -249,6 +259,7 @@ impl Analysis {
                 self.gram_cols.pop_front();
             }
             self.gram_cols.push_back(col);
+            self.gram_ver = next_gram_version();
         }
     }
 
@@ -268,6 +279,7 @@ struct Snap {
     side: Vec<f32>,
     hold: Vec<f32>,
     gram: Vec<[u8; GRAM_BANDS]>,
+    gram_ver: u64,
     scope: Vec<f32>,
     stereo: Vec<(f32, f32)>,
     wave: Vec<WaveCol>,
@@ -390,17 +402,21 @@ impl MeterStrip {
         }
     }
 
+    /// What the painters need for one frame. Only the modules on show get their
+    /// series copied (the scope alone is 16 KB).
     fn snap(&self) -> Snap {
         let empty = Analysis::new(48_000);
         let a = self.analysis.as_ref().unwrap_or(&empty);
+        let shown = |m: Module| self.modules.contains(&m);
         Snap {
-            mid: a.mid.bands().to_vec(),
-            side: a.side.bands().to_vec(),
-            hold: a.hold.clone(),
-            gram: a.gram_cols.iter().copied().collect(),
-            scope: a.scope.iter().copied().collect(),
-            stereo: a.stereo.iter().copied().collect(),
-            wave: a.wave.iter().copied().collect(),
+            mid: if shown(Module::Spectrum) { a.mid.bands().to_vec() } else { Vec::new() },
+            side: if shown(Module::Spectrum) && self.mid_side { a.side.bands().to_vec() } else { Vec::new() },
+            hold: if shown(Module::Spectrum) { a.hold.clone() } else { Vec::new() },
+            gram: if shown(Module::Spectrogram) { a.gram_cols.iter().copied().collect() } else { Vec::new() },
+            gram_ver: a.gram_ver,
+            scope: if shown(Module::Scope) { a.scope.iter().copied().collect() } else { Vec::new() },
+            stereo: if shown(Module::Stereo) { a.stereo.iter().copied().collect() } else { Vec::new() },
+            wave: if shown(Module::Waveform) { a.wave.iter().copied().collect() } else { Vec::new() },
             peak_db: [db(a.peak[0]), db(a.peak[1])],
             rms_db: [db(a.rms_sq[0].sqrt()), db(a.rms_sq[1].sqrt())],
             corr: a.correlation(),
@@ -475,12 +491,40 @@ pub fn draw_correlation(window: &mut Window, r: Rect, corr: f32, vertical: bool)
     }
 }
 
+/// `cols` merged so none is narrower than a pixel: groups of neighbours become one
+/// column holding their lowest and highest sample and their mean colour weights, so
+/// the outline is the same with fewer bars. Returns `cols` unchanged when they fit.
+fn merge_wave_cols(cols: &[WaveCol], pixels: usize) -> std::borrow::Cow<'_, [WaveCol]> {
+    let pixels = pixels.max(1);
+    if cols.len() <= pixels {
+        return std::borrow::Cow::Borrowed(cols);
+    }
+    let merged = (0..pixels)
+        .map(|i| {
+            let group = &cols[i * cols.len() / pixels..((i + 1) * cols.len() / pixels).max(i * cols.len() / pixels + 1)];
+            let n = group.len() as f32;
+            WaveCol {
+                min: group.iter().fold(f32::MAX, |m, c| m.min(c.min)),
+                max: group.iter().fold(f32::MIN, |m, c| m.max(c.max)),
+                low: group.iter().map(|c| c.low).sum::<f32>() / n,
+                high: group.iter().map(|c| c.high).sum::<f32>() / n,
+            }
+        })
+        .collect();
+    std::borrow::Cow::Owned(merged)
+}
+
 fn paint_waveform(window: &mut Window, r: Rect, s: &Snap) {
     let pal = p();
     kit::hline(window, r, r.py(0.5), content(0.06));
-    let w = r.w / WAVE_COLS as f32;
-    let first = WAVE_COLS - s.wave.len();
-    for (i, c) in s.wave.iter().enumerate() {
+    // The scroll is WAVE_COLS columns wide; on a narrower module several share a pixel.
+    let slots = (r.w.floor() as usize).clamp(1, WAVE_COLS);
+    let w = r.w / slots as f32;
+    // The history fills the module from the right: only its share of the slots.
+    let shown = (s.wave.len() * slots).div_ceil(WAVE_COLS).max(1);
+    let first = slots - shown.min(slots);
+    let cols = merge_wave_cols(&s.wave, shown);
+    for (i, c) in cols.iter().enumerate() {
         // Bass reads warm, highs cool, the middle in the accent.
         let color = mix(mix(pal.accent, pal.meter_high, c.low), pal.accent2, c.high);
         let (top, bottom) = (r.py(0.5 - c.max.clamp(-1., 1.) * 0.48), r.py(0.5 - c.min.clamp(-1., 1.) * 0.48));
@@ -488,30 +532,90 @@ fn paint_waveform(window: &mut Window, r: Rect, s: &Snap) {
     }
 }
 
-fn paint_spectrogram(window: &mut Window, r: Rect, s: &Snap) {
-    let pal = p();
-    let (cw, rh) = (r.w / GRAM_COLS as f32, r.h / GRAM_BANDS as f32);
-    let first = GRAM_COLS - s.gram.len();
-    let ramp = |v: u8| -> Hsla {
-        let t = f32::from(v) / 255.;
-        // Quiet → loud as a heat map built from theme tokens: the well, a
-        // violet between the second accent and record red, red, then amber.
-        let violet = mix(pal.accent2, pal.record, 0.55);
-        if t < 0.5 {
-            mix(pal.well, violet, ((t - 0.27) / 0.23).clamp(0., 1.))
-        } else if t < 0.75 {
-            mix(violet, pal.record, (t - 0.5) / 0.25)
-        } else {
-            mix(pal.record, pal.meter_mid, (t - 0.75) / 0.25)
-        }
-    };
-    for (i, col) in s.gram.iter().enumerate() {
-        let x = r.x + (first + i) as f32 * cw;
+/// The heat-map colour of a spectrogram cell (0..=255 level), from theme tokens.
+fn gram_ramp(pal: &Palette, v: u8) -> Hsla {
+    let t = f32::from(v) / 255.;
+    // Quiet → loud: the well, a violet between the second accent and record
+    // red, red, then amber.
+    let violet = mix(pal.accent2, pal.record, 0.55);
+    if t < 0.5 {
+        mix(pal.well, violet, ((t - 0.27) / 0.23).clamp(0., 1.))
+    } else if t < 0.75 {
+        mix(violet, pal.record, (t - 0.5) / 0.25)
+    } else {
+        mix(pal.record, pal.meter_mid, (t - 0.75) / 0.25)
+    }
+}
+
+/// Cells quieter than this are left to the well behind.
+const GRAM_FLOOR: u8 = 70;
+
+/// The spectrogram as RGBA pixels (premultiplied, BGRA order as GPUI wants it):
+/// `kx` x `ky` pixels per cell, the newest column on the right, the lowest band at
+/// the bottom. Nothing above the floor is transparent.
+fn gram_pixels(gram: &[[u8; GRAM_BANDS]], kx: usize, ky: usize, colour: impl Fn(u8) -> [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (GRAM_COLS * kx, GRAM_BANDS * ky);
+    let mut px = vec![0u8; w * h * 4];
+    let first = GRAM_COLS - gram.len();
+    for (i, col) in gram.iter().enumerate() {
         for (b, v) in col.iter().enumerate() {
-            if *v > 70 {
-                kit::bar(window, x, r.bottom() - (b + 1) as f32 * rh, cw + 0.5, rh + 0.5, 0., ramp(*v));
+            if *v <= GRAM_FLOOR {
+                continue;
+            }
+            let c = colour(*v);
+            let y0 = (GRAM_BANDS - 1 - b) * ky;
+            for y in y0..y0 + ky {
+                let row = (y * w + (first + i) * kx) * 4;
+                for x in 0..kx {
+                    px[row + x * 4..row + x * 4 + 4].copy_from_slice(&c);
+                }
             }
         }
+    }
+    (w as u32, h as u32, px)
+}
+
+/// What a spectrogram image was made from: (version, kx, ky, colour tokens).
+type GramKey = (u64, usize, usize, [u32; 4]);
+
+thread_local! {
+    /// The image of the last spectrogram painted.
+    static GRAM_IMAGE: std::cell::RefCell<Option<(GramKey, Arc<RenderImage>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One image instead of up to 5 000 quads: the cells arrive 45 times a second,
+/// the quads would be rebuilt (and sorted by the scene) on every frame.
+fn paint_spectrogram(window: &mut Window, r: Rect, s: &Snap) {
+    let pal = p();
+    let scale = window.scale_factor();
+    let cell = |len: f32, n: usize| ((len / n as f32 * scale).ceil() as usize).clamp(1, 6);
+    let (kx, ky) = (cell(r.w, GRAM_COLS), cell(r.h, GRAM_BANDS));
+    let tokens = [pal.well, pal.accent2, pal.record, pal.meter_mid].map(|c| {
+        let q = |v: f32| (v.clamp(0., 1.) * 255.) as u32;
+        (q(c.h) << 24) | (q(c.s) << 16) | (q(c.l) << 8) | q(c.a)
+    });
+    let key = (s.gram_ver, kx, ky, tokens);
+    let image = GRAM_IMAGE.with_borrow_mut(|slot| {
+        if let Some((k, img)) = slot
+            && *k == key
+        {
+            return Some(img.clone());
+        }
+        let (w, h, mut data) = gram_pixels(&s.gram, kx, ky, |v| {
+            let c = gpui::Rgba::from(gram_ramp(&pal, v));
+            let a = (c.a * 255.).round();
+            // Premultiplied BGRA.
+            [(c.b * a).round() as u8, (c.g * a).round() as u8, (c.r * a).round() as u8, a as u8]
+        });
+        let buffer = image::RgbaImage::from_raw(w, h, std::mem::take(&mut data))?;
+        let img = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+        if let Some((_, old)) = slot.replace((key, img.clone())) {
+            let _ = window.drop_image(old);
+        }
+        Some(img)
+    });
+    if let Some(img) = image {
+        let _ = window.paint_image(r.bounds(), r.bounds(), gpui::Corners::default(), img, 0, false);
     }
 }
 
@@ -902,6 +1006,49 @@ pub fn overlay(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Vec<AnyElemen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spectrogram_pixels_put_the_newest_column_right_and_the_lowest_band_at_the_bottom() {
+        let mut loud = [0u8; GRAM_BANDS];
+        loud[0] = 200; // the lowest band
+        let quiet = [GRAM_FLOOR; GRAM_BANDS]; // at the floor: not drawn
+        let (w, h, px) = gram_pixels(&[quiet, loud], 2, 3, |_| [1, 2, 3, 255]);
+        assert_eq!((w as usize, h as usize), (GRAM_COLS * 2, GRAM_BANDS * 3));
+        let at = |x: usize, y: usize| &px[(y * w as usize + x) * 4..][..4];
+        // Two columns, so they sit in the last two cells of 128; the loud one is the last.
+        let x_loud = (GRAM_COLS - 1) * 2;
+        for dy in 0..3 {
+            assert_eq!(at(x_loud, (GRAM_BANDS - 1) * 3 + dy), &[1, 2, 3, 255]);
+            assert_eq!(at(x_loud + 1, (GRAM_BANDS - 1) * 3 + dy), &[1, 2, 3, 255]);
+        }
+        assert_eq!(at(x_loud, 0), &[0, 0, 0, 0], "bands above are empty");
+        assert_eq!(at(x_loud - 2, (GRAM_BANDS - 1) * 3), &[0, 0, 0, 0], "the quiet column draws nothing");
+        assert_eq!(at(0, 0), &[0, 0, 0, 0], "columns not yet heard are empty");
+    }
+
+    #[test]
+    fn a_wave_history_wider_than_the_module_is_merged_into_fewer_bars_with_the_same_outline() {
+        let cols: Vec<WaveCol> = (0..420)
+            .map(|i| {
+                let a = (i as f32 * 0.05).sin().abs();
+                WaveCol { min: -a, max: a, low: 0.2, high: 0.6 }
+            })
+            .collect();
+        let merged = merge_wave_cols(&cols, 140);
+        assert_eq!(merged.len(), 140);
+        // The extremes survive the merge, so a peak is never lost.
+        let (lo, hi) = (cols.iter().fold(0f32, |m, c| m.min(c.min)), cols.iter().fold(0f32, |m, c| m.max(c.max)));
+        assert_eq!((merged.iter().fold(0f32, |m, c| m.min(c.min)), merged.iter().fold(0f32, |m, c| m.max(c.max))), (lo, hi));
+        assert!((merged[3].low - 0.2).abs() < 1e-6 && (merged[3].high - 0.6).abs() < 1e-6);
+        // Every merged bar covers the span of the samples it replaced.
+        for (k, m) in merged.iter().enumerate() {
+            for c in &cols[k * 3..k * 3 + 3] {
+                assert!(m.min <= c.min && m.max >= c.max);
+            }
+        }
+        // Narrow enough already: untouched.
+        assert!(matches!(merge_wave_cols(&cols, 500), std::borrow::Cow::Borrowed(_)));
+    }
 
     fn sine(freq: f32, amp: f32, frames: usize, sr: f32) -> Vec<[f32; 2]> {
         (0..frames).map(|n| (std::f32::consts::TAU * freq * n as f32 / sr).sin() * amp).map(|v| [v, v]).collect()

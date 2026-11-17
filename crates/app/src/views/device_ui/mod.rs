@@ -34,6 +34,8 @@ pub mod echo;
 pub mod eq;
 pub mod filter;
 pub mod generic;
+pub mod granular;
+pub mod instr;
 pub mod kick808;
 pub mod kit;
 pub mod length;
@@ -109,13 +111,36 @@ impl History {
     }
 }
 
+/// How much room an editor has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// The compact card in the Device View.
+    #[default]
+    Card,
+    /// The expanded card (more controls, a taller dock).
+    Large,
+    /// A device window: the editor gets the window's width and height, its
+    /// plots grow with it, and it scrolls only when the window is smaller
+    /// than the editor needs ([`kit::panel`] reads this).
+    Window,
+}
+
+impl Layout {
+    /// Whether the editor shows its expanded controls (the large card and the window).
+    pub fn is_big(self) -> bool {
+        self != Layout::Card
+    }
+}
+
 /// One device as its editor sees it this frame.
 #[derive(Clone)]
 pub struct Dev {
     pub id: DeviceId,
     pub enabled: bool,
-    /// The expanded editor (more controls, a taller dock).
+    /// The expanded editor (more controls, a taller dock): true for
+    /// [`Layout::Large`] and [`Layout::Window`].
     pub big: bool,
+    pub layout: Layout,
     pub set: Rc<ParamSet>,
     /// Normalised values the project stores (missing = default).
     pub values: Rc<BTreeMap<u32, f32>>,
@@ -226,6 +251,8 @@ pub enum PopKind {
     Sidechain { device: DeviceId, param: u32 },
     /// Preset list for a stock FX or synth plugin opened inside a Device Window.
     Presets(DeviceId),
+    /// The name field of a Device Window's Save preset popover.
+    SavePreset(DeviceId),
     /// The synth window's menus (wavetables, matrix sources and destinations…).
     Synth(crate::views::device_window::synth::SynthPop),
 }
@@ -279,6 +306,8 @@ pub struct UiState {
     pub vault: crate::views::device_window::vault::VaultState,
     /// State of each Drum Extractor device (source file, job progress, extracted slices).
     pub drum_extract: HashMap<DeviceId, drum_extract::ExtractViewState>,
+    /// The device windows' frame: A/B slots, preset list, meter peaks, latency probe.
+    pub chrome: HashMap<DeviceId, crate::views::device_window::chrome::ChromeState>,
     last_change: Instant,
     pub sample_rate: f64,
 }
@@ -305,6 +334,7 @@ impl Default for UiState {
             synth: HashMap::new(),
             vault: Default::default(),
             drum_extract: HashMap::new(),
+            chrome: HashMap::new(),
             last_change: Instant::now() - Duration::from_secs(10),
             sample_rate: 48_000.,
         }
@@ -376,6 +406,7 @@ impl UiState {
             id: d.id,
             enabled: d.enabled,
             big: self.big.contains(&d.id),
+            layout: if self.big.contains(&d.id) { Layout::Large } else { Layout::Card },
             set,
             values: Rc::new(d.params.clone()),
             meter: live.meter.clone(),
@@ -425,6 +456,7 @@ impl UiState {
         self.synth.retain(|id, _| alive(*id));
         self.vault.prune(&alive);
         self.drum_extract.retain(|id, _| alive(*id));
+        self.chrome.retain(|id, _| alive(*id));
     }
 }
 
@@ -548,7 +580,8 @@ pub fn overlay(ws: &mut Workspace, window: Option<WindowId>, cx: &mut Context<Wo
         PopKind::Choice { device, param } => choice_menu(ws, *device, *param, cx)?,
         PopKind::EqBand { device, band } => eq::band_menu(ws, *device, *band, cx)?,
         PopKind::Sidechain { device, param } => sidechain_menu(ws, *device, *param, cx)?,
-        PopKind::Presets(device) => crate::views::menus::preset_menu_card(ws, *device, true, cx)?,
+        PopKind::Presets(device) => crate::views::device_window::chrome::preset_menu(ws, *device, cx)?,
+        PopKind::SavePreset(device) => crate::views::device_window::chrome::save_card(ws, *device, cx)?,
         PopKind::Synth(pop) => crate::views::device_window::synth::pop_menu(ws, pop, cx)?,
     };
     let id = gpui::ElementId::Name(format!("fx-pop-{}", pop.seq).into());
@@ -704,6 +737,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "instrument.wavetable"
             | "instrument.acid303"
             | "instrument.kick808"
+            | "instrument.granular"
             | "instrument.sampler"
             | "instrument.drum"
             | "instrument.vault"
@@ -748,6 +782,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "instrument.wavetable" => wavetable::render(ws, dev, cx),
         "instrument.acid303" => acid303::render(ws, dev, cx),
         "instrument.kick808" => kick808::render(ws, dev, cx),
+        "instrument.granular" => granular::render(ws, dev, cx),
         "instrument.sampler" => sampler::render(ws, dev, d, cx),
         "instrument.drum" => drum::render(ws, dev, d, cx),
         "instrument.vault" => vault::render(ws, dev, cx),
@@ -774,6 +809,7 @@ pub(crate) mod testing {
             id: DeviceId(1),
             enabled: true,
             big: false,
+            layout: Layout::Card,
             set,
             values: Rc::new(values),
             meter: Rc::new(Vec::new()),
@@ -879,7 +915,7 @@ mod tests {
         let comp = project.tracks.iter().flat_map(|t| &t.devices).find(|d| matches!(&d.kind, aitrack_model::DeviceKind::Stock { plugin_id } if plugin_id == "fx.compressor")).unwrap();
         let mut ui = UiState::default();
         let dev = ui.dev(b.engine.as_mut(), b.plugins.as_ref(), comp, "fx.compressor", 128.);
-        assert_eq!(dev.meter.len(), 3);
+        assert_eq!(dev.meter.len(), 70);
         assert!(dev.info(aitrack_stock::fx::compressor::p::THRESHOLD).is_some());
         std::thread::sleep(Duration::from_millis(40));
         ui.poll(b.engine.as_mut(), comp.id, "fx.compressor");

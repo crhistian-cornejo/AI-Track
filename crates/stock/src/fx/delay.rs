@@ -19,10 +19,12 @@
 //! Meter layout: `[wet peak L, wet peak R, duck gain (0..1), freeze (0..1)]`.
 
 pub mod bbd;
+#[cfg(test)]
+mod quality;
 pub mod tape;
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
-use aitrack_dsp::delay::{AllpassDiffuser, DelayLine};
+use aitrack_dsp::delay::{AllpassDiffuser, DelayLine, SincKernel};
 use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower};
 use aitrack_dsp::lfo::{SYNC_DIVISIONS, division_seconds};
 use aitrack_dsp::shaper::{Adaa1, ShaperKind};
@@ -115,6 +117,57 @@ pub fn tap_pattern(n: usize) -> impl Iterator<Item = (f32, f32)> {
     })
 }
 
+/// Delay-time glide: an exponential approach limited to `max_slope` samples
+/// of delay per sample. A moving read point changes the pitch of what it
+/// plays by `1 − slope`; a plain exponential glide starts a big jump at a
+/// slope of several, which plays the echo backwards for a moment. Here a
+/// jump bends the repeats by at most `max_slope` (0.5 = one octave down or
+/// a fifth up) and still lands softly.
+#[derive(Clone, Copy, Debug)]
+pub struct Glide {
+    // f64: at 100 000 samples an f32 cannot take a step smaller than 0.004,
+    // so the final approach of a long time stalled several samples short.
+    value: f64,
+    target: f64,
+    coef: f64,
+    max_slope: f64,
+}
+
+impl Glide {
+    pub fn new(value: f32) -> Self {
+        Self { value: value as f64, target: value as f64, coef: 1.0, max_slope: 0.5 }
+    }
+
+    /// Time constant of the final approach and the steepest slope allowed.
+    pub fn set_rate(&mut self, ms: f32, max_slope: f32, sample_rate: f64) {
+        self.coef = 1.0 - (-1.0 / (ms as f64 * 0.001 * sample_rate)).exp();
+        self.max_slope = max_slope as f64;
+    }
+
+    pub fn set_target(&mut self, target: f32) {
+        self.target = target as f64;
+    }
+
+    pub fn snap_to_target(&mut self) {
+        self.value = self.target;
+    }
+
+    pub fn value(&self) -> f32 {
+        self.value as f32
+    }
+
+    #[inline]
+    pub fn next(&mut self) -> f32 {
+        let step = ((self.target - self.value) * self.coef).clamp(-self.max_slope, self.max_slope);
+        self.value += step;
+        // Close enough to be the target: stop creeping.
+        if (self.target - self.value).abs() < 1e-3 {
+            self.value = self.target;
+        }
+        self.value as f32
+    }
+}
+
 /// Per-channel feedback-loop processing, plus the tape record head.
 #[derive(Clone, Copy)]
 struct Loop {
@@ -166,7 +219,12 @@ pub struct Delay {
     tape: TapeCoeffs,
     bump: [SvfState; 2],
     tap_lp: [OnePole; 2],
-    time: [Smoother; 2],
+    time: [Glide; 2],
+    sinc: SincKernel,
+    in_hp: [SvfState; 2],
+    in_lp: [SvfState; 2],
+    filt_mix: Smoother,
+    filt_on: bool,
     feedback: Smoother,
     wet: Smoother,
     dry: Smoother,
@@ -229,7 +287,12 @@ impl Delay {
             tape: TapeCoeffs::default(),
             bump: [SvfState::default(); 2],
             tap_lp: [OnePole::default(); 2],
-            time: [Smoother::new(1000.0); 2],
+            time: [Glide::new(1000.0); 2],
+            sinc: SincKernel::new(),
+            in_hp: [SvfState::default(); 2],
+            in_lp: [SvfState::default(); 2],
+            filt_mix: Smoother::new(0.0),
+            filt_on: false,
             feedback: Smoother::new(0.0),
             wet: Smoother::new(0.0),
             dry: Smoother::new(1.0),
@@ -277,6 +340,15 @@ impl Delay {
         }
         self.hp = SvfCoeffs::new(SvfMode::Highpass, self.params.plain(p::LOW_CUT), 0.707, 0.0, sr);
         self.lp = SvfCoeffs::new(SvfMode::Lowpass, self.params.plain(p::HIGH_CUT), 0.707, 0.0, sr);
+        // The filters also shape the first echo; fully open they step aside
+        // so a clean delay stays bit-clean.
+        self.filt_on = self.params.plain(p::LOW_CUT) > 20.5 || self.params.plain(p::HIGH_CUT) < 19_500.0;
+        self.filt_mix.set_target(if self.filt_on { 1.0 } else { 0.0 });
+        // A tape echo has a heavy transport: slower, gentler bends.
+        let (glide_ms, glide_slope) = if engine == 1 { (200.0, 0.35) } else { (120.0, 0.5) };
+        for t in &mut self.time {
+            t.set_rate(glide_ms, glide_slope, sr);
+        }
         let age = self.params.plain(p::AGE) / 100.0;
         self.tape = TapeCoeffs::new(age, sr);
         let cutoff = bbd_cutoff(age);
@@ -308,7 +380,7 @@ impl Delay {
         self.diffusion = 0.7 * self.params.plain(p::DIFFUSION) / 100.0;
         self.taps = self.params.choice(p::TAPS) + 1;
         if self.first {
-            for s in [&mut self.feedback, &mut self.wet, &mut self.dry, &mut self.width, &mut self.freeze] {
+            for s in [&mut self.feedback, &mut self.wet, &mut self.dry, &mut self.width, &mut self.freeze, &mut self.filt_mix] {
                 s.snap_to_target();
             }
         }
@@ -351,7 +423,7 @@ impl Segmented for Delay {
         let decay = (-1.0 / (0.3 * self.sr as f32)).exp();
         let mut peak = self.peak;
         let mut duck_gain = self.duck_gain;
-        let Self { lines, bbd, loops, diffusers, transport, bump, tap_lp, time, feedback, wet, dry, width, freeze, duck_env, mod_phase, mod_inc, .. } = self;
+        let Self { lines, bbd, loops, diffusers, transport, bump, tap_lp, time, feedback, wet, dry, width, freeze, duck_env, mod_phase, mod_inc, sinc, in_hp, in_lp, filt_mix, .. } = self;
         for_frames(ctx.buffer, start, end, |_, l, r| {
             // Modulation: quadrature sines so the sides move apart.
             *mod_phase += *mod_inc;
@@ -375,7 +447,7 @@ impl Segmented for Delay {
             let (tap_l, tap_r) = if engine == 2 {
                 (bbd[0].read(dl), bbd[1].read(dr))
             } else {
-                (lines[0].read_cubic(dl - 1.0), lines[1].read_cubic(dr - 1.0))
+                (sinc.read(&lines[0], dl - 1.0), sinc.read(&lines[1], dr - 1.0))
             };
             let fz = freeze.next();
             let fb = feedback.next();
@@ -393,12 +465,20 @@ impl Segmented for Delay {
                 }
                 fb * y
             };
+            // The input goes through the same filters as the repeats, so the
+            // first echo is already shaped (it used to come out flat and only
+            // the second one darkened).
+            let fm = filt_mix.next();
+            let mut shape = |c: usize, x: f32| {
+                let y = in_lp[c].process(&lp, in_hp[c].process(&hp, x));
+                x + (y - x) * fm
+            };
             let (in_l, in_r) = match mode {
                 // Ping-pong: input enters the left line, the lines feed
                 // each other.
-                1 => (mono * gin + back(0, tap_r), back(1, tap_l)),
-                2 => (mono * gin + back(0, tap_l), 0.0),
-                _ => (l * gin + back(0, tap_l), r * gin + back(1, tap_r)),
+                1 => (shape(0, mono * gin) + back(0, tap_r), back(1, tap_l)),
+                2 => (shape(0, mono * gin) + back(0, tap_l), 0.0),
+                _ => (shape(0, l * gin) + back(0, tap_l), shape(1, r * gin) + back(1, tap_r)),
             };
             let (in_l, in_r) = if is_tape {
                 // Frozen, the head stops colouring what goes round.
@@ -418,8 +498,8 @@ impl Segmented for Delay {
             if taps > 1 {
                 let (mut xl, mut xr) = (0.0, 0.0);
                 for (k, (at, g)) in tap_pattern(taps).enumerate() {
-                    let a = lines[0].read_cubic((dl * at).max(1.0)) * g;
-                    let b = if mode == 2 { a } else { lines[1].read_cubic((dr * at).max(1.0)) * g };
+                    let a = sinc.read(&lines[0], (dl * at).max(1.0)) * g;
+                    let b = if mode == 2 { a } else { sinc.read(&lines[1], (dr * at).max(1.0)) * g };
                     if k % 2 == 0 {
                         xl += b;
                         xr += a;
@@ -474,13 +554,11 @@ impl Processor for Delay {
             self.bbd = [Bbd::new(sample_rate), Bbd::new(sample_rate)];
             self.diffusers = diffusers(sample_rate);
         }
-        for (s, ms) in [(&mut self.feedback, 20.0), (&mut self.wet, 20.0), (&mut self.dry, 20.0), (&mut self.width, 20.0), (&mut self.freeze, 30.0)] {
+        for (s, ms) in [(&mut self.feedback, 20.0), (&mut self.wet, 20.0), (&mut self.dry, 20.0), (&mut self.width, 20.0), (&mut self.freeze, 30.0), (&mut self.filt_mix, 20.0)] {
             s.set_time(ms, sample_rate);
         }
-        // Time glides with a ~120 ms constant (pitch-bending repeats).
-        for t in &mut self.time {
-            t.set_time(120.0, sample_rate);
-        }
+        // Time glides (pitch-bending repeats) at the rate `update` picks
+        // for the engine.
         for t in &mut self.transport {
             t.set_rate(sample_rate as f32);
         }
@@ -504,6 +582,8 @@ impl Processor for Delay {
             d.clear();
         }
         self.bump = [SvfState::default(); 2];
+        self.in_hp = [SvfState::default(); 2];
+        self.in_lp = [SvfState::default(); 2];
         for t in &mut self.tap_lp {
             t.reset();
         }

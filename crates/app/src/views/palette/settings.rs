@@ -9,7 +9,8 @@ pub struct PaletteSettings {
     /// Search Splice too (its unofficial API). Off until the user opts in.
     pub splice: bool,
     /// The folder the Splice desktop app saves licensed sounds to, indexed
-    /// into the library. `None` = Splice's default (`~/Splice/sounds`).
+    /// into the library. `None` = look for it (`~/Splice/sounds`, `~/Splice`,
+    /// Ableton's `User Library/Samples/Splice`).
     pub splice_folder: Option<PathBuf>,
 }
 
@@ -33,7 +34,7 @@ impl PaletteSettings {
     }
 
     pub fn splice_folder(&self) -> Option<PathBuf> {
-        self.splice_folder.clone().or_else(aitrack_splice::default_sounds_folder)
+        self.splice_folder.clone().or_else(|| aitrack_library::splice::detect().map(|d| d.folder)).or_else(aitrack_library::splice::default_folder)
     }
 }
 

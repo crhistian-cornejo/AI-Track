@@ -581,7 +581,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Worksp
     let tab = view(ws, dev.id).tab;
     let top = div()
         .flex_none()
-        .h(px(56.))
+        .h(px(68.))
         .px(px(SP4))
         .flex()
         .items_center()

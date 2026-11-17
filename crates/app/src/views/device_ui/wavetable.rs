@@ -146,8 +146,13 @@ pub fn paint_filter(window: &mut gpui::Window, cx: &mut gpui::App, r: Rect, f: F
 /// The corner points of an ADSR drawn in a unit square: start, attack peak,
 /// decay end, release start, end. Times are the parameters' normalised
 /// values, so the log scale of the knobs is the scale of the picture.
+/// Where the top (full level) and the bottom (silence) of the picture sit:
+/// the top leaves a strip for the stages' values.
+const ENV_TOP: f32 = 0.22;
+const ENV_BOTTOM: f32 = 0.9;
+
 pub fn adsr_points(attack: f32, decay: f32, sustain: f32, release: f32) -> [(f32, f32); 5] {
-    let (top, bottom) = (0.1, 0.9);
+    let (top, bottom) = (ENV_TOP, ENV_BOTTOM);
     let a = 0.02 + 0.24 * attack;
     let d = a + 0.02 + 0.24 * decay;
     let s = d + 0.18;
@@ -164,7 +169,7 @@ pub fn adsr(ws: &mut Workspace, dev: &Dev, slot: u8, ids: [u32; 4], color: Hsla,
     let base = slot as usize * 8;
     let handles = vec![
         Handle { fx: pts[1].0, fy: pts[1].1, x: ax(a, 1. / 0.24), index: base, reset: vec![default(a)], ..Default::default() },
-        Handle { fx: pts[2].0, fy: pts[2].1, x: ax(d, 1. / 0.24), y: ax(s, -1. / 0.8), index: base + 1, reset: vec![default(d), default(s)], ..Default::default() },
+        Handle { fx: pts[2].0, fy: pts[2].1, x: ax(d, 1. / 0.24), y: ax(s, -1. / (ENV_BOTTOM - ENV_TOP)), index: base + 1, reset: vec![default(d), default(s)], ..Default::default() },
         Handle { fx: pts[4].0, fy: pts[4].1 - 0.06, x: ax(r, 1. / 0.28), index: base + 2, reset: vec![default(r)], ..Default::default() },
     ];
     let marks = handles.clone();
@@ -689,10 +694,10 @@ mod tests {
     fn envelope_points_follow_the_parameters() {
         let p = adsr_points(0., 0., 1., 0.);
         assert_eq!(p[0], (0., 0.9));
-        assert!((p[1].1 - 0.1).abs() < 1e-6 && (p[2].1 - 0.1).abs() < 1e-6, "full sustain stays at the top");
+        assert!((p[1].1 - ENV_TOP).abs() < 1e-6 && (p[2].1 - ENV_TOP).abs() < 1e-6, "full sustain stays at the top");
         let slow = adsr_points(1., 1., 0.25, 1.);
         assert!(slow[1].0 > p[1].0 && slow[2].0 - slow[1].0 > p[2].0 - p[1].0);
-        assert!((slow[2].1 - 0.7).abs() < 1e-6, "sustain 25% is a quarter of the way up");
+        assert!((slow[2].1 - (ENV_BOTTOM - 0.25 * (ENV_BOTTOM - ENV_TOP))).abs() < 1e-6, "sustain 25% is a quarter of the way up");
         assert_eq!(slow[2].1, slow[3].1);
         for w in slow.windows(2) {
             assert!(w[1].0 > w[0].0, "time runs left to right");

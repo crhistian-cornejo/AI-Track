@@ -30,6 +30,8 @@ pub enum PrefsPage {
     /// MIDI input ports and the track live MIDI goes to.
     Midi,
     Performance,
+    /// VST3/CLAP plugins: folders searched, what was found and what was left out.
+    Plugins,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +50,12 @@ pub enum Modal {
 pub enum PickTarget {
     Accent,
     Token(&'static str),
+}
+
+/// A panel height that still sits at the old density's default moves to the
+/// new one's; one the user dragged elsewhere stays.
+fn follow_default(h: f32, old_default: f32, new_default: f32) -> f32 {
+    if (h - old_default).abs() < 0.5 { new_default } else { h }
 }
 
 /// Appearance state owned by the workspace.
@@ -112,7 +120,15 @@ impl Look {
 impl Workspace {
     /// Change appearance settings: saved at once, applied (cross-faded) next frame.
     pub fn set_look(&mut self, animate: bool, cx: &mut Context<Self>, f: impl FnOnce(&mut Appearance)) {
+        let before = self.look.app.density;
         f(&mut self.look.app);
+        let after = self.look.app.density;
+        if after != before {
+            // A panel the user never resized follows the new density's default heights.
+            let (from, to) = (Metrics::of(before), Metrics::of(after));
+            self.bottom_h = follow_default(self.bottom_h, from.dock_h, to.dock_h);
+            self.mixer_h = follow_default(self.mixer_h, from.mixer_h, to.mixer_h);
+        }
         self.look.app.save();
         self.look.pending = Some(animate);
         cx.notify();
@@ -264,6 +280,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
         PrefsPage::Sounds => sounds_page(ws, cx),
         PrefsPage::Midi => midi_page(ws, window, cx),
         PrefsPage::Performance => performance_page(ws, cx),
+        PrefsPage::Plugins => plugins_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
         let on = page == target;
@@ -299,6 +316,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .child(nav("nav-look", Icon::Sparkles, "Appearance", PrefsPage::Appearance))
                 .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds))
                 .child(nav("nav-midi", Icon::Piano, "MIDI", PrefsPage::Midi))
+                .child(nav("nav-plugins", Icon::Plug, "Plugins", PrefsPage::Plugins))
                 .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance)),
         )
         .child(
@@ -309,6 +327,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                     PrefsPage::Sounds => "sounds-scroll",
                     PrefsPage::Midi => "midi-scroll",
                     PrefsPage::Performance => "perf-scroll",
+                    PrefsPage::Plugins => "plugins-scroll",
                 })
                 .flex_1()
                 .min_w(px(0.))
@@ -334,16 +353,75 @@ fn index_splice_folder(ws: &mut Workspace, cx: &mut Context<Workspace>) {
             Ok(()) => ws.toast(format!("Indexing {}", dir.display()), cx),
             Err(e) => ws.toast(e, cx),
         },
-        Some(dir) => ws.toast(format!("No Splice folder at {} yet; choose it with “Folder…”", dir.display()), cx),
+        Some(dir) => ws.toast(format!("No Splice folder at {} yet: install the Splice desktop app, or choose its folder with “Folder…”", dir.display()), cx),
         None => ws.toast("Choose the Splice folder first", cx),
     }
+}
+
+/// Where the Splice folder stands, in words, and whether it needs attention.
+fn splice_folder_status(chosen: bool, folder: Option<&std::path::Path>, sounds: Option<u64>) -> (String, bool) {
+    match (folder, folder.is_some_and(std::path::Path::is_dir)) {
+        (Some(f), true) => match sounds {
+            Some(n) => (format!("Found at {} · {n} sounds indexed. New downloads appear on their own.", f.display()), false),
+            None => (format!("Found at {}. New downloads appear on their own.", f.display()), false),
+        },
+        (Some(f), false) if chosen => (format!("{} is not there. Choose the folder again, or use the automatic search.", f.display()), true),
+        _ => ("Not found: looked in ~/Splice/sounds, ~/Splice and Ableton's User Library (Samples/Splice). Install the Splice desktop app, or choose its folder; it is picked up as soon as it exists.".to_owned(), false),
+    }
+}
+
+/// The Splice folder: what was found (or chosen), what it holds, and the buttons.
+fn splice_folder_row(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let chosen = ws.palette.settings.splice_folder.is_some();
+    let folder = ws.palette.settings.splice_folder();
+    let sounds = match &ws.sounds.page.splice {
+        crate::bridge::SpliceState::Indexed { sounds, .. } => Some(*sounds),
+        _ => None,
+    };
+    let (text, warn) = splice_folder_status(chosen, folder.as_deref(), sounds);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .child(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(if warn { pal.solo } else { pal.text }).child(text))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .child(text_button("splice-folder", "Folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
+                    let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Splice folder".into()) });
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(Ok(Some(paths))) = rx.await
+                            && let Some(p) = paths.into_iter().next()
+                        {
+                            let _ = this.update(cx, |ws, cx| {
+                                ws.palette.settings.splice_folder = Some(p);
+                                ws.palette.settings.save();
+                                index_splice_folder(ws, cx);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .detach();
+                })))
+                .when(chosen, |d| {
+                    d.child(text_button("splice-auto", "Find it automatically", None, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.palette.settings.splice_folder = None;
+                        this.palette.settings.save();
+                        cx.notify();
+                    })))
+                })
+                .child(text_button("splice-index", "Index now", Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| index_splice_folder(this, cx)))),
+        )
+        .into_any_element()
 }
 
 fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     ws.palette.load();
     let on = ws.palette.settings.splice;
-    let folder = ws.palette.settings.splice_folder().map_or("Not set".to_owned(), |d| d.display().to_string());
     // Starts the Splice worker when on, so the stored sign-in is read (off this thread).
     let (signed, signing) = ws.palette.splice_ui().map_or((None, false), |s| {
         let _ = s.poll_sign_in();
@@ -360,7 +438,10 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             None,
             text_button("open-hub", "Open Content Hub", Some(Icon::Package), false).on_click(cx.listener(|this, _, _, cx| this.open_modal(Modal::ContentHub, cx))),
         ))
-        .child(section_title("SPLICE"))
+        .child(section_title("SPLICE FOLDER"))
+        .child(para("The sounds you license with the Splice desktop app are files in a folder on this computer. AI-Track finds that folder by itself, indexes it as its own collection (“Splice” in the Sounds panel and the search palette, filterable on its own), and picks up new downloads without a restart. Nothing is sent to Splice.", pal.muted))
+        .child(splice_folder_row(ws, cx))
+        .child(section_title("SPLICE ONLINE SEARCH (OPTIONAL)"))
         .child(
             div()
                 .p(px(SP3))
@@ -387,31 +468,6 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         ));
     if on {
         col = col
-            .child(setting_row(
-                "Splice folder",
-                Some(crate::paint::fit(&folder, 300., TEXT_XS).into()),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SP2))
-                    .child(text_button("splice-folder", "Folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
-                        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Splice folder".into()) });
-                        cx.spawn(async move |this, cx| {
-                            if let Ok(Ok(Some(paths))) = rx.await
-                                && let Some(p) = paths.into_iter().next()
-                            {
-                                let _ = this.update(cx, |ws, cx| {
-                                    ws.palette.settings.splice_folder = Some(p);
-                                    ws.palette.settings.save();
-                                    index_splice_folder(ws, cx);
-                                    cx.notify();
-                                });
-                            }
-                        })
-                        .detach();
-                    })))
-                    .child(text_button("splice-index", "Index now", Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| index_splice_folder(this, cx)))),
-            ))
             .child(setting_row(
                 "Account",
                 Some(match signed {
@@ -580,6 +636,61 @@ fn apply_audio(ws: &mut Workspace, c: AudioConfig, cx: &mut Context<Workspace>) 
     cx.notify();
 }
 
+fn plugins_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let scan = ws.b.plugins.scan_status();
+    div()
+        .flex()
+        .flex_col()
+        .child(section_title("PLUGINS"))
+        .child(para("VST3 and CLAP plugins are looked for in the system's folders and in any folder you add. A plugin that cannot be loaded is not hidden: it is listed below with the reason, and you can try it again.", pal.muted))
+        .child(setting_row(
+            "Sandbox",
+            Some("Run VST3/CLAP plugins in a separate process (applies to plugins loaded from now on)".into()),
+            switch("sandbox", ws.b.engine.sandbox_plugins()).on_click(cx.listener(|this, _, _, cx| {
+                let on = !this.b.engine.sandbox_plugins();
+                this.b.engine.set_sandbox_plugins(on);
+                cx.notify();
+            })),
+        ))
+        .child(setting_row("Plugin folders", Some(scan.message.clone().into()), {
+            let mut row = div().flex().items_center().gap(px(SP2));
+            if scan.running {
+                row = row.child(widgets::hbar(scan.fraction, 160., 6., pal.accent));
+            }
+            row.child(text_button("add-plugin-folder", "Add folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
+                let rx = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Custom VST3 / CLAP folder".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = rx.await
+                        && let Some(dir) = paths.into_iter().next()
+                    {
+                        let _ = this.update(cx, |ws, cx| {
+                            if ws.b.plugins.add_plugin_folder(dir.clone()) {
+                                ws.b.plugins.rescan();
+                                ws.toast(format!("Scanning {}", dir.display()), cx);
+                            } else {
+                                ws.toast("Folder already in plugin search list", cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            })))
+            .child(text_button("rescan", if scan.running { "Scanning…" } else { "Rescan" }, Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
+                this.b.plugins.rescan();
+                cx.notify();
+            })))
+        }))
+        .child(plugin_report_block(ws, cx))
+        .into_any_element()
+}
+
 fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let cfg = ws.b.engine.audio_config();
@@ -600,7 +711,6 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         BUFFER_SIZES.iter().map(|b| (b.to_string(), *b == cfg.buffer_size, *b >= range.0 && *b <= range.1)).collect();
     let one_way = cfg.buffer_ms();
     let latency = ws.b.engine.audio_latency();
-    let scan = ws.b.plugins.scan_status();
     let channel_chips = |id: &'static str, count: u16, enabled: &[u16], output: bool, cx: &mut Context<Workspace>| {
         let items: Vec<(String, bool, bool)> = (0..count.max(1)).map(|c| (format!("{}", c + 1), enabled.contains(&c), count > 0)).collect();
         chip_row(id, items, cx, move |this, i, cx| {
@@ -651,94 +761,146 @@ fn audio_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 cx.notify();
             })),
         ))
-        .child(section_title("PLUGINS"))
-        .child(setting_row(
-            "Sandbox",
-            Some("Run VST3/CLAP plugins in a separate process (applies to plugins loaded from now on)".into()),
-            switch("sandbox", ws.b.engine.sandbox_plugins()).on_click(cx.listener(|this, _, _, cx| {
-                let on = !this.b.engine.sandbox_plugins();
-                this.b.engine.set_sandbox_plugins(on);
-                cx.notify();
-            })),
-        ))
-        .child(setting_row("Plugin folders", Some(scan.message.clone().into()), {
-            let mut row = div().flex().items_center().gap(px(SP2));
-            if scan.running {
-                row = row.child(widgets::hbar(scan.fraction, 160., 6., pal.accent));
-            }
-            row.child(text_button("add-plugin-folder", "Add folder…", Some(Icon::FolderOpen), false).on_click(cx.listener(|_, _, _, cx| {
-                let rx = cx.prompt_for_paths(PathPromptOptions {
-                    files: false,
-                    directories: true,
-                    multiple: false,
-                    prompt: Some("Custom VST3 / CLAP folder".into()),
-                });
-                cx.spawn(async move |this, cx| {
-                    if let Ok(Ok(Some(paths))) = rx.await
-                        && let Some(dir) = paths.into_iter().next()
-                    {
-                        let _ = this.update(cx, |ws, cx| {
-                            if ws.b.plugins.add_plugin_folder(dir.clone()) {
-                                ws.b.plugins.rescan();
-                                ws.toast(format!("Scanning {}", dir.display()), cx);
-                            } else {
-                                ws.toast("Folder already in plugin search list", cx);
-                            }
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
-            })))
-            .child(text_button("rescan", if scan.running { "Scanning…" } else { "Rescan" }, Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
-                this.b.plugins.rescan();
-                cx.notify();
-            })))
-        }))
-        .child({
-            let defaults: Vec<String> = [aitrack_model::PluginFormat::Vst3, aitrack_model::PluginFormat::Clap]
-                .into_iter()
-                .flat_map(aitrack_host::scan::default_search_paths)
-                .map(|p| p.display().to_string())
-                .collect();
-            let custom = ws.b.plugins.plugin_folders();
-            let mut box_ = div()
-                .p(px(SP2))
-                .rounded(px(r_md()))
-                .bg(content(0.03))
-                .border_1()
-                .border_color(border())
-                .flex()
-                .flex_col()
-                .gap(px(SP1))
-                .child(label(format!("Default OS folders: {}", defaults.join(" · ")), TEXT_XS, pal.faint));
-            for (i, dir) in custom.into_iter().enumerate() {
-                let label_path = dir.display().to_string();
-                let remove_path = dir;
-                box_ = box_.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(SP2))
-                        .pt(px(SP1))
-                        .child(mono(label_path, TEXT_XS, pal.text))
-                        .child(
-                            widgets::sized_icon_button(("rm-plug-dir", i), Icon::X, false, 18., 11.)
-                                .tooltip(widgets::tip("Remove custom folder", None))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if this.b.plugins.remove_plugin_folder(&remove_path) {
-                                        this.b.plugins.rescan();
-                                        cx.notify();
-                                    }
-                                })),
-                        ),
-                );
-            }
-            box_
-        })
         .child(div().pt(px(SP3)).child(label(format!("Engine: {}", ws.b.engine.status_label()), TEXT_SM, pal.faint)))
         .into_any_element()
+}
+
+/// Whether Preferences lists every plugin found (kept across redraws).
+#[derive(Default)]
+struct PluginListOpen(bool);
+impl gpui::Global for PluginListOpen {}
+
+/// What the plugin scan did: the folders it searched, the files it left out
+/// and why (with a retry), and on request every plugin it found.
+fn plugin_report_block(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = theme::p();
+    let report = ws.b.plugins.plugin_report();
+    let open = cx.try_global::<PluginListOpen>().is_some_and(|g| g.0);
+    let mut box_ = div().p(px(SP2)).rounded(px(r_md())).bg(content(0.03)).border_1().border_color(border()).flex().flex_col().gap(px(SP1));
+    box_ = box_.child(label("Folders searched", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD));
+    if report.folders.is_empty() {
+        // Before the first scan has finished: the system's folders in words.
+        let defaults: Vec<String> = [aitrack_model::PluginFormat::Vst3, aitrack_model::PluginFormat::Clap]
+            .into_iter()
+            .flat_map(aitrack_host::scan::default_search_paths)
+            .map(|p| p.display().to_string())
+            .collect();
+        box_ = box_.child(label(defaults.join(" · "), TEXT_XS, pal.faint));
+    }
+    for (i, f) in report.folders.iter().enumerate() {
+        let fmt = plugin_format_name(f.format);
+        let note = if !f.exists { "not found".to_owned() } else { format!("{} file{}", f.files, if f.files == 1 { "" } else { "s" }) };
+        let path = f.path.clone();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .child(widgets::badge(fmt, pal.faint))
+            .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(mono(crate::paint::fit(&f.path.display().to_string(), 360., TEXT_XS), TEXT_XS, pal.text)))
+            .child(label(note, TEXT_XS, if f.exists { pal.muted } else { pal.solo }));
+        if f.custom {
+            row = row.child(
+                widgets::sized_icon_button(("rm-plug-dir", i), Icon::X, false, 18., 11.).tooltip(widgets::tip("Stop searching this folder", None)).on_click(cx.listener(move |this, _, _, cx| {
+                    if this.b.plugins.remove_plugin_folder(&path) {
+                        this.b.plugins.rescan();
+                        cx.notify();
+                    }
+                })),
+            );
+        }
+        box_ = box_.child(row);
+    }
+    // Left out, each with why.
+    if !report.problems.is_empty() {
+        box_ = box_.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt(px(SP2))
+                .child(label(format!("Left out ({})", report.problems.len()), TEXT_XS, pal.solo).font_weight(FontWeight::SEMIBOLD))
+                .child(text_button("retry-all-plugins", "Retry all", Some(Icon::Refresh), false).on_click(cx.listener(|this, _, _, cx| {
+                    for p in this.b.plugins.plugin_report().problems {
+                        this.b.plugins.retry_plugin(&p.path);
+                    }
+                    cx.notify();
+                }))),
+        );
+        for (i, p) in report.problems.iter().enumerate() {
+            let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let (retry, reveal) = (p.path.clone(), p.path.clone());
+            box_ = box_.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(SP2))
+                    .pt(px(SP1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().flex().items_center().gap(px(SP1)).child(widgets::badge(plugin_format_name(p.format), pal.faint)).child(label(name, TEXT_SM, pal.text)).child(label(p.title.clone(), TEXT_XS, pal.solo)))
+                            .child(para_wrapped(p.advice.clone(), pal.muted))
+                            .when(!p.detail.is_empty(), |d| d.child(mono(crate::paint::fit(&p.detail, 420., TEXT_XS), TEXT_XS, pal.faint))),
+                    )
+                    .child(widgets::sized_icon_button(("plug-reveal", i), Icon::FolderOpen, false, 22., 13.).tooltip(widgets::tip("Show in the file manager", None)).on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&reveal))))
+                    .child(text_button(("plug-retry", i), "Retry", Some(Icon::Refresh), false).on_click(cx.listener(move |this, _, _, cx| {
+                        this.b.plugins.retry_plugin(&retry);
+                        cx.notify();
+                    }))),
+            );
+        }
+    }
+    // Found: on request.
+    let found = ws.b.plugins.external_plugins();
+    let grouped = group_found(found);
+    let n = grouped.len();
+    box_ = box_.child(
+        div().pt(px(SP2)).child(
+            text_button("plug-found-toggle", if open { format!("Hide the {n} found") } else { format!("Show the {n} found") }, None, false).on_click(cx.listener(|_, _, _, cx| {
+                let now = cx.try_global::<PluginListOpen>().is_some_and(|g| g.0);
+                cx.set_global(PluginListOpen(!now));
+                cx.notify();
+            })),
+        ),
+    );
+    if open {
+        for (name, vendor, formats) in grouped {
+            box_ = box_.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SP2))
+                    .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&name, 220., TEXT_SM), TEXT_SM, pal.text)))
+                    .child(label(crate::paint::fit(&vendor, 160., TEXT_XS), TEXT_XS, pal.faint))
+                    .children(formats.into_iter().map(|f| widgets::badge(f, pal.muted))),
+            );
+        }
+    }
+    box_.into_any_element()
+}
+
+fn plugin_format_name(f: aitrack_model::PluginFormat) -> &'static str {
+    match f {
+        aitrack_model::PluginFormat::Vst3 => "VST3",
+        aitrack_model::PluginFormat::Clap => "CLAP",
+    }
+}
+
+/// The plugins found, one line per plugin whatever its formats: name, maker, formats.
+fn group_found(found: &[crate::bridge::ExternalPlugin]) -> Vec<(String, String, Vec<&'static str>)> {
+    crate::views::palette::devices::group_plugins(found.iter())
+        .into_iter()
+        .map(|g| (g.name().to_owned(), g.vendor().to_owned(), g.formats().into_iter().map(plugin_format_name).collect()))
+        .collect()
+}
+
+/// Text that wraps onto several lines.
+fn para_wrapped(text: String, color: gpui::Hsla) -> Div {
+    div().text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(color).child(text)
 }
 
 // ───────────────────────────── Performance ─────────────────────────────
@@ -1451,7 +1613,7 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
         ))
         .child(setting_row(
             "Density",
-            None,
+            Some("Heights of bars, tracks and strips".into()),
             seg(
                 "density",
                 &[
@@ -1563,7 +1725,34 @@ pub fn backdrop(ws: &Workspace) -> Option<AnyElement> {
 
 #[cfg(test)]
 mod tests {
+    use super::splice_folder_status;
+    use std::path::Path;
+
+    #[test]
+    fn the_splice_folder_status_says_found_missing_or_where_it_looked() {
+        let here = std::env::temp_dir();
+        let (t, warn) = splice_folder_status(false, Some(&here), Some(12));
+        assert!(t.contains("12 sounds") && t.contains("on their own") && !warn);
+        let (t, warn) = splice_folder_status(false, Some(&here), None);
+        assert!(t.starts_with("Found at") && !warn);
+        // Nothing chosen and nothing there: a hint, not an alarm, and where it looked.
+        let (t, warn) = splice_folder_status(false, Some(Path::new("/no/such/Splice")), None);
+        assert!(t.contains("~/Splice") && t.contains("Ableton") && !warn);
+        // A folder the user chose that is gone is a problem.
+        let (t, warn) = splice_folder_status(true, Some(Path::new("/no/such/Splice")), None);
+        assert!(t.contains("/no/such/Splice") && warn);
+    }
+
     use super::*;
+
+    #[test]
+    fn panels_follow_the_density_only_while_at_its_default() {
+        let (c, k) = (Metrics::COMFORTABLE, Metrics::COMPACT);
+        assert_eq!(follow_default(c.dock_h, c.dock_h, k.dock_h), k.dock_h);
+        assert_eq!(follow_default(k.mixer_h, k.mixer_h, c.mixer_h), c.mixer_h);
+        // A height the user chose stays put.
+        assert_eq!(follow_default(333., c.dock_h, k.dock_h), 333.);
+    }
 
     #[test]
     fn the_cache_line_splits_decoded_files_from_warp_renders() {

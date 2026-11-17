@@ -3,6 +3,11 @@
 //! four macros on the right, and below them the expert panel of the
 //! preset's engine ([`engines`]).
 //!
+//! The window frame's header is the one preset selector (name, previous /
+//! next, the list, save, A/B): the browser is a view of the bank that filters
+//! what the header's arrows step through, and its rows load through the same
+//! path, so there is no second control that picks a preset.
+//!
 //! Loading a preset is one `load_preset` edit (every parameter plus the
 //! name, one undo step), and every knob is a `SetParam`, so the Device View
 //! card ([`crate::views::device_ui::vault`]), this window and the engine
@@ -95,6 +100,8 @@ pub fn load(ws: &mut Workspace, device: DeviceId, path: &str, cx: &mut Context<W
     match loaded {
         Ok((name, params)) => {
             ws.s.load_preset(device, &name, &params);
+            // Recalling a preset starts the A/B comparison afresh, as in the header.
+            ws.fx.chrome.entry(device).or_default().ab = super::presets::Ab::default();
         }
         Err(e) => ws.toast(e, cx),
     }
@@ -362,6 +369,7 @@ fn browser(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
         .child(types)
         .child(tags)
         .child(tools)
+        .child(label("The arrows in the window header step through this list.", TEXT_XS, pal.faint))
         .child(widgets::divider_h())
         .child(rows)
 }
@@ -376,9 +384,6 @@ fn hero(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
     let fav = preset.as_ref().is_some_and(|p| ws.fx.vault.favourites().contains(&p.path));
     let sub = preset.as_ref().map_or_else(|| browse::engine_name(eng).to_owned(), |p| format!("{} · {}", p.kind, browse::engine_name(eng)));
     let tags = preset.as_ref().map(|p| p.tags.clone()).unwrap_or_default();
-    let nav = |id: &'static str, i: Icon, dir: i32, tip: &'static str, cx: &mut Context<Workspace>| {
-        widgets::sized_icon_button((id, dev.key(0)), i, false, 28., 14.).tooltip(widgets::tip(tip, None)).on_click(cx.listener(move |this, _, _, cx| step_preset(this, device, dir, cx)))
-    };
     let mut tag_row = div().flex().flex_wrap().gap(px(SP1));
     for t in tags {
         tag_row = tag_row.child(div().h(px(16.)).px(px(SP1 + 2.)).flex().items_center().rounded_full().bg(content(0.06)).child(label(t, TEXT_XS, pal.muted)));
@@ -387,9 +392,7 @@ fn hero(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
         .flex()
         .items_center()
         .gap(px(SP2))
-        .child(nav("vault-prev", Icon::ChevronLeft, -1, "Previous preset (in the browser's list)", cx))
         .child(div().flex().flex_col().gap(px(2.)).child(label(name, 22., pal.text).font_weight(FontWeight::BOLD)).child(label(sub, TEXT_SM, pal.muted)))
-        .child(nav("vault-next", Icon::ChevronRight, 1, "Next preset (in the browser's list)", cx))
         .when_some(preset.as_ref().map(|p| p.path.clone()), |d, path| d.child(star(("vault-hero-star", dev.key(0)), path, fav, cx)));
     div()
         .flex_none()

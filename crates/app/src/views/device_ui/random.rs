@@ -8,7 +8,7 @@
 //! one step (Interval).
 
 use super::Dev;
-use super::kit::{self, Handle, PlotCfg, ax};
+use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::midi_kit as mk;
 use crate::icons::{Icon, icon};
 use crate::theme::*;
@@ -100,6 +100,34 @@ pub fn distribution(c: &Cfg, key: i32) -> [f32; 128] {
     out
 }
 
+/// A steady number in 0..1 for a seed and a draw (the picture's stand-in for the device's own draws).
+fn unit(seed: u64, n: u64) -> f32 {
+    let mut z = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(n.wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add(0x2545_F491_4F6C_DD1D);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) >> 40) as f32 / 16_777_216.0
+}
+
+/// What `n` notes of `key` in a row could come out as: each is altered with
+/// the Chance, and an altered one takes one of the candidates. The same seed
+/// gives the same draws; the device's own draws are not these.
+pub fn example_draws(c: &Cfg, key: i32, n: usize, seed: u64) -> Vec<i32> {
+    let list = candidates(c, key);
+    (0..n as u64)
+        .map(|i| {
+            if list.is_empty() || unit(seed, 2 * i) >= c.chance {
+                return key.clamp(0, 127);
+            }
+            i32::from(list[(unit(seed, 2 * i + 1) * list.len() as f32) as usize % list.len()].lands)
+        })
+        .collect()
+}
+
+/// Notes the example strip of a window plays.
+const DRAWS: usize = 16;
+/// The share of a window's plot the distribution takes; the example strip has the rest.
+const SPLIT: f32 = 0.62;
+
 /// Keys either side of the played one that the strip shows.
 fn half_span(c: &Cfg) -> i32 {
     (c.choices.max(1) * c.step + 2).clamp(12, 30)
@@ -107,7 +135,11 @@ fn half_span(c: &Cfg) -> i32 {
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let c = Cfg::of(dev);
-    let h = mk::plot_h(dev);
+    let win = mk::windowed(dev);
+    // The plot's whole height, and the part the distribution has of it.
+    let total_h = if win { mk::seen_h(ws, dev, 0, mk::plot_h(dev)) } else { mk::plot_h(dev) };
+    let split = if win { SPLIT } else { 1. };
+    let h = total_h * split;
     let key = if c.mask != 0 { 60 + dev.choice(p::ROOT) as i32 } else { 60 };
     let half = half_span(&c);
     let cols = (2 * half + 1) as f32;
@@ -121,7 +153,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let col_frac = |offset: i32| (PAD + (offset + half) as f32 * cw + cw / 2.) / w;
     let top_frac = |k: i32| {
         let p = dist.get(k.clamp(0, 127) as usize).copied().unwrap_or(0.);
-        (base_rel - (area * p / peak).max(3.)) / h
+        (base_rel - (area * p / peak).max(3.)) / total_h
     };
     // The far end of the reach and the first step, on the side the bars lean to.
     let side = if c.sign == 1 { -1 } else { 1 };
@@ -132,7 +164,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let off = n * side * c.step;
         // Past the strip the handle waits at its edge, on the floor.
         if off.abs() > half {
-            return (col_frac(off.clamp(-half, half)), (base_rel - 3.) / h);
+            return (col_frac(off.clamp(-half, half)), (base_rel - 3.) / total_h);
         }
         (col_frac(off), top_frac(key + off))
     };
@@ -162,9 +194,12 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     }
     let right = right.join(" · ");
     let ghosts = candidates(&c, key);
+    let draws = example_draws(&c, key, DRAWS, dev.plain(p::SEED) as u64);
 
-    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
+    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |whole: Rect, window, cx| {
         let pal = p();
+        // The distribution has the top of the plot; a window's example strip has the rest.
+        let r = Rect { h: whole.h * split, ..whole };
         let lit = |c: Hsla| if enabled { c } else { pal.muted };
         let cw = (r.w - 2. * PAD) / cols;
         let x_of = |k: i32| r.x + PAD + (k - key + half) as f32 * cw;
@@ -185,7 +220,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             }
             kit::bar(window, x_of(k), strip + 1., (cw - 0.6).max(1.), KEYS_H, 0., fill);
             if k.rem_euclid(12) == 0 && k != key {
-                kit::txt(window, cx, &mk::note_name(k), x_of(k), r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Left);
+                kit::txt(window, cx, &mk::note_name(k), x_of(k), r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Left);
             }
         }
         // The candidates outside the scale, faint, before they snap.
@@ -213,7 +248,37 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::bar(window, x_of(k) + 1., strip - bh, (cw - 2.).max(2.), bh, 1.5, with_alpha(lit(color), 0.85));
         }
         kit::bar(window, x_of(key) + cw / 2. - 0.5, r.y + TOP, 1., area, 0., with_alpha(pal.text, 0.25));
-        kit::txt(window, cx, &mk::note_name(key), x_of(key) + cw / 2., r.bottom() - 13., TEXT_XS, pal.text, TextAlign::Center);
+        kit::txt(window, cx, &mk::note_name(key), x_of(key) + cw / 2., r.bottom() - 13., TEXT_SM, pal.text, TextAlign::Center);
+        if win {
+            // A run of notes: C in the top row, what comes out of each in the bottom one.
+            let s = Rect { y: r.bottom(), h: whole.h - r.h, ..whole };
+            kit::hline(window, s, s.y, pal.grid_bar);
+            kit::txt(window, cx, &format!("{DRAWS} notes in a row: {} in, what could come out", mk::note_name(key)), s.x + 6., s.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+            let (lo, hi) = draws.iter().fold((key, key), |(lo, hi), k| (lo.min(*k), hi.max(*k)));
+            let (top, bottom) = (s.y + 22., s.bottom() - 8.);
+            let span = (hi - lo).max(1) as f32;
+            let bar_h = ((bottom - top) / (span + 1.)).clamp(3., 9.);
+            let y_of = |k: i32| bottom - bar_h - (bottom - top - bar_h) * (k - lo) as f32 / span;
+            let cw = (s.w - 16.) / DRAWS as f32;
+            kit::hline(window, s, y_of(key) + bar_h / 2., content(0.1));
+            for (i, k) in draws.iter().enumerate() {
+                let x = s.x + 8. + cw * i as f32;
+                let colour = match k.cmp(&key) {
+                    std::cmp::Ordering::Equal => pal.text,
+                    std::cmp::Ordering::Greater => series(0),
+                    std::cmp::Ordering::Less => series(1),
+                };
+                if *k != key {
+                    kit::bar(window, x + (cw - 3.) / 2., y_of(*k).min(y_of(key)), 1., (y_of(*k) - y_of(key)).abs() + bar_h, 0., with_alpha(pal.text, 0.2));
+                }
+                kit::bar(window, x, y_of(key), cw - 3., bar_h, 1.5, with_alpha(pal.text, 0.18));
+                kit::bar(window, x, y_of(*k), cw - 3., bar_h, 1.5, with_alpha(lit(colour), 0.9));
+            }
+            kit::txt(window, cx, &mk::note_name(hi), s.right() - 6., y_of(hi) - 2., TEXT_SM, pal.faint, TextAlign::Right);
+            if lo != hi {
+                kit::txt(window, cx, &mk::note_name(lo), s.right() - 6., y_of(lo) - 12., TEXT_SM, pal.faint, TextAlign::Right);
+            }
+        }
         for (i, (fx, fy)) in marks.iter().enumerate() {
             kit::dot(window, r.pt(*fx, *fy), if i == 0 { 6. } else { 5. }, lit(if side == 1 { series(0) } else { series(1) }), Some(pal.raised));
         }
@@ -275,7 +340,7 @@ fn project_chip(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyEl
         .bg(if on { accent_alpha(0.2) } else { content(0.06) })
         .hover(|s| s.bg(if on { accent_alpha(0.28) } else { content(0.12) }))
         .tooltip(widgets::tip("Use the project's scale (copied into Root and Scale)", None))
-        .child(label("Project", TEXT_XS, if on { pal.accent } else { pal.text }).font_weight(FontWeight::MEDIUM))
+        .child(label("Project", TEXT_SM, if on { pal.accent } else { pal.text }).font_weight(FontWeight::MEDIUM))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _, _, cx| {
             let values = toggle(!on, project_scale(this));
@@ -304,7 +369,7 @@ fn project_chip(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyEl
                     .hover(|s| s.bg(content(0.12)))
                     .tooltip(widgets::tip("The project's scale changed: copy it again", None))
                     .child(icon(Icon::Refresh, 10., pal.muted))
-                    .child(label("Match", TEXT_XS, pal.text).font_weight(FontWeight::MEDIUM))
+                    .child(label("Match", TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let values = copy(true, project_scale(this));
@@ -320,6 +385,21 @@ fn project_chip(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyEl
 mod tests {
     use super::super::testing::dev;
     use super::*;
+
+    #[test]
+    fn example_draws_follow_the_chance_and_the_candidates_and_are_steady() {
+        let c = |chance: f32, choices: i32, sign: usize| Cfg { chance, step: 2, choices, sign, mask: 0 };
+        assert!(example_draws(&c(0., 3, 0), 60, 16, 1).iter().all(|k| *k == 60), "no chance, no change");
+        assert!(example_draws(&c(1., 0, 0), 60, 16, 1).iter().all(|k| *k == 60), "nothing to choose from");
+        let up = example_draws(&c(1., 2, 0), 60, 64, 3);
+        assert!(up.iter().all(|k| *k == 62 || *k == 64), "{up:?}");
+        assert!(up.contains(&62) && up.contains(&64), "both candidates come up in 64 draws");
+        assert_eq!(up, example_draws(&c(1., 2, 0), 60, 64, 3));
+        assert_ne!(up, example_draws(&c(1., 2, 0), 60, 64, 4));
+        let half = example_draws(&c(0.5, 1, 0), 60, 400, 9).iter().filter(|k| **k != 60).count();
+        assert!((140..260).contains(&half), "about half are altered: {half}");
+        assert_eq!(example_draws(&Cfg::of(&dev("midi.random", &[])), 60, DRAWS, 0).len(), DRAWS);
+    }
 
     fn cfg(sign: usize, choices: i32, step: i32, chance: f32, mask: u16) -> Cfg {
         Cfg { chance, step, choices, sign, mask }

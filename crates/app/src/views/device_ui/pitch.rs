@@ -88,10 +88,14 @@ pub fn fate(c: &Cfg, key: i32) -> Fate {
 }
 
 /// Geometry of the two rows for a plot of this height: `(row height, top of the lower row)`.
-fn rows(h: f32) -> (f32, f32) {
-    let rh = ((h - TOP - BOTTOM) * 0.3).clamp(12., 28.);
+/// In a window the rows are allowed to be taller, so the lines between them have room.
+fn rows(h: f32, window: bool) -> (f32, f32) {
+    let rh = ((h - TOP - BOTTOM) * 0.3).clamp(12., if window { 64. } else { 28. });
     (rh, h - BOTTOM - rh)
 }
+
+/// The keys a window follows through the device by name: a low one, a chord and a high one.
+const EXAMPLES: [i32; 5] = [48, 60, 64, 67, 84];
 
 fn headline(c: &Cfg) -> String {
     let range = if c.lowest == 0 && c.highest >= 127 { "all keys".to_owned() } else { format!("{}–{}", mk::note_name(c.lowest), mk::note_name(c.highest.min(127))) };
@@ -109,8 +113,9 @@ fn tail(c: &Cfg) -> String {
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let c = Cfg::of(dev);
-    let h = mk::plot_h(dev);
-    let (rh, y2) = rows(h);
+    let win = mk::windowed(dev);
+    let h = if win { mk::seen_h(ws, dev, 0, mk::plot_h(dev)) } else { mk::plot_h(dev) };
+    let (rh, y2) = rows(h, win);
     // The plot's width as last painted (a first guess before that).
     let seen = f32::from(ws.fx.region(dev.id, 0).get().size.width);
     let w = if seen > 100. { seen } else if dev.big { 580. } else { 500. };
@@ -139,14 +144,14 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
         let pal = p();
         let lit = |c: Hsla| if enabled { c } else { pal.muted };
-        let (rh, y2) = rows(r.h);
+        let (rh, y2) = rows(r.h, win);
         let (x0, cw) = (r.x + PAD_L, (r.w - PAD_L - PAD_R) / 128.);
         let col = |k: i32| x0 + k as f32 * cw;
         let (top, low) = (r.y + TOP, r.y + y2);
         mk::corner(window, cx, r, &left, false, 3.);
         mk::corner(window, cx, r, &right, true, 3.);
-        kit::txt(window, cx, "in", r.x + 6., top + rh / 2. - 6., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, "out", r.x + 6., low + rh / 2. - 6., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "in", r.x + 6., top + rh / 2. - 6., TEXT_SM, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "out", r.x + 6., low + rh / 2. - 6., TEXT_SM, pal.faint, TextAlign::Left);
         // Which keys sound after the shift, and how each got there.
         let mut moved = [false; 128];
         let mut wrapped = [false; 128];
@@ -194,7 +199,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         }
         // The octaves.
         for note in (0..128).step_by(12) {
-            kit::txt(window, cx, &mk::note_name(note), col(note), r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, &mk::note_name(note), col(note), r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Left);
         }
         // One line per key (every other key when they would crowd).
         let stride = (7. / cw).ceil().max(1.) as usize;
@@ -221,6 +226,26 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     kit::bar(window, end_x - 0.5, mid_y - 2.5, 1.5, 5., 0., pal.record);
                 }
                 Fate::Blocked => {}
+            }
+        }
+        if win {
+            // Five example keys followed by name: where each is played and where it sounds.
+            for key in EXAMPLES {
+                let x_in = col(key) + cw / 2.;
+                let to = match fate(&c, key) {
+                    Fate::Same => Some(key),
+                    Fate::Moved(k) | Fate::Wrapped(k) => Some(i32::from(k)),
+                    Fate::Blocked => None,
+                };
+                kit::txt(window, cx, &mk::note_name(key), x_in, top + rh / 2. - 6., TEXT_SM, pal.text, TextAlign::Center);
+                match to {
+                    Some(k) => {
+                        let x_out = col(k) + cw / 2.;
+                        kit::line(window, &[point(px(x_in), px(top + rh)), point(px(x_out), px(low))], 1.5, with_alpha(pal.text, 0.8));
+                        kit::txt(window, cx, &mk::note_name(k), x_out, low + rh / 2. - 6., TEXT_SM, pal.text, TextAlign::Center);
+                    }
+                    None => kit::txt(window, cx, "×", x_in, low + rh / 2. - 6., TEXT_SM, pal.record, TextAlign::Center),
+                }
             }
         }
         for (i, (fx, fy)) in marks.iter().enumerate() {
@@ -302,8 +327,22 @@ mod tests {
     #[test]
     fn both_rows_fit_the_plot() {
         for h in [mk::PLOT_H - 2., mk::PLOT_H_BIG - 2.] {
-            let (rh, y2) = rows(h);
+            let (rh, y2) = rows(h, false);
             assert!(y2 > TOP + rh + 8. && y2 + rh <= h - 14., "{h}");
         }
+        // A tall window keeps room between the rows for the lines.
+        for h in [220., 320., 500.] {
+            let (rh, y2) = rows(h, true);
+            assert!(rh <= 64. && y2 > TOP + rh + 60_f32.min(h * 0.2), "{h}");
+        }
+        assert!(rows(500., true).0 > rows(500., false).0);
+    }
+
+    #[test]
+    fn the_example_keys_follow_the_shift() {
+        let c = Cfg { shift: 7, lowest: 0, highest: 127, block_outside: false, overflow: FOLD, layer: false, level: 1. };
+        assert_eq!(EXAMPLES.map(|k| fate(&c, k)), [Fate::Moved(55), Fate::Moved(67), Fate::Moved(71), Fate::Moved(74), Fate::Moved(91)]);
+        let blocked = Cfg { block_outside: true, lowest: 60, highest: 71, ..c };
+        assert_eq!(fate(&blocked, 48), Fate::Blocked);
     }
 }

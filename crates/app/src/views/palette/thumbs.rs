@@ -1,7 +1,9 @@
-//! Plugin thumbnails for device results: a cached screenshot of the plugin's
-//! editor (`<config>/thumbnails/plugins/<id>.png`) when one exists, looked
-//! up on a background thread; otherwise the row draws a generated card
-//! (vendor colour, category icon, vendor initials).
+//! Plugin thumbnails for device results: the picture of a third-party plugin's
+//! editor the host took the first time the user opened it
+//! (`<config>/thumbnails/plugins/<id>.<stamp>.png`, see [`aitrack_host::thumbs`]),
+//! looked up on a background thread; our own devices draw their glyph
+//! ([`super::glyphs`]); a plugin never opened shows a generated card (vendor
+//! colour, category icon, vendor initials).
 //!
 //! [`Covers`] does the same for sample rows: the sample pack's artwork
 //! ([`aitrack_library::cover`]), resolved once per folder on a background
@@ -15,9 +17,9 @@ pub fn dir() -> PathBuf {
     crate::appearance::config_dir().join("thumbnails").join("plugins")
 }
 
-/// File-name-safe key for a plugin id (stock id or VST3/CLAP uid).
+/// File-name-safe key for a plugin id (stock id or `vst3:`/`clap:` id).
 pub fn key(id: &str) -> String {
-    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
+    aitrack_host::thumbs::key(id)
 }
 
 /// Up to two initials of a vendor or plugin name ("Fab Filter" → "FF").
@@ -35,21 +37,33 @@ pub fn hue_slot(name: &str) -> usize {
     name.bytes().fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % crate::theme::SERIES
 }
 
+/// What a thumbnail lookup is for: a plugin build (found by its version's stamp) or any other id.
+type Job = (String, Option<(aitrack_model::PluginFormat, PathBuf)>);
+
+/// Thumbnails of plugin editors, looked up on a thread of their own and kept
+/// as paths only (the picture is decoded when its row is drawn). A plugin's
+/// picture is the one of its current version: see [`aitrack_host::thumbs`].
 pub struct Thumbs {
     found: HashMap<String, Option<PathBuf>>,
-    tx: Sender<String>,
+    tx: Sender<Job>,
     rx: Receiver<(String, Option<PathBuf>)>,
 }
 
 impl Default for Thumbs {
     fn default() -> Self {
-        let (tx, jobs) = unbounded::<String>();
+        let (tx, jobs) = unbounded::<Job>();
         let (done, rx) = unbounded();
         let run = move || {
             let dir = dir();
-            while let Ok(id) = jobs.recv() {
-                let k = key(&id);
-                let hit = ["png", "jpg"].iter().map(|e| dir.join(format!("{k}.{e}"))).find(|p| p.is_file());
+            while let Ok((id, plugin)) = jobs.recv() {
+                let hit = match plugin {
+                    // The picture the host took the first time the plugin was opened.
+                    Some((format, path)) => aitrack_host::thumbs::stamp(format, &path).and_then(|stamp| aitrack_host::thumbs::find(&dir, &id, &stamp)),
+                    None => {
+                        let k = key(&id);
+                        ["png", "jpg"].iter().map(|e| dir.join(format!("{k}.{e}"))).find(|p| p.is_file())
+                    }
+                };
                 if done.send((id, hit)).is_err() {
                     break;
                 }
@@ -61,14 +75,25 @@ impl Default for Thumbs {
 }
 
 impl Thumbs {
-    /// The cached screenshot of `id`, once looked up.
-    pub fn get(&mut self, id: &str) -> Option<PathBuf> {
+    /// The picture of `id`, once looked up; the first ask queues the lookup and answers `None`.
+    /// For a plugin pass its format and file, so a new version is not shown the old picture.
+    pub fn get(&mut self, id: &str, plugin: Option<(aitrack_model::PluginFormat, &Path)>) -> Option<PathBuf> {
         match self.found.get(id) {
             Some(p) => p.clone(),
             None => {
                 self.found.insert(id.to_owned(), None);
-                let _ = self.tx.send(id.to_owned());
+                let _ = self.tx.send((id.to_owned(), plugin.map(|(f, p)| (f, p.to_path_buf()))));
                 None
+            }
+        }
+    }
+
+    /// Look again for what was not there: a plugin opened since may have a picture now.
+    /// Cheap (one lookup each, on the thread); called when the palette opens.
+    pub fn recheck(&mut self, plugins: impl Iterator<Item = (String, aitrack_model::PluginFormat, PathBuf)>) {
+        for (id, format, path) in plugins {
+            if self.found.get(&id).is_some_and(Option::is_none) {
+                let _ = self.tx.send((id, Some((format, path))));
             }
         }
     }
@@ -143,6 +168,45 @@ mod tests {
         assert_eq!(initials(""), "?");
         assert_eq!(key("com.x/Y z"), "com.x_Y_z");
         assert_eq!(hue_slot("Arturia"), hue_slot("Arturia"));
+    }
+
+    #[test]
+    fn a_plugin_picture_is_found_for_its_version_only_and_a_later_one_shows_after_recheck() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("aitrack-thumbs-lookup-{}-{nanos}", std::process::id()));
+        let plugin = tmp.join("P.clap");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&plugin, b"v1").unwrap();
+        // Points the lookup at a folder of ours.
+        let thumbs_dir = dir();
+        let id = format!("clap:test-{nanos}");
+        let fmt = aitrack_model::PluginFormat::Clap;
+        let mut t = Thumbs::default();
+        let wait = |t: &mut Thumbs| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !t.poll() && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        assert_eq!(t.get(&id, Some((fmt, &plugin))), None, "queued");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        t.poll();
+        // The host takes the picture after the first opening.
+        let stamp = aitrack_host::thumbs::stamp(fmt, &plugin).unwrap();
+        let px: Vec<u8> = (0..64 * 64).flat_map(|i| [(i % 251) as u8, (i % 13 * 19) as u8, 90, 255]).collect();
+        let stored = aitrack_host::thumbs::store(&thumbs_dir, &id, &stamp, &px, 64, 64).unwrap().unwrap();
+        t.recheck(std::iter::once((id.clone(), fmt, plugin.clone())));
+        wait(&mut t);
+        assert_eq!(t.get(&id, Some((fmt, &plugin))), Some(stored.clone()));
+        // The plugin is updated: its old picture is not shown for the new file.
+        std::fs::write(&plugin, b"version two").unwrap();
+        let mut again = Thumbs::default();
+        assert_eq!(again.get(&id, Some((fmt, &plugin))), None);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        again.poll();
+        assert_eq!(again.get(&id, Some((fmt, &plugin))), None);
+        let _ = std::fs::remove_file(stored);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

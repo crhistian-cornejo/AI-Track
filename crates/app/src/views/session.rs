@@ -16,7 +16,6 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 
-const HEADER_H: f32 = 36.;
 const GAP: f32 = SP1;
 const COL_PAD: f32 = SP1;
 
@@ -47,7 +46,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .gap(px(GAP))
         .child(
             div()
-                .h(px(HEADER_H))
+                .h(px(m().session_head_h))
                 .px(px(SP2))
                 .flex()
                 .items_center()
@@ -230,7 +229,7 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
 
     let header = div()
         .id(("session-head", tid.0 as usize))
-        .h(px(HEADER_H))
+        .h(px(m().session_head_h))
         .px(px(SP2))
         .flex()
         .items_center()

@@ -157,6 +157,7 @@ pub struct RealLibrary {
     watcher: Option<LibraryWatcher>,
     /// Kind of every root, by (library, id), to tell where a sound comes from.
     root_kinds: RefCell<HashMap<(usize, i64), RootKind>>,
+    folders_cache: RefCell<Option<(u64, Vec<SoundFolder>)>>,
     /// The free-plugin installer (`None` where there is no standard plugin folder) and the cards last built from it.
     plugins: Option<aitrack_library::plugins::PluginInstaller>,
     plugin_cards: Vec<aitrack_library::plugins::PluginCard>,
@@ -201,6 +202,7 @@ impl RealLibrary {
             splice_folder: None,
             watcher: None,
             root_kinds: RefCell::default(),
+            folders_cache: RefCell::default(),
             plugins: aitrack_library::plugins::UserDirs::standard().map(|dirs| {
                 let data = this_data_dir(&user_for_data);
                 aitrack_library::plugins::PluginInstaller::new(data, dirs)
@@ -256,6 +258,13 @@ impl RealLibrary {
         }
     }
 
+    /// The Splice folder exists but is not a collection of the library yet.
+    fn splice_root_pending(&self) -> bool {
+        let (Some(folder), Some(lib)) = (self.splice_folder.as_deref().filter(|f| f.is_dir()), self.libs[USER].as_ref()) else { return false };
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        !lib.roots().unwrap_or_default().iter().any(|r| r.kind == RootKind::Splice && canon(&r.path) == canon(folder))
+    }
+
     fn query(&self, f: impl Fn(&Library) -> aitrack_library::Result<Vec<Sample>>) -> Vec<LibraryItem> {
         let mut out = Vec::new();
         for (i, lib) in self.libs.iter().enumerate() {
@@ -301,6 +310,8 @@ impl RealLibrary {
 /// search thread (`sound_searcher`), which has connections of its own.
 struct SoundView<'a> {
     libs: &'a [Option<Library>; 2],
+    /// The folders offered as filters, with the sounds counted when they were made.
+    folders: &'a RefCell<Option<(u64, Vec<SoundFolder>)>>,
     root_kinds: &'a RefCell<HashMap<(usize, i64), RootKind>>,
     splice_folder: Option<&'a Path>,
     /// A scan is running.
@@ -347,6 +358,41 @@ impl SoundView<'_> {
         }
     }
 
+    /// The folders worth filtering by, across both libraries. Reading them is a
+    /// pass over every path, so they are kept until the number of sounds changes.
+    fn folder_list(&self) -> Vec<SoundFolder> {
+        let stamp: u64 = self.libs.iter().flatten().filter_map(|l| l.count().ok()).sum();
+        if let Some((s, list)) = &*self.folders.borrow()
+            && *s == stamp
+        {
+            return list.clone();
+        }
+        let mut out = Vec::new();
+        for (i, lib) in self.libs.iter().enumerate() {
+            let Some(lib) = lib else { continue };
+            for root in lib.roots().unwrap_or_default() {
+                let all = lib.folders(root.id).unwrap_or_default();
+                if all.is_empty() {
+                    // A flat folder is a filter by itself.
+                    let n = lib.count_where(&aitrack_library::Filters { root: Some(root.id), ..Default::default() }).unwrap_or(0);
+                    if n > 0 {
+                        let label = root.path.file_name().map_or_else(|| "Folder".to_owned(), |n| n.to_string_lossy().into_owned());
+                        out.push(SoundFolder { library: i, root: root.id.0, under: None, label, count: n });
+                    }
+                    continue;
+                }
+                for (path, n) in aitrack_library::browse_folders(&all, 16) {
+                    let label = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                    out.push(SoundFolder { library: i, root: root.id.0, under: Some(path), label, count: n });
+                }
+            }
+        }
+        out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+        out.truncate(24);
+        *self.folders.borrow_mut() = Some((stamp, out.clone()));
+        out
+    }
+
     fn bpm_trust(&self, id: u64) -> BpmTrust {
         let source = self.lib(id).and_then(|(lib, sample)| {
             lib.connection().query_row("SELECT bpm_source FROM samples WHERE id = ?1", [sample.0], |r| r.get::<_, Option<String>>(0)).ok().flatten()
@@ -388,9 +434,21 @@ impl SoundView<'_> {
         sq.filters.key = q.key.map(|(scale, exact)| KeyFilter { scale, mode: if exact { KeyMatch::Exact } else { KeyMatch::Compatible }, include_atonal: true });
         sq.filters.genre = q.tag.clone();
         sq.filters.favorites_only = q.favorites;
+        // The tempo is asked of the database too, a little wider than the exact test below, so a
+        // big library is cut down before the 1500-row cap and not after it.
+        sq.filters.loop_tempo = q.bpm.map(|(bpm, tol)| aitrack_library::BpmFilter { bpm, tolerance_pct: tol * 1.2 + 0.5, half_double: true });
+        let words = aitrack_library::text::words(&q.text);
         let mut hits: Vec<(f32, SoundHit)> = Vec::new();
         for (i, lib) in self.libs.iter().enumerate() {
             let Some(lib) = lib else { continue };
+            let mut sq = sq.clone();
+            if let Some(f) = &q.folder {
+                if f.library != i {
+                    continue;
+                }
+                sq.filters.root = Some(aitrack_library::RootId(f.root));
+                sq.filters.under = f.under.clone();
+            }
             let Ok(mut samples) = lib.search(&sq) else { continue };
             self.fill_keys(&mut samples);
             for smp in &samples {
@@ -422,11 +480,15 @@ impl SoundView<'_> {
                     bpm_trust: BpmTrust::from_source(None),
                     unanalysed: (tonal && smp.key_root.is_none()) || (smp.is_loop() && smp.bpm.is_none()),
                 };
-                hits.push((key_score * 0.6 + tempo * 0.4, hit));
+                // What was typed leads (a name that starts with it, then one that has it as a word,
+                // then one that only contains it), the song's fit orders the rest; both libraries
+                // are ranked together, not one after the other.
+                let fit = if q.key.is_some() || q.bpm.is_some() { key_score * 0.6 + tempo * 0.4 } else { 0. };
+                let text = if words.is_empty() { 0. } else { aitrack_library::relevance(&words, smp) };
+                hits.push((text + fit, hit));
             }
         }
-        // Closest fit first when the song asks for one; otherwise the library's own order.
-        if q.key.is_some() || q.bpm.is_some() {
+        if !words.is_empty() || q.key.is_some() || q.bpm.is_some() {
             hits.sort_by(|a, b| b.0.total_cmp(&a.0));
         }
         let limit = if q.limit == 0 { 400 } else { q.limit };
@@ -448,13 +510,13 @@ impl SoundView<'_> {
             }
             h
         }).collect();
-        SoundPage { hits, more, tags, splice: self.splice_state() }
+        SoundPage { hits, more, tags, folders: self.folder_list(), splice: self.splice_state() }
     }
 }
 
 impl RealLibrary {
     fn view(&self) -> SoundView<'_> {
-        SoundView { libs: &self.libs, root_kinds: &self.root_kinds, splice_folder: self.splice_folder.as_deref(), scanning: self.status.running }
+        SoundView { libs: &self.libs, folders: &self.folders_cache, root_kinds: &self.root_kinds, splice_folder: self.splice_folder.as_deref(), scanning: self.status.running }
     }
 }
 
@@ -487,6 +549,7 @@ impl LibraryBridge for RealLibrary {
     fn sound_searcher(&self) -> Option<SoundSearchFn> {
         let (factory, user) = (self.factory_path.clone(), self.user_path.clone());
         let mut libs: Option<[Option<Library>; 2]> = None;
+        let folders = RefCell::default();
         Some(Box::new(move |q, env| {
             // Opened on first use, on the search thread: connections are not shared with the UI's.
             let libs = libs.get_or_insert_with(|| [factory.as_deref().and_then(|p| Library::open(p).ok()), None]);
@@ -494,7 +557,7 @@ impl LibraryBridge for RealLibrary {
                 libs[USER] = Library::open(&user).ok();
             }
             let kinds = RefCell::default();
-            SoundView { libs, root_kinds: &kinds, splice_folder: env.splice_folder.as_deref(), scanning: env.scanning }.search(q)
+            SoundView { libs, folders: &folders, root_kinds: &kinds, splice_folder: env.splice_folder.as_deref(), scanning: env.scanning }.search(q)
         }))
     }
 
@@ -533,7 +596,9 @@ impl LibraryBridge for RealLibrary {
     }
 
     fn set_splice_folder(&mut self, folder: Option<PathBuf>) {
-        if folder == self.splice_folder {
+        // The same folder is looked at again when it was not there before and is now (Splice
+        // was installed while the app ran) and has not been made a collection yet.
+        if folder == self.splice_folder && !self.splice_root_pending() {
             return;
         }
         self.splice_folder = folder;
@@ -823,6 +888,40 @@ mod tests {
             lib.poll();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_splice_folder_that_appears_later_is_picked_up_and_folders_filter_the_results() {
+        let dir = std::env::temp_dir().join(format!("aitrack-test-splice-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lib = RealLibrary::open(None, dir.join("user.db"));
+        let splice = dir.join("Splice");
+        let query = SoundQuery { text: "pad".into(), ..Default::default() };
+        // Splice is not installed yet.
+        lib.set_splice_folder(Some(splice.clone()));
+        assert_eq!(lib.search_sounds(&query).splice, SpliceState::Missing(splice.clone()));
+        // It is installed and a sound licensed while the app runs; the same folder is looked at again.
+        let (a, b) = (splice.join("packs").join("Deep House"), splice.join("packs").join("Trap"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        write_wav(&a.join("Dark Pad Eléctrico.wav"), 0.3);
+        write_wav(&b.join("Pad Soft.wav"), 0.3);
+        lib.set_splice_folder(Some(splice.clone()));
+        wait(&mut lib, "the new folder to be indexed", |l| !l.scan_status().running && l.search_sounds(&query).hits.len() == 2);
+        let page = lib.search_sounds(&query);
+        // Ranked by what was typed: the name that starts with it before the one that contains it.
+        assert_eq!(page.hits[0].item.name, "Pad Soft");
+        // Parts of words and accents.
+        assert_eq!(lib.search_sounds(&SoundQuery { text: "ELECTRICO".into(), ..Default::default() }).hits.len(), 1);
+        // The folders offered skip `packs/`, which splits nothing, and filter.
+        let labels: Vec<&str> = page.folders.iter().map(|f| f.label.as_str()).collect();
+        assert!(labels.contains(&"Deep House") && labels.contains(&"Trap") && !labels.contains(&"packs"), "{labels:?}");
+        let deep = page.folders.iter().find(|f| f.label == "Deep House").unwrap().clone();
+        let inside = lib.search_sounds(&SoundQuery { folder: Some(deep), ..Default::default() });
+        assert_eq!(inside.hits.iter().map(|h| h.item.name.as_str()).collect::<Vec<_>>(), vec!["Dark Pad Eléctrico"]);
+        drop(lib);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

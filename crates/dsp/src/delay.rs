@@ -123,6 +123,93 @@ impl AllpassReader {
     }
 }
 
+/// Taps of the windowed-sinc reader.
+pub const SINC_TAPS: usize = 8;
+const SINC_PHASES: usize = 256;
+const SINC_BETA: f64 = 7.0;
+/// Default kernel cutoff (fraction of Nyquist).
+const SINC_CUTOFF: f64 = 0.96;
+
+/// Windowed-sinc fractional reader: 8 taps of a Kaiser-windowed sinc, with
+/// the kernel for each fraction tabulated (256 phases, interpolated between
+/// neighbours). Its images stay far below what linear or Hermite reads
+/// leave when the delay time moves, so sweeping a time is clean up to the
+/// top of the band; the price is eight multiply-adds per read. The kernel
+/// is built once (allocates); `read` is real-time safe.
+#[derive(Clone, Debug)]
+pub struct SincKernel {
+    table: Vec<[f32; SINC_TAPS]>,
+}
+
+impl Default for SincKernel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term, q) = (1.0, 1.0, x * x / 4.0);
+    for k in 1..40 {
+        term *= q / (k * k) as f64;
+        sum += term;
+    }
+    sum
+}
+
+impl SincKernel {
+    /// Cutoff 0.96 of Nyquist: the cleanest images when the time moves.
+    pub fn new() -> Self {
+        Self::with_cutoff(SINC_CUTOFF)
+    }
+
+    /// Kernel with its cutoff at `cutoff` × Nyquist (0.8 – 1.0). At 1.0 a
+    /// whole-sample delay is read back untouched, which is what a feedback
+    /// loop that must not lose any top end (a frozen tank) needs.
+    pub fn with_cutoff(cutoff: f64) -> Self {
+        let cutoff = cutoff.clamp(0.8, 1.0);
+        let half = (SINC_TAPS / 2) as f64;
+        let i0 = bessel_i0(SINC_BETA);
+        let table = (0..=SINC_PHASES + 1)
+            .map(|ph| {
+                let t = ph as f64 / SINC_PHASES as f64;
+                let mut h = [0.0f64; SINC_TAPS];
+                for (j, v) in h.iter_mut().enumerate() {
+                    // Distance of this tap's sample from the wanted point.
+                    let u = j as f64 - (half - 1.0) - t;
+                    let x = std::f64::consts::PI * cutoff * u;
+                    let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
+                    let r = u / half;
+                    let win = if r.abs() < 1.0 { bessel_i0(SINC_BETA * (1.0 - r * r).sqrt()) / i0 } else { 0.0 };
+                    *v = cutoff * sinc * win;
+                }
+                let sum: f64 = h.iter().sum();
+                h.map(|v| (v / sum) as f32)
+            })
+            .collect();
+        Self { table }
+    }
+
+    /// Smallest delay `read` accepts without clamping.
+    pub const MIN_DELAY: f32 = (SINC_TAPS / 2 - 1) as f32;
+
+    /// Interpolated value `delay` samples back, `delay >= MIN_DELAY` (3).
+    #[inline]
+    pub fn read(&self, line: &DelayLine, delay: f32) -> f32 {
+        let d = delay.clamp(Self::MIN_DELAY, line.max_delay() as f32 - 1.0);
+        let i = d as usize;
+        let pos = (d - i as f32) * SINC_PHASES as f32;
+        let p = pos as usize;
+        let f = pos - p as f32;
+        let (a, b) = (&self.table[p], &self.table[p + 1]);
+        let base = i - (SINC_TAPS / 2 - 1);
+        let mut acc = 0.0;
+        for j in 0..SINC_TAPS {
+            acc += (a[j] + (b[j] - a[j]) * f) * line.read(base + j);
+        }
+        acc
+    }
+}
+
 /// Schroeder all-pass diffuser `y = -g x + d`, `d ← x + g y` with an
 /// integer delay.
 #[derive(Clone, Debug)]
@@ -214,5 +301,42 @@ mod tests {
             e_out += y * y;
         }
         assert!((e_out - 1.0f32).abs() < 1e-3, "{e_out}");
+    }
+
+    #[test]
+    fn sinc_reads_exact_integers_and_is_flat() {
+        let k = SincKernel::new();
+        let mut d = DelayLine::new(64);
+        for i in 0..40 {
+            d.push((i as f32 * 0.37).sin());
+        }
+        for m in [3usize, 4, 10] {
+            assert!((k.read(&d, m as f32) - d.read(m)).abs() < 2e-3, "integer delay {m}");
+        }
+        // With the cutoff at Nyquist a whole-sample read is exact.
+        let exact = SincKernel::with_cutoff(1.0);
+        assert!((exact.read(&d, 7.0) - d.read(7)).abs() < 1e-6);
+        // A ramp (a very low tone) is interpolated to within a few thousandths.
+        let mut d = DelayLine::new(64);
+        for i in 0..40 {
+            d.push(i as f32);
+        }
+        let ramp = k.read(&d, 10.5);
+        assert!((ramp - 28.5).abs() < 0.002, "ramp {ramp}");
+        // Tone gain at a half-sample fraction: within 0.1 dB to 12 kHz.
+        let sr = 48_000.0f64;
+        for f in [1_000.0, 6_000.0, 12_000.0] {
+            let mut d = DelayLine::new(64);
+            let (mut hi, mut n) = (0.0f64, 0);
+            for i in 0..2000 {
+                d.push((std::f64::consts::TAU * f * i as f64 / sr).sin() as f32);
+                if i > 100 {
+                    hi += (k.read(&d, 20.5) as f64).powi(2);
+                    n += 1;
+                }
+            }
+            let db = 10.0 * (2.0 * hi / n as f64).log10();
+            assert!(db.abs() < 0.1, "{f} Hz: {db} dB");
+        }
     }
 }

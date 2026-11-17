@@ -14,6 +14,7 @@
 
 use crate::format::LoadError;
 use crate::ids::*;
+use crate::groove::PoolGroove;
 use crate::scale::Scale;
 use crate::time::{Tick, TempoMap, PPQ};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,19 @@ pub struct Project {
     pub sources: BTreeMap<SourceId, Source>,
     pub loop_region: Option<(Tick, Tick)>,
     pub ids: IdAllocator,
+    /// The grooves the project uses (Live's Groove Pool), with their settings.
+    #[serde(default)]
+    pub grooves: Vec<PoolGroove>,
+    /// Global groove amount, 0..=[`MAX_GROOVE_AMOUNT`]: scales the timing,
+    /// random and velocity of every groove. 1 = as set.
+    #[serde(default = "one")]
+    pub groove_amount: f32,
+    /// The groove each notes clip is played with (see [`Project::clip_groove`]).
+    /// Kept beside the clips, not in them: a clip without an entry plays its
+    /// notes as they are, and an entry for a clip that no longer exists is
+    /// ignored (so undoing a clip's deletion brings its groove back).
+    #[serde(default)]
+    pub clip_grooves: BTreeMap<ClipId, GrooveId>,
 }
 
 impl Default for Project {
@@ -79,6 +93,9 @@ impl Project {
             sources: BTreeMap::new(),
             loop_region: Some((0, 16 * PPQ)),
             ids: IdAllocator::default(),
+            grooves: Vec::new(),
+            groove_amount: 1.0,
+            clip_grooves: BTreeMap::new(),
         };
         let main = Track::new(TrackId(p.ids.next_raw()), TrackKind::Main, "Main", Color(0xE0E0E0));
         p.tracks.push(main);
@@ -96,6 +113,20 @@ impl Project {
     pub fn alloc_device_id(&mut self) -> DeviceId { DeviceId(self.ids.next_raw()) }
     pub fn alloc_scene_id(&mut self) -> SceneId { SceneId(self.ids.next_raw()) }
     pub fn alloc_placement_id(&mut self) -> PlacementId { PlacementId(self.ids.next_raw()) }
+
+    pub fn groove(&self, id: GrooveId) -> Option<&PoolGroove> {
+        self.grooves.iter().find(|g| g.id == id)
+    }
+
+    /// The pool groove clip `clip` is played with, if it has one that is
+    /// still in the pool.
+    pub fn clip_groove(&self, clip: ClipId) -> Option<&PoolGroove> {
+        self.clip_grooves.get(&clip).and_then(|g| self.groove(*g))
+    }
+
+    pub fn alloc_groove_id(&mut self) -> GrooveId {
+        GrooveId(self.ids.next_raw())
+    }
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
         self.tracks.iter().find(|t| t.id == id)

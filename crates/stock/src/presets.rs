@@ -182,14 +182,20 @@ impl PresetBuilder {
     /// Write to `<root>/<plugin>/<Category>/<Name>.json`.
     pub fn write(self, root: &Path) -> std::io::Result<PathBuf> {
         let (category, preset) = self.build();
-        let bad = |s: &str| s.is_empty() || s.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']);
-        if bad(&category) || bad(&preset.name) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid preset name {category}/{}", preset.name)));
-        }
-        let dir = root.join(&preset.plugin).join(&category);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.json", preset.name));
-        std::fs::write(&path, preset.to_json() + "\n")?;
-        Ok(path)
+        write_preset(root, &category, &preset)
     }
+}
+
+/// Write `preset` to `<root>/<plugin>/<Category>/<Name>.json` (for
+/// generators that adjust a built preset before it is saved).
+pub fn write_preset(root: &Path, category: &str, preset: &Preset) -> std::io::Result<PathBuf> {
+    let bad = |s: &str| s.is_empty() || s.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']);
+    if bad(category) || bad(&preset.name) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid preset name {category}/{}", preset.name)));
+    }
+    let dir = root.join(&preset.plugin).join(category);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", preset.name));
+    std::fs::write(&path, preset.to_json() + "\n")?;
+    Ok(path)
 }

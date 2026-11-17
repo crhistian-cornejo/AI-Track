@@ -7,12 +7,13 @@
 //! two range dots (Min and Max). The device has no meter, so there are no
 //! live points: notes coming in are not reported.
 
-use super::kit::{self, Handle, PlotCfg, ax};
+use super::kit::{self, Handle, PlotCfg, Rect, ax};
+use super::midi_kit as mk;
 use super::Dev;
 use crate::theme::*;
 use crate::workspace::Workspace;
 use aitrack_stock::midi::velocity::{Shape, p};
-use gpui::{AnyElement, Context, InteractiveElement, ParentElement, Styled, TextAlign, div, px};
+use gpui::{AnyElement, Context, InteractiveElement, ParentElement, Styled, TextAlign, canvas, div, px};
 
 /// The plot fraction of a velocity 1..127 across (and, flipped, up).
 fn frac(v: f32) -> f32 {
@@ -55,12 +56,21 @@ pub fn out_of(shape: &Shape, input: f32) -> f32 {
     shape.apply(input / 127., 0.)
 }
 
+/// The velocities of the example notes a window plays through the device.
+pub const EXAMPLES: [f32; 8] = [16., 32., 48., 64., 80., 96., 112., 127.];
+
+/// What each example note comes out as: `(in, out)`.
+pub fn example_notes(shape: &Shape) -> Vec<(f32, f32)> {
+    EXAMPLES.iter().map(|v| (*v, out_of(shape, *v))).collect()
+}
+
 /// How far (velocity steps) the random draw can move an output either way.
 pub fn spread(shape: &Shape) -> f32 {
     shape.random * 0.5 * 127.
 }
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+    let win = mk::windowed(dev);
     let shape = shape_of(dev);
     let enabled = dev.enabled;
     let fixed = shape.mode == 2;
@@ -114,9 +124,16 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let c = if i == 0 { pal.accent2 } else { colour };
             kit::dot(window, r.pt(*fx, *fy), if i == 0 { 6.5 } else { 5.5 }, c, Some(pal.text));
         }
-        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, "played →", r.right() - 6., r.bottom() - 16., TEXT_XS, pal.faint, TextAlign::Right);
-        kit::txt(window, cx, "out ↑", r.x + 6., r.y + 18., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "played →", r.right() - 6., r.bottom() - 16., TEXT_SM, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, "out ↑", r.x + 6., r.y + 18., TEXT_SM, pal.faint, TextAlign::Left);
+        if win {
+            // The scale of both axes, where the grid lines cross.
+            for v in [32., 64., 96.] {
+                kit::txt(window, cx, &format!("{v:.0}"), r.px(gx(v)), r.bottom() - 16., TEXT_SM, pal.faint, TextAlign::Center);
+                kit::txt(window, cx, &format!("{v:.0}"), r.x + 6., r.py(gy(v)) - 12., TEXT_SM, pal.faint, TextAlign::Left);
+            }
+        }
     });
 
     let mut controls = vec![p::CURVE, p::COMPAND, p::PIVOT, p::GAIN, p::MIN, p::MAX, p::RANDOM];
@@ -127,6 +144,47 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         controls.push(p::SEED);
     }
     let frame = div().id(("velocity-plot", dev.key(0))).size_full().rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot);
+    // In a window the curve has company: eight notes of rising velocity in, and what each comes out as.
+    let frame = if win {
+        let notes = example_notes(&shape);
+        let (spread_by, random) = (spread(&shape), shape.random > 0. && !fixed);
+        let examples = canvas(
+            |_, _, _| {},
+            move |b, _, window, cx| {
+                let pal = p();
+                let colour = if enabled { pal.accent } else { pal.muted };
+                let r = Rect::of(b);
+                kit::txt(window, cx, "eight example notes", r.x + 8., r.y + 6., TEXT_SM, pal.faint, TextAlign::Left);
+                kit::txt(window, cx, "faint: played · bright: out", r.x + 8., r.y + 18., TEXT_SM, pal.faint, TextAlign::Left);
+                let (top, bottom) = (r.y + 40., r.bottom() - 18.);
+                let area = (bottom - top).max(8.);
+                let cw = (r.w - 16.) / notes.len() as f32;
+                kit::hline(window, r, bottom, pal.grid_bar);
+                for q in [0.25, 0.5, 0.75] {
+                    kit::hline(window, r, bottom - area * q, pal.grid_beat);
+                }
+                for (i, (vin, vout)) in notes.iter().enumerate() {
+                    let x = r.x + 8. + cw * i as f32;
+                    let bw = (cw * 0.4 - 1.).max(2.);
+                    let (hi, ho) = (area * frac(*vin).max(0.01), area * frac(*vout).max(0.01));
+                    kit::bar(window, x, bottom - hi, bw, hi, 1.5, with_alpha(pal.text, 0.22));
+                    kit::bar(window, x + bw + 2., bottom - ho, bw, ho, 1.5, with_alpha(colour, 0.9));
+                    if random {
+                        let (lo_v, hi_v) = ((vout - spread_by).max(shape.min), (vout + spread_by).min(shape.max));
+                        let (yl, yh) = (bottom - area * frac(lo_v), bottom - area * frac(hi_v));
+                        kit::bar(window, x + bw + 2. + bw / 2. - 0.5, yh, 1., yl - yh, 0., with_alpha(pal.text, 0.6));
+                    }
+                    kit::txt(window, cx, &format!("{vout:.0}"), x + bw + 2. + bw / 2., (bottom - ho - 13.).max(top - 12.), TEXT_SM, pal.text, TextAlign::Center);
+                    kit::txt(window, cx, &format!("{vin:.0}"), x + bw + 1., bottom + 3., TEXT_SM, pal.faint, TextAlign::Center);
+                }
+            },
+        )
+        .size_full();
+        let panel = div().flex_none().w(px(236.)).h_full().rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(examples);
+        div().id(("velocity-win", dev.key(0))).size_full().flex().gap(px(SP2)).child(frame.flex_1().min_w(px(0.))).child(panel)
+    } else {
+        frame
+    };
     let controls = div().flex_none().flex().flex_wrap().items_center().gap(px(SP1)).child(kit::pick(dev, p::MODE, cx)).child(kit::strip(ws, dev, &controls, &[], cx));
     super::midi_kit::body_with(dev, "velocity-body", 520., 100., 192., frame, vec![controls])
 }
@@ -164,6 +222,17 @@ mod tests {
         // Swapped Min and Max still make a range.
         let swapped = shape_of(&dev("midi.velocity", &[(p::MIN, 100.), (p::MAX, 20.)]));
         assert_eq!((swapped.min, swapped.max), (20., 100.));
+    }
+
+    #[test]
+    fn the_example_notes_rise_and_come_out_as_the_curve_says() {
+        let straight = example_notes(&shape_of(&dev("midi.velocity", &[])));
+        assert_eq!(straight.len(), 8);
+        assert!(straight.iter().all(|(i, o)| (i - o).abs() < 1e-3), "straight through");
+        let soft = example_notes(&shape_of(&dev("midi.velocity", &[(p::CURVE, 60.)])));
+        assert!(soft[1].1 > soft[1].0 && soft.windows(2).all(|w| w[1].1 >= w[0].1), "a lifted curve stays rising");
+        let fixed = example_notes(&shape_of(&dev("midi.velocity", &[(p::MODE, 2.), (p::FIXED, 90.)])));
+        assert!(fixed.iter().all(|(_, o)| *o == 90.));
     }
 
     #[test]

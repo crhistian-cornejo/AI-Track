@@ -22,6 +22,8 @@ vst3 = "0.3"
 clack-host = "0.2"
 clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "tail", "log", "timer"] }
 libloading = "0.8"
+# Plugin editor thumbnails (PNG only; already in the build for the app).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -42,7 +44,7 @@ windows = { version = "0.62", features = [
 libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSThread"] }
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSGraphics", "NSScreen", "NSBitmapImageRep", "NSImageRep"] }
 core-foundation = "0.10"
 
 [dev-dependencies]
@@ -52,4 +54,8 @@ workspace = true
 
 [[test]]
 name = "real_plugins"
+harness = false
+
+[[test]]
+name = "editor_thumbs"
 harness = false

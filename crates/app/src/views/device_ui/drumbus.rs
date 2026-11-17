@@ -4,6 +4,7 @@
 //! laid over it, and flashes on every hit the Boom locks to. The bar on its
 //! right edge is the Boom amount: drag it.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::{Dev, set_now};
 use crate::theme::*;
@@ -179,7 +180,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::fill_to(window, &add, r.bottom(), with_alpha(colour, 0.22));
             kit::line(window, &add, 2., colour);
         } else {
-            kit::txt(window, cx, "play the bus to see the boom", r.px(0.5), r.py(0.5), TEXT_XS, pal.faint, TextAlign::Center);
+            kit::txt(window, cx, "play the bus to see the boom", r.px(0.5), r.py(0.5), TEXT_SM, pal.faint, TextAlign::Center);
         }
         if flash > 0. {
             kit::bar(window, r.px(0.88), r.y, r.w * 0.12, r.h, 0., with_alpha(pal.accent, 0.22 * flash));
@@ -191,7 +192,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let now = r.py(gauge_frac(amount));
         kit::bar(window, r.px(0.97) - 2., now, 4., bottom - now, 2., with_alpha(pal.accent, 0.7));
         kit::dot(window, r.pt(0.97, gauge_frac(amount)), 5.5, pal.accent, Some(pal.text));
-        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
         paint_ruler(r, freq, colour, window, cx);
     });
 
@@ -219,7 +220,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let pal = p();
         kit::bar(window, r.x + 4., r.py(0.62), r.w - 8., 6., 3., content(0.08));
         kit::bar(window, r.x + 4., r.py(0.62), (r.w - 8.) * crunch, 6., 3., with_alpha(pal.accent, 0.8));
-        kit::txt(window, cx, &format!("{:.0}%", crunch * 100.), r.x + 4., r.y + 3., TEXT_XS, pal.muted, TextAlign::Left);
+        kit::txt(window, cx, &format!("{:.0}%", crunch * 100.), r.x + 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Left);
     });
     // Compress: the reduction now, from the right, and the threshold it works at.
     let gr_now = if live { dev.m(GR) } else { 0. };
@@ -229,8 +230,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         kit::bar(window, r.x + 4., r.py(0.62), r.w - 8., 6., 3., content(0.08));
         let w = (r.w - 8.) * (-gr_now / COMP_GR_SPAN).clamp(0., 1.);
         kit::bar(window, r.right() - 4. - w, r.py(0.62), w, 6., 3., pal.record);
-        kit::txt(window, cx, &format!("{gr_now:.1} dB"), r.x + 4., r.y + 3., TEXT_XS, if gr_now < -0.05 { pal.text } else { pal.faint }, TextAlign::Left);
-        kit::txt(window, cx, &format!("thr {thr:.0}"), r.right() - 4., r.y + 3., TEXT_XS, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, &format!("{gr_now:.1} dB"), r.x + 4., r.y + 3., TEXT_SM, if gr_now < -0.05 { pal.text } else { pal.faint }, TextAlign::Left);
+        // The threshold only when there is room beside the reduction.
+        if r.w > 150. {
+            kit::txt(window, cx, &format!("thr {thr:.0}"), r.right() - 4., r.y + 3., TEXT_SM, pal.faint, TextAlign::Right);
+        }
     });
     // Transients: the gain applied now, around the middle.
     let trans_now = if live { dev.m(TRANS_DB) } else { 0. };
@@ -241,7 +245,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let w = (trans_now / TRANS_SPAN).clamp(-1., 1.) * (r.w - 8.) / 2.;
         kit::bar(window, mid.min(mid + w), r.py(0.62), w.abs(), 6., 3., if trans_now >= 0. { pal.play } else { pal.record });
         kit::bar(window, mid, r.py(0.62) - 2., 1., 10., 0., pal.grid_bar);
-        kit::txt(window, cx, &format!("{trans_now:+.1} dB"), mid, r.y + 3., TEXT_XS, if trans_now.abs() > 0.05 { pal.text } else { pal.faint }, TextAlign::Center);
+        kit::txt(window, cx, &format!("{trans_now:+.1} dB"), mid, r.y + 3., TEXT_SM, if trans_now.abs() > 0.05 { pal.text } else { pal.faint }, TextAlign::Center);
     });
     // Boom: its note, and the envelope its Decay makes over 800 ms.
     let decay = dev.plain(p::BOOM_DECAY);
@@ -250,7 +254,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let pts = kit::sample_curve(r, 48, |fx| 1. - 0.9 * (-(fx * 800.) / decay).exp());
         kit::fill_to(window, &pts, r.bottom(), accent_alpha(0.12));
         kit::line(window, &pts, 1.5, pal.accent);
-        kit::txt(window, cx, &format!("{} · {}", note_name(nearest_note(freq)), widgets_hz(freq)), r.right() - 4., r.y + 3., TEXT_XS, pal.muted, TextAlign::Right);
+        kit::txt(window, cx, &format!("{} · {}", note_name(nearest_note(freq)), widgets_hz(freq)), r.right() - 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Right);
     });
     // Damp: the low-pass's response, 20 Hz to 20 kHz.
     let damp_hz = dev.plain(p::DAMP);
@@ -278,7 +282,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             .bg(if on_note { accent_alpha(0.2) } else { content(0.06) })
             .hover(|s| s.bg(content(0.12)))
             .tooltip(widgets::tip("Force To Note: tune the Boom to the nearest note", None))
-            .child(label("To note", TEXT_XS, if on_note { p().accent } else { p().text }).font_weight(FontWeight::MEDIUM))
+            .child(label("To note", TEXT_SM, if on_note { p().accent } else { p().text }).font_weight(FontWeight::MEDIUM))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
                 set_now(this, device, p::BOOM_FREQ, target);
@@ -287,44 +291,35 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             .into_any_element()
     };
 
-    let out = vec![kit::num(ws, dev, p::TRIM, cx), kit::num(ws, dev, p::MIX, cx), kit::num(ws, dev, p::OUTPUT, cx)];
-    let drive = vec![kit::num(ws, dev, p::DRIVE, cx), kit::pick(dev, p::DRIVE_TYPE, cx)];
-    let crunch_ctl = vec![kit::num(ws, dev, p::CRUNCH, cx)];
-    let comp_ctl = vec![kit::num(ws, dev, p::COMPRESS, cx)];
-    let trans_ctl = vec![kit::num(ws, dev, p::TRANSIENTS, cx)];
-    let boom_controls = vec![kit::num(ws, dev, p::BOOM_AMOUNT, cx), kit::num(ws, dev, p::BOOM_FREQ, cx), kit::num(ws, dev, p::BOOM_DECAY, cx)];
-    let damp_ctl = vec![kit::num(ws, dev, p::DAMP, cx)];
+    let out = vec![ctl(ws, dev, p::TRIM, cx), ctl(ws, dev, p::MIX, cx), ctl(ws, dev, p::OUTPUT, cx)];
+    let drive = vec![ctl(ws, dev, p::DRIVE, cx), kit::pick(dev, p::DRIVE_TYPE, cx)];
+    let crunch_ctl = vec![ctl(ws, dev, p::CRUNCH, cx)];
+    let comp_ctl = vec![ctl(ws, dev, p::COMPRESS, cx)];
+    let trans_ctl = vec![ctl(ws, dev, p::TRANSIENTS, cx)];
+    let boom_controls = vec![ctl(ws, dev, p::BOOM_AMOUNT, cx), ctl(ws, dev, p::BOOM_FREQ, cx), ctl(ws, dev, p::BOOM_DECAY, cx)];
+    let damp_ctl = vec![ctl(ws, dev, p::DAMP, cx)];
 
-    let stages = div()
-        .flex_none()
-        .flex()
-        .flex_wrap()
-        .gap(px(SP1))
+    let stages = (if win::in_window(dev) { kit::flow() } else { div().flex_none().flex().flex_wrap().gap(px(SP1)) })
         .child(stage(dev, "DRIVE", Some(p::DRIVE_ON), None, minis.then_some(drive_mini), drive, cx))
         .child(stage(dev, "CRUNCH", Some(p::CRUNCH_ON), None, minis.then_some(crunch_mini), crunch_ctl, cx))
         .child(stage(dev, "COMP", Some(p::COMP_ON), None, minis.then_some(comp_mini), comp_ctl, cx))
         .child(stage(dev, "TRANS", Some(p::TRANS_ON), None, minis.then_some(trans_mini), trans_ctl, cx))
         .child(stage(dev, "BOOM", Some(p::BOOM_ON), Some(snap), minis.then_some(boom_mini), boom_controls, cx))
         .child(stage(dev, "DAMP", Some(p::DAMP_ON), None, minis.then_some(damp_mini), damp_ctl, cx))
-        .child(
-            div()
-                .flex_none()
-                .p(px(SP2))
-                .gap(px(SP1))
-                .flex()
-                .flex_col()
-                .rounded(px(r_md()))
-                .bg(content(0.03))
-                .border_1()
-                .border_color(border())
-                .child(label("OUTPUT", TEXT_XS, p().faint).font_weight(FontWeight::SEMIBOLD))
-                .child(div().flex().items_center().gap(px(SP1)).children(out)),
-        );
+        .child(stage(dev, "OUTPUT", None, None, None, out, cx));
 
-    kit::panel(1060.)
-        .child(div().flex_1().min_h(px(0.)).rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot))
+    // The card is as wide as its stages need; the window takes whatever it has
+    // and the stages wrap (the Boom view above keeps at least 160 px).
+    let windowed = win::in_window(dev);
+    kit::panel(if windowed { 720. } else { 1060. })
+        .child((if windowed { kit::display(160.) } else { div().flex_1().min_h(px(0.)) }).rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot))
         .child(stages)
         .into_any_element()
+}
+
+/// A stage's control: a knob in a device window, a compact number in the card.
+fn ctl(ws: &mut Workspace, dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
+    if win::in_window(dev) { win::knob(dev, id, cx) } else { kit::num(ws, dev, id, cx) }
 }
 
 /// "55 Hz".
@@ -356,7 +351,7 @@ fn stage(dev: &Dev, title: &str, switch: Option<u32>, extra: Option<AnyElement>,
         .flex()
         .items_center()
         .gap(px(SP1))
-        .child(label(title.to_owned(), TEXT_XS, if on { pal.text } else { pal.faint }).font_weight(FontWeight::SEMIBOLD))
+        .child(label(title.to_owned(), TEXT_SM, if on { pal.text } else { pal.faint }).font_weight(FontWeight::SEMIBOLD))
         .child(div().flex_1().min_w(px(SP1)))
         .children(extra)
         .when_some(switch, |d, id| {
@@ -369,19 +364,13 @@ fn stage(dev: &Dev, title: &str, switch: Option<u32>, extra: Option<AnyElement>,
                     })),
             )
         });
-    div()
-        .flex_none()
-        .p(px(SP2))
-        .gap(px(SP1))
-        .flex()
-        .flex_col()
-        .rounded(px(r_md()))
-        .bg(content(0.03))
-        .border_1()
-        .border_color(if on { border_strong() } else { border() })
+    // In a window the stages share each line's width (see `kit::flow`).
+    let card = div().p(px(SP2)).gap(px(SP1)).flex().flex_col().rounded(px(r_md())).bg(content(0.03)).border_1().border_color(if on { border_strong() } else { border() });
+    let card = if win::in_window(dev) { kit::grow(card) } else { card.flex_none() };
+    card
         .child(header)
         .children(display)
-        .child(div().flex().items_center().gap(px(SP1)).when(!on, |d| d.opacity(0.45)).children(body))
+        .child(div().flex().items_center().justify_around().gap(px(SP1)).when(!on, |d| d.opacity(0.45)).children(body))
 }
 
 /// The keyboard ruler along the view's bottom: a tick per semitone between
@@ -400,14 +389,14 @@ fn paint_ruler(r: Rect, freq: f32, colour: gpui::Hsla, window: &mut Window, cx: 
             let sharp = NOTE_NAMES[m.rem_euclid(12) as usize].len() > 1;
             kit::bar(window, x, y - if sharp { 5. } else { 8. }, 1., if sharp { 5. } else { 8. }, 0., content(if sharp { 0.2 } else { 0.4 }));
             if m.rem_euclid(12) == 0 {
-                kit::txt(window, cx, &note_name(m), x, y + 2., TEXT_XS, pal.faint, TextAlign::Center);
+                kit::txt(window, cx, &note_name(m), x, y + 2., TEXT_SM, pal.faint, TextAlign::Center);
             }
         }
         m += 1;
     }
     let x = x0 + (x1 - x0) * boom_pos(freq);
     kit::dot(window, point(px(x), px(y)), 5., colour, Some(pal.text));
-    kit::txt(window, cx, &note_name(nearest_note(freq)), x + 9., y + 2., TEXT_XS, pal.text, TextAlign::Left);
+    kit::txt(window, cx, &note_name(nearest_note(freq)), x + 9., y + 2., TEXT_SM, pal.text, TextAlign::Left);
 }
 
 

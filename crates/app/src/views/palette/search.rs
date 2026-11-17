@@ -52,6 +52,8 @@ pub struct SampleRow {
     pub favorite: bool,
     /// Online-only in a cloud folder: listed by name, downloaded when played.
     pub cloud: bool,
+    /// From the folder the Splice desktop app downloads licensed sounds to.
+    pub splice: bool,
     /// Text relevance, higher first.
     pub score: f32,
 }
@@ -91,6 +93,7 @@ impl SampleRow {
             is_loop: s.is_loop(),
             favorite: s.favorite,
             cloud: s.cloud,
+            splice: false,
             score: 0.,
         }
     }
@@ -110,6 +113,7 @@ impl SampleRow {
             is_loop: it.is_loop,
             favorite: it.favorite,
             cloud: false,
+            splice: false,
             score: 0.,
         }
     }
@@ -129,22 +133,13 @@ impl SampleRow {
     }
 }
 
-/// How well `row` matches the typed words: name prefix > name word > tag/pack.
+/// How well `row` matches the typed words: name prefix > name word > part of
+/// a name > tag/pack, accents and case ignored (the library's own rule).
 pub fn relevance(row: &SampleRow, text: &str) -> f32 {
-    let name = row.name.to_lowercase();
-    let mut score = 0.;
-    for w in text.split_whitespace().map(str::to_lowercase) {
-        if name.starts_with(&w) {
-            score += 4.;
-        } else if name.split(|c: char| !c.is_alphanumeric()).any(|p| p.starts_with(&w)) {
-            score += 3.;
-        } else if name.contains(&w) {
-            score += 2.;
-        } else if row.tags.iter().any(|t| t.contains(&w)) || row.pack.as_deref().is_some_and(|p| p.to_lowercase().contains(&w)) {
-            score += 1.;
-        }
-    }
-    score + if row.favorite { 0.5 } else { 0. }
+    let words = aitrack_library::text::words(text);
+    let mut extra: Vec<&str> = row.tags.iter().map(String::as_str).collect();
+    extra.extend(row.pack.as_deref());
+    aitrack_library::text::score(&words, &row.name, &extra).unwrap_or(0.) + if row.favorite { 0.5 } else { 0. }
 }
 
 /// Keep the rows carrying every tag, then rank and cap them.
@@ -245,10 +240,16 @@ impl Worker {
                 let mut rows = Vec::new();
                 for (i, lib) in libs.iter().enumerate() {
                     if let Some(lib) = lib {
+                        // Which of the user's folders is Splice's.
+                        let splice_roots: HashSet<i64> = if i == USER {
+                            lib.roots().map(|r| r.into_iter().filter(|r| r.kind == aitrack_library::RootKind::Splice).map(|r| r.id.0).collect()).unwrap_or_default()
+                        } else {
+                            HashSet::new()
+                        };
                         match lib.search(&sq) {
                             Ok(mut found) => {
                                 fill_keys(libs[USER].as_ref(), &mut found);
-                                rows.extend(found.iter().map(|s| SampleRow::from_sample(i, s)));
+                                rows.extend(found.iter().map(|s| SampleRow { splice: splice_roots.contains(&s.root_id.0), ..SampleRow::from_sample(i, s) }));
                             }
                             Err(e) => log::warn!("palette search: {e}"),
                         }
@@ -304,6 +305,7 @@ mod tests {
             is_loop: false,
             favorite: false,
             cloud: false,
+            splice: false,
             score: 0.,
         }
     }
@@ -313,6 +315,13 @@ mod tests {
         let q = SampleQuery { text: "kick".into(), ..Default::default() };
         let (rows, _) = finish(vec![row("Snare_kickish", &[]), row("Perc", &["kick"]), row("Kick_01", &[])], &q);
         assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["Kick_01", "Snare_kickish", "Perc"]);
+    }
+
+    #[test]
+    fn accents_do_not_change_the_order() {
+        let q = SampleQuery { text: "electrico".into(), ..Default::default() };
+        let (rows, _) = finish(vec![row("Pad Eléctrico", &[]), row("Eléctrico Bajo", &[]), row("Piano", &["electrico"])], &q);
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["Eléctrico Bajo", "Pad Eléctrico", "Piano"]);
     }
 
     #[test]

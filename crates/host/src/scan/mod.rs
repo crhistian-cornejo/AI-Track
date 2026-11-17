@@ -188,8 +188,80 @@ fn exit_now() -> ! {
     std::process::exit(0)
 }
 
+/// Why a plugin file is not in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProblemKind {
+    /// Loading it took longer than the timeout and the scanner was stopped.
+    Timeout,
+    /// The scanner process died while loading it.
+    Crashed,
+    /// It loaded but reported an error (no factory, no classes…).
+    Failed,
+    /// The file has no loadable binary (an empty or half-installed bundle).
+    Unreadable,
+    /// `aitrack-plugin-scanner` is missing, so nothing could be checked.
+    NoScanner,
+}
+
+impl ProblemKind {
+    /// A short title for the list.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Timeout => "Took too long to load",
+            Self::Crashed => "Crashed while loading",
+            Self::Failed => "Could not be loaded",
+            Self::Unreadable => "Incomplete plugin file",
+            Self::NoScanner => "Not checked",
+        }
+    }
+
+    /// What the user can do about it.
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::Timeout => "Often a plugin waiting for a licence or a login window. Open it once in its own app, then retry.",
+            Self::Crashed => "The plugin crashed when loaded; AI-Track stayed safe. Update or reinstall it, then retry.",
+            Self::Failed => "The file is not a valid plugin for this system (wrong architecture, missing parts). Reinstall it, then retry.",
+            Self::Unreadable => "The bundle has no plugin binary inside. Reinstall the plugin.",
+            Self::NoScanner => "The plugin checker is missing next to the app; reinstall AI-Track.",
+        }
+    }
+}
+
+impl From<BlockReason> for ProblemKind {
+    fn from(r: BlockReason) -> Self {
+        match r {
+            BlockReason::Timeout => Self::Timeout,
+            BlockReason::Crashed => Self::Crashed,
+            BlockReason::Failed => Self::Failed,
+        }
+    }
+}
+
+/// A plugin file that did not make it into the list, with the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProblem {
+    pub format: PluginFormat,
+    pub path: PathBuf,
+    pub kind: ProblemKind,
+    /// What the checker said, when it said anything.
+    pub message: String,
+}
+
+/// A folder the scanner looks in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchRoot {
+    pub format: PluginFormat,
+    pub path: PathBuf,
+    /// Added by the user (the OS folders are not).
+    pub custom: bool,
+    pub exists: bool,
+    /// Plugin files of this format found in it.
+    pub files: usize,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ScanReport {
+    pub elapsed: Duration,
     /// Plugin files found on disk.
     pub files: usize,
     pub cached: usize,
@@ -205,6 +277,9 @@ pub struct ScanReport {
 pub struct Scanner {
     cache_path: PathBuf,
     cache: ScanCache,
+    /// Files that could not be checked for a reason that is not the plugin's
+    /// (kept for this run only: they are tried again next time).
+    unchecked: std::collections::BTreeMap<PathBuf, ScanProblem>,
     scanner_exe: Option<PathBuf>,
     timeout: Duration,
     user_paths: Vec<(PluginFormat, PathBuf)>,
@@ -221,6 +296,7 @@ impl Scanner {
         Self {
             cache_path,
             cache,
+            unchecked: Default::default(),
             scanner_exe: default_scanner_exe(),
             timeout: DEFAULT_TIMEOUT,
             user_paths: Vec::new(),
@@ -285,6 +361,44 @@ impl Scanner {
         out
     }
 
+    /// Every folder searched, whether it exists and how many plugin files it holds.
+    pub fn search_roots(&self) -> Vec<SearchRoot> {
+        let mut out = Vec::new();
+        for format in [PluginFormat::Vst3, PluginFormat::Clap] {
+            let defaults = if self.use_default_paths { default_search_paths(format) } else { Vec::new() };
+            let custom = self.user_paths.iter().filter(|(f, _)| *f == format).map(|(_, p)| p.clone());
+            for (path, is_custom) in defaults.into_iter().map(|p| (p, false)).chain(custom.map(|p| (p, true))) {
+                let exists = path.is_dir();
+                let files = if exists { find_plugin_files(std::slice::from_ref(&path), format).len() } else { 0 };
+                out.push(SearchRoot { format, path, custom: is_custom, exists, files });
+            }
+        }
+        out
+    }
+
+    /// Every plugin file that is not in the list and why: the blocklist (kept
+    /// between runs) and what could not be checked this run.
+    pub fn problems(&self) -> Vec<ScanProblem> {
+        let mut out: Vec<ScanProblem> = self
+            .cache
+            .blocklist
+            .iter()
+            .map(|(path, b)| ScanProblem { format: b.format, path: path.clone(), kind: b.reason.into(), message: b.message.clone() })
+            .collect();
+        out.extend(self.unchecked.values().filter(|p| !self.cache.blocklist.contains_key(&p.path)).cloned());
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Check one file again even if it was blocked. Returns the problem if it still fails.
+    pub fn retry(&mut self, format: PluginFormat, path: &Path) -> Option<ScanProblem> {
+        self.unblock(path);
+        self.unchecked.remove(path);
+        self.scan_files(&[(format, path.to_path_buf())]);
+        let _ = self.save();
+        self.problems().into_iter().find(|p| p.path == path)
+    }
+
     /// Incremental scan of all search paths; saves the cache.
     pub fn scan(&mut self) -> Result<ScanReport> {
         let files = self.discover();
@@ -295,6 +409,7 @@ impl Scanner {
         let before = self.cache.entries.len();
         self.cache.entries.retain(|p, _| present.contains(p));
         self.cache.blocklist.retain(|p, _| present.contains(p));
+        self.unchecked.retain(|p, _| present.contains(p));
         report.removed = before - self.cache.entries.len();
         self.save()?;
         Ok(report)
@@ -302,28 +417,55 @@ impl Scanner {
 
     /// Scan the given files (without pruning or saving).
     pub fn scan_files(&mut self, files: &[(PluginFormat, PathBuf)]) -> ScanReport {
+        self.scan_files_with(files, &|_, _| {})
+    }
+
+    /// [`Scanner::scan_files`], telling `progress(done, total)` as each file
+    /// is settled (from any thread; cached files count at once).
+    pub fn scan_files_with(&mut self, files: &[(PluginFormat, PathBuf)], progress: &(dyn Fn(usize, usize) + Sync)) -> ScanReport {
+        let started = Instant::now();
+        let total = files.len();
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let settle = |n: usize| {
+            let d = done.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+            progress(d, total);
+        };
         let mut report = ScanReport { files: files.len(), ..Default::default() };
         let mut todo: Vec<(PluginFormat, PathBuf, FileKey)> = Vec::new();
         for (format, path) in files {
-            let Some(key) = FileKey::of(*format, path) else { continue };
+            let Some(key) = FileKey::of(*format, path) else {
+                let message = "no plugin binary inside".to_owned();
+                self.unchecked.insert(path.clone(), ScanProblem { format: *format, path: path.clone(), kind: ProblemKind::Unreadable, message: message.clone() });
+                report.failed.push((path.clone(), message));
+                settle(1);
+                continue;
+            };
+            self.unchecked.remove(path);
             if self.cache.fresh_entry(path, key).is_some() {
                 report.cached += 1;
+                settle(1);
             } else if self.cache.is_blocked(path, key) {
                 report.skipped_blocked += 1;
+                settle(1);
             } else if let Some(infos) = (*format == PluginFormat::Vst3).then(|| moduleinfo::read(path)).flatten() {
                 report.from_moduleinfo += 1;
+                settle(1);
                 self.cache.entries.insert(path.clone(), CacheEntry { format: *format, key, plugins: infos, from_moduleinfo: true });
             } else {
                 todo.push((*format, path.clone(), key));
             }
         }
         if todo.is_empty() {
+            report.elapsed = started.elapsed();
             return report;
         }
         let Some(exe) = self.scanner_exe.clone() else {
-            for (_, path, _) in &todo {
-                report.failed.push((path.clone(), format!("{SCANNER_EXE} not found")));
+            for (format, path, _) in &todo {
+                let message = format!("{SCANNER_EXE} not found");
+                self.unchecked.insert(path.clone(), ScanProblem { format: *format, path: path.clone(), kind: ProblemKind::NoScanner, message: message.clone() });
+                report.failed.push((path.clone(), message));
             }
+            report.elapsed = started.elapsed();
             return report;
         };
 
@@ -339,6 +481,7 @@ impl Scanner {
                         let (format, path, key) = job;
                         let r = scan_out_of_process(&exe, format, &path, timeout);
                         results.lock().unwrap().push((format, path, key, r));
+                        settle(1);
                     }
                 });
             }
@@ -357,10 +500,14 @@ impl Scanner {
                         self.cache.entries.remove(&path);
                         self.cache.blocklist.insert(path.clone(), BlockEntry { format, key, reason, message: message.clone() });
                     }
+                    if failure.block_reason().is_none() {
+                        self.unchecked.insert(path.clone(), ScanProblem { format, path: path.clone(), kind: ProblemKind::NoScanner, message: message.clone() });
+                    }
                     report.failed.push((path, message));
                 }
             }
         }
+        report.elapsed = started.elapsed();
         report
     }
 }

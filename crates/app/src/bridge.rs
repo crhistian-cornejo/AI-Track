@@ -470,11 +470,61 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
             v[64..70].copy_from_slice(&[env, 0.6 * env, hat, (env * 0.7 + hat * 0.3).min(1.0), 0.7 * env + 0.08, 0.68 * env + 0.08]);
             put(&v)
         }
-        "fx.compressor" => put(&[-7.0 * env, level, level - 7.0 * env + 3.0]),
+        "fx.compressor" => {
+            // Header, the 64-point static curve (the editor draws its own), latency, style, feedback.
+            let mut v = [0.0f32; 70];
+            v[..3].copy_from_slice(&[-7.0 * env, level, level - 7.0 * env + 3.0]);
+            put(&v)
+        }
+        "fx.buscomp" => {
+            let mut v = [0.0f32; 70];
+            v[..3].copy_from_slice(&[-5.0 * env, level, level - 5.0 * env + 2.0]);
+            v[68] = if playing && env > 0.8 { 1.0 } else { 0.0 };
+            v[69] = 200.0 + 400.0 * (1.0 - env);
+            put(&v)
+        }
+        "fx.clipper" => put(&[if playing { -6.0 * env } else { 0.0 }, if playing { -9.0 + 12.0 * env } else { -120.0 }, if playing { -3.0 - 1.5 * (1.0 - env) } else { -120.0 }]),
+        "fx.mbdyn" => {
+            // Band levels and applied gains, band peaks, then in/out peaks, latency and flags; the curves stay zero.
+            let mut v = vec![0.0f32; aitrack_stock::fx::mbdyn::METER_LEN];
+            let lv = |k: f32| if playing { -26.0 + k * 14.0 * env - 6.0 * (1.0 - env) } else { -120.0 };
+            let bands = [lv(1.3), lv(0.8) + 4.0 * hat, lv(0.3) + 8.0 * hat];
+            for (i, l) in bands.iter().enumerate() {
+                v[aitrack_stock::fx::mbdyn::METER_LEVEL + i] = *l;
+                v[aitrack_stock::fx::mbdyn::METER_GAIN + i] = if playing { [-5.0 * env, -2.0 * env + 1.5 * (1.0 - env), 2.5 * (1.0 - hat) - 1.0 * hat][i] } else { 0.0 };
+                v[aitrack_stock::fx::mbdyn::METER_BAND_PEAK + i] = if playing { *l + 4.0 } else { -120.0 };
+            }
+            v[aitrack_stock::fx::mbdyn::METER_IN_PEAK] = if playing { -4.0 + 3.0 * env } else { -120.0 };
+            v[aitrack_stock::fx::mbdyn::METER_OUT_PEAK] = if playing { -5.0 + 2.0 * env } else { -120.0 };
+            put(&v)
+        }
+        "fx.drumbus" => {
+            let mut v = [0.0f32; 135];
+            v[..7].copy_from_slice(&[-4.0 * env, level + 2.0, level - 1.0, 0.0, 0.4 * env, (beat.floor()).max(0.0), 3.0 * env - 1.0]);
+            for i in 0..64 {
+                let t = i as f32 / 63.0;
+                // Key (low band of the input) and the synthesised boom, as a decaying hit every beat.
+                let hit = if playing { (-(t * 4.0 + beat.fract()).rem_euclid(1.0) * 6.0).exp() } else { 0.0 };
+                v[71 + i] = 0.5 * hit;
+                v[7 + i] = 0.35 * hit * (0.6 + 0.4 * (i as f32 * 0.5).sin().abs());
+            }
+            put(&v)
+        }
         "fx.gate" => put(&[if env > 0.25 { 0.0 } else { -40.0 * (1.0 - env * 4.0) }, level, if env > 0.25 { 1.0 } else { 0.0 }]),
         "fx.transient" => put(&[if playing { 6.0 * env - 2.0 * (1.0 - env) * hat } else { 0.0 }]),
-        "fx.limiter" => put(&[-4.0 * env, if playing { -1.0 } else { -120.0 }, if playing { -5.0 + 6.0 * env } else { -120.0 }]),
+        "fx.limiter" => put(&[
+            -4.0 * env,
+            if playing { -1.0 } else { -120.0 },
+            if playing { -5.0 + 6.0 * env } else { -120.0 },
+            if playing { -11.8 } else { -120.0 },
+            if playing { -9.6 + 1.5 * env } else { -120.0 },
+            if playing { 6.4 } else { 0.0 },
+            if playing { -8.0 + 3.0 * env } else { -120.0 },
+        ]),
         "fx.saturator" => put(&[0.7 * env, 0.6 * env, 0.6 * env, 0.3 * hat * env.max(0.2), 0.25 * hat]),
+        // Tape, amp and console publish their peaks (linear) and one activity value.
+        "fx.tape" | "fx.amp" => put(&[0.7 * env, 0.6 * env, 0.5 * env + 0.1 * hat]),
+        "fx.console" => put(&[0.7 * env, 0.6 * env, 4.0 * env]),
         "fx.shaper" => put(&[beat.fract(), if playing { 0.15 + 0.85 * beat.fract().min(0.6) / 0.6 } else { 1.0 }]),
         "fx.reverb" => put(&[0.3 * env + 0.1 * hat, 0.28 * env + 0.12 * hat, 2.4]),
         "fx.delay" => put(&[0.3 * hat, 0.26 * (1.0 - hat) * env, 1.0 - 0.3 * env]),
@@ -1172,6 +1222,42 @@ pub struct ScanStatus {
     pub message: String,
 }
 
+/// A folder the plugin scan looks in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginFolder {
+    pub path: PathBuf,
+    pub format: PluginFormat,
+    /// Added by the user; the system's own folders cannot be removed.
+    pub custom: bool,
+    pub exists: bool,
+    /// Plugin files of this format inside it.
+    pub files: usize,
+}
+
+/// A plugin file that is not in the list, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginProblem {
+    pub path: PathBuf,
+    pub format: PluginFormat,
+    /// "Crashed while loading".
+    pub title: String,
+    /// What to try.
+    pub advice: String,
+    /// What the checker said.
+    pub detail: String,
+}
+
+/// What the last plugin scan found and left out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PluginReport {
+    pub folders: Vec<PluginFolder>,
+    pub problems: Vec<PluginProblem>,
+    /// Plugin files seen (listed or not).
+    pub files: usize,
+    /// How long the scan took, once one has finished.
+    pub took: Option<std::time::Duration>,
+}
+
 pub trait PluginCatalog {
     fn stock_devices(&self) -> &[DeviceInfo];
     fn external_plugins(&self) -> &[ExternalPlugin];
@@ -1202,15 +1288,18 @@ pub trait PluginCatalog {
     fn poll(&mut self) -> bool {
         false
     }
-    fn plugin_folders(&self) -> Vec<PathBuf> {
-        Vec::new()
-    }
     fn add_plugin_folder(&mut self, _path: PathBuf) -> bool {
         false
     }
     fn remove_plugin_folder(&mut self, _path: &Path) -> bool {
         false
     }
+    /// The folders searched and the files left out, as of the last scan.
+    fn plugin_report(&self) -> PluginReport {
+        PluginReport::default()
+    }
+    /// Check a file that failed again (it is not skipped this time).
+    fn retry_plugin(&mut self, _path: &Path) {}
 }
 
 pub struct StubCatalog {
@@ -1243,6 +1332,10 @@ impl Default for StubCatalog {
             ext("Valhalla Supermassive", "Valhalla DSP", PluginFormat::Vst3, "Fx|Reverb", false),
             ext("Airwindows Consolidated", "Airwindows", PluginFormat::Clap, "audio-effect", false),
             ext("Chow Tape Model", "Chowdhury DSP", PluginFormat::Clap, "audio-effect|distortion", false),
+            // The same plugins in the other format: the palette shows one row each.
+            ext("Surge XT", "Surge Synth Team", PluginFormat::Vst3, "Instrument|Synth", true),
+            ext("Vital", "Vital Audio", PluginFormat::Clap, "instrument|synthesizer", true),
+            ext("Airwindows Consolidated", "Airwindows", PluginFormat::Vst3, "Fx", false),
         ];
         Self { stock, external }
     }
@@ -1254,6 +1347,42 @@ impl PluginCatalog for StubCatalog {
     }
     fn external_plugins(&self) -> &[ExternalPlugin] {
         &self.external
+    }
+    fn plugin_report(&self) -> PluginReport {
+        // Demo data for the Preferences page: two folders, one missing, two files left out.
+        let folder = |path: &str, format, custom, exists, files| PluginFolder { path: PathBuf::from(path), format, custom, exists, files };
+        let problem = |file: &str, format, title: &str, advice: &str, detail: &str| PluginProblem {
+            path: PathBuf::from(file),
+            format,
+            title: title.into(),
+            advice: advice.into(),
+            detail: detail.into(),
+        };
+        PluginReport {
+            folders: vec![
+                folder("/Library/Audio/Plug-Ins/VST3", PluginFormat::Vst3, false, true, 12),
+                folder("/Library/Audio/Plug-Ins/CLAP", PluginFormat::Clap, false, true, 7),
+                folder("/Volumes/Plugins/VST3", PluginFormat::Vst3, true, false, 0),
+            ],
+            problems: vec![
+                problem(
+                    "/Library/Audio/Plug-Ins/VST3/Old Reverb.vst3",
+                    PluginFormat::Vst3,
+                    "Crashed while loading",
+                    "The plugin crashed when loaded; AI-Track stayed safe. Update or reinstall it, then retry.",
+                    "scanner exited with signal: 11 and no result",
+                ),
+                problem(
+                    "/Library/Audio/Plug-Ins/CLAP/Licensed Synth.clap",
+                    PluginFormat::Clap,
+                    "Took too long to load",
+                    "Often a plugin waiting for a licence or a login window. Open it once in its own app, then retry.",
+                    "timed out",
+                ),
+            ],
+            files: 21,
+            took: Some(std::time::Duration::from_millis(1090)),
+        }
     }
 }
 
@@ -1317,6 +1446,20 @@ impl SoundOrigin {
     }
 }
 
+/// A folder of a collection to search inside.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoundFolder {
+    /// Which library: 0 the factory bank, 1 the user's.
+    pub library: usize,
+    pub root: i64,
+    /// Folder inside the root, `/`-separated; `None` = the whole root.
+    pub under: Option<String>,
+    /// What the chip says.
+    pub label: String,
+    /// Sounds inside (counted when the list was made).
+    pub count: u64,
+}
+
 /// What the Sounds panel asks the library for. The key and BPM are the
 /// project's when "fit to song" is on; the library only filters by them, the
 /// panel works out how each result is adjusted ([`aitrack_library::fit`]).
@@ -1332,6 +1475,7 @@ pub struct SoundQuery {
     pub tag: Option<String>,
     pub origin: Option<SoundOrigin>,
     pub favorites: bool,
+    pub folder: Option<SoundFolder>,
     /// 0 = a few hundred.
     pub limit: usize,
 }
@@ -1381,6 +1525,8 @@ pub struct SoundPage {
     pub more: bool,
     /// The genres/tags in the results with their counts, most common first (for the tag chips).
     pub tags: Vec<(String, usize)>,
+    /// The folders worth filtering by, most sounds first.
+    pub folders: Vec<SoundFolder>,
     pub splice: SpliceState,
 }
 
@@ -1884,7 +2030,8 @@ impl LibraryBridge for StubLibrary {
     }
 
     fn search_sounds(&self, q: &SoundQuery) -> SoundPage {
-        let text = q.text.trim().to_lowercase();
+        let words = aitrack_library::text::words(&q.text);
+        let folder_of = |i: &LibraryItem| i.path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let origin_of = |id: u64| match id % 5 {
             0 => SoundOrigin::Splice,
             1 | 2 => SoundOrigin::Factory,
@@ -1920,7 +2067,8 @@ impl LibraryBridge for StubLibrary {
         let mut hits: Vec<SoundHit> = self
             .items
             .iter()
-            .filter(|i| text.is_empty() || i.name.to_lowercase().contains(&text) || i.category.to_lowercase().contains(&text))
+            .filter(|i| aitrack_library::text::score(&words, &i.name, &[&i.category]).is_some())
+            .filter(|i| q.folder.as_ref().is_none_or(|f| f.under.as_deref() == Some(folder_of(i).as_str())))
             .filter(|i| match q.kind {
                 SoundKind::All => true,
                 SoundKind::Loops => i.is_loop,
@@ -1948,7 +2096,14 @@ impl LibraryBridge for StubLibrary {
         }
         let mut tags: Vec<(String, usize)> = tags.into_iter().collect();
         tags.sort_by_key(|(t, n)| (std::cmp::Reverse(*n), t.clone()));
-        SoundPage { hits, more: false, tags, splice: SpliceState::Indexed { folder: PathBuf::from("~/Splice/sounds"), sounds: 6 } }
+        let mut folders: BTreeMap<String, u64> = BTreeMap::new();
+        for i in &self.items {
+            *folders.entry(folder_of(i)).or_default() += 1;
+        }
+        let mut folders: Vec<SoundFolder> =
+            folders.into_iter().map(|(label, count)| SoundFolder { library: 1, root: 1, under: Some(label.clone()), label, count }).collect();
+        folders.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+        SoundPage { hits, more: false, tags, folders, splice: SpliceState::Indexed { folder: PathBuf::from("~/Splice/sounds"), sounds: 6 } }
     }
 }
 
@@ -2380,6 +2535,30 @@ impl Bridges {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_stub_meters_of_the_dynamics_family_are_as_long_as_their_editors_read() {
+        // What each editor needs before it treats the meter as live, and what the window frame reads.
+        let need = [
+            ("fx.compressor", 70),
+            ("fx.buscomp", 70),
+            ("fx.clipper", 3),
+            ("fx.gate", 3),
+            ("fx.limiter", 7),
+            ("fx.mbdyn", aitrack_stock::fx::mbdyn::METER_LEN),
+            ("fx.drumbus", 135),
+            ("fx.tape", 3),
+            ("fx.amp", 3),
+            ("fx.console", 3),
+        ];
+        for (plugin, len) in need {
+            let mut m = [0.0f32; 320];
+            assert_eq!(stub_device_meter(plugin, true, 0.1, 1., &mut m), len, "{plugin}");
+            assert!(m[..len].iter().all(|v| v.is_finite()), "{plugin}");
+            // Stopped, nothing is published as a level.
+            assert_eq!(stub_device_meter(plugin, false, 0., 0., &mut m), len, "{plugin} stopped");
+        }
+    }
     use super::*;
 
     #[test]

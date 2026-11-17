@@ -69,24 +69,30 @@ fn rank(s: &PluginState) -> u8 {
     }
 }
 
-/// The cards to list, in order: what can be done now first, links last.
+/// The cards to list, in order: what can be done now first, links last; among
+/// equals, the better answer to what was typed (words, any part of a word, no
+/// accents: the same matching as every other search box).
 pub fn visible(cards: &[PluginCard], query: &str, category: Option<&str>, show: Show) -> Vec<usize> {
-    let q = query.trim().to_lowercase();
+    let words = aitrack_library::text::words(query);
+    let mut scores: Vec<f32> = vec![0.; cards.len()];
     let mut out: Vec<usize> = (0..cards.len())
         .filter(|&i| {
             let c = &cards[i];
             let e = &c.entry;
-            let text = q.is_empty() || [&e.name, &e.vendor, &e.category, &e.description].iter().any(|s| s.to_lowercase().contains(&q)) || e.tags.iter().any(|t| t.to_lowercase().contains(&q));
+            let mut extra: Vec<&str> = vec![&e.vendor, &e.category, &e.description];
+            extra.extend(e.tags.iter().map(String::as_str));
+            let text = aitrack_library::text::score(&words, &e.name, &extra);
+            scores[i] = text.unwrap_or(0.);
             let cat = category.is_none_or(|k| e.category == k);
             let by_show = match show {
                 Show::All => true,
                 Show::Ready => matches!(c.state, PluginState::Available | PluginState::Update { .. } | PluginState::Installing { .. }),
                 Show::Installed => matches!(c.state, PluginState::Installed { .. } | PluginState::Update { .. } | PluginState::External),
             };
-            text && cat && by_show
+            text.is_some() && cat && by_show
         })
         .collect();
-    out.sort_by_key(|&i| rank(&cards[i].state));
+    out.sort_by(|&a, &b| rank(&cards[a].state).cmp(&rank(&cards[b].state)).then_with(|| scores[b].total_cmp(&scores[a])));
     out
 }
 
@@ -497,6 +503,9 @@ mod tests {
         assert!(tokyo.contains(&"tdr-nova".to_owned()) && !tokyo.contains(&"vital".to_owned()));
         assert!(names(&c, &visible(&c, "vocoder", None, Show::All)).contains(&"tal-vocoder".to_owned()), "tag and name");
         assert!(visible(&c, "zzzz", None, Show::All).is_empty());
+        // The same matching as the palette: a part of a word, upper case, any word order.
+        assert!(names(&c, &visible(&c, "OTELNIK", None, Show::All)).contains(&"tdr-kotelnikov".to_owned()), "inside a word");
+        assert!(names(&c, &visible(&c, "dawn tokyo", None, Show::All)).contains(&"tdr-nova".to_owned()), "any order");
     }
 
     #[test]

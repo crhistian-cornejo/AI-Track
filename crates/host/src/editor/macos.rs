@@ -4,15 +4,18 @@ use std::ffi::c_void;
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEventMask, NSView, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEventMask, NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowStyleMask};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
+use super::placement::Screen;
 use crate::error::{HostError, Result};
 
 pub(super) struct Window {
     window: Retained<NSWindow>,
     view: Retained<NSView>,
     shown: std::cell::Cell<bool>,
+    /// The caller put the window somewhere: `show` must not centre it.
+    placed: std::cell::Cell<bool>,
 }
 
 fn mtm() -> Result<MainThreadMarker> {
@@ -32,8 +35,12 @@ impl Window {
         // detach the plugin view first.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str(title));
+        // No zoom-in when it opens: during that animation the window is a few
+        // percent smaller than it is, and a plugin sizing itself to it (or a
+        // screenshot) would see a size that is not the editor's.
+        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
         let view = window.contentView().ok_or_else(|| HostError::Editor("NSWindow has no content view".into()))?;
-        Ok(Self { window, view, shown: std::cell::Cell::new(false) })
+        Ok(Self { window, view, shown: std::cell::Cell::new(false), placed: std::cell::Cell::new(false) })
     }
 
     pub fn parent_ptr(&self) -> *mut c_void {
@@ -45,7 +52,9 @@ impl Window {
     }
 
     pub fn show(&self) {
-        self.window.center();
+        if !self.placed.get() {
+            self.window.center();
+        }
         self.window.makeKeyAndOrderFront(None);
         self.shown.set(true);
     }
@@ -60,12 +69,66 @@ impl Window {
         (frame.size.width.max(0.0) as u32, frame.size.height.max(0.0) as u32)
     }
 
+    pub fn top_left(&self) -> (f64, f64) {
+        let f = self.window.frame();
+        (f.origin.x, f.origin.y + f.size.height)
+    }
+
+    pub fn place(&self, x: f64, y: f64) {
+        self.window.setFrameTopLeftPoint(NSPoint::new(x, y));
+        self.placed.set(true);
+    }
+
+    pub fn set_resizable(&self, resizable: bool) {
+        let mut style = self.window.styleMask();
+        style.set(NSWindowStyleMask::Resizable, resizable);
+        self.window.setStyleMask(style);
+    }
+
+    pub fn set_limits(&self, min: (u32, u32), max: Option<(u32, u32)>) {
+        self.window.setContentMinSize(NSSize::new(f64::from(min.0), f64::from(min.1)));
+        let max = max.map_or(NSSize::new(f64::from(f32::MAX), f64::from(f32::MAX)), |m| NSSize::new(f64::from(m.0), f64::from(m.1)));
+        self.window.setContentMaxSize(max);
+    }
+
     pub fn user_closed(&self) -> bool {
         self.shown.get() && !self.window.isVisible()
     }
 
     pub fn scale_factor(&self) -> f64 {
         self.window.backingScaleFactor()
+    }
+
+    /// The content view as it is drawn now, as RGBA with the alpha premultiplied
+    /// (`None` when AppKit gives no bitmap). Views drawn with Core Graphics or
+    /// AppKit show up; one drawn straight to an OpenGL or Metal layer may not.
+    pub fn snapshot(&self) -> Option<(Vec<u8>, u32, u32)> {
+        let bounds = self.view.bounds();
+        let rep = self.view.bitmapImageRepForCachingDisplayInRect(bounds)?;
+        self.view.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+        let (w, h) = (rep.pixelsWide().max(0) as usize, rep.pixelsHigh().max(0) as usize);
+        let (spp, bpr) = (rep.samplesPerPixel().max(0) as usize, rep.bytesPerRow().max(0) as usize);
+        if w == 0 || h == 0 || !(3..=4).contains(&spp) || rep.isPlanar() || rep.bitsPerSample() != 8 || bpr < w * spp {
+            return None;
+        }
+        let data = rep.bitmapData();
+        if data.is_null() {
+            return None;
+        }
+        // SAFETY: AppKit owns `bytesPerRow * pixelsHigh` bytes at `bitmapData` for as long as `rep` lives.
+        let src = unsafe { std::slice::from_raw_parts(data, bpr * h) };
+        let alpha_first = rep.bitmapFormat().contains(objc2_app_kit::NSBitmapFormat::AlphaFirst);
+        let mut out = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for px in src[y * bpr..y * bpr + w * spp].chunks_exact(spp) {
+                match (spp, alpha_first) {
+                    (4, false) => out.extend_from_slice(px),
+                    (4, true) => out.extend_from_slice(&[px[1], px[2], px[3], px[0]]),
+                    _ => out.extend_from_slice(&[px[0], px[1], px[2], 255]),
+                }
+            }
+        }
+        Some((out, w as u32, h as u32))
     }
 }
 
@@ -84,6 +147,18 @@ pub(super) fn set_client_size(raw: usize, width: u32, height: u32) {
     // owning `Window` (which retains the NSWindow) is alive.
     let window = unsafe { &*(raw as *const NSWindow) };
     window.setContentSize(NSSize::new(width as f64, height as f64));
+}
+
+/// The displays, with the top edge as `y` (AppKit's y grows upwards).
+pub(super) fn screens() -> Vec<Screen> {
+    let Some(mtm) = MainThreadMarker::new() else { return Vec::new() };
+    NSScreen::screens(mtm)
+        .iter()
+        .map(|s| {
+            let f = s.frame();
+            Screen { x: f.origin.x, y: f.origin.y + f.size.height, w: f.size.width, h: f.size.height }
+        })
+        .collect()
 }
 
 /// Most events handled per call, and the longest a call may take: an editor

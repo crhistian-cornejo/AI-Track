@@ -2,6 +2,7 @@
 //! next to the tone section + cabinet response (drag the handle up and
 //! down = Tone, or Treble in Amp mode), the mode's knobs below.
 
+use super::super::dynamics::win;
 use super::super::kit::{self, Handle, PlotCfg, ax, freq_frac};
 use super::super::{Dev, caption};
 use crate::theme::*;
@@ -39,6 +40,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let cab = dev.choice(p::CAB).min(3);
     let enabled = dev.enabled;
     let clip = dev.m(2);
+    // The signal's peak now (linear), once the engine publishes it.
+    let live = if dev.meter.len() >= 3 { dev.m(0).min(1.) } else { 0. };
 
     let at = 0.3f32;
     let handles = vec![Handle {
@@ -58,10 +61,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let color = if enabled { pal.accent } else { pal.muted };
         let pts = kit::sample_curve(r, 120, |fx| curve_frac(transfer(m, gain, bias, fx * 2. - 1.)));
         kit::line(window, &pts, 2., color);
+        if live > 0.002 {
+            kit::dot(window, r.pt((live + 1.) / 2., curve_frac(transfer(m, gain, bias, live))), 3.5, pal.text, None);
+        }
         // Clipping activity: a bar along the left edge.
         let h = (clip / 1.5).clamp(0., 1.) * (r.h - 8.);
         kit::bar(window, r.x + 2., r.bottom() - 4. - h, 4., h, 2., with_alpha(pal.accent2, 0.7));
-        kit::txt(window, cx, MODES[m], r.right() - 6., r.y + 3., TEXT_XS, pal.muted, TextAlign::Right);
+        kit::txt(window, cx, MODES[m], r.right() - 6., r.y + 3., TEXT_SM, pal.muted, TextAlign::Right);
         kit::dot(window, r.pt(hp.0, hp.1), 6., color, Some(pal.text));
     });
 
@@ -86,9 +92,26 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let pts = kit::sample_curve(r, 120, |fx| resp_frac(tone_db(m, tone, bass, mid, treble, cab, kit::frac_freq(fx) as f64, sr)));
         kit::fill_to(window, &pts, r.bottom(), with_alpha(color, 0.08));
         kit::line(window, &pts, 2., color);
-        kit::txt(window, cx, &format!("CAB {cab_name}"), r.right() - 6., r.y + 4., TEXT_XS, pal.muted, TextAlign::Right);
+        kit::txt(window, cx, &format!("CAB {cab_name}"), r.right() - 6., r.y + 4., TEXT_SM, pal.muted, TextAlign::Right);
         kit::dot(window, r.pt(th.0, th.1), 6., series(1), Some(pal.text));
     });
+
+    if win::in_window(dev) {
+        let mut circuit = vec![win::chip_row(vec![kit::pick(dev, p::MODE, cx)])];
+        circuit.extend(mode_params(m).iter().map(|id| win::knob(dev, *id, cx)));
+        let displays = div().child(win::square(ws, dev, 0, curve)).child(div().flex_1().min_w(px(0.)).h_full().child(resp));
+        return win::arrange(
+            ws,
+            dev,
+            760.,
+            None,
+            displays,
+            vec![win::group_of(dev, "Circuit", None, circuit, cx), win::group(dev, "Output", None, &[p::CAB, p::OUTPUT, p::MIX], cx)],
+            vec![win::group(dev, "Input", None, &[p::INPUT, p::OVERSAMPLING], cx)],
+            cx,
+        )
+        .into_any_element();
+    }
 
     let mut knobs = vec![p::MODE];
     knobs.extend_from_slice(mode_params(m));

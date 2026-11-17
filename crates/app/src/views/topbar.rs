@@ -31,7 +31,9 @@ const LEFT_INSET: f32 = SP2;
 const CAPTION_W: f32 = 46.;
 
 /// Where menus opened from the bar drop down.
-const MENU_Y: f32 = TOP_BAR_H - SP1;
+fn menu_y() -> f32 {
+    m().top_bar_h - SP1
+}
 
 // ───────────────────────────── Tap tempo ─────────────────────────────
 
@@ -92,7 +94,7 @@ fn readout(id: &'static str, width: f32) -> gpui::Stateful<Div> {
         .id(id)
         .flex_none()
         .w(px(width))
-        .h(px(BAR_FIELD_H))
+        .h(px(m().bar_field_h))
         .px(px(SP2))
         .flex()
         .items_center()
@@ -110,7 +112,7 @@ fn toggle(id: &'static str, i: Icon, on: bool, color: Hsla) -> gpui::Stateful<Di
     div()
         .id(id)
         .flex_none()
-        .size(px(BAR_FIELD_H))
+        .size(px(m().bar_field_h))
         .flex()
         .items_center()
         .justify_center()
@@ -127,7 +129,7 @@ fn text_toggle(id: &'static str, text: impl Into<gpui::SharedString>) -> gpui::S
     div()
         .id(id)
         .flex_none()
-        .h(px(BAR_FIELD_H))
+        .h(px(m().bar_field_h))
         .px(px(SP2))
         .flex()
         .items_center()
@@ -288,7 +290,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .tooltip(widgets::tip("File: new, open, save, templates", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
-                    this.open_menu(MenuKind::File, point(at.x - px(12.), px(MENU_Y)), cx);
+                    this.open_menu(MenuKind::File, point(at.x - px(12.), px(menu_y())), cx);
                 })),
         )
         .child(
@@ -379,7 +381,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .tooltip(widgets::tip("Time signature", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
-                    this.open_menu(MenuKind::TimeSignature, point(at.x - px(24.), px(MENU_Y)), cx);
+                    this.open_menu(MenuKind::TimeSignature, point(at.x - px(24.), px(menu_y())), cx);
                 }))
                 .child(mono(format!("{}/{}", sig.numerator, sig.denominator), TEXT_MD, pal.text)),
         )
@@ -402,7 +404,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             .tooltip(widgets::tip("Project key — drives piano roll, tools, samples and AI", None))
             .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                 let at = e.position();
-                this.open_menu(MenuKind::Scale, point(at.x - px(56.), px(MENU_Y)), cx);
+                this.open_menu(MenuKind::Scale, point(at.x - px(56.), px(menu_y())), cx);
             }))
             .child(icon(Icon::ScaleSnap, 12., if has_key { pal.accent } else { pal.faint }))
             .child(
@@ -540,7 +542,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             div()
                 .id("cpu")
                 .flex_none()
-                .h(px(BAR_FIELD_H))
+                .h(px(m().bar_field_h))
                 .px(px(SP1))
                 .flex()
                 .items_center()
@@ -554,7 +556,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             div()
                 .id("computer-midi-kbd")
                 .flex_none()
-                .h(px(BAR_FIELD_H))
+                .h(px(m().bar_field_h))
                 .px(px(SP1 + 2.))
                 .gap(px(SP1))
                 .flex()
@@ -626,7 +628,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     div()
         .relative()
         .flex_none()
-        .h(px(TOP_BAR_H))
+        .h(px(m().top_bar_h))
         .w_full()
         .flex()
         .items_center()
@@ -673,7 +675,7 @@ fn caption_controls(window: &Window) -> Option<AnyElement> {
     Some(
         div()
             .flex_none()
-            .h(px(TOP_BAR_H))
+            .h(px(m().top_bar_h))
             .flex()
             .occlude()
             .child(button("win-min", "\u{e921}", WindowControlArea::Min))
@@ -773,8 +775,10 @@ mod tests {
 
     #[test]
     fn bar_sizes_sit_on_the_grid() {
-        const { assert!(BAR_FIELD_H < TOP_BAR_H) };
-        assert_eq!((TOP_BAR_H - BAR_FIELD_H) % 4., 0.);
+        for m in [Metrics::COMFORTABLE, Metrics::COMPACT] {
+            assert!(m.bar_field_h < m.top_bar_h);
+            assert_eq!((m.top_bar_h - m.bar_field_h) % 4., 0.);
+        }
         assert_eq!(LEFT_INSET % 4., 0.);
     }
 }

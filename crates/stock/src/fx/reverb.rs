@@ -27,11 +27,13 @@
 //!
 //! Meter layout: `[wet peak L, wet peak R, mid-band RT60 (s), duck gain]`.
 
+#[cfg(test)]
+mod quality;
 pub mod shimmer;
 pub mod voicing;
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
-use aitrack_dsp::delay::{AllpassDiffuser, AllpassReader, DelayLine};
+use aitrack_dsp::delay::{AllpassDiffuser, DelayLine, SincKernel};
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::svf::{OnePole, SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
@@ -78,9 +80,14 @@ const MAX_PREDELAY_MS: f32 = 500.0;
 const MAX_EARLY_MS: f32 = 100.0;
 const MAX_LINE_MS: f32 = 200.0;
 const MAX_MOD_MS: f32 = 1.0;
-const DIFFUSERS: usize = 4;
+const DIFFUSERS: usize = 6;
 const EARLY_TAPS: usize = 8;
-const FREEZE_GAIN: f32 = 0.99995;
+/// Per-pass gain of a frozen line: about −0.07 dB per minute of hold.
+const FREEZE_GAIN: f32 = 0.999999;
+/// How many times the modes of the tank overlap (see `Reverb::update`).
+const MODAL_OVERLAP: f32 = 1.25;
+/// Share of the diffused input that joins the early reflections.
+const BRIDGE: f32 = 0.4;
 /// Overall wet trim so a steady input plays back at about its own level.
 const FDN_WET: f32 = 2.1;
 const PLATE_WET: f32 = 0.6;
@@ -129,11 +136,18 @@ const SIGN_IN_R: [f32; MAX_LINES] = [1., 1., -1., 1., 1., -1., -1., 1., -1., 1.,
 const SIGN_OUT_L: [f32; MAX_LINES] = [1., 1., -1., -1., 1., -1., 1., 1., -1., 1., -1., -1., 1., 1., -1., 1.];
 const SIGN_OUT_R: [f32; MAX_LINES] = [-1., 1., 1., -1., 1., 1., -1., 1., 1., -1., -1., 1., 1., -1., 1., -1.];
 const MOD_SPREAD: [f32; MAX_LINES] = [1.0, 0.81, 1.19, 0.73, 1.27, 0.93, 1.09, 0.77, 1.35, 0.87, 1.13, 0.71, 1.23, 0.97, 1.31, 0.83];
-const DIFF_MS_L: [f32; DIFFUSERS] = [1.7, 2.9, 4.3, 6.1];
-const DIFF_MS_R: [f32; DIFFUSERS] = [1.9, 3.3, 4.7, 6.7];
+const DIFF_MS_L: [f32; DIFFUSERS] = [1.7, 2.9, 4.3, 6.1, 9.1, 13.3];
+const DIFF_MS_R: [f32; DIFFUSERS] = [1.9, 3.3, 4.7, 6.7, 9.9, 14.9];
 const EARLY_AT_L: [f32; EARLY_TAPS] = [0.05, 0.11, 0.19, 0.28, 0.39, 0.53, 0.71, 0.93];
 const EARLY_AT_R: [f32; EARLY_TAPS] = [0.07, 0.14, 0.22, 0.33, 0.45, 0.6, 0.79, 0.98];
 const EARLY_SIGN: [f32; EARLY_TAPS] = [1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0];
+
+/// Starting phase of line `i`'s modulation: spread by the golden ratio so
+/// the lines never sweep together (that would sound like one flanger).
+fn lfo_start(i: usize) -> (f32, f32) {
+    let ph = (i as f32 * 0.618_034).fract() * TAU;
+    (ph.cos(), ph.sin())
+}
 
 /// In-place orthonormal fast Walsh–Hadamard transform of `v[..n]`.
 #[inline]
@@ -180,7 +194,6 @@ impl Absorption {
 #[derive(Clone)]
 struct Line {
     buf: DelayLine,
-    reader: AllpassReader,
     len: f32,
     target: f32,
     loss: Absorption,
@@ -204,6 +217,7 @@ impl Line {
 
 struct Fdn {
     lines: Vec<Line>,
+    sinc: SincKernel,
     n: usize,
     diff_l: Vec<AllpassDiffuser>,
     diff_r: Vec<AllpassDiffuser>,
@@ -219,15 +233,14 @@ impl Fdn {
     fn new(sr: f64) -> Self {
         let max = ((MAX_LINE_MS + 4.0 * MAX_MOD_MS) * 0.001 * sr as f32) as usize + 8;
         let lines = (0..MAX_LINES)
-            .map(|_| Line {
+            .map(|i| Line {
                 buf: DelayLine::new(max),
-                reader: AllpassReader::default(),
                 len: 1000.0,
                 target: 1000.0,
                 loss: Absorption { gain: 0.5, low: 1.0, high: 1.0 },
                 low: OnePole::default(),
                 high: OnePole::default(),
-                rot: (1.0, 0.0),
+                rot: lfo_start(i),
                 step: (1.0, 0.0),
             })
             .collect();
@@ -239,6 +252,7 @@ impl Fdn {
         };
         Self {
             lines,
+            sinc: SincKernel::with_cutoff(1.0),
             n: 16,
             diff_l: diff(&DIFF_MS_L),
             diff_r: diff(&DIFF_MS_R),
@@ -252,12 +266,11 @@ impl Fdn {
     }
 
     fn clear(&mut self) {
-        for l in &mut self.lines {
+        for (i, l) in self.lines.iter_mut().enumerate() {
             l.buf.clear();
-            l.reader.reset();
             l.low.reset();
             l.high.reset();
-            l.rot = (1.0, 0.0);
+            l.rot = lfo_start(i);
         }
         for d in self.diff_l.iter_mut().chain(self.diff_r.iter_mut()) {
             d.clear();
@@ -272,6 +285,7 @@ impl Fdn {
         let mut y = [0.0f32; MAX_LINES];
         let depth = self.mod_depth;
         let glide = self.glide;
+        let sinc = &self.sinc;
         for i in 0..n {
             let line = &mut self.lines[i];
             line.len += (line.target - line.len) * glide;
@@ -280,9 +294,10 @@ impl Fdn {
             let (sc, ss) = line.step;
             line.rot = (c * sc - s * ss, c * ss + s * sc);
             let delay = line.len + depth * (0.5 + 0.5 * line.rot.1);
-            // All-pass interpolation: flat magnitude, so the fractional and
-            // modulated reads add no extra high-frequency loss to the loop.
-            d[i] = line.reader.read(&line.buf, delay - 1.0);
+            // Windowed-sinc read: flat to 12 kHz at any fraction, and the
+            // moving read point leaves no images (an all-pass reader
+            // clicks each time its fraction wraps).
+            d[i] = sinc.read(&line.buf, delay - 1.0);
             y[i] = line.absorb(d[i]);
         }
         fwht(&mut y, n);
@@ -314,8 +329,8 @@ impl Fdn {
 
 /// Dattorro's tank lengths at his 29 761 Hz reference rate.
 const PLATE_SR: f32 = 29_761.0;
-const PLATE_IN: [f32; 4] = [142.0, 107.0, 379.0, 277.0];
-const PLATE_IN_G: [f32; 4] = [0.75, 0.75, 0.625, 0.625];
+const PLATE_IN: [f32; 6] = [142.0, 107.0, 379.0, 277.0, 521.0, 683.0];
+const PLATE_IN_G: [f32; 6] = [0.75, 0.75, 0.625, 0.625, 0.55, 0.55];
 const PLATE_AP1: f32 = 672.0;
 const PLATE_A: f32 = 4453.0;
 const PLATE_AP2: f32 = 1800.0;
@@ -646,11 +661,25 @@ impl Reverb {
         fdn.mod_depth = ms(mod_amt * MAX_MOD_MS * mod_scale);
         let order: &[usize] = if n == 16 { &ORDER_16 } else { &ORDER_8 };
         let mut kept = 0.0;
-        for rank in 0..n {
+        let lengths: [f32; MAX_LINES] = std::array::from_fn(|rank| {
+            if rank >= n {
+                return 0.0;
+            }
             let jitter = SPREAD_JITTER[rank * MAX_LINES / n];
             let at = ((rank as f32 + jitter) / (n - 1) as f32).clamp(0.0, 1.0);
+            ms(sweep(shortest, longest, at)).max(8.0)
+        });
+        // Modal overlap: a mode rings over 2.2 / RT60 Hz and the loop has
+        // Σ delays modes per Hz, so a short decay on short lines leaves
+        // gaps between the modes and rings like a pipe. Stretch the lines
+        // until the modes overlap about 1.5 times (halls already do).
+        let total: f32 = lengths.iter().sum();
+        let wanted = MODAL_OVERLAP * self.rt[1] / 2.2 * sr;
+        let stretch = (wanted / total.max(1.0)).clamp(1.0, 4.0);
+        let cap = ms(MAX_LINE_MS);
+        for rank in 0..n {
             let line = &mut fdn.lines[order[rank]];
-            line.target = ms(sweep(shortest, longest, at)).max(8.0);
+            line.target = (lengths[rank] * stretch).min(cap);
             let loop_len = line.target + 0.5 * fdn.mod_depth;
             let loss = Absorption::design(loop_len, sr, self.rt);
             kept += loss.gain * loss.gain;
@@ -674,12 +703,15 @@ impl Reverb {
         // Plate.
         let loop_len = self.plate.set_scale(sr, 0.5 + size);
         // Four decay multiplications per trip round the figure eight.
-        self.plate.decay = if freeze { 0.99999 } else { 10f32.powf(-3.0 * loop_len / (4.0 * sr * self.rt[1])).min(0.9995) };
+        self.plate.decay = if freeze { 0.999995 } else { 10f32.powf(-3.0 * loop_len / (4.0 * sr * self.rt[1])).min(0.9995) };
         let damping = (self.params.plain(p::DAMPING) / 100.0 * v.damping).min(1.0);
         let damp_hz = (self.params.plain(p::DAMP_FREQ) * 2f32.powf(2.0 * (0.5 - damping))).min(sr * 0.45);
-        self.plate.damp = (-TAU * damp_hz / sr).exp();
+        // Frozen, the damping filter would keep darkening the tank.
+        self.plate.damp = if freeze { 0.0 } else { (-TAU * damp_hz / sr).exp() };
         self.plate.in_g = 0.4 + 0.6 * self.diffusion.min(1.0);
-        self.plate.exc = PLATE_EXCURSION * sr / PLATE_SR * (mod_amt / 0.3).min(3.0) * mod_scale.min(1.5);
+        // Frozen, a moving fractional read would filter the top off the
+        // tank on every pass; hold the all-passes on whole samples.
+        self.plate.exc = if freeze { 0.0 } else { PLATE_EXCURSION * sr / PLATE_SR * (mod_amt / 0.3).min(3.0) * mod_scale.min(1.5) };
         self.plate.inc = rate / sr;
 
         // Colour.
@@ -812,7 +844,10 @@ impl Segmented for Reverb {
                         er += own_r.read_linear((pd + EARLY_AT_R[k] * span).min(max_pre)) * fdn.early_gain_r[k];
                     }
                 }
-                (a * k + el * eg, b * k + er * eg)
+                // The diffused input is the onset of the late field: let
+                // a little of it bridge the gap before the shortest line
+                // answers, so the echoes thicken from the first reflections.
+                (a * k + (el + BRIDGE * dl) * eg, b * k + (er + BRIDGE * dr) * eg)
             };
             if color_on {
                 wl = color_out[0].process(&clp, wl);

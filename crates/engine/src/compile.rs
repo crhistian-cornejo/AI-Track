@@ -643,7 +643,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             }
             let clip = project.clips.get(&id)?;
             let compiled = match project.sources.get(&clip.source)? {
-                Source::Notes(n) if t.kind == TrackKind::Instrument => CompiledClip::midi(id, clip, n),
+                Source::Notes(n) if t.kind == TrackKind::Instrument => {
+                    CompiledClip::midi_grooved(id, clip, n, project.clip_groove(id).map(|e| (e, project.groove_amount)))
+                }
                 Source::Audio(a) if t.kind == TrackKind::Audio => {
                     let audio = cx.samples.get(&a.path, sr as u32);
                     if audio.is_none()
@@ -893,6 +895,10 @@ pub(crate) enum Patch {
     MacroValue { rack: DeviceId, index: u16, value: f32 },
     /// A rack's Chain Select value.
     Selector { rack: DeviceId, value: u8 },
+    /// How strongly a pool groove acts.
+    GrooveSettings { id: aitrack_model::GrooveId, settings: aitrack_model::GrooveSettings },
+    /// The global groove amount.
+    GrooveAmount(f32),
 }
 
 /// If `new` differs from `old` only in device parameters, track volume and
@@ -906,12 +912,28 @@ pub(crate) enum Patch {
 /// stops this from compiling until it is decided here whether the compiler
 /// reads it.
 pub(crate) fn param_patches(old: &Project, new: &Project) -> Option<Vec<Patch>> {
-    let Project { format_version: _, name: _, tempo, scale: _, sample_rate_hint: _, tracks, scenes, clips, sources, loop_region: _, ids: _ } = old;
-    let Project { format_version: _, name: _, tempo: tempo_b, scale: _, sample_rate_hint: _, tracks: tracks_b, scenes: scenes_b, clips: clips_b, sources: sources_b, loop_region: _, ids: _ } = new;
+    let Project { format_version: _, name: _, tempo, scale: _, sample_rate_hint: _, tracks, scenes, clips, sources, loop_region: _, ids: _, grooves, groove_amount, clip_grooves } = old;
+    let Project { format_version: _, name: _, tempo: tempo_b, scale: _, sample_rate_hint: _, tracks: tracks_b, scenes: scenes_b, clips: clips_b, sources: sources_b, loop_region: _, ids: _, grooves: grooves_b, groove_amount: groove_amount_b, clip_grooves: clip_grooves_b } = new;
     if tempo != tempo_b || scenes != scenes_b || clips != clips_b || sources != sources_b || tracks.len() != tracks_b.len() {
         return None;
     }
     let mut out = Vec::new();
+    // The groove pool: a groove's settings and the global amount move live;
+    // its template (cells, base, name) or its place in the pool is a compile.
+    if grooves.len() != grooves_b.len() || clip_grooves != clip_grooves_b {
+        return None;
+    }
+    for (a, b) in grooves.iter().zip(grooves_b) {
+        if a.id != b.id || a.groove != b.groove {
+            return None;
+        }
+        if a.settings != b.settings {
+            out.push(Patch::GrooveSettings { id: a.id, settings: b.settings });
+        }
+    }
+    if groove_amount != groove_amount_b {
+        out.push(Patch::GrooveAmount(*groove_amount_b));
+    }
     for (a, b) in tracks.iter().zip(tracks_b) {
         if a == b {
             continue;
@@ -1088,6 +1110,12 @@ pub(crate) fn apply_patch(project: &mut Project, patch: &Patch) {
                 s.level_db = db;
             }
         }
+        Patch::GrooveSettings { id, settings } => {
+            if let Some(g) = project.grooves.iter_mut().find(|g| g.id == id) {
+                g.settings = settings.normalized();
+            }
+        }
+        Patch::GrooveAmount(a) => project.groove_amount = a.clamp(0.0, aitrack_model::MAX_GROOVE_AMOUNT),
         Patch::Selector { rack, value } => {
             fn set(devices: &mut [Device], rack: DeviceId, value: u8) -> bool {
                 for d in devices {

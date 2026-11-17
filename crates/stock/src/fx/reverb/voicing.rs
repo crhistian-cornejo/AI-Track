@@ -45,7 +45,7 @@ const FDN: Voicing = Voicing {
     engine: Engine::Fdn,
     lines: None,
     longest: (45.0, 195.0),
-    spread: 0.3,
+    spread: 0.2,
     early_span: (10.0, 95.0),
     early_gain: 0.8,
     diffusion: 1.0,
@@ -65,9 +65,9 @@ pub const VOICES: [Voicing; 11] = [
     // Classic Plate.
     Voicing { engine: Engine::Plate, early_gain: 0.0, ..FDN },
     // Concert Hall: long, even, gently modulated, warm top.
-    Voicing { lines: Some(16), longest: (60.0, 195.0), spread: 0.32, early_span: (14.0, 95.0), early_gain: 0.7, mod_scale: 0.8, damping: 1.15, ..FDN },
+    Voicing { lines: Some(16), longest: (60.0, 195.0), spread: 0.22, early_span: (14.0, 95.0), early_gain: 0.7, mod_scale: 0.8, damping: 1.15, ..FDN },
     // Bright Hall: the same hall with half the damping and more motion.
-    Voicing { lines: Some(16), longest: (55.0, 190.0), spread: 0.3, early_span: (12.0, 90.0), early_gain: 0.6, mod_scale: 1.2, damping: 0.5, ..FDN },
+    Voicing { lines: Some(16), longest: (55.0, 190.0), spread: 0.2, early_span: (12.0, 90.0), early_gain: 0.6, mod_scale: 1.2, damping: 0.5, ..FDN },
     // Plate.
     Voicing { engine: Engine::Plate, early_gain: 0.0, ..FDN },
     // Room.
@@ -79,7 +79,7 @@ pub const VOICES: [Voicing; 11] = [
     // Shimmer: big modulated hall with the pitch feedback always on.
     Voicing { lines: Some(16), longest: (70.0, 195.0), early_span: (20.0, 95.0), early_gain: 0.3, mod_scale: 1.6, damping: 0.8, shimmer_floor: 0.4, ..FDN },
     // Cloud: very long, heavily diffused and modulated wash.
-    Voicing { lines: Some(16), longest: (90.0, 195.0), spread: 0.25, early_span: (20.0, 95.0), early_gain: 0.2, diffusion: 1.07, mod_scale: 2.5, ..FDN },
+    Voicing { lines: Some(16), longest: (90.0, 195.0), spread: 0.18, early_span: (20.0, 95.0), early_gain: 0.2, diffusion: 1.07, mod_scale: 2.5, ..FDN },
 ];
 
 pub const ALGORITHMS: &[&str] = &["Classic", "Concert Hall", "Bright Hall", "Plate", "Room", "Chamber", "Ambience", "Shimmer", "Cloud"];

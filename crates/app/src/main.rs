@@ -7,6 +7,7 @@
 mod actions;
 mod commands;
 mod editing;
+mod fps;
 mod gesture;
 mod keys;
 mod nav;
@@ -44,6 +45,7 @@ fn bridges() -> bridge::Bridges {
 fn main() {
     let platform = gpui_platform::current_platform(false);
     gpui::Application::with_platform(platform).with_assets(assets::Assets).run(|cx: &mut App| {
+        fps::install(cx);
         assets::load_fonts(cx);
         actions::bind(cx);
         keys::bind(cx);
@@ -66,6 +68,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(1024.), px(640.))),
                 app_id: Some("dev.aitrack.daw".into()),
+                // GPUI draws a window that is not the focused one at 30 Hz at most, which the
+                // display's 60 Hz tick turns into 20 fps: the playhead and meters of the main
+                // window would stutter whenever a device window has the focus. Low-power mode
+                // does its own throttling (`Workspace::render`).
+                inactive_frame_interval: None,
                 // The app draws its own title bar (transport lives in it). On
                 // Windows the drag areas hit-test as the caption, so snapping
                 // and double-click maximise stay native.
@@ -74,7 +81,7 @@ fn main() {
                     title: Some("AI-Track".into()),
                     appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
                     traffic_light_position: cfg!(target_os = "macos")
-                        .then(|| point(px(14.), px((theme::TOP_BAR_H - 14.) / 2.))),
+                        .then(|| point(px(14.), px((theme::Metrics::of(appearance::Appearance::load().density).top_bar_h - 14.) / 2.))),
                 }),
                 ..Default::default()
             },

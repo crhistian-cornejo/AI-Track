@@ -66,6 +66,9 @@ enum Slot {
     Loop,
     Clip(crate::ClipId),
     Warp(crate::SourceId),
+    Groove(crate::GrooveId),
+    GrooveSettings(crate::GrooveId),
+    GrooveAmount,
     Automation(crate::TrackId, crate::AutomationTarget),
 }
 
@@ -86,6 +89,9 @@ fn slot(c: &Command) -> Option<Slot> {
         Command::SetLoop { .. } => Slot::Loop,
         Command::UpdateClip { id, .. } => Slot::Clip(*id),
         Command::SetWarp { source, .. } => Slot::Warp(*source),
+        Command::UpdateGroove { id, .. } => Slot::Groove(*id),
+        Command::SetGrooveSettings { id, .. } => Slot::GrooveSettings(*id),
+        Command::SetGrooveAmount { .. } => Slot::GrooveAmount,
         Command::SetAutomation { track, target, .. } => Slot::Automation(*track, *target),
         _ => return None,
     })

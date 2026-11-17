@@ -1403,6 +1403,12 @@ impl CompiledGraph {
     pub(crate) fn release_all_notes(&mut self) {
         for t in &mut self.tracks {
             t.release_all = true;
+            // The playhead jumped: a groove change waiting for it is due now.
+            for c in &mut t.clips {
+                if let Some(g) = c.groove.as_mut() {
+                    g.settle();
+                }
+            }
         }
     }
 
@@ -1494,6 +1500,24 @@ impl CompiledGraph {
             if let Some(p) = find_proc_mut(&mut t.devices, device) {
                 set_param_guarded(&p.proc, param, v);
                 return;
+            }
+        }
+    }
+
+    /// Fast path: the global groove amount for every clip that has a groove.
+    pub(crate) fn set_groove_amount(&mut self, amount: f32, now: Tick) {
+        for c in self.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+            if let Some(g) = c.groove.as_mut() {
+                g.set_amount(amount, now);
+            }
+        }
+    }
+
+    /// Fast path: one pool groove's settings.
+    pub(crate) fn set_groove_settings(&mut self, id: aitrack_model::GrooveId, settings: aitrack_model::GrooveSettings, now: Tick) {
+        for c in self.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+            if let Some(g) = c.groove.as_mut().filter(|g| g.id == id) {
+                g.set_settings(settings, now);
             }
         }
     }
@@ -2024,3 +2048,7 @@ mod midi_fx;
 #[cfg(test)]
 #[path = "tests/stock_midi.rs"]
 mod stock_midi;
+
+#[cfg(test)]
+#[path = "tests/groove.rs"]
+mod groove;

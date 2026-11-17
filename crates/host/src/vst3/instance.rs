@@ -15,7 +15,7 @@ use vst3::{ComPtr, ComWrapper, Interface};
 use super::com::*;
 use super::module::Vst3Module;
 use super::{entry_to_info, iid_ptr};
-use crate::editor::EditorWindow;
+use crate::editor::{self, EditorWindow, placement};
 use crate::error::{HostError, Result};
 use crate::info::HostedPluginInfo;
 use crate::io::BusScratch;
@@ -51,6 +51,8 @@ unsafe fn create<I: Interface>(factory: &ComPtr<IPluginFactory>, cid: &TUID) -> 
 pub(crate) struct Vst3Main {
     view: Option<ComPtr<IPlugView>>,
     window: Option<EditorWindow>,
+    /// Plugin key and what to write of the open window's place and size.
+    placement: Option<(String, placement::Memory)>,
     connections: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
     controller: Option<ComPtr<IEditController>>,
     separate_controller: bool,
@@ -205,6 +207,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
 
     let main = Vst3Main {
         view: None,
+        placement: None,
         window: None,
         connections,
         controller,
@@ -431,6 +434,15 @@ impl Vst3Main {
         self.view.is_some()
     }
 
+    pub fn editor_window(&self) -> Option<&EditorWindow> {
+        self.window.as_ref()
+    }
+
+    /// The editor window's content size, while it is open.
+    pub fn editor_size(&self) -> Option<(u32, u32)> {
+        self.window.as_ref().map(EditorWindow::client_size)
+    }
+
     pub fn raise_editor(&mut self) {
         if let Some(window) = &self.window {
             window.raise();
@@ -448,7 +460,32 @@ impl Vst3Main {
         }
     }
 
-    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+    /// The size the view settles on for a window of `want` (its own
+    /// constraints applied); `want` when it says nothing.
+    fn constrain(view: &ComPtr<IPlugView>, want: (u32, u32)) -> (u32, u32) {
+        let mut r = ViewRect { left: 0, top: 0, right: want.0 as i32, bottom: want.1 as i32 };
+        unsafe { view.checkSizeConstraint(&mut r) };
+        match rect_size(&r) {
+            (w, h) if w > 0 && h > 0 => (w, h),
+            _ => want,
+        }
+    }
+
+    /// The smallest and largest size the view accepts, found by asking it
+    /// about extreme sizes (a limit it does not have comes back unchanged).
+    fn limits(view: &ComPtr<IPlugView>) -> ((u32, u32), Option<(u32, u32)>) {
+        const HUGE: u32 = 8192;
+        let min = Self::constrain(view, (1, 1));
+        let max = Self::constrain(view, (HUGE, HUGE));
+        let cap = |v: u32| if v >= HUGE { None } else { Some(v) };
+        let max = match (cap(max.0), cap(max.1)) {
+            (None, None) => None,
+            (w, h) => Some((w.unwrap_or(HUGE), h.unwrap_or(HUGE))),
+        };
+        (min, max)
+    }
+
+    pub fn open_editor(&mut self, title: &str, key: &str) -> Result<()> {
         let controller = self.controller.as_ref().ok_or(HostError::NoEditor)?;
         let raw = unsafe { controller.createView(c"editor".as_ptr()) };
         let view = unsafe { ComPtr::from_raw(raw) }.ok_or(HostError::NoEditor)?;
@@ -456,17 +493,19 @@ impl Vst3Main {
         if unsafe { view.isPlatformTypeSupported(platform) } != OK {
             return Err(HostError::Editor("view does not support this platform".into()));
         }
+        // The size the plugin asks for is the size the window gets.
         let mut rect: ViewRect = unsafe { std::mem::zeroed() };
         unsafe { view.getSize(&mut rect) };
         let (mut w, mut h) = rect_size(&rect);
         if w == 0 || h == 0 {
             (w, h) = (640, 480);
         }
-        let resizable = unsafe { view.canResize() } == OK;
+        let mut resizable = unsafe { view.canResize() } == OK;
         let window = EditorWindow::new(title, w, h, resizable)?;
         *self.frame.window.lock() = Some(window.raw());
         *self.frame.size.lock() = (w, h);
         let frame_ptr = self.frame.as_com_ref::<IPlugFrame>().map_or(std::ptr::null_mut(), |r| r.as_ptr());
+        let recalled = placement::recall(key);
         unsafe {
             view.setFrame(frame_ptr);
             #[cfg(windows)]
@@ -478,23 +517,56 @@ impl Vst3Main {
                 *self.frame.window.lock() = None;
                 return Err(HostError::Editor("IPlugView::attached failed".into()));
             }
-            // Scale changes may have resized the view.
+            // What the view says once it is attached is the truth: scale
+            // changes and saved sizes may have resized it, and some plugins
+            // only know whether they can be resized now.
             let mut rect: ViewRect = std::mem::zeroed();
             if view.getSize(&mut rect) == OK {
                 let (nw, nh) = rect_size(&rect);
                 if nw > 0 && nh > 0 && (nw, nh) != (w, h) {
-                    *self.frame.size.lock() = (nw, nh);
-                    window.set_client_size(nw, nh);
+                    (w, h) = (nw, nh);
+                    *self.frame.size.lock() = (w, h);
+                    window.set_client_size(w, h);
+                }
+            }
+            let now = view.canResize() == OK;
+            if now != resizable {
+                resizable = now;
+                window.set_resizable(resizable);
+            }
+            if resizable {
+                let (min, max) = Self::limits(&view);
+                window.set_limits(min, max);
+                // The size the user left it at, if the plugin takes it.
+                if let Some(saved) = recalled.filter(|s| s.w > 0 && s.h > 0) {
+                    let want = Self::constrain(&view, (saved.w, saved.h));
+                    if want != (w, h) {
+                        let mut r = ViewRect { left: 0, top: 0, right: want.0 as i32, bottom: want.1 as i32 };
+                        view.onSize(&mut r);
+                        (w, h) = want;
+                        *self.frame.size.lock() = (w, h);
+                        window.set_client_size(w, h);
+                    }
                 }
             }
         }
+        if let Some((x, y)) = recalled.and_then(|s| editor::restorable(&s)) {
+            window.place(x, y);
+        }
         window.show();
+        self.placement = Some((key.to_owned(), placement::Memory::opened(Some(window.placement()))));
         self.view = Some(view);
         self.window = Some(window);
         Ok(())
     }
 
     pub fn close_editor(&mut self) {
+        if let (Some(window), Some((key, memory))) = (&self.window, &mut self.placement)
+            && let Some(saved) = memory.closing(window.placement())
+        {
+            placement::remember(key, saved);
+        }
+        self.placement = None;
         if let Some(view) = self.view.take() {
             unsafe {
                 view.removed();
@@ -537,7 +609,7 @@ impl Vst3Main {
         }
         if self.handler.open_requested.swap(false, Ordering::AcqRel) && self.view.is_none() {
             let title = format!("{} — {}", state.hosted.name, state.hosted.vendor);
-            if let Err(e) = self.open_editor(&title) {
+            if let Err(e) = self.open_editor(&title, &state.hosted.stable_id()) {
                 log::warn!("{}: requested editor failed to open: {e}", state.hosted.name);
             }
         }
@@ -549,6 +621,11 @@ impl Vst3Main {
         if closed {
             self.close_editor();
             return;
+        }
+        if let (Some(window), Some((key, memory))) = (&self.window, &mut self.placement)
+            && let Some(saved) = memory.observe(std::time::Instant::now(), window.placement())
+        {
+            placement::remember(key, saved);
         }
         let (Some(view), Some(window)) = (&self.view, &self.window) else { return };
         let (cw, ch) = window.client_size();

@@ -580,6 +580,22 @@ impl EngineHandle {
         self.send_rt(RtCommand::SetRackSelector(rack, value))
     }
 
+    /// Fast path for the global groove amount (0..=1.3): every clip with a
+    /// groove follows from a little ahead of the playhead on, and no graph is
+    /// compiled. The project's value still needs its `Command`.
+    pub fn set_groove_amount(&self, amount: f32) -> bool {
+        let amount = if amount.is_finite() { amount.clamp(0.0, aitrack_model::MAX_GROOVE_AMOUNT) } else { 1.0 };
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::GrooveAmount(amount)));
+        self.send_rt(RtCommand::SetGrooveAmount(amount))
+    }
+
+    /// Fast path for a pool groove's Quantize / Timing / Random / Velocity.
+    pub fn set_groove_settings(&self, id: aitrack_model::GrooveId, settings: aitrack_model::GrooveSettings) -> bool {
+        let settings = settings.normalized();
+        let _ = self.tx.send(Msg::Patch(crate::compile::Patch::GrooveSettings { id, settings }));
+        self.send_rt(RtCommand::SetGrooveSettings(id, settings))
+    }
+
     /// Graphs compiled since the engine started. A drag of a knob or fader
     /// must not move this.
     pub fn compile_count(&self) -> u64 {
@@ -1152,6 +1168,8 @@ impl Control {
                 Patch::Send { track, index, db } => RtCommand::SetSend(track, index, db),
                 Patch::MacroValue { .. } => continue,
                 Patch::Selector { rack, value } => RtCommand::SetRackSelector(rack, value),
+                Patch::GrooveSettings { id, settings } => RtCommand::SetGrooveSettings(id, settings),
+                Patch::GrooveAmount(amount) => RtCommand::SetGrooveAmount(amount),
             };
             let _ = tx.push(cmd);
         }

@@ -6,7 +6,7 @@
 //! sidechain (source, high-pass, listen) and the soft clip with its
 //! "working hard" lamp.
 
-use super::dynamics::trace;
+use super::dynamics::{trace, win};
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::{Dev, caption, set_now};
 use crate::icons::{Icon, icon};
@@ -98,7 +98,7 @@ fn sidechain_panel(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> An
         .child(icon(if open { Icon::ChevronDown } else { Icon::ChevronRight }, 10., pal.faint))
         .child(caption("SIDECHAIN"))
         .child(div().flex_1())
-        .child(mono(if hz > 0. { format!("HPF {hz:.0} Hz") } else { "HPF off".to_owned() }, TEXT_XS, pal.faint))
+        .child(mono(if hz > 0. { format!("HPF {hz:.0} Hz") } else { "HPF off".to_owned() }, TEXT_SM, pal.faint))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _, _, cx| {
             let was = this.fx.opt(device, SC_PANEL, 1.) > 0.5;
@@ -155,7 +155,7 @@ fn steps(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
                 .cursor_pointer()
                 .bg(if on { accent_alpha(0.28) } else { gpui::transparent_black() })
                 .hover(|d| d.bg(if on { accent_alpha(0.34) } else { content(0.1) }))
-                .child(label(step_label(name).to_owned(), TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
+                .child(label(step_label(name).to_owned(), TEXT_SM, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     set_now(this, device, id, norm);
@@ -196,7 +196,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         kit::line(window, &[r.pt(0., fy_of(LO)), r.pt(1., fy_of(0.))], 1., content(0.14));
         if soft_clip {
             kit::hline(window, r, r.py(fy_of(CEILING_DB)), with_alpha(pal.record, 0.5));
-            kit::txt(window, cx, "clip", r.right() - 4., r.py(fy_of(CEILING_DB)) + 2., TEXT_XS, with_alpha(pal.record, 0.8), TextAlign::Right);
+            kit::txt(window, cx, "clip", r.right() - 4., r.py(fy_of(CEILING_DB)) + 2., TEXT_SM, with_alpha(pal.record, 0.8), TextAlign::Right);
         }
         let pts = kit::sample_curve(r, 96, |x| fy_of(t.out(LO - LO * x)));
         kit::fill_to(window, &pts, r.bottom(), accent_alpha(0.1));
@@ -205,9 +205,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         kit::vline(window, r, tx, with_alpha(pal.accent2, 0.55));
         let label = format!("{:.1} dB", t.threshold);
         if tx > r.px(0.6) {
-            kit::txt(window, cx, &label, tx - 4., r.y + 3., TEXT_XS, pal.muted, TextAlign::Right);
+            kit::txt(window, cx, &label, tx - 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Right);
         } else {
-            kit::txt(window, cx, &label, tx + 4., r.y + 3., TEXT_XS, pal.muted, TextAlign::Left);
+            kit::txt(window, cx, &label, tx + 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Left);
         }
         // Where the signal sits on the curve right now.
         if peak_in > LO + 0.5 {
@@ -239,7 +239,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(steps(dev, p::RATIO, cx))
         .child(caption("ATTACK ms"))
         .child(steps(dev, p::ATTACK, cx))
-        .child(div().flex().items_center().gap(px(SP2)).child(caption("RELEASE s")).child(div().flex_1()).when_some(release_note, |d, n| d.child(mono(n, TEXT_XS, pal.faint))))
+        .child(div().flex().items_center().gap(px(SP2)).child(caption("RELEASE s")).child(div().flex_1()).when_some(release_note.clone(), |d, n| d.child(mono(n, TEXT_SM, pal.faint))))
         .child(steps(dev, p::RELEASE, cx))
         .child(div().flex_1())
         .child(sidechain_panel(ws, dev, cx));
@@ -249,7 +249,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let region = ws.fx.region(dev.id, 1);
     let threshold = t.threshold;
     let latency = if soft_clip && live { dev.m(M_LATENCY) } else { 0. };
-    let sc_open = ws.fx.opt(dev.id, SC_PANEL, 1.) > 0.5;
+    // The window always shows the filter's response over the history.
+    let sc_open = win::in_window(dev) || ws.fx.opt(dev.id, SC_PANEL, 1.) > 0.5;
     let sc_hz = SC_HPF_HZ[dev.choice(p::SC_HPF).min(SC_HPF_HZ.len() - 1)];
     let sc_listen = dev.on(p::SC_LISTEN);
     let history = div().flex_1().min_w(px(0.)).h_full().rounded(px(r_md())).bg(pal.well).border_1().border_color(border()).overflow_hidden().child(
@@ -276,12 +277,64 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 if soft_clip {
                     kit::dot(window, gpui::point(gpui::px(r.x + 10.), gpui::px(r.bottom() - 10.)), 3., if clip_hot { pal.record } else { with_alpha(pal.record, 0.3) }, None);
                     let text = if latency > 0. { format!("soft clip · {latency:.0} smp") } else { "soft clip".to_owned() };
-                    kit::txt(window, cx, &text, r.x + 18., r.bottom() - 16., TEXT_XS, if clip_hot { pal.record } else { pal.faint }, TextAlign::Left);
+                    kit::txt(window, cx, &text, r.x + 18., r.bottom() - 16., TEXT_SM, if clip_hot { pal.record } else { pal.faint }, TextAlign::Left);
                 }
             },
         )
         .size_full(),
     );
+
+
+    if win::in_window(dev) {
+        // The frame has the gain reduction and the levels; this is the curve, the
+        // history with the key filter, the click-stops and the grouped knobs.
+        let stops = |title: &str, note: Option<String>, id: u32, cx: &mut Context<Workspace>| {
+            div()
+                .flex_none()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(SP1))
+                .child(div().flex().items_center().gap(px(SP2)).child(caption(title.to_owned())).child(div().flex_1()).when_some(note, |d, n| d.child(mono(n, TEXT_SM, pal.faint))))
+                .child(steps(dev, id, cx))
+                .into_any_element()
+        };
+        let envelope = win::group_of(
+            dev,
+            "Envelope",
+            None,
+            vec![div()
+                .flex_none()
+                .w(px(312.))
+                .flex()
+                .flex_col()
+                .gap(px(SP2))
+                .child(stops("RATIO", None, p::RATIO, cx))
+                .child(stops("ATTACK ms", None, p::ATTACK, cx))
+                .child(stops("RELEASE s", release_note.clone(), p::RELEASE, cx))
+                .into_any_element()],
+            cx,
+        );
+        let sidechain = win::group_of(
+            dev,
+            "Sidechain",
+            None,
+            vec![win::chip_row(vec![super::sidechain_chip(ws, dev, p::SIDECHAIN, cx), kit::pick(dev, p::SC_LISTEN, cx)]), win::knob(dev, p::SC_HPF, cx)],
+            cx,
+        );
+        let displays = div().child(win::square(ws, dev, 0, curve)).child(history.flex_1().min_w(px(0.)).h_full());
+        return win::arrange(
+            ws,
+            dev,
+            900.,
+            Some(div().flex_none().flex().items_center().child(win::legend(&[("input", pal.muted), ("output", pal.accent2), ("gain reduction", pal.record)]))),
+            displays,
+            vec![win::group(dev, "Level", None, &[p::THRESHOLD, p::MAKEUP, p::MIX], cx), envelope],
+            vec![win::group(dev, "Output", None, &[p::RANGE, p::OUTPUT, p::SOFT_CLIP], cx), sidechain],
+            cx,
+        )
+        .into_any_element();
+    }
 
     // Right: the gain reduction now, as a tall bar with a scale.
     let meter = div()
@@ -303,7 +356,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                         for db in [3., 6., 10., 15.] {
                             let y = r.py(db / GR_SPAN);
                             kit::hline(window, Rect { w: 8., ..r }, y, pal.grid_bar);
-                            kit::txt(window, cx, &format!("{db:.0}"), r.x + 12., y - 6., TEXT_XS, pal.faint, TextAlign::Left);
+                            kit::txt(window, cx, &format!("{db:.0}"), r.x + 12., y - 6., TEXT_SM, pal.faint, TextAlign::Left);
                         }
                         let x = r.right() - 20.;
                         kit::bar(window, x, r.y, 16., (-gr / GR_SPAN).clamp(0., 1.) * r.h, 0., pal.record);
@@ -312,9 +365,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .size_full(),
             ),
         )
-        .child(label("GR dB", TEXT_XS, pal.faint))
-        .child(mono(if live { format!("{:>5} in", kit::fmt_db(peak_in)) } else { "—".to_owned() }, TEXT_XS, pal.faint))
-        .child(mono(if live { format!("{:>5} out", kit::fmt_db(peak_out)) } else { "—".to_owned() }, TEXT_XS, if live && peak_out > CEILING_DB { pal.record } else { pal.faint }));
+        .child(label("GR dB", TEXT_SM, pal.faint))
+        .child(mono(if live { format!("{:>5} in", kit::fmt_db(peak_in)) } else { "—".to_owned() }, TEXT_SM, pal.faint))
+        .child(mono(if live { format!("{:>5} out", kit::fmt_db(peak_out)) } else { "—".to_owned() }, TEXT_SM, if live && peak_out > CEILING_DB { pal.record } else { pal.faint }));
 
     let sidechain = div()
         .flex_none()

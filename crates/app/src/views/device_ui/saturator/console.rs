@@ -2,6 +2,7 @@
 //! amp — drag the handle sideways = drive) next to the glue compressor's
 //! static curve with its gain-reduction meter (drag up and down = Glue).
 
+use super::super::dynamics::win;
 use super::super::kit::{self, Handle, PlotCfg, ax};
 use super::super::{Dev, caption};
 use crate::theme::*;
@@ -27,6 +28,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
     let enabled = dev.enabled;
     let gr = dev.m(2).max(0.);
+    let live = if dev.meter.len() >= 3 { (dev.m(0) * 1.5).min(1.5) } else { 0. };
+    // The window's frame has a gain reduction rail; the plot keeps its own bar only in the card.
+    let windowed = win::in_window(dev);
 
     // Curve over input −1.5…1.5.
     let at = 0.8f32;
@@ -40,7 +44,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let color = if enabled { pal.accent } else { pal.muted };
         let pts = kit::sample_curve(r, 120, |fx| curve_frac(curve(m, (fx * 2. - 1.) * 1.5, g)));
         kit::line(window, &pts, 2., color);
-        kit::txt(window, cx, MODES[m], r.right() - 6., r.y + 3., TEXT_XS, pal.muted, TextAlign::Right);
+        if live > 0.003 {
+            kit::dot(window, r.pt((live / 1.5 + 1.) / 2., curve_frac(curve(m, live, g))), 3.5, pal.text, None);
+        }
+        kit::txt(window, cx, MODES[m], r.right() - 6., r.y + 3., TEXT_SM, pal.muted, TextAlign::Right);
         kit::dot(window, r.pt(hp.0, hp.1), 6., color, Some(pal.text));
     });
 
@@ -64,13 +71,39 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         });
         kit::line(window, &pts, 2., color);
         // Gain reduction meter on the right edge (0…12 dB down from the top).
-        let h = (gr / 12.).clamp(0., 1.) * (r.h - 8.);
-        kit::bar(window, r.right() - 8., r.y + 4., 4., h, 2., with_alpha(pal.accent2, 0.8));
-        kit::txt(window, cx, if is_glue { "GLUE" } else { "GLUE OFF" }, r.x + 6., r.y + 3., TEXT_XS, pal.muted, TextAlign::Left);
+        if !windowed {
+            let h = (gr / 12.).clamp(0., 1.) * (r.h - 8.);
+            kit::bar(window, r.right() - 8., r.y + 4., 4., h, 2., with_alpha(pal.accent2, 0.8));
+        }
+        kit::txt(window, cx, if is_glue { "GLUE" } else { "GLUE OFF" }, r.x + 6., r.y + 3., TEXT_SM, pal.muted, TextAlign::Left);
         if let Some((x, y)) = gh {
             kit::dot(window, r.pt(x, y), 6., color, Some(pal.text));
         }
     });
+
+    if windowed {
+        let displays = div().child(div().flex_1().min_w(px(0.)).h_full().child(shape)).child(div().flex_1().min_w(px(0.)).h_full().child(comp));
+        let mut drive = vec![p::DRIVE];
+        if is_glue {
+            drive.push(p::GLUE);
+        }
+        drive.push(p::IRON);
+        return win::arrange(
+            ws,
+            dev,
+            700.,
+            None,
+            displays,
+            vec![
+                win::group_of(dev, "Mode", None, vec![win::chip_row(vec![kit::pick(dev, p::MODE, cx)])], cx),
+                win::group(dev, "Console", None, &drive, cx),
+                win::group(dev, "Output", None, &[p::OUTPUT, p::MIX], cx),
+            ],
+            vec![win::group(dev, "Quality", None, &[p::OVERSAMPLING], cx)],
+            cx,
+        )
+        .into_any_element();
+    }
 
     let mut main = vec![p::MODE, p::DRIVE];
     if is_glue {

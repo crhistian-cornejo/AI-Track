@@ -10,6 +10,7 @@ pub mod amp;
 pub mod console;
 pub mod tape;
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, ax, freq_frac};
 use super::{Dev, caption};
 use crate::theme::*;
@@ -58,6 +59,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .map(|(b, s)| Handle { fx: (at + 1.) / 2., fy: curve_y(s, at), y: ax(band(b, p::DRIVE), -1.), index: b, reset: vec![default(band(b, p::DRIVE))], ..Default::default() })
         .collect();
     let (shapes2, enabled) = (shapes.clone(), dev.enabled);
+    let live = if dev.meter.len() >= 2 { dev.m(0).min(1.) } else { 0. };
     let transfer = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, _| {
         let pal = p();
         kit::hline(window, r, r.py(0.5), pal.grid_bar);
@@ -68,6 +70,17 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let pts = kit::sample_curve(r, 96, |fx| curve_y(s, fx * 2. - 1.));
             kit::line(window, &pts, if b == selected { 2.5 } else { 1.5 }, with_alpha(color, if b == selected { 1. } else { 0.7 }));
             kit::dot(window, r.pt((at + 1.) / 2., curve_y(s, at)), 6., color, (b == selected).then_some(pal.text));
+        }
+        // The signal now, on the selected band's curve.
+        if live > 0.002
+            && let Some(s) = shapes2.get(selected)
+        {
+            // The handle already marks the point when the signal is near it: one dot, not two.
+            let (x, y) = (r.px((live + 1.) / 2.), r.py(curve_y(s, live)));
+            let (hx, hy) = (r.px((at + 1.) / 2.), r.py(curve_y(s, at)));
+            if (x - hx).hypot(y - hy) > 14. {
+                kit::dot(window, r.pt((live + 1.) / 2., curve_y(s, live)), 3.5, pal.text, None);
+            }
         }
     });
 
@@ -92,13 +105,41 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let db = if levels[b] > 1e-4 { 20. * levels[b].log10() } else { -120. };
             let h = ((db + 48.) / 48.).clamp(0., 1.) * (r.h - 30.);
             kit::bar(window, a + 3., r.bottom() - 14. - h, (z - a - 6.).max(1.), h, 2., with_alpha(color, 0.55));
-            kit::txt(window, cx, &labels[b], (a + z) / 2., r.y + 4., TEXT_XS, pal.muted, TextAlign::Center);
+            kit::txt(window, cx, &labels[b], (a + z) / 2., r.y + 4., TEXT_SM, pal.muted, TextAlign::Center);
         }
         for fx in &lines {
             kit::vline(window, r, r.px(*fx), pal.text);
             kit::dot(window, r.pt(*fx, 0.5), 6., pal.raised, Some(pal.text));
         }
     });
+
+    if win::in_window(dev) {
+        // Every band's controls in a card of its own (the plots show the
+        // selected one emphasised); the frame has the level in and out, the
+        // spectrum keeps the level of each band.
+        let mut groups = Vec::new();
+        for bd in 0..nb {
+            let st = dev.choice(band(bd, p::STYLE));
+            let mut ids = vec![band(bd, p::DRIVE), band(bd, p::LEVEL)];
+            if style::uses_bias(st) {
+                ids.push(band(bd, p::BIAS));
+            }
+            if st == style::BITCRUSH {
+                ids.extend([band(bd, p::BITS), band(bd, p::CRUSH_RATE)]);
+            }
+            let name = ["LOW", "MID", "HIGH"][if nb == 1 { 1 } else if nb == 2 { bd * 2 } else { bd }];
+            let mut body = vec![win::chip_row(vec![kit::pick(dev, band(bd, p::STYLE), cx)])];
+            body.extend(ids.iter().map(|id| win::knob(dev, *id, cx)));
+            groups.push(win::group_of(dev, &format!("{name} band"), None, body, cx).border_color(with_alpha(series(bd), if bd == selected { 0.9 } else { 0.35 })));
+        }
+        groups.push(win::group(dev, "Output", None, &[p::MIX, p::OUTPUT], cx));
+        let more = vec![
+            win::group_of(dev, "Mode", None, vec![win::chip_row(vec![kit::pick(dev, p::BANDS, cx), kit::pick(dev, p::AUTO_GAIN, cx), kit::pick(dev, p::OVERSAMPLING, cx)])], cx),
+            win::group(dev, "Tone", None, &[p::TONE], cx),
+        ];
+        let displays = div().child(win::square(ws, dev, 0, transfer)).child(div().flex_1().min_w(px(0.)).h_full().child(spectrum));
+        return win::arrange(ws, dev, 760., None, displays, groups, more, cx).into_any_element();
+    }
 
     let b = selected;
     let st = dev.choice(band(b, p::STYLE));

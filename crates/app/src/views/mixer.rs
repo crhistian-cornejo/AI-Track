@@ -17,13 +17,12 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
-const SLOT_H: f32 = 20.;
 const INSERTS: usize = 3;
 
 fn slot(text: impl Into<gpui::SharedString>, active: bool, i: Option<Icon>) -> Div {
     let pal = p();
     div()
-        .h(px(SLOT_H))
+        .h(px(slot_h()))
         .px(px(SP1 + 2.))
         .gap(px(SP1))
         .flex()
@@ -53,19 +52,24 @@ pub struct Rows {
 
 /// Space a strip's fixed parts need: row and strip padding, border, the
 /// name plate, mute/solo/arm and the dB readout, with the gaps between them.
-const FIXED_H: f32 = 2. * SP2 + 2. * SP1 + 2. + NAME_H + SLOT_H + DB_H + 3. * SP1;
-const NAME_H: f32 = 32.;
-const DB_H: f32 = 16.;
-const PAN_H: f32 = 44.;
+fn fixed_h() -> f32 {
+    2. * m().strip_pad + 2. * SP1 + 2. + m().strip_name_h + m().slot_h + m().strip_db_h + 3. * SP1
+}
+fn slot_h() -> f32 {
+    m().slot_h
+}
+fn pan_h() -> f32 {
+    m().strip_pan_h
+}
 /// The fader never gets shorter than this.
 pub const FADER_MIN: f32 = 40.;
 const FADER_MAX: f32 = 360.;
 
 pub fn rows(h: f32, returns: usize) -> Rows {
-    let mut left = h - FIXED_H;
+    let mut left = h - fixed_h();
     let mut r = Rows { input: false, inserts: 0, sends: false, output: false, pan: false, fader_h: 0. };
     // (row height, fader room the row must leave) in the order rows come back.
-    let sends_h = returns as f32 * (SLOT_H + 2.) - 2.;
+    let sends_h = returns as f32 * (slot_h() + 2.) - 2.;
     let mut fits = |need: f32, keep: f32| {
         if need <= 0. {
             return true;
@@ -77,13 +81,13 @@ pub fn rows(h: f32, returns: usize) -> Rows {
             false
         }
     };
-    r.pan = fits(PAN_H, 56.);
-    r.output = r.pan && fits(SLOT_H, 72.);
+    r.pan = fits(pan_h(), 56.);
+    r.output = r.pan && fits(slot_h(), 72.);
     r.sends = r.output && returns > 0 && fits(sends_h, 80.);
     let sends_ok = r.output && (returns == 0 || r.sends);
-    r.input = sends_ok && fits(SLOT_H, 96.);
+    r.input = sends_ok && fits(slot_h(), 96.);
     if r.input {
-        while r.inserts < INSERTS && fits(SLOT_H + if r.inserts == 0 { 0. } else { 2. }, 112.) {
+        while r.inserts < INSERTS && fits(slot_h() + if r.inserts == 0 { 0. } else { 2. }, 112.) {
             r.inserts += 1;
         }
     }
@@ -105,8 +109,8 @@ pub fn render(ws: &mut Workspace, _window: &mut Window, cx: &mut Context<Workspa
     let h = ws.mixer_h_fitted() - 2.;
     let layout = rows(h, returns.len());
     // Tracks scroll sideways; returns, VCAs and Main stay pinned on the right.
-    let mut scrolling = div().h_full().flex().gap(px(SP1)).p(px(SP2));
-    let mut pinned = div().flex_none().h_full().flex().gap(px(SP1)).p(px(SP2)).border_l_1().border_color(border());
+    let mut scrolling = div().h_full().flex().gap(px(SP1)).p(px(m().strip_pad));
+    let mut pinned = div().flex_none().h_full().flex().gap(px(SP1)).p(px(m().strip_pad)).border_l_1().border_color(border());
     let mut last_group = 1;
     for (k, id) in tracks {
         let group = k / 1000;
@@ -162,9 +166,9 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
     let fx: Vec<&Device> = t.devices.iter().filter(|d| !d.is_instrument()).collect();
     for i in 0..rows.inserts {
         inserts = inserts.child(match fx.get(i) {
-            Some(d) => slot(crate::paint::fit(&d.name, STRIP_W - 24., TEXT_XS), d.enabled, None),
+            Some(d) => slot(crate::paint::fit(&d.name, m().strip_w - 24., TEXT_XS), d.enabled, None),
             None if !is_vca => slot("", false, None),
-            None => div().h(px(SLOT_H)),
+            None => div().h(px(slot_h())),
         });
     }
     // Sends: one row per return, so every strip has the same rows.
@@ -178,7 +182,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         sends = sends.child(
             div()
                 .id(("send", (id.0 as usize) << 4 | ri))
-                .h(px(SLOT_H))
+                .h(px(slot_h()))
                 .px(px(SP1))
                 .gap(px(SP1))
                 .flex()
@@ -199,7 +203,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                         }))
                 })
                 .child(mono(letter, TEXT_XS, if has { pal.text } else { pal.faint }).w(px(10.)))
-                .child(widgets::hbar(if has { pos } else { 0. }, STRIP_W - 28. - SP2, 4., accent_alpha(0.8))),
+                .child(widgets::hbar(if has { pos } else { 0. }, m().strip_w - 28. - SP2, 4., accent_alpha(0.8))),
         );
     }
     let output = crate::mixer_routing::output_label(&ws.s.project, id);
@@ -230,7 +234,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
     div()
         .id(("strip", id.0 as usize))
         .flex_none()
-        .w(px(if is_main { STRIP_W + SP4 } else { STRIP_W }))
+        .w(px(if is_main { m().strip_w + SP4 } else { m().strip_w }))
         .h_full()
         .p(px(SP1))
         .gap(px(SP1))
@@ -240,12 +244,13 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         .bg(if selected { pal.raised } else { pal.surface })
         .border_1()
         .border_color(if selected { accent_alpha(0.45) } else { border() })
+        .when(!selected, |d| d.hover(|s| s.border_color(border_strong())))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.s.selected_track = Some(id);
             cx.notify();
         }))
         .when(rows.input, |d| {
-            let el = slot(crate::paint::fit(&input, STRIP_W - 28., TEXT_XS), !is_vca, Some(Icon::Plug));
+            let el = slot(crate::paint::fit(&input, m().strip_w - 28., TEXT_XS), !is_vca, Some(Icon::Plug));
             if !monitored {
                 return d.child(el);
             }
@@ -268,7 +273,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         .when(rows.inserts > 0, |d| d.child(inserts))
         .when(rows.sends, |d| d.child(sends))
         .when(rows.output, |d| {
-            let el = slot(crate::paint::fit(&output, STRIP_W - 28., TEXT_XS), true, Some(Icon::Send));
+            let el = slot(crate::paint::fit(&output, m().strip_w - 28., TEXT_XS), true, Some(Icon::Send));
             if !routable {
                 return d.child(el);
             }
@@ -286,7 +291,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         })
         .when(rows.pan, |d| d.child(
             div()
-                .h(px(PAN_H))
+                .h(px(pan_h()))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -296,7 +301,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 })
                 .child(mono(if is_vca { "—".into() } else { pan_text }, TEXT_XS, pal.muted).w(px(24.))),
         ))
-        .child(mono(format_db(t.volume_db), TEXT_SM, pal.text).h(px(DB_H)).flex().justify_center())
+        .child(mono(format_db(t.volume_db), TEXT_SM, pal.text).h(px(m().strip_db_h)).flex().justify_center())
         .child(
             div()
                 .flex_1()
@@ -309,7 +314,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         )
         .child(
             div()
-                .h(px(SLOT_H))
+                .h(px(slot_h()))
                 .flex()
                 .justify_center()
                 .gap(px(SP1))
@@ -343,7 +348,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         )
         .child(
             div()
-                .h(px(NAME_H))
+                .h(px(m().strip_name_h))
                 .px(px(SP1 + 2.))
                 .flex()
                 .flex_col()
@@ -352,7 +357,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
                 .bg(with_alpha(color, 0.2))
                 .border_t_2()
                 .border_color(color)
-                .child(label(crate::paint::fit(&t.name, STRIP_W - 12., TEXT_SM), TEXT_SM, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .child(label(crate::paint::fit(&t.name, m().strip_w - 12., TEXT_SM), TEXT_SM, pal.text).font_weight(FontWeight::SEMIBOLD))
                 .child(label(vca_name.map_or_else(|| kind_name(t.kind).to_owned(), |v| format!("→ {v}")), TEXT_XS, pal.muted)),
         )
         .children(routing_popover)
@@ -449,21 +454,21 @@ mod tests {
     fn the_strip_fits_its_height() {
         for h in [200., 264., 320., 400., 520.] {
             let r = rows(h, 3);
-            let mut used = FIXED_H + r.fader_h + SP1;
+            let mut used = fixed_h() + r.fader_h + SP1;
             if r.pan {
-                used += PAN_H + SP1;
+                used += pan_h() + SP1;
             }
             if r.output {
-                used += SLOT_H + SP1;
+                used += slot_h() + SP1;
             }
             if r.input {
-                used += SLOT_H + SP1;
+                used += slot_h() + SP1;
             }
             if r.sends {
-                used += 3. * (SLOT_H + 2.) - 2. + SP1;
+                used += 3. * (slot_h() + 2.) - 2. + SP1;
             }
             if r.inserts > 0 {
-                used += r.inserts as f32 * (SLOT_H + 2.) - 2. + SP1;
+                used += r.inserts as f32 * (slot_h() + 2.) - 2. + SP1;
             }
             assert!(used <= h + SP1 + 0.5 || r.fader_h == FADER_MIN, "{h}: {used}");
         }

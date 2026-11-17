@@ -626,9 +626,118 @@ pub fn strip(
     row
 }
 
-/// The root of an editor: fixed width, the dock's height, a column.
+thread_local! {
+    /// Set while a device window's editor is being built: [`panel`] then fills
+    /// the window instead of keeping the card's fixed width.
+    static IN_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The widest and tallest minimum the editor asked for since the scope began.
+    static NEED: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0., 0.)) };
+    /// The height of the editor's open drawer since the scope began (0 = closed or none).
+    static DRAWER: std::cell::Cell<f32> = const { std::cell::Cell::new(0.) };
+}
+
+/// While alive, editors built on this thread are laid out for a window.
+pub struct WindowScope(bool);
+
+impl WindowScope {
+    pub fn enter() -> Self {
+        NEED.with(|n| n.set((0., 0.)));
+        DRAWER.with(|d| d.set(0.));
+        Self(IN_WINDOW.with(|w| w.replace(true)))
+    }
+
+    /// The least width the editors built in this scope need (0 when none said).
+    pub fn min_width(&self) -> f32 {
+        NEED.with(|n| n.get().0)
+    }
+
+    /// The least height they need: below it the window scrolls (0 when none said).
+    pub fn min_height(&self) -> f32 {
+        NEED.with(|n| n.get().1)
+    }
+
+    /// The height the editor's open drawer takes on top of what it needs when
+    /// closed (0 when it is closed): the window grows by this much while the
+    /// drawer is open and gives it back when it closes.
+    pub fn drawer_height(&self) -> f32 {
+        DRAWER.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for WindowScope {
+    fn drop(&mut self) {
+        IN_WINDOW.with(|w| w.set(self.0));
+    }
+}
+
+/// Whether the editor being built is for a window ([`super::Layout::Window`]).
+pub fn in_window() -> bool {
+    IN_WINDOW.with(std::cell::Cell::get)
+}
+
+/// Tell the window what the editor being built cannot do with less than
+/// (width, height), so it scrolls instead of cutting it (a drawer that opened,
+/// a row that cannot wrap). A no-op outside a window.
+pub fn need(width: f32, height: f32) {
+    if in_window() {
+        NEED.with(|n| n.set((n.get().0.max(width), n.get().1.max(height))));
+    }
+}
+
+/// A drawer ("More") body: the groups that do not fit the editor's main row,
+/// shown below it while the drawer is open. It is a piece of the window frame:
+/// the window grows by the drawer's height when it opens (up to what the
+/// screen allows) and shrinks back when it closes, so the display above keeps
+/// its size; when the screen cannot give the room, the body scrolls. `estimate`
+/// is the height before the first frame has measured it.
+pub fn drawer(ws: &Workspace, dev: &Dev, groups: Vec<Div>, estimate: f32) -> Div {
+    let region = ws.fx.chrome.get(&dev.id).map(|c| c.drawer.clone());
+    let measured = region.as_ref().map_or(0., |r| f32::from(r.get().size.height));
+    let height = if measured > 8. { measured } else { estimate };
+    if in_window() {
+        DRAWER.with(|d| d.set(height + SP2));
+    }
+    let mut body = div().relative().flex_none().w_full().flex().flex_wrap().items_stretch().gap(px(SP2)).children(groups);
+    if let Some(region) = region {
+        body = body.child(canvas(move |b, _, _| region.set(b), |_, _, _, _| {}).absolute().size_full());
+    }
+    body
+}
+
+/// The shortest an editor in a window gets before the window scrolls.
+pub const WINDOW_PANEL_MIN_H: f32 = 280.;
+
+/// The root of an editor. In the dock it is `width` wide and as tall as the
+/// dock, a column. In a window (see [`WindowScope`]) `width` is the least it
+/// needs: it takes the room the window gives and the plots inside grow with
+/// it; below that width the window scrolls instead of cutting it off.
 pub fn panel(width: f32) -> Div {
+    if in_window() {
+        need(width, WINDOW_PANEL_MIN_H);
+        return div().flex_1().min_w(px(width)).h_full().min_h(px(WINDOW_PANEL_MIN_H)).p(px(SP2)).gap(px(SP2)).flex().flex_col();
+    }
     div().flex_none().w(px(width)).h_full().p(px(SP2)).gap(px(SP2)).flex().flex_col()
+}
+
+/// The display of an editor in a window: the plot or history that takes every
+/// pixel the controls leave, in both directions, and stops shrinking at
+/// `min_h`. Put it in a [`panel`]'s column, once.
+pub fn display(min_h: f32) -> Div {
+    div().flex_1().min_w(px(0.)).min_h(px(min_h))
+}
+
+/// A row of control groups that reflows with the window: the groups wrap onto
+/// more lines as it narrows and each line's groups stretch to fill it as it
+/// widens (see [`grow`]), so no line leaves dead space on the right and none
+/// has to be cut.
+pub fn flow() -> Div {
+    div().flex_none().w_full().flex().flex_wrap().items_stretch().gap(px(SP2))
+}
+
+/// A group (or a control) that takes its line's free width: use it on every
+/// child of a [`flow`]. Its own content width is the least it keeps.
+pub fn grow(group: Div) -> Div {
+    group.flex_grow_1()
 }
 
 /// A small `label value` read-out in a box.
@@ -782,6 +891,37 @@ pub fn section(dev: &Dev, title: impl Into<gpui::SharedString>, switch: Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_scope_makes_panels_fluid_and_remembers_the_widest() {
+        assert!(!in_window());
+        {
+            let scope = WindowScope::enter();
+            assert!(in_window());
+            assert_eq!((scope.min_width(), scope.min_height()), (0., 0.));
+            let _ = panel(640.);
+            let _ = panel(920.);
+            let _ = panel(500.);
+            assert_eq!(scope.min_width(), 920.);
+            assert_eq!(scope.min_height(), WINDOW_PANEL_MIN_H);
+            // A drawer that opened asks for more height, never less.
+            need(0., 620.);
+            need(0., 400.);
+            assert_eq!(scope.min_height(), 620.);
+            {
+                // Scopes nest: the inner one starts from nothing and leaves the thread in a window.
+                let inner = WindowScope::enter();
+                let _ = panel(300.);
+                assert_eq!(inner.min_width(), 300.);
+            }
+            assert!(in_window());
+        }
+        assert!(!in_window(), "the dock's cards keep their fixed width");
+        let _ = panel(920.);
+        need(900., 900.);
+        let scope = WindowScope::enter();
+        assert_eq!((scope.min_width(), scope.min_height()), (0., 0.), "a card built outside a scope asks for nothing");
+    }
 
     #[test]
     fn the_frequency_axis_round_trips() {

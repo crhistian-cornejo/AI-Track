@@ -15,7 +15,7 @@
 //!   data folder).
 
 use super::main_thread::MainThread;
-use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PresetInfo, ScanStatus};
+use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PluginFolder, PluginProblem, PluginReport, PresetInfo, ScanStatus};
 use aitrack_dsp::{Category, ParamInfo, PluginInfo, ProcessContext, Processor};
 use aitrack_engine::ProcessorFactory;
 use aitrack_host::sandbox::{SandboxEditor, SandboxedPlugin};
@@ -134,6 +134,11 @@ fn plugin_edit(device: DeviceId, e: ParamEdit) -> PluginEdit {
 
 impl PluginRuntime {
     pub fn new(main: MainThread, sandbox: bool) -> Arc<Self> {
+        // Plugin editor windows reopen at the size and place the user left them
+        // (sandboxed hosts get the same file through their environment).
+        aitrack_host::editor::placement::set_file(crate::appearance::config_dir().join("plugin_windows.json"));
+        // The first time a plugin's editor is opened, its picture is kept here (never during the scan).
+        aitrack_host::thumbs::set_dir(crate::views::palette::thumbs::dir());
         Arc::new(Self {
             main,
             known: RwLock::new(Vec::new()),
@@ -667,7 +672,34 @@ impl<P: Processor + 'static> Drop for MainThreadPlugin<P> {
 
 enum ScanMsg {
     Progress(f32, String),
-    Done(Result<(Vec<HostedPluginInfo>, String), String>),
+    Done(Result<(Vec<HostedPluginInfo>, String, PluginReport), String>),
+}
+
+/// What a finished scan found and left out, for Preferences.
+fn build_report(scanner: &Scanner, took: Option<Duration>) -> PluginReport {
+    let folders = scanner
+        .search_roots()
+        .into_iter()
+        .map(|r| PluginFolder { path: r.path, format: r.format, custom: r.custom, exists: r.exists, files: r.files })
+        .collect();
+    let problems = scanner
+        .problems()
+        .into_iter()
+        .map(|p| PluginProblem { path: p.path, format: p.format, title: p.kind.title().to_owned(), advice: p.kind.advice().to_owned(), detail: p.message })
+        .collect();
+    PluginReport { folders, problems, files: scanner.discover().len(), took }
+}
+
+/// The one line under "Plugin folders".
+fn scan_summary(plugins: usize, files: usize, problems: usize, took: Option<Duration>) -> String {
+    let mut s = format!("{plugins} plugin{} in {files} file{}", if plugins == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" });
+    if problems > 0 {
+        s.push_str(&format!(" · {problems} left out"));
+    }
+    if let Some(t) = took.filter(|t| t.as_millis() > 0) {
+        s.push_str(&format!(" · {:.1} s", t.as_secs_f32()));
+    }
+    s
 }
 
 pub struct RealCatalog {
@@ -678,6 +710,9 @@ pub struct RealCatalog {
     folders: Vec<PathBuf>,
     scan: Option<Receiver<ScanMsg>>,
     status: ScanStatus,
+    report: PluginReport,
+    /// Files to check again (they were blocked) at the next scan.
+    retry: Vec<PathBuf>,
 }
 
 fn external(infos: &[HostedPluginInfo]) -> Vec<ExternalPlugin> {
@@ -711,6 +746,8 @@ impl RealCatalog {
             folders,
             scan: None,
             status: ScanStatus { running: false, fraction: 0., message: format!("{} plugins (cached)", cached.len()) },
+            report: PluginReport::default(),
+            retry: Vec::new(),
         };
         this.rescan();
         this
@@ -750,37 +787,33 @@ impl PluginCatalog for RealCatalog {
         let (tx, rx) = unbounded();
         let path = self.cache_path.clone();
         let custom = self.folders.clone();
+        let retry = std::mem::take(&mut self.retry);
         let spawned = std::thread::Builder::new().name("aitrack-plugin-scan".into()).spawn(move || {
             let mut scanner = Scanner::new(&path);
             for dir in &custom {
                 scanner.add_search_path(aitrack_model::PluginFormat::Vst3, dir);
                 scanner.add_search_path(aitrack_model::PluginFormat::Clap, dir);
             }
-            let files = scanner.discover();
-            let has_scanner = scanner.has_scanner_exe();
-            let n = files.len().max(1);
-            // Small batches so the dialog can show progress (each batch is
-            // scanned out of process, a few in parallel).
-            let mut done = 0;
-            for chunk in files.chunks(4) {
-                let _ = tx.send(ScanMsg::Progress(done as f32 / n as f32, format!("Scanning plugins… {done}/{}", files.len())));
-                scanner.scan_files(chunk);
-                done += chunk.len();
+            for p in &retry {
+                scanner.unblock(p);
             }
-            // Prunes vanished files and saves the cache (everything is fresh now).
+            let started = std::time::Instant::now();
+            let files = scanner.discover();
+            // One pass over every file with the checkers running side by side (a slow
+            // plugin holds only its own worker), then the pass that prunes what is gone
+            // and saves: everything is fresh by then.
+            let tx_progress = tx.clone();
+            let total = files.len();
+            scanner.scan_files_with(&files, &move |done, _| {
+                let _ = tx_progress.send(ScanMsg::Progress(done as f32 / total.max(1) as f32, format!("Scanning plugins… {done}/{total}")));
+            });
             let result = scanner
                 .scan()
-                .map(|report| {
+                .map(|_| {
                     let plugins = scanner.plugins();
-                    let failed = report.failed.len() + report.skipped_blocked;
-                    let summary = if !has_scanner && failed > 0 {
-                        format!("{} plugins · aitrack-plugin-scanner missing ({failed} skipped)", plugins.len())
-                    } else if failed > 0 {
-                        format!("{} plugins · {failed} failed or blocked", plugins.len())
-                    } else {
-                        format!("{} plugins", plugins.len())
-                    };
-                    (plugins, summary)
+                    let report = build_report(&scanner, Some(started.elapsed()));
+                    let summary = scan_summary(plugins.len(), report.files, report.problems.len(), report.took);
+                    (plugins, summary, report)
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(ScanMsg::Done(result));
@@ -789,10 +822,6 @@ impl PluginCatalog for RealCatalog {
             self.scan = Some(rx);
             self.status = ScanStatus { running: true, fraction: 0., message: "Looking for plugins…".into() };
         }
-    }
-
-    fn plugin_folders(&self) -> Vec<PathBuf> {
-        self.folders.clone()
     }
 
     fn add_plugin_folder(&mut self, path: PathBuf) -> bool {
@@ -817,6 +846,15 @@ impl PluginCatalog for RealCatalog {
         self.status.clone()
     }
 
+    fn plugin_report(&self) -> PluginReport {
+        self.report.clone()
+    }
+
+    fn retry_plugin(&mut self, path: &Path) {
+        self.retry.push(path.to_path_buf());
+        self.rescan();
+    }
+
     fn poll(&mut self) -> bool {
         let Some(rx) = &self.scan else { return false };
         let mut changed = false;
@@ -824,7 +862,8 @@ impl PluginCatalog for RealCatalog {
             changed = true;
             match msg {
                 ScanMsg::Progress(f, m) => self.status = ScanStatus { running: true, fraction: f, message: m },
-                ScanMsg::Done(Ok((plugins, summary))) => {
+                ScanMsg::Done(Ok((plugins, summary, report))) => {
+                    self.report = report;
                     self.external = external(&plugins);
                     self.rt.set_known(plugins);
                     self.status = ScanStatus { running: false, fraction: 1., message: summary };
@@ -845,6 +884,32 @@ impl PluginCatalog for RealCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scan_summary_says_what_was_left_out_and_how_long_it_took() {
+        assert_eq!(scan_summary(1, 1, 0, None), "1 plugin in 1 file");
+        assert_eq!(scan_summary(38, 40, 2, Some(Duration::from_millis(1090))), "38 plugins in 40 files · 2 left out · 1.1 s");
+    }
+
+    #[test]
+    fn the_report_lists_missing_folders_and_files_that_could_not_be_checked() {
+        let dir = std::env::temp_dir().join(format!("aitrack-plugin-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mine")).unwrap();
+        std::fs::write(dir.join("mine").join("Odd.clap"), b"x").unwrap();
+        let mut scanner = Scanner::new(dir.join("cache.json")).with_scanner_exe(dir.join("no-scanner")).without_default_paths();
+        scanner.add_search_path(aitrack_model::PluginFormat::Clap, dir.join("mine"));
+        scanner.add_search_path(aitrack_model::PluginFormat::Clap, dir.join("gone"));
+        scanner.scan().unwrap();
+        let r = build_report(&scanner, None);
+        assert_eq!(r.files, 1);
+        assert_eq!(r.problems.len(), 1);
+        assert_eq!(r.problems[0].title, "Not checked");
+        assert!(!r.problems[0].advice.is_empty());
+        let gone = r.folders.iter().find(|f| f.path.ends_with("gone")).unwrap();
+        assert!(gone.custom && !gone.exists);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn stock_catalog_has_real_params_and_presets() {

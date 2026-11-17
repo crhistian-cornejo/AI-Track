@@ -97,7 +97,7 @@ pub fn tip_owned(text: String) -> impl Fn(&mut Window, &mut App) -> AnyView + 's
 
 /// A square icon button, `CONTROL_H` px, accent when active.
 pub fn icon_button(id: impl Into<ElementId>, i: Icon, active: bool) -> Stateful<Div> {
-    sized_icon_button(id, i, active, CONTROL_H, 16.)
+    sized_icon_button(id, i, active, m().control_h, 16.)
 }
 
 pub fn sized_icon_button(id: impl Into<ElementId>, i: Icon, active: bool, side: f32, glyph: f32) -> Stateful<Div> {
@@ -123,7 +123,7 @@ pub fn text_button(id: impl Into<ElementId>, text: impl Into<SharedString>, i: O
     div()
         .id(id)
         .flex_none()
-        .h(px(CONTROL_H))
+        .h(px(m().control_h))
         .px(px(SP3))
         .gap(px(SP2))
         .flex()
@@ -185,7 +185,7 @@ pub type OnSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 /// when changed mid-flight). `items` are `(icon, label)`.
 pub fn segmented(id: &'static str, items: &[(Option<Icon>, &'static str)], selected: usize, seg_w: f32, on_select: OnSelect) -> Div {
     let pal = p();
-    let h = CONTROL_H;
+    let h = m().control_h;
     let inner = h - 4.;
     let indicator = div()
         .absolute()
@@ -532,7 +532,7 @@ pub fn stepper(id: &'static str, value: String) -> (Div, Stateful<Div>, Stateful
     let inc = sized_icon_button(ElementId::Name(format!("{id}-inc").into()), Icon::Add, false, 24., 12.);
     let shell = div()
         .flex_none()
-        .h(px(CONTROL_H))
+        .h(px(m().control_h))
         .px(px(2.))
         .flex()
         .items_center()
@@ -800,7 +800,7 @@ impl Render for TextInput {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
-            .h(px(CONTROL_H))
+            .h(px(m().control_h))
             .w_full()
             .px(px(SP2))
             .gap(px(SP2))

@@ -2,7 +2,7 @@
 //! filters make, how each result is adjusted to the song, the synced preview
 //! asked for, and the remembered layout.
 
-use crate::bridge::{BpmTrust, LibraryItem, SoundGroup, SoundHit, SoundKind, SoundOrigin, SoundQuery, SyncedPreview};
+use crate::bridge::{BpmTrust, LibraryItem, SoundFolder, SoundGroup, SoundHit, SoundKind, SoundOrigin, SoundQuery, SyncedPreview};
 use aitrack_library::{Fit, FitKind, TempoFit, fit_key, fit_tempo};
 use aitrack_model::{PPQ, Scale, TempoMap, Tick};
 use serde::{Deserialize, Serialize};
@@ -35,11 +35,13 @@ pub struct Filters {
     pub tag: Option<String>,
     pub origin: Option<SoundOrigin>,
     pub favorites: bool,
+    /// Only inside this folder.
+    pub folder: Option<SoundFolder>,
 }
 
 impl Default for Filters {
     fn default() -> Self {
-        Self { fit: false, by_key: true, key_exact: false, by_bpm: true, bpm_tolerance: 6., kind: SoundKind::All, group: None, tag: None, origin: None, favorites: false }
+        Self { fit: false, by_key: true, key_exact: false, by_bpm: true, bpm_tolerance: 6., kind: SoundKind::All, group: None, tag: None, origin: None, favorites: false, folder: None }
     }
 }
 
@@ -54,8 +56,32 @@ pub fn build_query(text: &str, f: &Filters, song_scale: Option<Scale>, song_bpm:
         tag: f.tag.clone(),
         origin: f.origin,
         favorites: f.favorites,
+        folder: f.folder.clone(),
         limit: 0,
     }
+}
+
+/// Which folder is the Splice one: the user's choice, else the one already in
+/// use while it is there, else (when `probe_due`) whatever `detect` finds,
+/// else the place Splice would use, so the panel can say where it looked.
+/// Looking is a walk of the disk, hence `probe_due`.
+pub fn splice_folder(
+    explicit: Option<std::path::PathBuf>,
+    current: Option<&std::path::Path>,
+    probe_due: bool,
+    detect: impl FnOnce() -> Option<std::path::PathBuf>,
+    fallback: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if let Some(c) = current.filter(|c| c.is_dir()) {
+        return Some(c.to_path_buf());
+    }
+    if probe_due && let Some(found) = detect() {
+        return Some(found);
+    }
+    current.map(std::path::Path::to_path_buf).or(fallback)
 }
 
 /// How a result is adjusted to the song.
@@ -251,6 +277,24 @@ mod tests {
             bpm_trust: BpmTrust::Reliable,
             unanalysed: false,
         }
+    }
+
+    #[test]
+    fn the_splice_folder_is_the_choice_then_the_one_in_use_then_what_is_found() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("aitrack-splice-pick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fallback = Some(PathBuf::from("/nowhere/Splice"));
+        let found = || Some(PathBuf::from("/found/Splice"));
+        // A choice wins even when it is missing: the panel says so.
+        assert_eq!(splice_folder(Some("/mine".into()), Some(&dir), true, found, fallback.clone()), Some("/mine".into()));
+        // The folder in use is kept without looking at the disk again.
+        assert_eq!(splice_folder(None, Some(&dir), true, || panic!("must not look"), fallback.clone()), Some(dir.clone()));
+        // Missing: looked for when due, else the old guess stays (and nothing is walked).
+        assert_eq!(splice_folder(None, Some(Path::new("/gone")), true, found, fallback.clone()), Some("/found/Splice".into()));
+        assert_eq!(splice_folder(None, Some(Path::new("/gone")), false, || panic!("not due"), fallback.clone()), Some("/gone".into()));
+        assert_eq!(splice_folder(None, None, true, || None, fallback.clone()), fallback, "nothing found: say where it was looked");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

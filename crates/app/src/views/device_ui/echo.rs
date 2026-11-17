@@ -90,7 +90,8 @@ impl Echo {
         let pitch_step = dev.plain(p::PITCH).round() as i32;
         Self {
             step,
-            span: span_beats(step, configured),
+            // A window shows at least two bars.
+            span: if mk::windowed(dev) { span_beats(step, configured).max(8.) } else { span_beats(step, configured) },
             configured,
             reps: chain(configured, dev.plain(p::FEEDBACK) / 100., dev.plain(p::VEL_STEP).round() / 127., pitch_step, KEY, VELOCITY),
             len: if dev.choice(p::LENGTH) == 0 { NOTE_BEATS * gate } else { step * gate },
@@ -130,7 +131,8 @@ fn vel_frac(vel: f32, h: f32) -> f32 {
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let e = Echo::of(dev);
-    let h = mk::plot_h(dev);
+    let win = mk::windowed(dev);
+    let h = if win { mk::seen_h(ws, dev, 0, mk::plot_h(dev)) } else { mk::plot_h(dev) };
     let sync = dev.on(p::SYNC);
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
     // The first repeat that sounds: its start is the time, its height the feedback.
@@ -170,17 +172,27 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let bar = (b % 4.).abs() < 1e-3;
             kit::vline(window, r, x, if bar { pal.grid_bar } else { pal.grid_beat });
             if bar || e.span <= 8. {
-                kit::txt(window, cx, &format!("{}", b as i32), x + 3., r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Left);
+                kit::txt(window, cx, &format!("{}", b as i32), x + 3., r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Left);
             }
             b += every;
         }
         kit::hline(window, r, base, pal.grid_bar);
-        kit::txt(window, cx, "beats", r.right() - 6., r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Right);
+        if win {
+            // The velocity scale: full, and half.
+            for (q, text) in [(1., "127"), (0.5, "64")] {
+                kit::hline(window, r, base - usable * q, if q == 1. { pal.grid_bar } else { pal.grid_beat });
+                kit::txt(window, cx, text, r.x + 4., base - usable * q + 2., TEXT_SM, pal.faint, TextAlign::Left);
+            }
+        }
+        kit::txt(window, cx, "beats", r.right() - 6., r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Right);
         mk::corner(window, cx, r, &left, false, 3.);
         mk::corner(window, cx, r, &right, true, 3.);
         // The note played; hollow when the dry signal is off.
         let h0 = usable * VELOCITY;
         kit::bar(window, r.x + 1., base - h0, (NOTE_BEATS / e.span * r.w).max(3.), h0, 2., if e.dry { with_alpha(lit(pal.text), 0.6) } else { with_alpha(pal.text, 0.18) });
+        if win {
+            kit::txt(window, cx, if e.dry { "in" } else { "in (dry off)" }, r.x + 4., base - h0 - 14., TEXT_SM, pal.muted, TextAlign::Left);
+        }
         let room = e.step / e.span * r.w >= 26.;
         for rep in &e.reps {
             let t = rep.k as f32 * e.step;
@@ -189,6 +201,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let bh = (usable * rep.vel).max(2.);
             let fill = if rep.heard { with_alpha(lit(series(0)), (0.3 + 0.7 * rep.vel) * (0.35 + 0.65 * e.chance)) } else { with_alpha(pal.muted, 0.2) };
             kit::bar(window, x, base - bh, w, bh, 2., fill);
+            if win && rep.heard && w >= 16. && bh >= 16. {
+                kit::txt(window, cx, &format!("{:.0}", rep.vel * 127.), x + w / 2., base - bh + 3., TEXT_SM, kit::ink_on(fill), TextAlign::Center);
+            }
             if e.time_rand > 0. {
                 mk::span(window, r.px((t - e.time_rand) / e.span), r.px((t + e.time_rand) / e.span), base - 3., 3., 1.5, with_alpha(pal.text, 0.5));
             }
@@ -204,7 +219,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 }
                 // Above the velocity whisker, when there is one.
                 let high = if e.vel_rand > 0. { (rep.vel * (1. + e.vel_rand)).min(1.) } else { rep.vel };
-                kit::txt(window, cx, &label, x + w / 2., (base - usable * high - 14.).max(r.y + 14.), TEXT_XS, pal.muted, TextAlign::Center);
+                kit::txt(window, cx, &label, x + w / 2., (base - usable * high - 14.).max(r.y + 14.), TEXT_SM, pal.muted, TextAlign::Center);
             }
         }
         // Where the fade never reaches.

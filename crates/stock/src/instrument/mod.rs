@@ -2,6 +2,7 @@
 
 pub mod acid303;
 pub mod drum;
+pub mod granular;
 pub mod kick808;
 pub mod sample;
 pub mod sampler;

@@ -826,7 +826,7 @@ fn device_submenu_card(
                 menu_item("dev-folders", Some(Icon::FolderOpen), "Plugin folders…", None, false).on_click(cx.listener(
                     |this, _, _, cx| {
                         this.close_menu(cx);
-                        this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx);
+                        this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Plugins), cx);
                     },
                 )),
             );

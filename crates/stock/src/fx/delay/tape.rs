@@ -104,6 +104,7 @@ pub struct TapeColor {
     pre: SvfState,
     de: SvfState,
     gap: SvfState,
+    dc: SvfState,
     sat: Adaa1,
 }
 
@@ -114,6 +115,8 @@ pub struct TapeCoeffs {
     pub de: SvfCoeffs,
     pub gap: SvfCoeffs,
     pub bump: SvfCoeffs,
+    /// Takes the offset the asymmetric head puts on loud signals back out.
+    pub dc: SvfCoeffs,
 }
 
 /// Playback bandwidth for an Age of `age` (0..1): 16 kHz new, 2.5 kHz worn.
@@ -129,6 +132,7 @@ impl TapeCoeffs {
             de: SvfCoeffs::new(SvfMode::HighShelf, 3_000.0, 0.707, -6.0, sr),
             gap: SvfCoeffs::new(SvfMode::Lowpass, gap_hz(age).min(nyq), 0.6, 0.0, sr),
             bump: SvfCoeffs::new(SvfMode::Bell, 90.0, 1.0, 1.0 + 2.0 * age, sr),
+            dc: SvfCoeffs::new(SvfMode::Highpass, 8.0, 0.707, 0.0, sr),
         }
     }
 }
@@ -146,7 +150,7 @@ impl TapeColor {
     pub fn new() -> Self {
         let mut sat = Adaa1::new(ShaperKind::Asym);
         sat.set_bias(BIAS);
-        Self { pre: SvfState::default(), de: SvfState::default(), gap: SvfState::default(), sat }
+        Self { pre: SvfState::default(), de: SvfState::default(), gap: SvfState::default(), dc: SvfState::default(), sat }
     }
 
     /// The loop's colour at `drive` (linear gain into the saturator).
@@ -157,13 +161,17 @@ impl TapeColor {
         let e = self.pre.process(&c.pre, x);
         let s = self.sat.process(e * drive) / (drive * SLOPE);
         let d = self.de.process(&c.de, s);
-        self.gap.process(&c.gap, d)
+        // The asymmetric curve rectifies loud peaks into an offset that
+        // would sit in the loop and the output (13 % of the level at +12 dB
+        // drive); a very low high-pass takes it out.
+        self.dc.process(&c.dc, self.gap.process(&c.gap, d))
     }
 
     pub fn reset(&mut self) {
         self.pre.reset();
         self.de.reset();
         self.gap.reset();
+        self.dc.reset();
         self.sat.reset();
     }
 }

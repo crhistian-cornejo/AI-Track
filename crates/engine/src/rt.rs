@@ -127,6 +127,10 @@ pub(crate) enum RtCommand {
     SetTrackNoInput(TrackId, bool),
     /// A rack's Chain Select value.
     SetRackSelector(DeviceId, u8),
+    /// The global groove amount.
+    SetGrooveAmount(f32),
+    /// A pool groove's settings.
+    SetGrooveSettings(aitrack_model::GrooveId, aitrack_model::GrooveSettings),
 }
 
 /// A raw short MIDI message (status + up to two data bytes).
@@ -717,6 +721,18 @@ impl AudioProcessor {
                 RtCommand::SetTrackInput(track, first, count) => {
                     if let Some(g) = &mut self.graph {
                         g.set_track_input(track, (count > 0).then_some((first, count)));
+                    }
+                }
+                RtCommand::SetGrooveAmount(amount) => {
+                    let now = self.now_ticks().ceil() as Tick;
+                    if let Some(g) = &mut self.graph {
+                        g.set_groove_amount(amount, now);
+                    }
+                }
+                RtCommand::SetGrooveSettings(id, settings) => {
+                    let now = self.now_ticks().ceil() as Tick;
+                    if let Some(g) = &mut self.graph {
+                        g.set_groove_settings(id, settings, now);
                     }
                 }
                 RtCommand::SetRackSelector(rack, value) => {

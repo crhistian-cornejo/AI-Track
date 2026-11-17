@@ -23,7 +23,7 @@
 //! drawing, and the pattern functions carry it.
 
 use super::kit::{self, Rect};
-use super::{Dev, ParamSet, Region, current, set_gliding, set_many, set_now};
+use super::{Dev, Layout, ParamSet, Region, current, set_gliding, set_many, set_now};
 use crate::icons::{Icon, icon};
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
@@ -59,6 +59,19 @@ const LEVEL_H: f32 = 28.;
 const SWITCH_H: f32 = 16.;
 const VIEW_H: f32 = 96.;
 const VIEW_LABELS: f32 = 16.;
+/// In a window the lanes and the viewer share what height there is, each no
+/// shorter than this (below it the window's body scrolls instead).
+const WIN_GUTTER: f32 = 52.;
+const WIN_GATE_H: f32 = 52.;
+const WIN_DIV_H: f32 = 28.;
+const WIN_PITCH_H: f32 = 52.;
+const WIN_LEVEL_H: f32 = 44.;
+const WIN_SWITCH_H: f32 = 20.;
+const WIN_NUMBERS_H: f32 = 16.;
+/// The lane block: numbers, eight lanes, seven gaps.
+const LANES_MIN: f32 = WIN_NUMBERS_H + WIN_GATE_H + WIN_DIV_H + WIN_PITCH_H + WIN_LEVEL_H + 4. * WIN_SWITCH_H + 8. * SP1;
+const VIEW_MIN: f32 = 168.;
+const CLASSIC_MIN: f32 = 200.;
 /// Divisions a step can have, by index (the plugin's `DIV_NAMES`).
 const DIV_COUNT: u32 = 5;
 const SEEDS: u32 = 1000;
@@ -123,6 +136,63 @@ impl SpeedTrace {
 /// Plot fraction (0 = top) of a read speed: one octave is a quarter of the height.
 fn speed_frac(speed: f32) -> f32 {
     (0.5 - 0.25 * speed.max(1e-3).log2()).clamp(0.02, 0.98)
+}
+
+/// The speed the first repeat of an event reads the chunk at, a fraction `t`
+/// (0..1) into the event: the Pitch and its End ramp, halved by Half-Time.
+pub fn expected_speed(pitch: f32, pitch_end: f32, half_time: bool, t: f32) -> f32 {
+    2f32.powf((pitch + pitch_end * t.clamp(0., 1.)).clamp(-48., 48.) / 12.) * if half_time { 0.5 } else { 1. }
+}
+
+/// What the Classic timeline draws, in beats (quarter notes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Classic {
+    pub interval: f32,
+    pub gate: f32,
+    pub offset: f32,
+    /// One repeat of the event.
+    pub grid: f32,
+    /// 0..1.
+    pub chance: f32,
+    /// Index of the Mix Mode: Insert, Mix, Duck, Gate.
+    pub mix: usize,
+}
+
+/// Beats of the Grid choices (the plugin's `GRIDS`, a bar being 4 beats), a
+/// triplet being two thirds of it.
+const GRID_BEATS: [f32; 6] = [0.125, 0.25, 0.5, 1., 2., 4.];
+
+impl Classic {
+    pub fn of(dev: &Dev) -> Self {
+        let (interval, gate) = classic_lengths(dev.choice(p::INTERVAL), dev.choice(p::GATE), 4.);
+        let grid = GRID_BEATS[dev.choice(p::GRID).min(GRID_BEATS.len() - 1)] * if dev.on(p::TRIPLETS) { 2. / 3. } else { 1. };
+        Self { interval: interval as f32, gate: gate as f32, offset: dev.choice(p::OFFSET) as f32 * 0.25, grid, chance: dev.plain(p::CHANCE) / 100., mix: dev.choice(p::MIX_MODE) }
+    }
+
+    /// Beats the timeline spans: at least two intervals and, when they are
+    /// short, four bars of them.
+    pub fn span(&self) -> f32 {
+        let k = (16. / self.interval.max(0.125)).floor().clamp(2., 16.);
+        (self.interval * k).max(4.)
+    }
+
+    /// The events inside the span, as `(start, end)` in beats: one per
+    /// interval, `offset` after its start, `gate` long, cut at the span.
+    pub fn events(&self) -> Vec<(f32, f32)> {
+        let span = self.span();
+        let step = self.interval.max(0.125);
+        (0..)
+            .map(|i| i as f32 * step + self.offset)
+            .take_while(|start| *start < span - 1e-4)
+            .map(|start| (start, (start + self.gate).min(span)))
+            .filter(|(a, b)| b > a)
+            .collect()
+    }
+
+    /// How many repeats of the chunk an event of `len` beats holds (at most 64).
+    pub fn repeats(&self, len: f32) -> usize {
+        ((len / self.grid.max(0.01)).ceil() as usize).clamp(1, 64)
+    }
 }
 
 // ───────────────────────────── The pattern ─────────────────────────────
@@ -756,7 +826,14 @@ fn small_button(id: impl Into<gpui::ElementId>, ic: Icon, text: &'static str, ti
         .active(|s| s.bg(pressed()))
         .tooltip(widgets::tip(tip, None))
         .child(icon(ic, 12., pal.muted))
-        .when(!text.is_empty(), |d| d.child(label(text, TEXT_XS, pal.text).font_weight(FontWeight::MEDIUM)))
+        .when(!text.is_empty(), |d| d.child(label(text, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM)))
+}
+
+/// A lane's height: fixed in the card, in a window `min` that grows by `grow`.
+#[derive(Clone, Copy)]
+struct LaneSize {
+    min: f32,
+    grow: f32,
 }
 
 /// What a lane draws for one column.
@@ -780,13 +857,16 @@ fn lane(
     dev: &Dev,
     kind: Kind,
     slot: u8,
-    height: f32,
+    size: LaneSize,
     name: &'static str,
+    ticks: Option<(&'static str, &'static str)>,
     cells: &[Col],
     progress: Option<f32>,
     cx: &mut Context<Workspace>,
 ) -> gpui::Div {
     let pal = p();
+    let win = dev.layout == Layout::Window;
+    let gutter = if win { WIN_GUTTER } else { GUTTER };
     let region = ws.fx.region(dev.id, slot);
     let (device, set) = (dev.id, dev.set.clone());
     let store = region.clone();
@@ -810,21 +890,32 @@ fn lane(
                 let h = if s.on { s.prob / 100. } else { s.prob / 100. * 0.35 };
                 // A tied step holds the event of the one before: a bar across the gap links them.
                 let tied = s.tie && i > 0;
-                cell.child(div().absolute().left_0().right_0().bottom_0().h(relative(h.max(0.06))).bg(if tied { with_alpha(pal.accent, 0.35) } else { fill }))
+                let chance_text = win && live && s.prob < 99.5;
+                cell.when(win, |d| d.child(div().absolute().left_0().right_0().top(relative(0.5)).h(px(1.)).bg(content(0.08))))
+                    .child(div().absolute().left_0().right_0().bottom_0().h(relative(h.max(0.06))).bg(if tied { with_alpha(pal.accent, 0.35) } else { fill }))
+                    .when(chance_text, |d| d.child(div().absolute().left_0().right_0().bottom(px(2.)).flex().justify_center().child(mono(format!("{:.0}", s.prob), TEXT_SM, if s.on { kit::ink_on(pal.accent) } else { pal.muted }))))
                     .when(tied, |d| d.child(div().absolute().left(px(-GAP)).w(px(GAP)).top(px(SP1)).h(px(SP1)).bg(pal.accent)).child(div().absolute().left_0().right_0().top(px(SP1)).h(px(SP1)).bg(pal.accent)))
             }
-            Kind::Div => cell.flex().items_center().justify_center().child(mono(div_name(s.div), TEXT_XS, if s.on { pal.text } else { pal.faint })),
+            Kind::Div => cell.flex().items_center().justify_center().child(mono(div_name(s.div), TEXT_SM, if s.on { pal.text } else { pal.faint })),
             Kind::Pitch => {
                 let bar = s.pitch.abs() as f32 / 12. * 0.5;
                 let colour = if s.on { pal.accent } else { pal.faint };
                 cell.child(div().absolute().left_0().right_0().top(relative(0.5)).h(px(1.)).bg(content(0.2)))
+                    .when(win, |d| d.child(div().absolute().left_0().right_0().top(relative(0.25)).h(px(1.)).bg(content(0.07))).child(div().absolute().left_0().right_0().top(relative(0.75)).h(px(1.)).bg(content(0.07))))
                     .when(s.pitch > 0, |d| d.child(div().absolute().left(px(SP1)).right(px(SP1)).bottom(relative(0.5)).h(relative(bar)).bg(colour)))
                     .when(s.pitch < 0, |d| d.child(div().absolute().left(px(SP1)).right(px(SP1)).top(relative(0.5)).h(relative(bar)).bg(colour)))
+                    .when(win && s.pitch != 0, |d| {
+                        let text = div().absolute().left_0().right_0().flex().justify_center().child(mono(format!("{:+}", s.pitch), TEXT_SM, pal.text));
+                        d.child(if s.pitch > 0 { text.top(px(1.)) } else { text.bottom(px(1.)) })
+                    })
             }
             Kind::Level => {
                 let frac = (s.level + 60.) / 60.;
                 let colour = if !live { content(0.1) } else if s.on { with_alpha(pal.accent2, 0.85) } else { content(0.2) };
-                cell.child(div().absolute().left(px(SP1)).right(px(SP1)).bottom_0().h(relative(frac.clamp(0.04, 1.))).bg(colour))
+                let level_text = win && live && s.level < -0.5;
+                cell.child(div().absolute().left(px(SP1)).right(px(SP1)).bottom_0().h(relative(frac.clamp(0.04, 1.))).bg(colour)).when(level_text, |d| {
+                    d.child(div().absolute().left_0().right_0().top(px(1.)).flex().justify_center().child(mono(format!("{:.0}", s.level), TEXT_SM, if frac > 0.75 && s.on { kit::ink_on(pal.accent2) } else { pal.muted })))
+                })
             }
             Kind::Switch(sw) => {
                 let set = match sw {
@@ -835,9 +926,9 @@ fn lane(
                 };
                 // A tie is a bar; the others are dots.
                 let mark = if sw == Sw::Tie {
-                    div().w(relative(1.)).h(px(4.)).bg(if set { pal.accent } else { content(0.1) })
+                    div().w(relative(1.)).h(px(if win { 6. } else { 4. })).bg(if set { pal.accent } else { content(0.1) })
                 } else {
-                    div().size(px(8.)).rounded_full().bg(if set { pal.accent } else { content(0.14) })
+                    div().size(px(if win { 10. } else { 8. })).rounded_full().bg(if set { pal.accent } else { content(0.14) })
                 };
                 cell.flex()
                     .items_center()
@@ -912,35 +1003,48 @@ fn lane(
             cx.notify();
         }));
     }
-    div()
-        .flex_none()
-        .h(px(height))
-        .flex()
-        .gap(px(GAP))
-        .child(div().flex_none().w(px(GUTTER)).flex().items_center().child(label(name, TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD)))
-        .child(row)
+    let name_label = label(name, TEXT_SM, pal.faint).font_weight(FontWeight::SEMIBOLD);
+    let gutter_box = match ticks.filter(|_| win) {
+        Some((top, bottom)) => div()
+            .flex_none()
+            .w(px(gutter))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .child(mono(top, TEXT_SM, pal.faint))
+            .child(name_label)
+            .child(mono(bottom, TEXT_SM, pal.faint)),
+        None => div().flex_none().w(px(gutter)).flex().items_center().child(name_label),
+    };
+    let outer = div().flex().gap(px(GAP));
+    let outer = if size.grow > 0. { outer.flex_grow(size.grow).flex_basis(px(size.min)).min_h(px(size.min)) } else { outer.flex_none().h(px(size.min)) };
+    outer.child(gutter_box).child(row)
 }
 
 fn lanes(ws: &mut Workspace, dev: &Dev, pattern: &Pattern, length: usize, active: Option<usize>, progress: Option<f32>, cx: &mut Context<Workspace>) -> gpui::Div {
     let pal = p();
     let cells: Vec<Col> = (0..STEPS).map(|i| Col { step: pattern[i], inside: i < length, playing: active == Some(i) }).collect();
+    let win = dev.layout == Layout::Window;
+    let gutter = if win { WIN_GUTTER } else { GUTTER };
+    let sized = |card: f32, window: f32, grow: f32| if win { LaneSize { min: window, grow } } else { LaneSize { min: card, grow: 0. } };
     let numbers = div()
         .flex_none()
         .h(px(16.))
         .flex()
         .gap(px(GAP))
-        .child(div().flex_none().w(px(GUTTER)))
+        .child(div().flex_none().w(px(gutter)))
         .child(div().flex_1().min_w(px(0.)).flex().gap(px(GAP)).children((0..STEPS).map(|i| {
-            div().flex_1().min_w(px(0.)).flex().justify_center().child(mono(format!("{}", i + 1), TEXT_XS, if active == Some(i) { pal.text } else if i % 4 == 0 { pal.muted } else { pal.faint }))
+            div().flex_1().min_w(px(0.)).flex().justify_center().child(mono(format!("{}", i + 1), TEXT_SM, if active == Some(i) { pal.text } else if i % 4 == 0 { pal.muted } else { pal.faint }))
         })));
-    let gate = lane(ws, dev, Kind::Gate, 11, GATE_H, "GATE", &cells, None, cx);
-    let tie = lane(ws, dev, Kind::Switch(Sw::Tie), 15, SWITCH_H, "TIE", &cells, None, cx);
-    let div_lane = lane(ws, dev, Kind::Div, 12, DIV_H, "DIV", &cells, None, cx);
-    let pitch = lane(ws, dev, Kind::Pitch, 13, PITCH_H, "PITCH", &cells, None, cx);
-    let level = lane(ws, dev, Kind::Level, 14, LEVEL_H, "LEVEL", &cells, None, cx);
-    let rev = lane(ws, dev, Kind::Switch(Sw::Rev), 16, SWITCH_H, "REV", &cells, None, cx);
-    let stop = lane(ws, dev, Kind::Switch(Sw::Stop), 17, SWITCH_H, "STOP", &cells, None, cx);
-    let filter = lane(ws, dev, Kind::Switch(Sw::Filter), 18, SWITCH_H, "FILTER", &cells, progress, cx);
+    let sw = sized(SWITCH_H, WIN_SWITCH_H, 0.);
+    let gate = lane(ws, dev, Kind::Gate, 11, sized(GATE_H, WIN_GATE_H, 3.), "GATE", Some(("100%", "0")), &cells, None, cx);
+    let tie = lane(ws, dev, Kind::Switch(Sw::Tie), 15, sw, "TIE", None, &cells, None, cx);
+    let div_lane = lane(ws, dev, Kind::Div, 12, sized(DIV_H, WIN_DIV_H, 1.), "DIV", None, &cells, None, cx);
+    let pitch = lane(ws, dev, Kind::Pitch, 13, sized(PITCH_H, WIN_PITCH_H, 2.5), "PITCH", Some(("+12", "-12")), &cells, None, cx);
+    let level = lane(ws, dev, Kind::Level, 14, sized(LEVEL_H, WIN_LEVEL_H, 2.), "LEVEL", Some(("0 dB", "-60")), &cells, None, cx);
+    let rev = lane(ws, dev, Kind::Switch(Sw::Rev), 16, sw, "REV", None, &cells, None, cx);
+    let stop = lane(ws, dev, Kind::Switch(Sw::Stop), 17, sw, "STOP", None, &cells, None, cx);
+    let filter = lane(ws, dev, Kind::Switch(Sw::Filter), 18, sw, "FILTER", None, &cells, progress, cx);
     // The length handle sits on the boundary after the last step.
     let region = ws.fx.region(dev.id, 11);
     let (device, set) = (dev.id, dev.set.clone());
@@ -948,7 +1052,7 @@ fn lanes(ws: &mut Workspace, dev: &Dev, pattern: &Pattern, length: usize, active
         .absolute()
         .top(px(16.))
         .bottom_0()
-        .left(px(GUTTER + GAP))
+        .left(px(gutter + GAP))
         .right_0()
         .child(
             div()
@@ -985,7 +1089,98 @@ fn lanes(ws: &mut Workspace, dev: &Dev, pattern: &Pattern, length: usize, active
                     }),
                 ),
         );
-    div().flex_none().relative().flex().flex_col().gap(px(SP1)).child(numbers).child(gate).child(tie).child(div_lane).child(pitch).child(level).child(rev).child(stop).child(filter).child(handle)
+    let block = div().relative().flex().flex_col().gap(px(SP1));
+    let block = if win { block.flex_grow(1.6).flex_basis(px(LANES_MIN)).min_h(px(LANES_MIN)) } else { block.flex_none() };
+    block.child(numbers).child(gate).child(tie).child(div_lane).child(pitch).child(level).child(rev).child(stop).child(filter).child(handle)
+}
+
+/// The Classic mode in a window: a few intervals along the beats, the event
+/// of each with its repeats of the chunk, and under them what comes out
+/// for the Mix Mode (the dry signal, the event, or both).
+fn paint_classic(window: &mut gpui::Window, cx: &mut gpui::App, r: Rect, c: &Classic, title: &str, enabled: bool, progress: Option<f32>) {
+    let pal = p();
+    let colour = if enabled { pal.accent } else { pal.muted };
+    let span = c.span();
+    // The names of the two lanes sit in a gutter on the left.
+    let gutter = 52.;
+    let (x0, w) = (r.x + 8. + gutter, r.w - 16. - gutter);
+    let x_of = |beat: f32| x0 + w * (beat / span).clamp(0., 1.);
+    let (top, bottom) = (r.y + 24., r.bottom() - 18.);
+    let lane_h = ((bottom - top - SP2) / 2.).max(12.);
+    let (y_event, y_out) = (top, top + lane_h + SP2);
+    // The beats, bars stronger.
+    let mut beat = 0.;
+    while beat <= span + 1e-3 {
+        let bar = (beat % 4.).abs() < 1e-3;
+        if span <= 16. || bar {
+            kit::vline(window, r, x_of(beat), if bar { pal.grid_bar } else { pal.grid_beat });
+        }
+        if (bar || span <= 8.) && beat < span - 1e-3 {
+            kit::txt(window, cx, &format!("{}", (beat / 4.).floor() as i32 + 1), x_of(beat) + 3., r.bottom() - 14., TEXT_SM, pal.faint, TextAlign::Left);
+        }
+        beat += 1.;
+    }
+    kit::txt(window, cx, "bar", r.x + 10., r.bottom() - 14., TEXT_SM, pal.faint, TextAlign::Left);
+    kit::txt(window, cx, title, r.x + 8., r.y + 6., TEXT_SM, pal.muted, TextAlign::Left);
+    kit::txt(window, cx, &format!("chance {:.0}%", c.chance * 100.), r.right() - 8., r.y + 6., TEXT_SM, pal.faint, TextAlign::Right);
+    kit::txt(window, cx, "EVENT", r.x + 10., y_event + lane_h / 2. - 6., TEXT_SM, pal.faint, TextAlign::Left);
+    kit::txt(window, cx, "OUT", r.x + 10., y_out + lane_h / 2. - 12., TEXT_SM, pal.faint, TextAlign::Left);
+    kit::txt(window, cx, ["insert", "mix", "duck", "gate"][c.mix.min(3)], r.x + 10., y_out + lane_h / 2., TEXT_SM, pal.muted, TextAlign::Left);
+    kit::bar(window, x0, y_event, w, lane_h, 3., content(0.04));
+    kit::bar(window, x0, y_out, w, lane_h, 3., content(0.04));
+    let alpha = 0.25 + 0.75 * c.chance;
+    let events = c.events();
+    // What the dry signal does around the events, by mix mode.
+    let dry = with_alpha(pal.text, 0.22);
+    let dry_h = lane_h * 0.55;
+    let dry_y = y_out + lane_h - dry_h - 2.;
+    // Where the dry signal is cut: the events, or for Gate the rest of their interval; Mix keeps it.
+    let step = c.interval.max(0.125);
+    let muted: Vec<(f32, f32)> = match c.mix {
+        1 => Vec::new(),
+        3 => events.iter().enumerate().map(|(i, (a, _))| (*a, ((i as f32 + 1.) * step).clamp(*a, span))).collect(),
+        _ => events.clone(),
+    };
+    let mut at = 0.;
+    for (a, b) in &muted {
+        if *a > at {
+            kit::bar(window, x_of(at), dry_y, x_of(*a) - x_of(at), dry_h, 1., dry);
+        }
+        at = at.max(*b);
+    }
+    if at < span {
+        kit::bar(window, x_of(at), dry_y, x_of(span) - x_of(at), dry_h, 1., dry);
+    }
+    if c.mix == 2 {
+        // Duck: the dry signal closes progressively over the event.
+        for (a, b) in &events {
+            for k in 0..8 {
+                let (s0, s1) = (a + (b - a) * k as f32 / 8., a + (b - a) * (k + 1) as f32 / 8.);
+                let h = dry_h * (1. - (k as f32 + 0.5) / 8.);
+                kit::bar(window, x_of(s0), dry_y + dry_h - h, (x_of(s1) - x_of(s0)).max(1.), h, 0., dry);
+            }
+        }
+    }
+    // The events and their repeats.
+    for (a, b) in &events {
+        kit::bar(window, x_of(*a), y_event + 2., (x_of(*b) - x_of(*a)).max(2.), lane_h - 4., 3., with_alpha(colour, 0.16 * alpha));
+        let reps = c.repeats(b - a);
+        let rw = (x_of(*b) - x_of(*a)) / reps as f32;
+        if rw >= 3. {
+            for k in 0..reps {
+                let s0 = x_of(*a) + rw * k as f32;
+                kit::bar(window, s0 + 0.5, y_event + 6., rw - 1., lane_h - 12., 2., with_alpha(colour, 0.35 + 0.5 * alpha * if k % 2 == 0 { 1. } else { 0.8 }));
+            }
+        } else {
+            kit::bar(window, x_of(*a), y_event + 6., (x_of(*b) - x_of(*a)).max(2.), lane_h - 12., 2., with_alpha(colour, 0.35 + 0.5 * alpha));
+        }
+        // The wet signal in the output lane.
+        let wet_h = if c.mix == 1 { dry_h } else { lane_h - 8. };
+        kit::bar(window, x_of(*a), y_out + lane_h - wet_h - 2., (x_of(*b) - x_of(*a)).max(2.), wet_h, 2., with_alpha(colour, 0.45 + 0.4 * alpha));
+    }
+    if let (Some(pr), Some((a, b))) = (progress, events.first()) {
+        kit::bar(window, x_of(a + (b - a) * pr), y_event, 2., lane_h, 1., pal.text);
+    }
 }
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
@@ -1011,6 +1206,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let (interval, gate) = classic_lengths(dev.choice(p::INTERVAL), dev.choice(p::GATE), 4.);
     let (share, overlaps) = event_share(interval, gate);
     let classic_title = format!("every {} · event {}{}", dev.text(p::INTERVAL), dev.text(p::GATE), if overlaps { " (runs into the next)" } else { "" });
+    let win = dev.layout == Layout::Window;
+    let classic = Classic::of(dev);
+    // The read speed the first repeat of an event is expected to have, from the settings.
+    let (pitch0, pitch_end, half_time) = (dev.plain(p::PITCH), dev.plain(p::PITCH_END), dev.on(p::HALF_TIME));
+    let expected: Vec<(f32, f32)> = if pitch0 != 0. || pitch_end != 0. || half_time { (0..=40).map(|i| (i as f32 / 40., expected_speed(pitch0, pitch_end, half_time, i as f32 / 40.))).collect() } else { Vec::new() };
 
     // ── Header ──
     let device = dev.id;
@@ -1028,7 +1228,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .border_color(if hold_on { accent() } else { border_strong() })
         .bg(if hold_on { accent_alpha(0.35) } else { content(0.06) })
         .tooltip(widgets::tip("Hold: keep it pressed to repeat now; Shift+click latches it", Some("Shift+Alt+H")))
-        .child(label("HOLD", TEXT_XS, if hold_on { p().text } else { p().muted }).font_weight(FontWeight::SEMIBOLD))
+        .child(label("HOLD", TEXT_SM, if hold_on { p().text } else { p().muted }).font_weight(FontWeight::SEMIBOLD))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -1124,6 +1324,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let top = if grid_mode {
         let pr = (live && active.is_some()).then_some(progress.clamp(0., 1.));
         lanes(ws, dev, &pattern, length, active, pr, cx)
+    } else if win {
+        let timeline = kit::plot(ws, dev, kit::PlotCfg { slot: 1, ..Default::default() }, cx, move |r: Rect, window, cx| {
+            paint_classic(window, cx, r, &classic, &classic_title, enabled, (live && state.round() == 1.).then_some(progress))
+        });
+        div().flex().flex_col().flex_grow(1.6).flex_basis(px(CLASSIC_MIN)).min_h(px(CLASSIC_MIN)).child(timeline.flex_1().min_h(px(0.)))
     } else {
         let lane_plot = kit::plot(ws, dev, kit::PlotCfg { slot: 1, ..Default::default() }, cx, move |r: Rect, window, cx| {
             let pal = p();
@@ -1133,7 +1338,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             if live {
                 kit::bar(window, r.x + 8. + (r.w - 16.) * share * progress, r.py(0.34), 2., r.h * 0.32, 1., pal.text);
             }
-            kit::txt(window, cx, &classic_title, r.x + 8., r.y + 6., TEXT_XS, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, &classic_title, r.x + 8., r.y + 6., TEXT_SM, pal.faint, TextAlign::Left);
         });
         div().flex_none().h(px(96.)).rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(lane_plot)
     };
@@ -1146,7 +1351,25 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let w = Rect { y: r.y + VIEW_LABELS, h: r.h - VIEW_LABELS, ..r };
         kit::bar(window, w.x, w.y, w.w, w.h, 0., with_alpha(colour, 0.06));
         kit::hline(window, w, w.py(0.5), pal.grid_bar);
+        if win {
+            // The speed ladder: an octave up or down is a quarter of the height.
+            for (speed, text) in [(2., "2×"), (1., "1×"), (0.5, "½×")] {
+                let y = w.py(speed_frac(speed));
+                if speed != 1. {
+                    kit::hline(window, w, y, pal.grid_beat);
+                }
+                kit::txt(window, cx, text, w.right() - 6., y - 12., TEXT_SM, pal.faint, TextAlign::Right);
+            }
+            if peaks.is_empty() {
+                kit::txt(window, cx, "play the track: the frozen chunk shows here", w.px(0.5), w.py(0.5) - 24., TEXT_SM, pal.faint, TextAlign::Center);
+            }
+        }
         kit::paint_wave(window, w, &peaks, with_alpha(colour, 0.65));
+        if win && expected.len() > 1 {
+            let curve: Vec<gpui::Point<Pixels>> = expected.iter().map(|(t, sp)| w.pt(*t, speed_frac(*sp))).collect();
+            kit::line(window, &curve, 1.5, with_alpha(pal.accent2, if trace.points.len() > 1 { 0.3 } else { 0.7 }));
+            kit::txt(window, cx, "expected speed", w.x + 6., w.bottom() - 14., TEXT_SM, with_alpha(pal.accent2, 0.8), TextAlign::Left);
+        }
         // The loop: its ends and the span between them.
         for fx in [0., 1.] {
             kit::vline(window, w, w.px(fx) + if fx == 0. { 1. } else { -1. }, with_alpha(colour, 0.9));
@@ -1168,7 +1391,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::dot(window, w.pt(1., ramp_frac(*ramp, *to)), 3., colour, None);
         }
         let left = if live { format!("↻ loop · {}", state_name(state)) } else { "↻ loop of the chunk".to_owned() };
-        kit::txt(window, cx, &left, r.x + 6., r.y + 2., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, &left, r.x + 6., r.y + 2., TEXT_SM, pal.faint, TextAlign::Left);
         if !ramps.is_empty() {
             let names: Vec<String> = ramps
                 .iter()
@@ -1178,10 +1401,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     Ramp::Level => format!("level {from:+.0} → {to:+.0} dB"),
                 })
                 .collect();
-            kit::txt(window, cx, &names.join("  ·  "), r.px(0.5), r.y + 2., TEXT_XS, pal.faint, TextAlign::Center);
+            kit::txt(window, cx, &names.join("  ·  "), r.px(0.5), r.y + 2., TEXT_SM, pal.faint, TextAlign::Center);
         }
         if live {
-            kit::txt(window, cx, &format!("speed {speed:.2}×"), r.right() - 6., r.y + 2., TEXT_XS, pal.accent2, TextAlign::Right);
+            kit::txt(window, cx, &format!("speed {speed:.2}×"), r.right() - 6., r.y + 2., TEXT_SM, pal.accent2, TextAlign::Right);
         }
     });
 
@@ -1197,20 +1420,66 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         }
     }
     // Ramps read "from → change reached at the end of the event".
-    let mut tone: Vec<AnyElement> = vec![ramp_pair(ws, dev, p::PITCH, p::PITCH_END, cx), ramp_pair(ws, dev, p::FILTER_FREQ, p::FILTER_END, cx), ramp_pair(ws, dev, p::LEVEL, p::LEVEL_END, cx)];
-    tone.extend([p::PITCH_DECAY, p::DECAY, p::REVERSE, p::RAMP].into_iter().map(|id| kit::ctl(ws, dev, id, cx)));
+    let mut tone: Vec<AnyElement> = Vec::new();
+    if !win {
+        tone = vec![ramp_pair(ws, dev, p::PITCH, p::PITCH_END, cx), ramp_pair(ws, dev, p::FILTER_FREQ, p::FILTER_END, cx), ramp_pair(ws, dev, p::LEVEL, p::LEVEL_END, cx)];
+        tone.extend([p::PITCH_DECAY, p::DECAY, p::REVERSE, p::RAMP].into_iter().map(|id| kit::ctl(ws, dev, id, cx)));
+    }
     let tape = vec![kit::ctl(ws, dev, p::STOP_TIME, cx)];
-    let filter = vec![kit::ctl(ws, dev, p::FILTER_WIDTH, cx)];
-    let cards = div()
-        .flex_none()
-        .flex()
-        .flex_wrap()
-        .gap(px(SP1))
-        .child(kit::section(dev, "REPEAT", None, repeat, cx))
-        .child(kit::section(dev, "TONE", None, tone, cx))
-        .child(kit::section(dev, "TAPE-STOP", Some(p::TAPE_STOP), tape, cx))
-        .child(kit::section(dev, "HALF-TIME", Some(p::HALF_TIME), Vec::new(), cx))
-        .child(kit::section(dev, "FILTER", Some(p::FILTER_ON), filter, cx));
+    let cards = if win {
+        // In a window the controls are grouped by what they do, each card small enough to sit beside the others.
+        let pitch = vec![ramp_pair(ws, dev, p::PITCH, p::PITCH_END, cx), kit::ctl(ws, dev, p::PITCH_DECAY, cx)];
+        let level = vec![ramp_pair(ws, dev, p::LEVEL, p::LEVEL_END, cx), kit::ctl(ws, dev, p::DECAY, cx)];
+        let filter = vec![ramp_pair(ws, dev, p::FILTER_FREQ, p::FILTER_END, cx), kit::ctl(ws, dev, p::FILTER_WIDTH, cx)];
+        let playback = vec![kit::ctl(ws, dev, p::REVERSE, cx), kit::ctl(ws, dev, p::RAMP, cx)];
+        div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .gap(px(SP1))
+            .child(kit::section(dev, "REPEAT", None, repeat, cx))
+            .child(kit::section(dev, "PITCH", None, pitch, cx))
+            .child(kit::section(dev, "LEVEL", None, level, cx))
+            .child(kit::section(dev, "FILTER", Some(p::FILTER_ON), filter, cx))
+            .child(kit::section(dev, "PLAYBACK", None, playback, cx))
+            .child(kit::section(dev, "TAPE-STOP", Some(p::TAPE_STOP), tape, cx))
+            .child(kit::section(dev, "HALF-TIME", Some(p::HALF_TIME), Vec::new(), cx))
+    } else {
+        div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .gap(px(SP1))
+            .child(kit::section(dev, "REPEAT", None, repeat, cx))
+            .child(kit::section(dev, "TONE", None, tone, cx))
+            .child(kit::section(dev, "TAPE-STOP", Some(p::TAPE_STOP), tape, cx))
+            .child(kit::section(dev, "HALF-TIME", Some(p::HALF_TIME), Vec::new(), cx))
+            .child(kit::section(dev, "FILTER", Some(p::FILTER_ON), vec![kit::ctl(ws, dev, p::FILTER_WIDTH, cx)], cx))
+    };
+
+    if win {
+        let view = div()
+            .flex()
+            .flex_col()
+            .flex_grow(1.2)
+            .flex_basis(px(VIEW_MIN))
+            .min_h(px(VIEW_MIN))
+            .rounded(px(r_md()))
+            .bg(p().well)
+            .border_1()
+            .border_color(border())
+            .overflow_hidden()
+            .child(viewer.flex_1().min_h(px(0.)));
+        return kit::panel(640.)
+            .child(head)
+            .child(
+                div().id(("stutter-body", dev.key(0))).flex_1().min_h(px(0.)).overflow_y_scroll().child(
+                    div().min_h_full().flex().flex_col().gap(px(SP2)).when(grid_mode, |d| d.child(tools)).child(top).child(view).child(cards),
+                ),
+            )
+            .children(capture(dev.id, cx))
+            .into_any_element();
+    }
 
     kit::panel(if dev.big { 640. } else { 520. })
         .child(head)
@@ -1364,6 +1633,46 @@ mod tests {
         assert_eq!(ramp_frac(Ramp::Pitch, 0.), 0.5);
         assert!(ramp_frac(Ramp::Pitch, 12.) < 0.5 && ramp_frac(Ramp::Level, 0.) < ramp_frac(Ramp::Level, -30.));
         assert!((0.02..=0.98).contains(&ramp_frac(Ramp::Filter, 100.)));
+    }
+
+    #[test]
+    fn the_expected_speed_follows_the_pitch_ramp_and_half_time() {
+        assert_eq!(expected_speed(0., 0., false, 0.5), 1.);
+        assert_eq!(expected_speed(12., 0., false, 0.), 2.);
+        assert_eq!(expected_speed(0., -12., false, 1.), 0.5);
+        assert!((expected_speed(0., -12., false, 0.5) - 2f32.powf(-0.5)).abs() < 1e-6);
+        assert_eq!(expected_speed(0., 0., true, 0.), 0.5);
+        assert_eq!(expected_speed(100., 0., false, 0.), 16., "clamped to four octaves");
+    }
+
+    #[test]
+    fn the_classic_timeline_shows_whole_intervals_with_their_events_and_repeats() {
+        let c = |interval: f32, gate: f32, offset: f32, grid: f32| Classic { interval, gate, offset, grid, chance: 1., mix: 0 };
+        // One bar: four of them over 16 beats; an event of a quarter note at the start of each.
+        let bar = c(4., 1., 0., 0.25);
+        assert_eq!(bar.span(), 16.);
+        assert_eq!(bar.events(), vec![(0., 1.), (4., 5.), (8., 9.), (12., 13.)]);
+        assert_eq!(bar.repeats(1.), 4, "four sixteenths");
+        // Short intervals still fill four bars; the offset moves every event.
+        let sixteenth = c(0.25, 0.125, 0.0625 * 4., 0.125);
+        assert_eq!(sixteenth.span(), 4.);
+        assert_eq!(sixteenth.events().len(), 15, "the one at the very end is cut");
+        assert_eq!(sixteenth.events()[0], (0.25, 0.375));
+        // An event that runs past the end is cut; two intervals are the least shown.
+        let long = c(16., 20., 0., 1.);
+        assert_eq!(long.span(), 32.);
+        assert_eq!(long.events(), vec![(0., 20.), (16., 32.)]);
+        assert_eq!(c(1., 1., 0., 0.01).repeats(8.), 64, "never more than 64 blocks");
+        let d = dev("fx.stutter", &[(p::INTERVAL, 3.), (p::GATE, 1.), (p::GRID, 2.), (p::TRIPLETS, 1.), (p::OFFSET, 2.), (p::CHANCE, 40.), (p::MIX_MODE, 2.)]);
+        let v = Classic::of(&d);
+        assert_eq!((v.interval, v.gate, v.offset, v.mix), (1., 0.25, 0.5, 2));
+        assert!((v.grid - 0.5 * 2. / 3.).abs() < 1e-6 && (v.chance - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_window_lanes_fit_inside_their_block_and_grow_from_the_card_sizes() {
+        assert_eq!(LANES_MIN, 16. + 52. + 28. + 52. + 44. + 80. + 32.);
+        const { assert!(WIN_GATE_H >= GATE_H && WIN_PITCH_H >= PITCH_H && WIN_LEVEL_H >= LEVEL_H && WIN_DIV_H >= DIV_H && WIN_SWITCH_H >= SWITCH_H) };
     }
 
     #[test]

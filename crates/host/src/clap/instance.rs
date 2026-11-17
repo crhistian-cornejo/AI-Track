@@ -24,7 +24,7 @@ use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
 use super::{ClapAudioHandler, ClapFlags, ClapHost, ClapMainThread, ClapShared, host_info, load_entry};
-use crate::editor::EditorWindow;
+use crate::editor::{self, EditorWindow, placement};
 use crate::error::{HostError as Error, Result};
 use crate::info::HostedPluginInfo;
 use crate::io::BusScratch;
@@ -39,6 +39,8 @@ struct GuiState {
     floating: bool,
     size: (u32, u32),
     can_resize: bool,
+    /// Plugin key and what to write of the window's place and size.
+    placement: Option<(String, placement::Memory)>,
 }
 
 pub(crate) struct ClapMain {
@@ -259,6 +261,15 @@ impl ClapMain {
         self.gui.is_some()
     }
 
+    pub fn editor_window(&self) -> Option<&EditorWindow> {
+        self.gui.as_ref().and_then(|g| g.window.as_ref())
+    }
+
+    /// The editor window's content size, while an embedded editor is open.
+    pub fn editor_size(&self) -> Option<(u32, u32)> {
+        self.gui.as_ref().and_then(|g| g.window.as_ref()).map(EditorWindow::client_size)
+    }
+
     pub fn raise_editor(&mut self) {
         let Some(state) = &self.gui else { return };
         if let Some(window) = &state.window {
@@ -282,14 +293,16 @@ impl ClapMain {
         }
     }
 
-    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+    pub fn open_editor(&mut self, title: &str, key: &str) -> Result<()> {
         let gui = self.gui_ext.ok_or(Error::NoEditor)?;
         let handle = self.instance.plugin_handle();
         let embedded = GuiConfiguration { api_type: Self::api(), is_floating: false };
         if gui.is_api_supported(&handle, embedded) {
             gui.create(&handle, embedded).map_err(|e| Error::Editor(format!("gui.create: {e:?}")))?;
             let can_resize = gui.can_resize(&handle);
-            let window = match EditorWindow::new(title, 400, 300, can_resize) {
+            // The size the plugin asks for is the size the window gets.
+            let asked = gui.get_size(&handle).map_or((400, 300), |s| (s.width.max(1), s.height.max(1)));
+            let window = match EditorWindow::new(title, asked.0, asked.1, can_resize) {
                 Ok(w) => w,
                 Err(e) => {
                     gui.destroy(&handle);
@@ -299,7 +312,16 @@ impl ClapMain {
             if !cfg!(target_os = "macos") {
                 let _ = gui.set_scale(&handle, window.scale_factor());
             }
-            let size = gui.get_size(&handle).map_or((400, 300), |s| (s.width.max(1), s.height.max(1)));
+            let mut size = gui.get_size(&handle).map_or(asked, |s| (s.width.max(1), s.height.max(1)));
+            // The size the user left it at, if the plugin takes it.
+            let recalled = placement::recall(key);
+            if can_resize && let Some(saved) = recalled.filter(|s| s.w > 0 && s.h > 0) {
+                let want = GuiSize { width: saved.w, height: saved.h };
+                let adj = gui.adjust_size(&handle, want).unwrap_or(want);
+                if gui.set_size(&handle, adj).is_ok() {
+                    size = (adj.width.max(1), adj.height.max(1));
+                }
+            }
             window.set_client_size(size.0, size.1);
             #[cfg(target_os = "macos")]
             let parent = unsafe { ClapWindow::from_cocoa_nsview(window.parent_ptr()) };
@@ -310,8 +332,12 @@ impl ClapMain {
                 return Err(Error::Editor(format!("gui.set_parent: {e:?}")));
             }
             let _ = gui.show(&handle);
+            if let Some((x, y)) = recalled.and_then(|s| editor::restorable(&s)) {
+                window.place(x, y);
+            }
             window.show();
-            self.gui = Some(GuiState { window: Some(window), floating: false, size, can_resize });
+            let memory = placement::Memory::opened(Some(window.placement()));
+            self.gui = Some(GuiState { window: Some(window), floating: false, size, can_resize, placement: Some((key.to_owned(), memory)) });
             return Ok(());
         }
         let floating = GuiConfiguration { api_type: Self::api(), is_floating: true };
@@ -322,14 +348,19 @@ impl ClapMain {
             }
             let _ = gui.show(&handle);
             self.flags.gui_closed.store(false, Ordering::Release);
-            self.gui = Some(GuiState { window: None, floating: true, size: (0, 0), can_resize: false });
+            self.gui = Some(GuiState { window: None, floating: true, size: (0, 0), can_resize: false, placement: None });
             return Ok(());
         }
         Err(Error::Editor("plugin supports neither embedded nor floating GUIs on this platform".into()))
     }
 
     pub fn close_editor(&mut self) {
-        let Some(state) = self.gui.take() else { return };
+        let Some(mut state) = self.gui.take() else { return };
+        if let (Some(window), Some((key, memory))) = (&state.window, &mut state.placement)
+            && let Some(saved) = memory.closing(window.placement())
+        {
+            placement::remember(key, saved);
+        }
         if let Some(gui) = self.gui_ext {
             let handle = self.instance.plugin_handle();
             let _ = gui.hide(&handle);
@@ -397,6 +428,11 @@ impl ClapMain {
             return;
         }
         let Some(window) = gs.window.as_ref() else { return };
+        if let Some((key, memory)) = &mut gs.placement
+            && let Some(saved) = memory.observe(Instant::now(), window.placement())
+        {
+            placement::remember(key, saved);
+        }
         let handle = self.instance.plugin_handle();
         if self.flags.resize.swap(false, Ordering::AcqRel) {
             let packed = self.flags.resize_size.load(Ordering::Acquire);

@@ -32,6 +32,10 @@ const GRIP_W: f32 = 4.;
 const VOLUME_W: f32 = 96.;
 /// Arrow keys wait this long on a row before it plays, so holding one to scroll does not play every row.
 const SETTLE: Duration = Duration::from_millis(90);
+/// How often the disk is searched for a Splice folder while there is none.
+const SPLICE_PROBE: Duration = Duration::from_secs(5);
+/// Folder chips shown before "More".
+const FOLDER_CHIPS: usize = 3;
 
 /// What the preview of a result was made from: if any of it changes while it
 /// plays, it is rendered again.
@@ -61,8 +65,13 @@ pub struct Sounds {
     searcher_tried: bool,
     settle: Option<Instant>,
     playing: Option<PreviewSig>,
-    /// The Splice folder last handed to the library.
+    /// The Splice folder last handed to the library, whether it was there then,
+    /// and when the disk was last searched for it.
     splice_folder: Option<std::path::PathBuf>,
+    splice_there: bool,
+    splice_probe: Option<Instant>,
+    /// All the folder chips are shown, not the first few.
+    folders_expanded: bool,
     analysis_asked: bool,
     loaded: bool,
     /// Dev view: pick and play the first result once there is one.
@@ -91,6 +100,9 @@ impl Sounds {
             settle: None,
             playing: None,
             splice_folder: None,
+            splice_there: false,
+            splice_probe: None,
+            folders_expanded: false,
             analysis_asked: false,
             loaded: false,
             play_first_pending: false,
@@ -221,6 +233,9 @@ fn key_down(ws: &mut Workspace, e: &KeyDownEvent, window: &mut Window, cx: &mut 
 /// the arrow-key settle, a preview that has to follow the song, the analysis
 /// of what lacks a key or tempo. `true` when something changed.
 pub fn tick(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
+    // The Splice folder is followed whether or not the panel is open: a sound licensed in
+    // Splice is found by the palette too.
+    sync_splice_folder(ws);
     if !ws.sounds.prefs.open {
         return false;
     }
@@ -228,15 +243,6 @@ pub fn tick(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     // A drag that ended without landing anywhere leaves nothing behind.
     if ws.sounds.carrying.is_some() && !cx.has_active_drag() {
         ws.sounds.carrying = None;
-    }
-    // The Splice folder: Preferences' choice, else its default place.
-    ws.palette.load();
-    let folder = ws.palette.settings.splice_folder();
-    if !ws.sounds.loaded || folder != ws.sounds.splice_folder {
-        ws.sounds.loaded = true;
-        ws.sounds.splice_folder = folder.clone();
-        ws.b.library.set_splice_folder(folder);
-        ws.sounds.dirty = true;
     }
     let f = &ws.sounds.filters;
     let fit_on = f.fit && ws.sounds.prefs.fit;
@@ -291,6 +297,32 @@ pub fn tick(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
         }
     }
     changed
+}
+
+/// Keep the library's Splice collection pointed at the right folder.
+fn sync_splice_folder(ws: &mut Workspace) {
+    // Preferences' choice, else the one found (looked for again every few seconds while there is
+    // none, so installing Splice while the app runs is noticed).
+    ws.palette.load();
+    let probe_due = ws.sounds.splice_probe.is_none_or(|t| t.elapsed() >= SPLICE_PROBE);
+    let folder = logic::splice_folder(
+        ws.palette.settings.splice_folder.clone(),
+        ws.sounds.splice_folder.as_deref(),
+        probe_due,
+        || aitrack_library::splice::detect().map(|d| d.folder),
+        aitrack_library::splice::default_folder(),
+    );
+    if probe_due {
+        ws.sounds.splice_probe = Some(Instant::now());
+    }
+    let there = folder.as_deref().is_some_and(std::path::Path::is_dir);
+    if !ws.sounds.loaded || folder != ws.sounds.splice_folder || there != ws.sounds.splice_there {
+        ws.sounds.loaded = true;
+        ws.sounds.splice_folder = folder.clone();
+        ws.sounds.splice_there = there;
+        ws.b.library.set_splice_folder(folder);
+        ws.sounds.dirty = true;
+    }
 }
 
 /// Show a page of results, keeping the selected sound selected if it is still in it.
@@ -481,6 +513,35 @@ pub fn render(ws: &mut Workspace, side: Side, cx: &mut Context<Workspace>) -> Op
             cx.notify();
         })));
     }
+    let folders_open = ws.sounds.folders_expanded;
+    let mut folders = div().flex().flex_wrap().items_center().gap(px(SP1)).child(label("In", TEXT_XS, pal.faint));
+    let all_folders = ws.sounds.page.folders.clone();
+    // The chosen folder always shows, even when it is not among the biggest.
+    let mut shown: Vec<&crate::bridge::SoundFolder> = all_folders.iter().take(if folders_open { usize::MAX } else { FOLDER_CHIPS }).collect();
+    if let Some(sel) = f.folder.as_ref()
+        && !shown.iter().any(|x| x.library == sel.library && x.root == sel.root && x.under == sel.under)
+    {
+        shown.insert(0, sel);
+    }
+    for (i, fo) in shown.iter().enumerate() {
+        let on = f.folder.as_ref().is_some_and(|x| x.library == fo.library && x.root == fo.root && x.under == fo.under);
+        let pick = (*fo).clone();
+        folders = folders.child(
+            chip(("sounds-folder", i), format!("{} {}", fo.label, fo.count), on)
+                .tooltip(widgets::tip_owned(fo.under.clone().unwrap_or_else(|| fo.label.clone())))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sounds.filters.folder = if on { None } else { Some(pick.clone()) };
+                    cx.notify();
+                })),
+        );
+    }
+    if all_folders.len() > FOLDER_CHIPS {
+        let more = if folders_open { "Less".to_owned() } else { format!("More (+{})", all_folders.len() - FOLDER_CHIPS) };
+        folders = folders.child(chip("sounds-folder-more", more, folders_open).on_click(cx.listener(|this, _, _, cx| {
+            this.sounds.folders_expanded = !this.sounds.folders_expanded;
+            cx.notify();
+        })));
+    }
     let mut tags = div().flex().flex_wrap().gap(px(SP1));
     for (i, (t, n)) in ws.sounds.page.tags.iter().take(8).enumerate() {
         let on = f.tag.as_deref() == Some(t.as_str());
@@ -588,6 +649,7 @@ pub fn render(ws: &mut Workspace, side: Side, cx: &mut Context<Workspace>) -> Op
                 .child(kinds)
                 .child(groups)
                 .child(origins)
+                .when(!ws.sounds.page.folders.is_empty(), |d| d.child(folders))
                 .when(!ws.sounds.page.tags.is_empty(), |d| d.child(tags)),
         )
         .child(div().h(px(1.)).w_full().bg(border()))
@@ -618,12 +680,17 @@ fn empty_text(ws: &Workspace) -> String {
     }
 }
 
-/// The one line about the Splice folder, and whether it is a problem.
+/// The one line about the Splice folder, and whether it is a problem. A
+/// folder the user chose that is not there is a problem; one nobody chose is
+/// only a hint, as most people do not use Splice at all.
 fn status_line(ws: &Workspace) -> (String, bool) {
     let busy = ws.b.library.scan_status();
+    let chosen = ws.palette.settings.splice_folder.is_some();
     match &ws.sounds.page.splice {
-        SpliceState::Missing(path) => (format!("No Splice folder at {}. Choose it in Preferences ▸ Sounds (Folder…).", path.display()), true),
+        SpliceState::Missing(path) if chosen => (format!("The Splice folder {} is not there. Choose it again in Preferences ▸ Sounds.", path.display()), true),
+        SpliceState::Missing(_) => ("No Splice folder found (looked in ~/Splice and Ableton's Splice samples). Using Splice? Choose its folder in Preferences ▸ Sounds.".to_owned(), false),
         _ if busy.running => (busy.message, false),
+        SpliceState::Indexed { sounds: 0, .. } => ("Splice folder found, with no sounds yet: license one in Splice and it appears here".to_owned(), false),
         SpliceState::Indexed { sounds, .. } => (format!("Splice folder: {sounds} sounds · new downloads appear on their own"), false),
         SpliceState::Scanning(_) => ("Reading the Splice folder…".to_owned(), false),
         SpliceState::Unknown => (String::new(), false),

@@ -4,7 +4,7 @@ use aitrack_model::{Key, Scale, ScaleKind};
 use rusqlite::types::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Library, SAMPLE_COLS, Sample, scale_kind_str};
+use crate::db::{Library, RootId, SAMPLE_COLS, Sample, scale_kind_str};
 use crate::error::Result;
 use crate::parse::from_camelot;
 use crate::taxonomy::{Category, SampleKind};
@@ -125,6 +125,13 @@ pub struct Filters {
     pub camelot: Option<String>,
     pub bpm: Option<BpmFilter>,
     pub bpm_range: Option<(f32, f32)>,
+    /// Tempo for loops only (½×, 1× or 2× within the tolerance): one-shots and
+    /// loops with no tempo pass, as a one-shot has none to compare.
+    pub loop_tempo: Option<BpmFilter>,
+    /// Only this collection (a folder the user added, the factory bank…).
+    pub root: Option<RootId>,
+    /// Only inside this folder of the root, `/`-separated, subfolders included.
+    pub under: Option<String>,
     pub genre: Option<String>,
     pub pack: Option<String>,
     pub favorites_only: bool,
@@ -269,6 +276,21 @@ pub(crate) fn build_where(f: &Filters) -> Where {
         let (c, a) = bpm_clause(lo, hi, false);
         w.push(c, a);
     }
+    if let Some(b) = f.loop_tempo {
+        let tol = b.bpm * b.tolerance_pct.max(0.0) / 100.0;
+        let (c, a) = bpm_clause(b.bpm - tol, b.bpm + tol, b.half_double);
+        w.push(format!("(s.is_loop = 0 OR s.bpm IS NULL OR {c})"), a);
+    }
+    if let Some(r) = f.root {
+        w.push("s.root_id = ?", [Value::Integer(r.0)]);
+    }
+    if let Some(dir) = &f.under {
+        let dir = dir.trim_matches('/');
+        if !dir.is_empty() {
+            let escaped = dir.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            w.push("s.rel_path LIKE ? ESCAPE '\\'", [Value::Text(format!("{escaped}/%"))]);
+        }
+    }
     if let Some(g) = &f.genre {
         w.push("s.genres LIKE ?", [Value::Text(format!("%|{g}|%"))]);
     }
@@ -285,6 +307,25 @@ pub(crate) fn build_where(f: &Filters) -> Where {
         w.push("s.last_used IS NOT NULL", []);
     }
     w
+}
+
+/// The folders worth offering as a filter: the first level of `folders`
+/// (all the folders of a root with their counts, as [`Library::folders`]
+/// gives them) that splits the root into more than one, so `packs/` holding
+/// only `packs/Deep House` and `packs/Trap` offers those two. Most sounds
+/// first, at most `cap`.
+pub fn browse_folders(folders: &[(String, u64)], cap: usize) -> Vec<(String, u64)> {
+    let depth = |p: &str| p.matches('/').count() + 1;
+    let max = folders.iter().map(|f| depth(&f.0)).max().unwrap_or(0);
+    for d in 1..=max {
+        let mut level: Vec<(String, u64)> = folders.iter().filter(|f| depth(&f.0) == d).cloned().collect();
+        if level.len() > 1 || d == max {
+            level.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            level.truncate(cap);
+            return level;
+        }
+    }
+    Vec::new()
 }
 
 /// A scored recommendation with a human-readable explanation.
@@ -329,9 +370,48 @@ pub fn tempo_compat(project_bpm: f32, sample_bpm: Option<f32>, is_loop: bool) ->
     }
 }
 
+/// How well `s` answers the typed `words`: name beats folders and tags, a
+/// favourite and a sound used before come a little ahead of equals. Rows
+/// the database matched through a tag the text does not show (a Camelot
+/// code, "124bpm") still count a little.
+pub fn relevance(words: &[String], s: &Sample) -> f32 {
+    let mut extra: Vec<&str> = vec![&s.rel_path];
+    extra.extend(s.pack.as_deref());
+    extra.extend(s.category.map(|c| c.as_str()));
+    extra.extend(s.subcategory.as_deref());
+    extra.extend(s.genres.iter().map(String::as_str));
+    extra.extend(s.user_tags.iter().map(String::as_str));
+    let text = crate::text::score(words, &s.name, &extra).unwrap_or(0.5);
+    text + if s.favorite { 0.5 } else { 0. } + if s.last_used.is_some() { 0.2 } else { 0. }
+}
+
 impl Library {
-    /// Full-text + filtered search.
+    /// Full-text + filtered search. With text, the best answers come first:
+    /// the database ranks the words it finds (a word that starts with the
+    /// text), and those are put in order of how much of the name they are;
+    /// when there is room left, names that only *contain* the text ("DarkKick"
+    /// for "kick") follow, folded the same way, so accents and case never matter.
     pub fn search(&self, q: &SearchQuery) -> Result<Vec<Sample>> {
+        let words = crate::text::words(q.text.as_deref().unwrap_or(""));
+        let mut out = self.search_fts(q)?;
+        if words.is_empty() || q.sort != SortBy::Relevance {
+            return Ok(out);
+        }
+        // Name beats folder beats tag; the database's own order breaks ties (stable).
+        let mut scored: Vec<(f32, Sample)> = out.drain(..).map(|s| (relevance(&words, &s), s)).collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out = scored.into_iter().map(|(_, s)| s).collect();
+        let limit = if q.limit == 0 { 200 } else { q.limit };
+        // Parts of words only for words of two letters or more, and not for later pages.
+        if out.len() < limit && q.offset == 0 && words.iter().all(|w| w.chars().count() >= 2) {
+            let have: std::collections::HashSet<i64> = out.iter().map(|s| s.id.0).collect();
+            let more = self.search_inside(q, &words, limit - out.len(), &have)?;
+            out.extend(more);
+        }
+        Ok(out)
+    }
+
+    fn search_fts(&self, q: &SearchQuery) -> Result<Vec<Sample>> {
         let mut w = build_where(&q.filters);
         let fts = q.text.as_deref().and_then(fts_query);
         let mut from = String::from("samples s JOIN roots r ON r.id = s.root_id");
@@ -356,6 +436,77 @@ impl Library {
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(rusqlite::params_from_iter(w.args.iter()), |r| self.row_to_sample(r))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Samples whose name or folders contain every word somewhere inside, best
+    /// first, up to `room`, leaving out those in `have`. Reads the names of the
+    /// rows the filters let through (a scan: tens of milliseconds for a
+    /// hundred thousand), which is why it only runs when the indexed search
+    /// left room.
+    fn search_inside(&self, q: &SearchQuery, words: &[String], room: usize, have: &std::collections::HashSet<i64>) -> Result<Vec<Sample>> {
+        let w = build_where(&q.filters);
+        let sql = format!(
+            "SELECT s.id, f.name, f.path FROM samples s JOIN roots r ON r.id = s.root_id JOIN samples_fts f ON f.rowid = s.id WHERE {}",
+            w.sql.join(" AND ")
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let mut rows = st.query(rusqlite::params_from_iter(w.args.iter()))?;
+        let mut hits: Vec<(f32, String, i64)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            if have.contains(&id) {
+                continue;
+            }
+            let name: String = r.get(1)?;
+            let folders: String = r.get(2)?;
+            let (name_f, folders_f) = (crate::text::fold(&name), crate::text::fold(&folders));
+            if words.iter().all(|w| name_f.contains(w.as_str()) || folders_f.contains(w.as_str())) {
+                let score = crate::text::score(words, &name, &[&folders]).unwrap_or(0.);
+                hits.push((score, name, id));
+            }
+        }
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+        hits.truncate(room);
+        self.samples_by_id(&hits.iter().map(|h| h.2).collect::<Vec<_>>())
+    }
+
+    /// The samples with these ids, in the order given (the missing ones skipped).
+    pub fn samples_by_id(&self, ids: &[i64]) -> Result<Vec<Sample>> {
+        let mut by_id: std::collections::HashMap<i64, Sample> = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(400) {
+            let sql = format!(
+                "SELECT {SAMPLE_COLS} FROM samples s JOIN roots r ON r.id = s.root_id WHERE s.id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut st = self.conn.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(chunk.iter()), |r| self.row_to_sample(r))?;
+            for s in rows {
+                let s = s?;
+                by_id.insert(s.id.0, s);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
+    /// The folders of a root with how many sounds each holds (subfolders
+    /// counted in their parents), by path, most sounds first. Sounds at the top
+    /// of the root belong to no folder.
+    pub fn folders(&self, root: RootId) -> Result<Vec<(String, u64)>> {
+        let mut st = self.conn.prepare("SELECT rel_path FROM samples WHERE root_id = ?1 AND status = 'ok'")?;
+        let mut rows = st.query([root.0])?;
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        while let Some(r) = rows.next()? {
+            let rel: String = r.get(0)?;
+            let mut end = 0;
+            while let Some(i) = rel[end..].find('/') {
+                end += i;
+                *counts.entry(rel[..end].to_owned()).or_default() += 1;
+                end += 1;
+            }
+        }
+        let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
     }
 
     /// Counts matches for filters (no text).
@@ -580,6 +731,161 @@ mod tests {
         assert_eq!(lib.count_where(&f).unwrap(), 2);
         let f = Filters { kind: Some(SampleKind::Chop), ..Default::default() };
         assert_eq!(lib.count_where(&f).unwrap(), 1);
+    }
+
+    /// A library of files with awkward names, scanned for real.
+    fn named(files: &[&str]) -> (tempfile::TempDir, Library) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib");
+        for rel in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            write_wav(&p, 22_050, 1, 0.2, 0.5);
+        }
+        let lib = Library::open(dir.path().join("lib.db")).unwrap();
+        lib.add_root(&root, RootKind::User).unwrap();
+        lib.scan(&BasicAnalyzer, &ScanOptions::default(), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        (dir, lib)
+    }
+
+    fn found(lib: &Library, text: &str) -> Vec<String> {
+        lib.search(&SearchQuery::text(text)).unwrap().into_iter().map(|s| s.name).collect()
+    }
+
+    #[test]
+    fn a_search_finds_parts_of_words_not_only_their_beginnings() {
+        let (_d, lib) = named(&["DarkKick.wav", "Kick_01.wav", "Snare.wav", "HardKickDrum.wav"]);
+        let k = found(&lib, "kick");
+        assert_eq!(k.len(), 3, "{k:?}");
+        // The whole word first, then the ones that only contain it.
+        assert_eq!(k[0], "Kick_01");
+        assert_eq!(found(&lib, "ardki").len(), 1, "inside a name, across no word boundary");
+        // Every word still has to be there.
+        assert_eq!(found(&lib, "dark kick"), vec!["DarkKick"]);
+        assert!(found(&lib, "kick snare").is_empty());
+    }
+
+    #[test]
+    fn accents_and_case_do_not_matter_either_way() {
+        let (_d, lib) = named(&["Bajo Eléctrico.wav", "SuperÉpico.wav", "Piano.wav", "Ñandú Loop.wav"]);
+        assert_eq!(found(&lib, "electrico"), vec!["Bajo Eléctrico"]);
+        assert_eq!(found(&lib, "ELÉCTRICO"), vec!["Bajo Eléctrico"]);
+        assert_eq!(found(&lib, "pico"), vec!["SuperÉpico"], "inside a word, accent folded");
+        assert_eq!(found(&lib, "épico"), vec!["SuperÉpico"]);
+        assert_eq!(found(&lib, "nandu"), vec!["Ñandú Loop"]);
+    }
+
+    #[test]
+    fn filters_by_folder_and_by_root() {
+        let (_d, lib) = named(&["House/Kick 1.wav", "House/Deep/Kick 2.wav", "Trap/Kick 3.wav"]);
+        let root = lib.roots().unwrap()[0].id;
+        let q = |under: &str| SearchQuery {
+            text: Some("kick".into()),
+            filters: Filters { root: Some(root), under: Some(under.into()), ..Default::default() },
+            ..Default::default()
+        };
+        let names = |under: &str| {
+            let mut n: Vec<String> = lib.search(&q(under)).unwrap().into_iter().map(|s| s.name).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names("House"), vec!["Kick 1", "Kick 2"], "a folder includes its subfolders");
+        assert_eq!(names("House/Deep"), vec!["Kick 2"]);
+        assert_eq!(names("Hous"), Vec::<String>::new(), "a folder is whole names, not a text prefix");
+        let none = Filters { root: Some(crate::db::RootId(root.0 + 99)), ..Default::default() };
+        assert_eq!(lib.count_where(&none).unwrap(), 0);
+    }
+
+    #[test]
+    fn folders_lists_the_directories_with_their_counts() {
+        let (_d, lib) = named(&["House/Kick 1.wav", "House/Deep/Kick 2.wav", "Trap/Kick 3.wav", "Top.wav"]);
+        let root = lib.roots().unwrap()[0].id;
+        let f = lib.folders(root).unwrap();
+        let get = |p: &str| f.iter().find(|x| x.0 == p).map(|x| x.1);
+        assert_eq!(get("House"), Some(2), "{f:?}");
+        assert_eq!(get("House/Deep"), Some(1));
+        assert_eq!(get("Trap"), Some(1));
+        assert_eq!(get(""), None, "files at the top are not a folder");
+    }
+
+    #[test]
+    fn tempo_filter_for_loops_is_done_by_the_database() {
+        let (_d, lib) = fixture();
+        let q = SearchQuery {
+            filters: Filters { loop_tempo: Some(BpmFilter { bpm: 124.0, tolerance_pct: 3.0, half_double: true }), ..Default::default() },
+            limit: 100,
+            ..Default::default()
+        };
+        let got = lib.search(&q).unwrap();
+        let n = names(&got);
+        // 124 and 126 bpm loops, the 70 bpm pad (x2 = 140 is out, 70 is not half of 124) is out; one-shots always pass.
+        assert!(n.contains(&"Bass Loop Am 124bpm"), "{n:?}");
+        assert!(n.contains(&"Kick 1"), "one-shots have no tempo and pass: {n:?}");
+        assert!(!n.contains(&"Lead Loop C#m 140bpm"), "{n:?}");
+    }
+
+    /// Timings of typical searches against a real bank and a big synthetic one.
+    /// `AITRACK_FACTORY_DB=<copy of factory.db> cargo test -p aitrack-library --lib
+    /// search_timings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn search_timings() {
+        use std::time::Instant;
+        let time = |lib: &Library, q: SearchQuery| {
+            let t = Instant::now();
+            let n = lib.search(&q).unwrap().len();
+            (n, t.elapsed().as_secs_f64() * 1000.)
+        };
+        let queries = ["kick", "ick", "pad am", "electrico", "a", "bass loop", "128"];
+        let report = |label: &str, lib: &Library| {
+            for text in queries {
+                let q = SearchQuery { text: Some(text.into()), limit: 400, ..Default::default() };
+                let (n, ms) = time(lib, q.clone());
+                let t = Instant::now();
+                let fts_only = lib.search_fts(&q).unwrap().len();
+                let fts_ms = t.elapsed().as_secs_f64() * 1000.;
+                println!("{label:>10} {text:>10}: {n:>5} hits in {ms:6.2} ms (indexed alone: {fts_only:>5} in {fts_ms:6.2} ms)");
+            }
+            let f = SearchQuery { filters: Filters { is_loop: Some(true), loop_tempo: Some(BpmFilter { bpm: 124.0, tolerance_pct: 6.0, half_double: true }), ..Default::default() }, limit: 1500, ..Default::default() };
+            let (n, ms) = time(lib, f);
+            println!("{label:>10} {:>10}: {n:>5} hits in {ms:6.2} ms", "loops@124");
+        };
+        if let Some(p) = std::env::var_os("AITRACK_FACTORY_DB") {
+            let lib = Library::open(p).unwrap();
+            println!("factory bank: {} samples", lib.count().unwrap());
+            report("factory", &lib);
+        }
+        // 200 000 rows written straight into the tables.
+        let lib = Library::open_in_memory().unwrap();
+        let root = lib.add_root(std::env::temp_dir(), RootKind::User).unwrap();
+        let words = ["Kick", "Snare", "Bass", "Pad", "Lead", "Loop", "Dark", "Hard", "Deep", "Vocal", "Chop", "Eléctrico", "Hat", "Clap", "FX"];
+        let c = lib.connection();
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..200_000i64 {
+            let name = format!("{} {} {:04}", words[(i % 15) as usize], words[((i / 15) % 15) as usize], i % 997);
+            let rel = format!("Pack {}/{}.wav", i % 300, name);
+            let looped = i % 3 == 0;
+            c.execute(
+                "INSERT INTO samples(id, root_id, rel_path, name, size, mtime, added_at, is_loop, kind, bpm, category) VALUES(?1, ?2, ?3, ?4, 1, 1, 1, ?5, ?6, ?7, 'drums')",
+                rusqlite::params![i + 1, root.0, rel, name, looped, if looped { "loop" } else { "one_shot" }, 80.0 + (i % 90) as f64],
+            )
+            .unwrap();
+            c.execute("INSERT INTO samples_fts(rowid, name, path, tags) VALUES(?1, ?2, ?3, 'drums one shot')", rusqlite::params![i + 1, name, format!("Pack {}", i % 300)]).unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+        println!("synthetic bank: {} samples", lib.count().unwrap());
+        report("200k", &lib);
+    }
+
+    #[test]
+    fn browse_folders_skips_levels_that_do_not_split_anything() {
+        let f = |v: &[(&str, u64)]| v.iter().map(|(p, n)| ((*p).to_owned(), *n)).collect::<Vec<_>>();
+        let splice = f(&[("packs", 30), ("packs/Deep House", 20), ("packs/Trap", 10), ("packs/Deep House/Kicks", 5)]);
+        assert_eq!(browse_folders(&splice, 10), f(&[("packs/Deep House", 20), ("packs/Trap", 10)]));
+        let flat = f(&[("House", 9), ("Trap", 12), ("House/Deep", 3)]);
+        assert_eq!(browse_folders(&flat, 1), f(&[("Trap", 12)]), "capped, biggest first");
+        assert_eq!(browse_folders(&f(&[("only", 4)]), 5), f(&[("only", 4)]), "a single folder is still the answer");
+        assert!(browse_folders(&[], 5).is_empty());
     }
 
     #[test]

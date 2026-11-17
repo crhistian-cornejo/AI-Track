@@ -66,6 +66,8 @@ pub(crate) struct SharedState {
     pub state_dirty: AtomicBool,
     /// The editor was opened at least once (see the module docs on unloading).
     pub editor_opened: AtomicBool,
+    /// A picture of the editor is due (see [`crate::thumbs`]): when, from then on.
+    pub snapshot_due: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 pub(crate) struct PluginShared {
@@ -132,10 +134,10 @@ impl MainSide {
         }
     }
 
-    fn open_editor(&mut self, title: &str) -> Result<()> {
+    fn open_editor(&mut self, title: &str, key: &str) -> Result<()> {
         match self {
-            MainSide::Vst3(m) => m.open_editor(title),
-            MainSide::Clap(m) => m.open_editor(title),
+            MainSide::Vst3(m) => m.open_editor(title, key),
+            MainSide::Clap(m) => m.open_editor(title, key),
         }
     }
 
@@ -150,6 +152,20 @@ impl MainSide {
         match self {
             MainSide::Vst3(m) => m.is_editor_open(),
             MainSide::Clap(m) => m.is_editor_open(),
+        }
+    }
+
+    fn editor_window(&self) -> Option<&crate::editor::EditorWindow> {
+        match self {
+            MainSide::Vst3(m) => m.editor_window(),
+            MainSide::Clap(m) => m.editor_window(),
+        }
+    }
+
+    fn editor_size(&self) -> Option<(u32, u32)> {
+        match self {
+            MainSide::Vst3(m) => m.editor_size(),
+            MainSide::Clap(m) => m.editor_size(),
         }
     }
 
@@ -257,6 +273,7 @@ impl HostedPlugin {
                 latency_changed: AtomicBool::new(false),
                 state_dirty: AtomicBool::new(false),
                 editor_opened: AtomicBool::new(false),
+                snapshot_due: parking_lot::Mutex::new(None),
             },
             main: MainThreadCell::new(main),
         });
@@ -489,16 +506,57 @@ impl PluginController {
 
     pub fn open_editor(&self) -> Result<()> {
         let title = format!("{} — {}", self.shared.state.hosted.name, self.shared.state.hosted.vendor);
+        let key = self.shared.state.hosted.stable_id();
         self.call(|m| {
             if m.is_editor_open() {
                 m.raise_editor();
                 Ok(())
             } else {
-                m.open_editor(&title)
+                m.open_editor(&title, &key)
             }
         })??;
         self.shared.state.editor_opened.store(true, Ordering::Relaxed);
+        self.plan_snapshot();
         Ok(())
+    }
+
+    /// How long after the editor opened its picture is taken: time to paint.
+    const SNAPSHOT_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// The first time the user opens this version of the plugin (and a picture
+    /// is wanted, see [`crate::thumbs`]), take its picture soon, from `idle`.
+    fn plan_snapshot(&self) {
+        let h = &self.shared.state.hosted;
+        let Some(dir) = crate::thumbs::dir() else { return };
+        let Some(stamp) = crate::thumbs::stamp(h.format, &h.path) else { return };
+        if !crate::thumbs::settled(&dir, &h.stable_id(), &stamp) {
+            *self.shared.state.snapshot_due.lock() = Some(std::time::Instant::now() + Self::SNAPSHOT_DELAY);
+        }
+    }
+
+    /// Take the picture that is due, once the editor has had time to paint. It
+    /// is drawn here, on the main thread, and shrunk and written on another.
+    fn snapshot_tick(&self) {
+        let due = {
+            let mut slot = self.shared.state.snapshot_due.lock();
+            match *slot {
+                Some(at) if std::time::Instant::now() >= at => slot.take(),
+                _ => None,
+            }
+        };
+        if due.is_none() {
+            return;
+        }
+        let shot = catch_unwind(AssertUnwindSafe(|| self.call(|m| m.editor_window().and_then(|w| w.snapshot())))).ok().and_then(|r| r.ok()).flatten();
+        let Some((rgba, w, h)) = shot else { return };
+        let hosted = &self.shared.state.hosted;
+        let (Some(dir), Some(stamp)) = (crate::thumbs::dir(), crate::thumbs::stamp(hosted.format, &hosted.path)) else { return };
+        let id = hosted.stable_id();
+        let _ = std::thread::Builder::new().name("aitrack-plugin-thumb".into()).spawn(move || {
+            if let Err(e) = crate::thumbs::store(&dir, &id, &stamp, &rgba, w, h) {
+                log::warn!("plugin thumbnail of {id}: {e}");
+            }
+        });
     }
 
     pub fn close_editor(&self) {
@@ -509,10 +567,23 @@ impl PluginController {
         self.call(|m| m.is_editor_open()).unwrap_or(false)
     }
 
+    /// Test hook: drag the open editor window to a content size, as a user
+    /// would. The next `idle` offers the size to the plugin.
+    #[doc(hidden)]
+    pub fn resize_editor_window(&self, width: u32, height: u32) {
+        let _ = self.call(|m| m.editor_window().map(|w| w.set_client_size(width, height)));
+    }
+
+    /// The open editor window's content size (points on macOS, pixels on Windows).
+    pub fn editor_size(&self) -> Option<(u32, u32)> {
+        self.call(|m| m.editor_size()).ok().flatten()
+    }
+
     /// Main-thread housekeeping; call from the UI tick.
     pub fn idle(&self) {
         let state = &self.shared.state;
         let _ = self.call(|m| m.idle(state));
+        self.snapshot_tick();
     }
 
     pub fn save_state(&self) -> Result<Vec<u8>> {

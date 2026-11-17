@@ -23,11 +23,13 @@ use gpui::{DispatchPhase, HitboxBehavior, MouseMoveEvent};
 use std::rc::Rc;
 
 /// Height of one automation lane.
-pub const AUTO_H: f32 = 56.;
+pub fn auto_h() -> f32 {
+    m().auto_h
+}
 
 /// Pixels between the bottom (0) and top (1) of an automation lane's values.
 pub fn auto_value_px() -> f32 {
-    AUTO_H - 12.
+    auto_h() - 12.
 }
 const CLIP_HEAD: f32 = 14.;
 
@@ -45,17 +47,17 @@ pub struct LaneRow {
 
 impl LaneRow {
     pub fn total(&self) -> f32 {
-        self.h + AUTO_H * self.autos.len() as f32
+        self.h + auto_h() * self.autos.len() as f32
     }
 
     /// The automation lane `ly` px below the row's top, and `ly` inside it.
     pub fn lane_at(&self, ly: f32) -> Option<(usize, AutomationTarget, f32)> {
-        let k = ((ly - self.h) / AUTO_H).floor();
+        let k = ((ly - self.h) / auto_h()).floor();
         if k < 0. {
             return None;
         }
         let k = k as usize;
-        self.autos.get(k).map(|t| (k, *t, ly - self.h - k as f32 * AUTO_H))
+        self.autos.get(k).map(|t| (k, *t, ly - self.h - k as f32 * auto_h()))
     }
 }
 
@@ -73,7 +75,7 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
             continue;
         }
         let autos = s.shown_lanes(t.id);
-        let h = crate::theme::density(t.height.max(40.).round());
+        let h = m().track_h(t.height);
         out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, autos, depth: groups::depth(&s.project, t.id) });
         y += out.last().map_or(0., LaneRow::total);
     }
@@ -109,8 +111,8 @@ pub fn automation_value_at(ws: &Workspace, track: TrackId, target: AutomationTar
     let row = rows(&ws.s).into_iter().find(|r| r.track == track)?;
     let k = row.autos.iter().position(|t| *t == target)?;
     let b = ws.regions.arrange.get();
-    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.h - k as f32 * AUTO_H;
-    Some((1. - (y - 6.) / (AUTO_H - 12.)).clamp(0., 1.))
+    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.h - k as f32 * auto_h();
+    Some((1. - (y - 6.) / (auto_h() - 12.)).clamp(0., 1.))
 }
 
 /// A device's automatable parameters as (id, name): a stock device's from
@@ -367,7 +369,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         for (k, &target) in r.autos.iter().enumerate() {
             let lane = t.automation.iter().find(|l| l.target == target && !l.points.is_empty());
             autos.push(AutoPaint {
-                y: ry + r.h + k as f32 * AUTO_H,
+                y: ry + r.h + k as f32 * auto_h(),
                 points: lane.map(|l| l.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect()).unwrap_or_default(),
                 line: lane.map(|l| automation_line(l, px_per_tick, view.scroll_x)).unwrap_or_default(),
                 color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
@@ -435,9 +437,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 window.paint_quad(paint::fill_rect(at(o, 0., *y, w, *lh), if *sel { content(0.025) } else { gpui::transparent_black() }));
                 window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh - 1., w, 1.), border()));
                 for k in 0..*autos {
-                    let ay = *y + *lh + k as f32 * AUTO_H;
-                    window.paint_quad(paint::fill_rect(at(o, 0., ay, w, AUTO_H), content(0.015)));
-                    window.paint_quad(paint::fill_rect(at(o, 0., ay + AUTO_H - 1., w, 1.), border()));
+                    let ay = *y + *lh + k as f32 * auto_h();
+                    window.paint_quad(paint::fill_rect(at(o, 0., ay, w, auto_h()), content(0.015)));
+                    window.paint_quad(paint::fill_rect(at(o, 0., ay + auto_h() - 1., w, 1.), border()));
                 }
             }
             // Grid: bars, beats and the subdivisions the zoom leaves room for.
@@ -482,13 +484,13 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             // Automation.
             for a in &autos {
                 let lane_top = a.y + 6.;
-                let lane_h = AUTO_H - 12.;
+                let lane_h = auto_h() - 12.;
                 // The selected range: a tinted band with edges, under the line.
                 if let Some((l, r)) = a.sel {
-                    window.paint_quad(paint::fill_rect(at(o, l, a.y, (r - l).max(0.), AUTO_H - 1.), accent_alpha(0.18)));
-                    window.paint_quad(paint::fill_rect(at(o, l, a.y, 1., AUTO_H - 1.), accent_alpha(0.8)));
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y, (r - l).max(0.), auto_h() - 1.), accent_alpha(0.18)));
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y, 1., auto_h() - 1.), accent_alpha(0.8)));
                     if r > l {
-                        window.paint_quad(paint::fill_rect(at(o, r - 1., a.y, 1., AUTO_H - 1.), accent_alpha(0.8)));
+                        window.paint_quad(paint::fill_rect(at(o, r - 1., a.y, 1., auto_h() - 1.), accent_alpha(0.8)));
                     }
                 }
                 if let Some(v) = a.idle {
@@ -568,7 +570,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let header_col = div()
         .id("arrange-headers")
         .flex_none()
-        .w(px(TRACK_HEADER_W))
+        .w(px(m().track_header_w))
         .h_full()
         .overflow_hidden()
         .border_r_1()
@@ -588,10 +590,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             window.paint_quad(paint::fill_rect(b, p().surface));
             window.paint_quad(paint::fill_rect(at(o, 0., h - 1., w, 1.), border()));
             if let Some((a, bb)) = loop_px {
-                window.paint_quad(paint::rrect(at(o, a, 3., bb - a, 8.), 3., accent_alpha(0.75)));
+                let lh = m().ruler_loop_h;
+                window.paint_quad(paint::rrect(at(o, a, (lh - 8.) / 2. + 1., bb - a, 8.), 3., accent_alpha(0.75)));
             }
             // Bar numbers, thinning out when zoomed out; beats when zoomed in.
-            ruler_overlay.paint_ruler(window, cx, o, w, h, 12.);
+            ruler_overlay.paint_ruler(window, cx, o, w, h, m().ruler_loop_h);
             ruler_overlay.paint_ruler_selection(window, o, h);
             ruler_overlay.paint_marker_flag(window, o, w, h);
             if playhead >= 0. && playhead <= w {
@@ -620,7 +623,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let y = f32::from(e.position.y - b.origin.y);
             let x = f32::from(e.position.x - b.origin.x) + this.s.arrange.scroll_x;
             let tick = (x / this.s.arrange.px_per_beat * PPQ as f32) as Tick;
-            if y < 12. {
+            if y < m().ruler_loop_h {
                 let anchor = this.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt).max(0);
                 this.begin_drag(Drag::LoopBrace { anchor }, cx);
             } else {
@@ -631,7 +634,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
 
     let toolbar = div()
         .flex_none()
-        .w(px(TRACK_HEADER_W))
+        .w(px(m().track_header_w))
         .h_full()
         .px(px(SP2))
         .flex()
@@ -644,7 +647,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(
             div()
                 .id("arr-snap")
-                .h(px(24.))
+                .h(px(m().ruler_h - SP1))
                 .px(px(SP2))
                 .gap(px(SP1))
                 .flex()
@@ -664,17 +667,17 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         // Live's Automation Arm: while recording, a control moved in a
         // plugin's window writes its automation.
         .child(
-            widgets::sized_icon_button("auto-arm", Icon::Automation, ws.s.automation_arm, 24., 14.)
+            widgets::sized_icon_button("auto-arm", Icon::Automation, ws.s.automation_arm, m().ruler_h - SP1, 14.)
                 .when(ws.s.automation_arm, |d| d.bg(with_alpha(pal.record, 0.18)))
                 .tooltip(widgets::tip("Automation Arm: record plugin moves as automation", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_arm(cx))),
         )
-        .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, 24., 14.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
+        .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, m().ruler_h - SP1, 14.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
             let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
             this.s.arrange = crate::nav::zoom_at(this.s.arrange, 0.8, centre);
             cx.notify();
         })))
-        .child(widgets::sized_icon_button("zoom-in", Icon::ZoomIn, false, 24., 14.).tooltip(widgets::tip("Zoom in", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
+        .child(widgets::sized_icon_button("zoom-in", Icon::ZoomIn, false, m().ruler_h - SP1, 14.).tooltip(widgets::tip("Zoom in", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
             let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
             this.s.arrange = crate::nav::zoom_at(this.s.arrange, 1.25, centre);
             cx.notify();
@@ -684,14 +687,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .size_full()
         .flex()
         .flex_col()
-        .child(div().flex_none().h(px(RULER_H)).flex().child(toolbar).child(ruler_el))
+        .child(div().flex_none().h(px(m().ruler_h)).flex().child(toolbar).child(ruler_el))
         .child(div().flex_1().min_h(px(0.)).flex().child(header_col).child(lanes_el))
-        .child(bus_section(ws, cx))
+        // With the mixer open the returns and Main are its pinned strips: no second copy.
+        .children((!ws.mixer_open).then(|| bus_section(ws, cx)))
         .into_any_element()
 }
-
-/// Height of one row of the pinned bus section.
-const BUS_H: f32 = 28.;
 
 /// Return tracks and Main, pinned under the lanes so the whole signal path
 /// is always in view: tracks → returns → Main. Clicking one selects it, so
@@ -700,7 +701,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let buses: Vec<aitrack_model::Track> =
         ws.s.project.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Return | TrackKind::Main)).cloned().collect();
-    let mut headers = div().flex_none().w(px(TRACK_HEADER_W)).flex().flex_col().border_r_1().border_color(border());
+    let mut headers = div().flex_none().w(px(m().track_header_w)).flex().flex_col().border_r_1().border_color(border());
     let mut lanes = div().flex_1().min_w(px(0.)).flex().flex_col();
     let mut letter = b'A';
     for t in buses {
@@ -718,12 +719,13 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         headers = headers.child(
             div()
                 .id(("bus-head", id.0 as usize))
-                .h(px(BUS_H))
+                .h(px(m().bus_h))
                 .flex()
                 .items_center()
                 .gap(px(SP2))
                 .pr(px(SP2))
                 .bg(if selected { pal.raised } else { pal.surface })
+                .when(!selected, |d| d.hover(|s| s.bg(mix(pal.surface, pal.raised, 0.55))))
                 .border_b_1()
                 .border_color(border())
                 .cursor_pointer()
@@ -734,7 +736,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 }))
                 .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
                 .child(icon(if is_main { Icon::Volume } else { Icon::Return }, 14., pal.muted))
-                .child(label(paint::fit(&t.name, TRACK_HEADER_W - 118., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
+                .child(label(paint::fit(&t.name, m().track_header_w - 118., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
                 .child(chip(("bus-m", id.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.s.set_track(id, TrackProp::Mute(!mute));
@@ -752,7 +754,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         );
         lanes = lanes.child(
             div()
-                .h(px(BUS_H))
+                .h(px(m().bus_h))
                 .px(px(SP2))
                 .flex()
                 .items_center()
@@ -870,9 +872,6 @@ fn group_rules(ws: &Workspace, id: TrackId) -> Vec<AnyElement> {
     outer.into_iter().take(4).map(|c| div().w(px(4.)).h_full().border_l_1().border_color(with_alpha(track_color(c), 0.8)).into_any_element()).collect()
 }
 
-/// From this height a track header also shows a volume slider under its
-/// buttons (drag a track's bottom edge to make it taller, as in Live).
-const TALL_HEADER: f32 = 80.;
 /// The track-height handle along the bottom edge of a header.
 const RESIZE_H: f32 = 4.;
 
@@ -912,16 +911,96 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
     let has_auto = t.automation.iter().any(|l| !l.points.is_empty());
     let is_group = t.kind == TrackKind::Group;
     let audio = t.kind.carries_audio();
-    let tall = r.h >= TALL_HEADER && audio;
+    let layout = HeaderLayout::for_height(r.h);
+    let tall = layout == HeaderLayout::Tall && audio;
+    let single = layout == HeaderLayout::Single;
     let (mute, solo, arm, collapsed) = (t.mute, t.solo, t.arm, t.collapsed);
     // One step per group the track is in, capped so deep trees keep their names.
     let indent = SP3 * r.depth.min(4) as f32;
+    // The pieces of the header, laid out by `layout`: one row on short tracks.
+    let fold = is_group.then(|| {
+        widgets::sized_icon_button(("fold", id.0 as usize), if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }, false, 16., 12.)
+            .tooltip(widgets::tip(if collapsed { "Unfold group" } else { "Fold group" }, None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.s.seal();
+                this.s.set_track(id, TrackProp::Collapsed(!collapsed));
+                this.s.seal();
+                // A track hidden by the fold cannot stay selected.
+                if let Some(sel) = this.s.selected_track
+                    && sel != id
+                    && groups::within(&this.s.project, sel, id)
+                {
+                    this.s.click_track(id, false, false);
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    });
+    let mut chips: Vec<AnyElement> = vec![
+        chip(("a-m", id.0 as usize), "M", mute, pal.mute)
+            .tooltip(widgets::tip("Mute", None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.s.set_track(id, TrackProp::Mute(!mute));
+                cx.notify();
+            }))
+            .into_any_element(),
+        chip(("a-s", id.0 as usize), "S", solo, pal.solo)
+            .tooltip(widgets::tip("Solo", None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.s.set_track(id, TrackProp::Solo(!solo));
+                cx.notify();
+            }))
+            .into_any_element(),
+    ];
+    if t.kind.has_clips() {
+        chips.push(
+            chip(("a-r", id.0 as usize), "R", arm, pal.record)
+                .tooltip(widgets::tip("Arm for recording", None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.s.set_track(id, TrackProp::Arm(!arm));
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+    }
+    // The keyboard chip needs room the short header does not have.
+    if t.kind == TrackKind::Instrument && !single {
+        let kbd = t.keyboard_input;
+        let kbd_color = if ws.piano_keyboard { pal.accent } else { pal.muted };
+        chips.push(
+            icon_chip(("a-kbd", id.0 as usize), Icon::Keyboard, kbd, kbd_color)
+                .tooltip(widgets::tip("Play this track with the PC/Mac keyboard (Z/X octave, C/V velocity)", None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_track_keyboard(id, cx);
+                }))
+                .into_any_element(),
+        );
+    }
+    let mut buttons = Some(chips);
+    let mut auto_chip = Some(
+        icon_chip(("a-auto", id.0 as usize), Icon::Automation, auto_on, if has_auto { pal.automation } else { pal.accent })
+            .tooltip(widgets::tip(if auto_on { "Hide automation" } else { "Show automation" }, Some("A")))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.s.toggle_automation(id);
+                cx.notify();
+            })),
+    );
+    // What is left of the header's width for the name.
+    let chip_count = if single { buttons.as_ref().map_or(0, Vec::len) + 1 } else { 0 };
+    let name_w = (m().track_header_w - 4. - indent - 2. * SP2 - if is_group { 20. } else { 0. } - if single { chip_count as f32 * 24. + SP1 } else { 14. + 2. * SP2 + 44. + 10. }).max(24.);
     let main = div()
         .id(("arr-head", id.0 as usize))
         .relative()
         .h(px(r.h))
         .flex()
         .bg(if selected { pal.raised } else { pal.surface })
+        .when(!selected, |d| d.hover(|s| s.bg(mix(pal.surface, pal.raised, 0.55))))
         .border_b_1()
         .border_color(border())
         .cursor_pointer()
@@ -973,80 +1052,32 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(SP2))
-                        .when(is_group, |d| {
-                            d.child(
-                                widgets::sized_icon_button(("fold", id.0 as usize), if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }, false, 16., 12.)
-                                    .tooltip(widgets::tip(if collapsed { "Unfold group" } else { "Fold group" }, None))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.s.seal();
-                                        this.s.set_track(id, TrackProp::Collapsed(!collapsed));
-                                        this.s.seal();
-                                        // A track hidden by the fold cannot stay selected.
-                                        if let Some(sel) = this.s.selected_track
-                                            && sel != id
-                                            && groups::within(&this.s.project, sel, id)
-                                        {
-                                            this.s.click_track(id, false, false);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted))
-                        .child(label(paint::fit(&t.name, TRACK_HEADER_W - 104. - indent, TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
-                        .when(audio, |d| d.child(volume_box(ws, id, t.volume_db, cx))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(SP1))
-                        .child(chip(("a-m", id.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.s.set_track(id, TrackProp::Mute(!mute));
-                            cx.notify();
-                        })))
-                        .child(chip(("a-s", id.0 as usize), "S", solo, pal.solo).on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.s.set_track(id, TrackProp::Solo(!solo));
-                            cx.notify();
-                        })))
-                        .when(t.kind.has_clips(), |d| {
-                            d.child(chip(("a-r", id.0 as usize), "R", arm, pal.record).on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.s.set_track(id, TrackProp::Arm(!arm));
-                                cx.notify();
-                            })))
-                        })
-                        .when(t.kind == TrackKind::Instrument, |d| {
-                            let kbd = t.keyboard_input;
-                            let kbd_color = if ws.piano_keyboard { pal.accent } else { pal.muted };
-                            d.child(
-                                icon_chip(("a-kbd", id.0 as usize), Icon::Keyboard, kbd, kbd_color)
-                                    .tooltip(widgets::tip("Play this track with the PC/Mac keyboard (Z/X octave, C/V velocity)", None))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_track_keyboard(id, cx);
-                                    })),
-                            )
-                        })
-                        .child(div().flex_1())
-                        .when(audio, |d| d.child(pan_knob(id, t.pan, cx)))
-                        // Always there (Live): shows the track's lanes, or a
-                        // Volume lane to draw in when it has none yet.
+                        .gap(if single { px(SP1) } else { px(SP2) })
+                        .children(fold)
+                        .when(!single, |d| d.child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted)))
                         .child(
-                            icon_chip(("a-auto", id.0 as usize), Icon::Automation, auto_on, if has_auto { pal.automation } else { pal.accent })
-                                .tooltip(widgets::tip(if auto_on { "Hide automation" } else { "Show automation" }, Some("A")))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.s.toggle_automation(id);
-                                    cx.notify();
-                                })),
+                            label(paint::fit(&t.name, name_w, TEXT_MD), TEXT_MD, if selected { pal.text } else { with_alpha(pal.text, 0.92) })
+                                .font_weight(if selected || is_group { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                                .flex_1(),
                         )
-                        .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
+                        .when(single, |d| d.child(div().flex().items_center().gap(px(SP1)).children(buttons.take().unwrap_or_default()).child(auto_chip.take().unwrap())))
+                        .when(!single && audio, |d| d.child(volume_box(ws, id, t.volume_db, cx))),
                 )
+                .when(!single, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(SP1))
+                            .children(buttons.take().unwrap_or_default())
+                            .child(div().flex_1())
+                            .when(audio, |d| d.child(pan_knob(id, t.pan, cx)))
+                            // Always there (Live): shows the track's lanes, or a
+                            // Volume lane to draw in when it has none yet.
+                            .child(auto_chip.take().unwrap())
+                            .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
+                    )
+                })
                 .when(tall, |d| d.child(volume_slider(id, t.volume_db, cx))),
         )
         // Drag the bottom edge to change the track's height.
@@ -1086,7 +1117,7 @@ fn lane_header(ws: &mut Workspace, t: &Track, k: usize, target: AutomationTarget
     let open = ws.auto_chooser.as_ref().is_some_and(|c| c.track == id && c.index == k);
     div()
         .id(("lane-head", key))
-        .h(px(AUTO_H))
+        .h(px(auto_h()))
         .pl(px(SP2 + 4. + indent))
         .pr(px(SP2))
         .flex()
@@ -1115,7 +1146,7 @@ fn lane_header(ws: &mut Workspace, t: &Track, k: usize, target: AutomationTarget
                     open_chooser(this, id, k, point(at.x - px(24.), at.y + px(12.)), window, cx);
                 }))
                 .child(icon(Icon::Automation, 12., if lane.is_some() { pal.automation } else { pal.faint }))
-                .child(label(paint::fit(&target_name(ws, target), TRACK_HEADER_W - 72. - indent, TEXT_SM), TEXT_SM, pal.text).flex_1())
+                .child(label(paint::fit(&target_name(ws, target), m().track_header_w - 72. - indent, TEXT_SM), TEXT_SM, pal.text).flex_1())
                 .child(icon(Icon::ChevronDown, 10., pal.muted)),
         )
         .child(
@@ -1240,7 +1271,9 @@ fn pan_knob(id: TrackId, pan: f32, cx: &mut Context<Workspace>) -> AnyElement {
 }
 
 /// Width of the volume slider of a tall header.
-const SLIDER_W: f32 = TRACK_HEADER_W - 44.;
+fn slider_w() -> f32 {
+    m().track_header_w - 44.
+}
 
 /// A tall header's volume slider: drag sideways (fader law, 0 dB at three
 /// quarters), double-click for 0 dB.
@@ -1262,13 +1295,13 @@ fn volume_slider(id: TrackId, db: f32, cx: &mut Context<Workspace>) -> AnyElemen
                 return;
             }
             this.s.seal();
-            this.begin_drag(Drag::HFader { track: id, last_x: f32::from(e.position.x), pos, travel: SLIDER_W }, cx);
+            this.begin_drag(Drag::HFader { track: id, last_x: f32::from(e.position.x), pos, travel: slider_w() }, cx);
         }))
         .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
             cx.stop_propagation();
             this.open_param_menu(id, AutomationTarget::Volume, e.position, cx);
         }))
-        .child(widgets::hbar(pos, SLIDER_W, 4., accent_alpha(0.8)))
+        .child(widgets::hbar(pos, slider_w(), 4., accent_alpha(0.8)))
         .into_any_element()
 }
 
@@ -1513,7 +1546,7 @@ fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: 
         if let Some((_, target, y)) = row.lane_at(ly) {
             let ppt = ws.s.arrange.px_per_beat / PPQ as f32;
             let points = ws.s.project.track(row.track).and_then(|t| t.automation.iter().find(|l| l.target == target)).map(|l| l.points.clone()).unwrap_or_default();
-            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 7. && ((1. - p.value) * (AUTO_H - 12.) + 6. - y).abs() < 9.);
+            let hit = points.iter().position(|p| (p.tick as f32 * ppt - x).abs() < 7. && ((1. - p.value) * (auto_h() - 12.) + 6. - y).abs() < 9.);
             if let Some(i) = hit {
                 ws.s.delete_automation_point(row.track, target, i);
                 cx.notify();

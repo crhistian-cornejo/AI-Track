@@ -44,5 +44,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+# Real font shaping for the frame-time benchmark in `fps.rs` (tests only).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui-pre-apple = "=0.3.9"
+
 [lints]
 workspace = true

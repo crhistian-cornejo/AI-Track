@@ -269,7 +269,17 @@ impl SandboxedPlugin {
     }
 
     pub fn spawn_with(exe: &Path, info: &HostedPluginInfo) -> Result<Self> {
-        let mut child = Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let mut command = Command::new(exe);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        // The host process remembers editor windows in the same file as we do.
+        if let Some(file) = crate::editor::placement::file() {
+            command.env(crate::editor::placement::ENV, file);
+        }
+        // ... and takes the pictures of editors into the same folder.
+        if let Some(dir) = crate::thumbs::dir() {
+            command.env(crate::thumbs::ENV, dir);
+        }
+        let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| HostError::Sandbox("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| HostError::Sandbox("no stdout".into()))?;
         let watch = Arc::new(Watch::new(child.id()));

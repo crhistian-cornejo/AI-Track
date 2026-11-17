@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use aitrack_dsp::{AudioBuffer, Event, EventKind, ProcessContext, Processor, Transport};
 use aitrack_host::scan::{Scanner, find_plugin_files};
 use aitrack_host::sandbox::SandboxedPlugin;
-use aitrack_host::{HostedPlugin, HostedPluginInfo, PluginFormat};
+use aitrack_host::{HostedPlugin, HostedPluginInfo, PluginController, PluginFormat};
 
 const SR: f64 = 48_000.0;
 const BLOCK: usize = 512;
@@ -248,19 +248,41 @@ fn check(info: &HostedPluginInfo, editor_secs: Option<f64>) -> Outcome {
                         std::thread::sleep(Duration::from_millis(15));
                     }
                     let open = ctl.is_editor_open();
+                    let first = ctl.editor_size();
                     o.lines.push(format!("editor opened, still open after {secs:.1}s: {open}"));
                     if !open {
                         o.failures.push("editor closed by itself".into());
                     }
+                    // A user drag of the window's edge: the plugin takes the size or pulls
+                    // the window back to the one it wants.
+                    let settle = |ctl: &PluginController| {
+                        for _ in 0..30 {
+                            aitrack_host::editor::pump_messages();
+                            ctl.idle();
+                            std::thread::sleep(Duration::from_millis(15));
+                        }
+                        ctl.editor_size()
+                    };
+                    let first = first.unwrap_or((0, 0));
+                    ctl.resize_editor_window(first.0 + 48, first.1 + 36);
+                    let dragged = settle(&ctl).unwrap_or((0, 0));
+                    let takes_resize = dragged != first;
+                    o.lines.push(format!("editor opens {first:?}; dragged to {:?}: {}", (first.0 + 48, first.1 + 36), if takes_resize { format!("took {dragged:?}") } else { "refused (fixed size)".to_owned() }));
                     ctl.close_editor();
                     aitrack_host::editor::pump_messages();
                     if ctl.is_editor_open() {
                         o.failures.push("editor did not close".into());
                     }
-                    // Re-open once: plugins must tolerate a second view.
+                    // Re-open: plugins must tolerate a second view, and it must come up the
+                    // size the user left (the plugin's own when it cannot be resized).
                     match ctl.open_editor() {
                         Ok(()) => {
-                            aitrack_host::editor::pump_messages();
+                            let again = settle(&ctl).unwrap_or((0, 0));
+                            let want = if takes_resize { dragged } else { first };
+                            o.lines.push(format!("editor reopened at {again:?} (expected {want:?})"));
+                            if again != want {
+                                o.failures.push(format!("editor size not stable across reopen: expected {want:?}, got {again:?}"));
+                            }
                             ctl.close_editor();
                         }
                         Err(e) => o.failures.push(format!("second open_editor: {e}")),
@@ -361,6 +383,8 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("aitrack-real-plugins-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cache = dir.join("plugins.json");
+    // Editor windows remember their size in this folder, not in the user's config.
+    aitrack_host::editor::placement::set_file(dir.join("plugin_windows.json"));
     let scanner = || Scanner::new(&cache).with_scanner_exe(env!("CARGO_BIN_EXE_aitrack-plugin-scanner")).without_default_paths();
     let t0 = Instant::now();
     let mut s = scanner();

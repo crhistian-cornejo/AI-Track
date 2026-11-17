@@ -17,6 +17,7 @@
 
 pub mod cloud;
 pub mod devices;
+pub mod glyphs;
 pub mod libraries;
 pub mod packs;
 pub mod peaks;
@@ -125,15 +126,32 @@ pub struct DeviceRow {
     pub category: String,
     pub group: devices::DeviceGroup,
     pub instrument: bool,
-    pub format: &'static str,
+    /// Every build the row stands for, as badges (`"Stock"`, `"VST3"`, `"CLAP"`); the first
+    /// is the one Enter opens (VST3 before CLAP).
+    pub formats: Vec<&'static str>,
+    /// The builds other than `dev`, to open one of them from its badge.
+    pub others: Vec<ExternalPlugin>,
+    /// The favourites key of each build.
+    pub keys: Vec<String>,
 }
 
 impl DeviceRow {
-    fn thumb_id(&self) -> String {
-        match &self.dev {
-            DeviceRef::Stock(id) => (*id).to_owned(),
-            DeviceRef::Plugin(p) => p.uid.clone(),
-        }
+    /// The plugin of format `badge` (`"VST3"`/`"CLAP"`) among this row's builds.
+    fn build(&self, badge: &str) -> Option<ExternalPlugin> {
+        let main = match &self.dev {
+            DeviceRef::Plugin(p) => Some(p.as_ref()),
+            DeviceRef::Stock(_) => None,
+        };
+        main.into_iter().chain(self.others.iter()).find(|p| format_badge(p.format) == badge).cloned()
+    }
+
+    /// The builds of a plugin row, the one Enter opens first, with the id their picture is kept under.
+    fn plugin_builds(&self) -> Vec<(String, &ExternalPlugin)> {
+        let main = match &self.dev {
+            DeviceRef::Plugin(p) => Some(p.as_ref()),
+            DeviceRef::Stock(_) => None,
+        };
+        main.into_iter().chain(self.others.iter()).map(|p| (format!("{}:{}", format_badge(p.format).to_lowercase(), p.uid), p)).collect()
     }
 }
 
@@ -190,6 +208,11 @@ pub struct PaletteState {
     pub device_kind: devices::DeviceKindTab,
     pub device_group: Option<devices::DeviceGroup>,
     pub device_groups_expanded: bool,
+    /// Only stock devices, or only VST3 or CLAP builds.
+    pub device_format: devices::FormatFilter,
+    /// Only this maker's devices.
+    pub device_vendor: Option<String>,
+    pub device_vendors_expanded: bool,
     pub tags_expanded: bool,
     pub plugin_prefs: crate::plugin_prefs::PluginPrefs,
     pub bpm: Option<(u32, u32)>,
@@ -279,22 +302,15 @@ impl PaletteState {
 /// Every typed word must appear in the name or the extras; a name prefix
 /// counts most. `None` = no match.
 pub fn text_score(q: &str, name: &str, extra: &[&str]) -> Option<f32> {
-    let name = name.to_lowercase();
-    let mut score = 0.;
-    for w in q.split_whitespace().map(str::to_lowercase) {
-        if name.starts_with(&w) {
-            score += 3.;
-        } else if name.split(|c: char| !c.is_alphanumeric()).any(|p| p.starts_with(&w)) {
-            score += 2.5;
-        } else if name.contains(&w) {
-            score += 2.;
-        } else if extra.iter().any(|e| e.to_lowercase().contains(&w)) {
-            score += 1.;
-        } else {
-            return None;
-        }
+    aitrack_library::text::score(&aitrack_library::text::words(q), name, extra)
+}
+
+/// `"VST3"` or `"CLAP"`.
+pub fn format_badge(f: PluginFormat) -> &'static str {
+    match f {
+        PluginFormat::Vst3 => "VST3",
+        PluginFormat::Clap => "CLAP",
     }
-    Some(score)
 }
 
 fn ranked<T>(items: impl Iterator<Item = (f32, T)>) -> Vec<T> {
@@ -395,6 +411,11 @@ fn ensure(ws: &mut Workspace) {
 
 pub fn open(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     ensure(ws);
+    // A plugin opened since the palette was last up may have a picture now.
+    let plugins: Vec<_> = ws.b.plugins.external_plugins().iter().map(|p| (format!("{}:{}", format_badge(p.format).to_lowercase(), p.uid), p.format, p.path.clone())).collect();
+    if let Some(t) = ws.palette.thumbs.as_mut() {
+        t.recheck(plugins.into_iter());
+    }
     ws.palette.open = true;
     ws.palette.selected = 0;
     ws.menu = None;
@@ -487,30 +508,33 @@ fn device_rows(ws: &Workspace, q: &str) -> Vec<DeviceRow> {
                 category: cat.to_owned(),
                 group,
                 instrument: group.is_instrument(),
-                format: "Stock",
+                formats: vec!["Stock"],
+                others: Vec::new(),
+                keys: vec![devices::stock_key(d.id)],
             },
         ))
     });
-    let ext = ws.b.plugins.external_plugins().iter().filter_map(|p| {
-        let format = match p.format {
-            PluginFormat::Vst3 => "VST3",
-            PluginFormat::Clap => "CLAP",
-            #[allow(unreachable_patterns)]
-            _ => "Plugin",
-        };
+    let ext = devices::group_plugins(ws.b.plugins.external_plugins().iter()).into_iter().filter_map(|g| {
+        let p = g.preferred();
+        let formats: Vec<&'static str> = g.formats().into_iter().map(format_badge).collect();
         let group = devices::classify_external(p.format, &p.uid, &p.name, &p.vendor, &p.category, p.is_instrument, prefs);
-        let s = text_score(q, &p.name, &[&p.vendor, format, group.label(), &p.category, if group.is_instrument() { "instrument" } else { "effect" }])?;
+        let vendor = g.vendor();
+        let mut extra: Vec<&str> = vec![vendor, group.label(), &p.category, if group.is_instrument() { "instrument" } else { "effect" }];
+        extra.extend(formats.iter().copied());
+        let s = text_score(q, &p.name, &extra)?;
         Some((
             s,
             DeviceRow {
                 dev: DeviceRef::Plugin(Box::new(p.clone())),
                 key: devices::external_key(p.format, &p.uid),
                 name: p.name.clone(),
-                vendor: p.vendor.clone(),
+                vendor: vendor.to_owned(),
                 category: group.label().to_owned(),
                 group,
                 instrument: group.is_instrument(),
-                format,
+                formats,
+                others: g.members().iter().skip(1).map(|m| (*m).clone()).collect(),
+                keys: g.members().iter().map(|m| devices::external_key(m.format, &m.uid)).collect(),
             },
         ))
     });
@@ -600,7 +624,9 @@ pub fn rebuild(ws: &mut Workspace) {
             if !q.is_empty() {
                 section(&mut rows, "Presets", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), ALL_PRESETS, true);
             }
-            let (yours, factory) = split_yours(samples());
+            let (from_splice, rest) = split_splice(samples());
+            let (yours, factory) = split_yours(rest);
+            section(&mut rows, "Splice folder", from_splice, ALL_SAMPLES / 4, true);
             section(&mut rows, "Yours", yours, ALL_SAMPLES / 2, true);
             section(&mut rows, "Samples", factory, ALL_SAMPLES, true);
             if !q.is_empty() {
@@ -609,35 +635,41 @@ pub fn rebuild(ws: &mut Workspace) {
             }
         }
         Tab::Samples | Tab::InKey => {
-            let (yours, factory) = split_yours(samples());
-            let both = !yours.is_empty() && !factory.is_empty();
-            section(&mut rows, "Yours", yours, search::SHOWN, both);
-            section(&mut rows, "Factory sounds", factory, search::SHOWN, both);
+            let (from_splice, rest) = split_splice(samples());
+            let (yours, factory) = split_yours(rest);
+            let sources = [!from_splice.is_empty(), !yours.is_empty(), !factory.is_empty()].iter().filter(|b| **b).count();
+            section(&mut rows, "Splice folder", from_splice, search::SHOWN, sources > 1);
+            section(&mut rows, "Yours", yours, search::SHOWN, sources > 1);
+            section(&mut rows, "Factory sounds", factory, search::SHOWN, sources > 1);
         }
         Tab::Splice => section(&mut rows, "", splice_items(ws), 100, false),
         Tab::Devices => {
             let mut all_devs = device_rows(ws, &q);
             let prefs = &ws.palette.plugin_prefs;
-            let favs = prefs.favorite_set();
+            let is_fav = |d: &DeviceRow| devices::is_favorite(prefs, &d.keys);
             let kind_tab = ws.palette.device_kind;
             let sub = ws.palette.device_group;
+            let (format, vendor) = (ws.palette.device_format, ws.palette.device_vendor.as_deref());
             all_devs.retain(|d| {
                 let kind_ok = match kind_tab {
                     devices::DeviceKindTab::All => true,
                     devices::DeviceKindTab::Instruments => d.instrument,
                     devices::DeviceKindTab::AudioEffects => !d.instrument,
-                    devices::DeviceKindTab::Favorites => favs.contains(d.key.as_str()),
+                    devices::DeviceKindTab::Favorites => is_fav(d),
                 };
-                kind_ok && sub.is_none_or(|g| d.group == g)
+                kind_ok
+                    && sub.is_none_or(|g| d.group == g)
+                    && format.admits(&d.formats)
+                    && vendor.is_none_or(|v| aitrack_library::text::fold(&d.vendor) == aitrack_library::text::fold(v))
             });
             if kind_tab != devices::DeviceKindTab::Favorites && sub.is_none() {
-                let fav_items: Vec<Item> = all_devs.iter().filter(|d| favs.contains(d.key.as_str())).cloned().map(Item::Device).collect();
+                let fav_items: Vec<Item> = all_devs.iter().filter(|d| is_fav(d)).cloned().map(Item::Device).collect();
                 section(&mut rows, "Favorites", fav_items, 40, true);
                 if q.is_empty() {
                     let recents: Vec<Item> = prefs
                         .recents
                         .iter()
-                        .filter_map(|rk| all_devs.iter().find(|d| &d.key == rk).cloned())
+                        .filter_map(|rk| all_devs.iter().find(|d| d.keys.contains(rk)).cloned())
                         .take(6)
                         .map(Item::Device)
                         .collect();
@@ -667,6 +699,11 @@ pub fn rebuild(ws: &mut Workspace) {
 /// The user's own samples (bridge index 1) apart from the factory bank's.
 fn split_yours(items: Vec<Item>) -> (Vec<Item>, Vec<Item>) {
     items.into_iter().partition(|it| matches!(it, Item::Sample(r) if r.id >> 48 == 1))
+}
+
+/// Sounds from the Splice folder apart from the rest of the list.
+fn split_splice(items: Vec<Item>) -> (Vec<Item>, Vec<Item>) {
+    items.into_iter().partition(|it| matches!(it, Item::Sample(r) if r.splice))
 }
 
 /// Search the library bridge directly (stub bridges have no index).
@@ -938,16 +975,27 @@ fn cycle_tab(ws: &mut Workspace, delta: i32, cx: &mut Context<Workspace>) {
 
 /// Put a device on the selected track's chain (one command).
 fn add_device(ws: &mut Workspace, d: &DeviceRow, cx: &mut Context<Workspace>) -> bool {
+    add_device_as(ws, d, None, cx)
+}
+
+/// [`add_device`], as the build of this `badge` (`"VST3"`/`"CLAP"`) when the row has it.
+fn add_device_as(ws: &mut Workspace, d: &DeviceRow, badge: Option<&str>, cx: &mut Context<Workspace>) -> bool {
     let Some(track) = ws.s.selected_track else {
         ws.toast("Select a track first", cx);
         return false;
     };
-    let added = match &d.dev {
-        DeviceRef::Stock(id) => ws.s.add_stock_device(track, id, &d.name).is_some(),
-        DeviceRef::Plugin(p) => ws.s.add_plugin_device(track, p).is_some(),
+    let chosen = badge.and_then(|b| d.build(b));
+    let mut key = d.key.clone();
+    let added = match (&d.dev, chosen) {
+        (DeviceRef::Plugin(_), Some(p)) => {
+            key = devices::external_key(p.format, &p.uid);
+            ws.s.add_plugin_device(track, &p).is_some()
+        }
+        (DeviceRef::Stock(id), _) => ws.s.add_stock_device(track, id, &d.name).is_some(),
+        (DeviceRef::Plugin(p), None) => ws.s.add_plugin_device(track, p).is_some(),
     };
     if added {
-        ws.palette.plugin_prefs.note_recent(&d.key);
+        ws.palette.plugin_prefs.note_recent(&key);
         ws.bottom_open = true;
         ws.set_tab(crate::state::BottomTab::Devices, cx);
         ws.toast(format!("Added {}", d.name), cx);
@@ -1283,7 +1331,15 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
                 .flex_col()
                 .gap(px(2.))
                 .overflow_hidden()
-                .child(div().flex().items_center().gap(px(SP1)).child(label(r.name.clone(), TEXT_MD, pal.text)).when(remote, |d| d.child(icon(CLOUD_ICON, 12., pal.muted))))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP1))
+                        .child(label(r.name.clone(), TEXT_MD, pal.text))
+                        .when(r.splice, |d| d.child(widgets::badge("Splice", pal.accent)))
+                        .when(remote, |d| d.child(icon(CLOUD_ICON, 12., pal.muted))),
+                )
                 .child(chips),
         )
         .child(if remote { cloud_status(&fetch_state) } else { mini_wave(bars, if selected { pal.accent } else { content(0.45) }) })
@@ -1393,17 +1449,34 @@ fn render_splice(ws: &mut Workspace, i: usize, s: &SpliceSample, selected: bool,
         .into_any_element()
 }
 
+/// The slot at the left of a device row: our own devices draw what they look like
+/// inside; a plugin shows the picture of its editor if it has been opened once (found in the
+/// background, never waited for), else a card with its category icon and maker's initials.
 fn device_thumb(ws: &mut Workspace, d: &DeviceRow) -> AnyElement {
     let pal = p();
-    if let Some(path) = ws.palette.thumbs.as_mut().and_then(|t| t.get(&d.thumb_id())) {
-        return img(path).w(px(48.)).h(px(32.)).flex_none().rounded(px(r_md())).into_any_element();
+    if let DeviceRef::Plugin(_) = &d.dev {
+        let builds = d.plugin_builds();
+        let hit = ws.palette.thumbs.as_mut().and_then(|t| builds.iter().find_map(|(id, p)| t.get(id, Some((p.format, p.path.as_path())))));
+        if let Some(path) = hit {
+            return img(path).w(px(48.)).h(px(32.)).flex_none().rounded(px(r_md())).into_any_element();
+        }
     }
-    let i = match &d.dev {
-        DeviceRef::Stock(id) => crate::views::menus::device_icon(id, ws),
-        DeviceRef::Plugin(_) if d.instrument => Icon::Piano,
-        DeviceRef::Plugin(_) => Icon::Plug,
-    };
     let tint = series(thumbs::hue_slot(&d.vendor));
+    if let DeviceRef::Stock(id) = &d.dev {
+        let glyph = glyphs::for_stock(id);
+        let ink = pal.text;
+        return div()
+            .w(px(48.))
+            .h(px(32.))
+            .flex_none()
+            .rounded(px(r_md()))
+            .bg(with_alpha(tint, 0.22))
+            .border_1()
+            .border_color(with_alpha(tint, 0.45))
+            .child(canvas(|_, _, _| (), move |b, _, window, _| glyphs::paint(window, crate::paint::at(b.origin, 6., 4., f32::from(b.size.width) - 12., f32::from(b.size.height) - 8.), glyph, ink)).size_full())
+            .into_any_element();
+    }
+    let i = if d.instrument { Icon::Piano } else { Icon::Plug };
     div()
         .w(px(48.))
         .h(px(32.))
@@ -1424,8 +1497,8 @@ fn device_thumb(ws: &mut Workspace, d: &DeviceRow) -> AnyElement {
 fn render_device(ws: &mut Workspace, i: usize, d: &DeviceRow, selected: bool, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let thumb = device_thumb(ws, d);
-    let fav = ws.palette.plugin_prefs.is_favorite(&d.key);
-    let key_fav = d.key.clone();
+    let fav = devices::is_favorite(&ws.palette.plugin_prefs, &d.keys);
+    let keys_fav = d.keys.clone();
     let key_menu = d.key.clone();
     let menu_name = d.name.clone();
     let inst = d.instrument;
@@ -1441,7 +1514,24 @@ fn render_device(ws: &mut Workspace, i: usize, d: &DeviceRow, selected: bool, cx
                 .child(label(format!("{} · {}", d.vendor, d.category), TEXT_XS, pal.faint)),
         )
         .when(d.instrument, |r| r.child(icon(Icon::MusicNote, 12., pal.faint)))
-        .child(widgets::badge(d.format, pal.muted))
+        .child(div().flex_none().flex().items_center().gap(px(SP1)).children(d.formats.iter().enumerate().map(|(n, f)| {
+            let (row, badge) = (d.clone(), *f);
+            // The first badge is the build Enter opens; another one opens its own.
+            let b = div().id(("dev-fmt", i * 4 + n)).child(widgets::badge(badge, if n == 0 { pal.muted } else { pal.faint }));
+            if d.formats.len() > 1 {
+                b.cursor_pointer()
+                    .tooltip(widgets::tip_owned(format!("Add the {badge} build")))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if add_device_as(this, &row, Some(badge), cx) {
+                            close(this, window, cx);
+                        }
+                    }))
+                    .into_any_element()
+            } else {
+                b.into_any_element()
+            }
+        })))
         .child(
             div()
                 .id(("dev-fav", i))
@@ -1449,7 +1539,7 @@ fn render_device(ws: &mut Workspace, i: usize, d: &DeviceRow, selected: bool, cx
                 .child(if fav { icon(Icon::StarFilled, 12., pal.solo) } else { icon(Icon::Star, 12., content(0.2)) })
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.palette.plugin_prefs.toggle_favorite(&key_fav);
+                    devices::toggle_favorite(&mut this.palette.plugin_prefs, &keys_fav);
                     rebuild(this);
                     cx.notify();
                 })),
@@ -1842,6 +1932,8 @@ fn device_filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         })));
     }
     let count = ws.palette.rows.iter().filter(|r| matches!(r, Row::Item(_))).count();
+    let scan = ws.b.plugins.scan_status();
+    let left_out = ws.b.plugins.plugin_report().problems;
     let top = div()
         .px(px(SP3))
         .flex()
@@ -1849,6 +1941,21 @@ fn device_filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .gap(px(SP2))
         .child(kinds)
         .child(div().flex_1())
+        .when(scan.running, |d| d.child(label(scan.message.clone(), TEXT_XS, pal.muted)))
+        .when(!scan.running && !left_out.is_empty(), |d| {
+            let lines: Vec<String> = left_out
+                .iter()
+                .take(8)
+                .map(|p| format!("{} — {}", p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p.title))
+                .chain((left_out.len() > 8).then(|| format!("…and {} more", left_out.len() - 8)))
+                .collect();
+            d.child(
+                chip("dev-left-out", format!("⚠ {} left out", left_out.len()), false)
+                    .h(px(20.))
+                    .tooltip(widgets::tip_owned(format!("Plugins that could not be loaded:\n{}\nClick for the reasons and to retry", lines.join("\n"))))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Audio), cx))),
+            )
+        })
         .child(mono(format!("{count} devices"), TEXT_XS, pal.faint));
 
     let subgroups: Vec<devices::DeviceGroup> = match ws.palette.device_kind {
@@ -1905,7 +2012,57 @@ fn device_filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
                 })),
         );
     }
-    div().pb(px(SP2)).flex().flex_col().gap(px(SP2)).border_b_1().border_color(border()).child(top).child(strip)
+    // Format and maker: the other two ways to narrow the list.
+    let mut formats = div().flex().items_center().gap(px(SP1)).child(label("Format", TEXT_XS, pal.faint));
+    for (i, f) in devices::FormatFilter::ALL.into_iter().enumerate() {
+        formats = formats.child(chip(("dev-fmt-filter", i), f.label(), ws.palette.device_format == f).h(px(20.)).on_click(cx.listener(move |this, _, _, cx| {
+            this.palette.device_format = f;
+            this.palette.selected = 0;
+            rebuild(this);
+            cx.notify();
+        })));
+    }
+    let makers = devices::vendor_counts(device_rows(ws, "").iter().map(|d| d.vendor.as_str()));
+    let vendors_open = ws.palette.device_vendors_expanded;
+    let mut maker_strip = div().id("dev-maker-strip").px(px(SP3)).flex().items_center().gap(px(SP1)).when(vendors_open, |d| d.flex_wrap()).when(!vendors_open, |d| d.overflow_hidden()).child(label("Maker", TEXT_XS, pal.faint));
+    let mut ordered: Vec<&(String, usize)> = makers.iter().collect();
+    if let Some(sel) = ws.palette.device_vendor.as_deref()
+        && let Some(pos) = ordered.iter().position(|(v, _)| aitrack_library::text::fold(v) == aitrack_library::text::fold(sel))
+    {
+        let m = ordered.remove(pos);
+        ordered.insert(0, m);
+    }
+    let hidden = ordered.len().saturating_sub(COMPACT_TAGS);
+    let shown = if vendors_open { ordered.len() } else { ordered.len().min(COMPACT_TAGS) };
+    for (i, (v, n)) in ordered.iter().take(shown).enumerate() {
+        let on = ws.palette.device_vendor.as_deref().is_some_and(|sel| aitrack_library::text::fold(sel) == aitrack_library::text::fold(v));
+        let name = v.clone();
+        maker_strip = maker_strip.child(chip(("dev-maker", i), format!("{v} {n}"), on).h(px(20.)).on_click(cx.listener(move |this, _, _, cx| {
+            let same = this.palette.device_vendor.as_deref().is_some_and(|sel| aitrack_library::text::fold(sel) == aitrack_library::text::fold(&name));
+            this.palette.device_vendor = if same { None } else { Some(name.clone()) };
+            this.palette.selected = 0;
+            rebuild(this);
+            cx.notify();
+        })));
+    }
+    if hidden > 0 {
+        let more = if vendors_open { "Less".to_owned() } else { format!("More (+{hidden})") };
+        maker_strip = maker_strip.child(chip("dev-maker-more", more, vendors_open).h(px(20.)).on_click(cx.listener(|this, _, _, cx| {
+            this.palette.device_vendors_expanded = !this.palette.device_vendors_expanded;
+            cx.notify();
+        })));
+    }
+    div()
+        .pb(px(SP2))
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .border_b_1()
+        .border_color(border())
+        .child(top)
+        .child(strip)
+        .child(div().px(px(SP3)).child(formats))
+        .child(maker_strip)
 }
 
 fn empty_state(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {

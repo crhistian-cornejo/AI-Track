@@ -3,6 +3,7 @@
 //! playback response — head bump and HF loss over frequency, with the bump
 //! (height = amount) and the loss corner (sideways = HF loss) draggable.
 
+use super::super::dynamics::win;
 use super::super::kit::{self, Handle, PlotCfg, ax, freq_frac};
 use super::super::{Dev, caption};
 use crate::theme::*;
@@ -64,8 +65,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         // How far into the loop the signal goes now.
         let lv = r.py(loop_frac(0., level).1);
         kit::hline(window, r, lv, with_alpha(pal.accent2, 0.5));
-        kit::txt(window, cx, "H", r.right() - 6., r.py(0.5) + 2., TEXT_XS, pal.faint, TextAlign::Right);
-        kit::txt(window, cx, "M", r.px(0.5) + 4., r.y + 3., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "H", r.right() - 6., r.py(0.5) + 2., TEXT_SM, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, "M", r.px(0.5) + 4., r.y + 3., TEXT_SM, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, &format!("saturation {:.0}%", level * 100.), r.x + 6., r.bottom() - 14., TEXT_SM, pal.muted, TextAlign::Left);
         kit::dot(window, r.pt(hx, hy), 6., with_alpha(color, 0.85), Some(pal.text));
     });
 
@@ -92,8 +94,25 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         for (i, (x, y)) in marks.iter().enumerate() {
             kit::dot(window, r.pt(*x, *y), 6., if i == 0 { series(1) } else { series(2) }, Some(pal.text));
         }
-        kit::txt(window, cx, &speed, r.right() - 6., r.y + 4., TEXT_XS, pal.muted, TextAlign::Right);
+        kit::txt(window, cx, &speed, r.right() - 6., r.y + 4., TEXT_SM, pal.muted, TextAlign::Right);
     });
+
+    if win::in_window(dev) {
+        // The frame has the levels in and out; the saturation (how far into the
+        // loop the signal goes) is written in the loop's corner.
+        let displays = div().child(win::square(ws, dev, 0, hyst)).child(div().flex_1().min_w(px(0.)).h_full().child(resp));
+        return win::arrange(
+            ws,
+            dev,
+            760.,
+            None,
+            displays,
+            vec![win::group(dev, "Tape", None, &[p::INPUT, p::DRIVE, p::SATURATION, p::BIAS], cx), win::group(dev, "Transport", None, &[p::SPEED, p::WOW, p::FLUTTER, p::MIX], cx)],
+            vec![win::group(dev, "Playback", None, &[p::HF_LOSS, p::HEAD_BUMP, p::WIDTH], cx), win::group(dev, "Output", None, &[p::OUTPUT, p::OVERSAMPLING], cx)],
+            cx,
+        )
+        .into_any_element();
+    }
 
     let readouts = div()
         .flex_none()

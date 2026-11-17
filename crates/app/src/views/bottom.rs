@@ -99,7 +99,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     };
     let mut bar = div()
         .flex_none()
-        .h(px(TAB_BAR_H + SP2))
+        .h(px(m().dock_bar_h))
         .px(px(SP2))
         .gap(px(SP2))
         .flex()
@@ -163,7 +163,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     };
 
     let resizing = matches!(ws.drag, Some(Drag::BottomResize { .. }));
-    let target = if ws.bottom_open { ws.bottom_h } else { TAB_BAR_H + SP2 };
+    let target = if ws.bottom_open { ws.bottom_h } else { m().dock_bar_h };
     let handle = div()
         .id("bottom-resize")
         .absolute()
@@ -177,7 +177,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 cx.stop_propagation();
                 if e.click_count >= 2 {
                     // Double-click the edge: back to the default height.
-                    this.bottom_h = crate::workspace::bottom_h_clamped(300., this.window_h);
+                    this.bottom_h = crate::workspace::bottom_h_clamped(m().dock_h, this.window_h);
                     cx.notify();
                 } else {
                     this.begin_bottom_resize(f32::from(e.position.y), cx);

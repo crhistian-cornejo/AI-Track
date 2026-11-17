@@ -11,6 +11,8 @@
 pub mod common;
 pub mod fx;
 pub mod instrument;
+#[cfg(test)]
+mod measure;
 pub mod midi;
 pub mod presets;
 mod stub;
@@ -68,6 +70,7 @@ static REGISTRY: &[StockPlugin] = &[
     StockPlugin { id: instrument::kick808::ID, name: "Kick 808", category: Category::Instrument, tags: &["808", "kick", "sub", "bass", "drums"], create: instrument::kick808::create },
     StockPlugin { id: instrument::sampler::ID, name: "Sampler", category: Category::Instrument, tags: &["sampler", "one-shot", "loop"], create: instrument::sampler::create },
     StockPlugin { id: instrument::drum::ID, name: "Drum Sampler", category: Category::Instrument, tags: &["drums", "sampler", "pads"], create: instrument::drum::create },
+    StockPlugin { id: instrument::granular::ID, name: "Granular", category: Category::Instrument, tags: &["granular", "texture", "pad", "freeze", "live", "sampler"], create: instrument::granular::create },
     StockPlugin { id: midi::arp::ID, name: "Arpeggiator", category: Category::MidiEffect, tags: &["midi", "arpeggiator", "pattern", "sequencer"], create: midi::arp::create },
     StockPlugin { id: midi::chord::ID, name: "Chord", category: Category::MidiEffect, tags: &["midi", "chord", "harmony"], create: midi::chord::create },
     StockPlugin { id: midi::scale::ID, name: "Scale", category: Category::MidiEffect, tags: &["midi", "scale", "key", "quantize", "harmony"], create: midi::scale::create },

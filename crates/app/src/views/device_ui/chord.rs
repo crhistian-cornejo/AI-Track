@@ -11,13 +11,15 @@
 //! being played.
 
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
+use super::midi_kit as mk;
 use super::{Dev, ParamSet, set_many};
 use crate::theme::*;
 use crate::workspace::Workspace;
 use aitrack_model::{DeviceId, Project};
 use aitrack_stock::midi::chord::{VOICES, p};
 use aitrack_stock::midi::theory::{Snap, scale_mask, snap_note};
-use gpui::{AnyElement, Context, InteractiveElement, ParentElement, Styled, TextAlign, div, px};
+use crate::widgets::mono;
+use gpui::{AnyElement, Context, InteractiveElement, ParentElement, Styled, TextAlign, div, prelude::FluentBuilder, px};
 use std::rc::Rc;
 
 /// The keyboard shown (C1 to C7 would be too dense: the intervals reach ±36).
@@ -29,6 +31,61 @@ pub const PLAYED: i32 = 60;
 const LANE_END: f32 = 0.56;
 const KEYS_START: f32 = 0.62;
 const BLACK_H: f32 = 0.62;
+
+/// Where the parts of the plot sit, as fractions of its height: the level
+/// markers above `lane_end`, the keyboard from `keys_start` to `keys_end`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geo {
+    pub lane_end: f32,
+    pub keys_start: f32,
+    pub keys_end: f32,
+}
+
+impl Geo {
+    pub fn of(window: bool) -> Self {
+        if window { Self { lane_end: 0.5, keys_start: 0.56, keys_end: 1. } } else { Self { lane_end: LANE_END, keys_start: KEYS_START, keys_end: 1. } }
+    }
+}
+
+/// The name of the chord the pitch classes `mask` (bit 0 = C) make, with
+/// `played` (a pitch class) as its root when it fits, else any note that
+/// does: "Cmaj7", "Am", "Gsus4". `None` when it is not a chord this knows.
+pub fn chord_name(mask: u16, played: usize) -> Option<String> {
+    // Intervals from the root and the suffix they make.
+    const KINDS: &[(&[u8], &str)] = &[
+        (&[0, 4, 7], ""),
+        (&[0, 3, 7], "m"),
+        (&[0, 3, 6], "dim"),
+        (&[0, 4, 8], "aug"),
+        (&[0, 2, 7], "sus2"),
+        (&[0, 5, 7], "sus4"),
+        (&[0, 7], "5"),
+        (&[0, 4, 7, 11], "maj7"),
+        (&[0, 3, 7, 11], "mMaj7"),
+        (&[0, 4, 7, 10], "7"),
+        (&[0, 3, 7, 10], "m7"),
+        (&[0, 3, 6, 10], "m7b5"),
+        (&[0, 3, 6, 9], "dim7"),
+        (&[0, 4, 7, 9], "6"),
+        (&[0, 3, 7, 9], "m6"),
+        (&[0, 5, 7, 10], "7sus4"),
+        (&[0, 2, 4, 7], "add9"),
+        (&[0, 2, 4, 7, 10], "9"),
+        (&[0, 2, 4, 7, 11], "maj9"),
+        (&[0, 2, 3, 7, 10], "m9"),
+    ];
+    let mask = mask & 0x0FFF;
+    let rot = |root: usize| ((mask >> root) | (mask << (12 - root))) & 0x0FFF;
+    let played = played % 12;
+    let roots = std::iter::once(played).chain((0..12).filter(|r| *r != played));
+    for root in roots.filter(|r| mask & (1 << r) != 0) {
+        let m = rot(root);
+        if let Some((_, suffix)) = KINDS.iter().find(|(iv, _)| iv.iter().fold(0u16, |a, i| a | 1 << i) == m) {
+            return Some(format!("{}{}", ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][root], suffix));
+        }
+    }
+    None
+}
 
 // ───────────────────────────── A keyboard ─────────────────────────────
 
@@ -176,6 +233,19 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let enabled = dev.enabled;
     let boxes = piano(LO, HI);
     let out = sounding(&voices, PLAYED, fit);
+    let win = mk::windowed(dev);
+    let geo = Geo::of(win);
+    // What comes out, named: the notes that sound and the chord they make.
+    let mut heard: Vec<i32> = out.iter().map(|(_, k)| *k).collect();
+    heard.sort_unstable();
+    heard.dedup();
+    let mask = heard.iter().fold(0u16, |m, k| m | 1 << k.rem_euclid(12));
+    let summary = match chord_name(mask, PLAYED.rem_euclid(12) as usize) {
+        Some(name) => format!("chord {name} · {}", heard.iter().map(|k| note_name(*k)).collect::<Vec<_>>().join(" ")),
+        None => heard.iter().map(|k| note_name(*k)).collect::<Vec<_>>().join(" "),
+    };
+    let names: Vec<(usize, String)> = out.iter().map(|(i, k)| (*i, note_name(*k))).collect();
+    let names_of = names.clone();
     let span = (HI - LO) as f32;
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
 
@@ -184,12 +254,12 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     for (v, voice) in voices.iter().enumerate().filter(|(_, v)| v.on) {
         let raw = (PLAYED + voice.interval).clamp(LO, HI);
         let Some(fx) = key_center(&boxes, raw) else { continue };
-        let fy = LANE_END - (LANE_END - 0.08) * (voice.level / 200.).clamp(0., 1.);
+        let fy = geo.lane_end - (geo.lane_end - 0.08) * (voice.level / 200.).clamp(0., 1.);
         handles.push(Handle {
             fx,
             fy,
             x: ax(p::interval(v), span / 72.),
-            y: ax(p::level(v), -1. / (LANE_END - 0.08)),
+            y: ax(p::level(v), -1. / (geo.lane_end - 0.08)),
             index: v,
             reset: vec![default(p::interval(v)), default(p::level(v))],
             ..Default::default()
@@ -200,10 +270,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let on_empty: kit::EmptyFn = {
         let (device, set): (DeviceId, Rc<ParamSet>) = (dev.id, dev.set.clone());
         Rc::new(move |this, fx, fy, cx| {
-            if fy < KEYS_START {
+            if fy < geo.keys_start || fy > geo.keys_end {
                 return;
             }
-            let rel = (fy - KEYS_START) / (1. - KEYS_START);
+            let rel = (fy - geo.keys_start) / (geo.keys_end - geo.keys_start);
             let Some(key) = key_at(&piano(LO, HI), fx, rel) else { return };
             if let Some(edits) = toggle_voice(&voices, key) {
                 let norms: Vec<(u32, f32)> = edits.iter().filter_map(|(id, v)| set.get(*id).map(|i| (*id, i.to_normalized(*v)))).collect();
@@ -216,7 +286,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, on_empty: Some(on_empty), ..Default::default() }, cx, move |r, window, cx| {
         let pal = p();
         let colour = if enabled { pal.accent } else { pal.muted };
-        let keys = Rect { x: r.x + 4., y: r.py(KEYS_START), w: r.w - 8., h: r.h * (1. - KEYS_START) - 4. };
+        let keys = Rect { x: r.x + 4., y: r.py(geo.keys_start), w: r.w - 8., h: r.h * (geo.keys_end - geo.keys_start) - 4. };
         // The scale (when the chord is fitted) and the notes that sound.
         let tint = |key: i32| {
             if let Some((i, _)) = out.iter().find(|(_, k)| *k == key) {
@@ -228,23 +298,27 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             }
         };
         paint_piano(window, keys, &boxes, tint);
-        kit::hline(window, r, r.py(LANE_END), pal.grid_bar);
+        kit::hline(window, r, r.py(geo.lane_end), pal.grid_bar);
         for q in [0.25, 0.5, 0.75, 1.] {
-            kit::hline(window, r, r.py(LANE_END - (LANE_END - 0.08) * q), pal.grid_beat);
+            kit::hline(window, r, r.py(geo.lane_end - (geo.lane_end - 0.08) * q), pal.grid_beat);
+            if win && q == 0.5 {
+                kit::txt(window, cx, "100%", r.right() - 6., r.py(geo.lane_end - (geo.lane_end - 0.08) * q) - 12., TEXT_SM, pal.faint, TextAlign::Right);
+            }
         }
         // The played key: a marker over its key.
         if let Some(c) = key_center(&boxes, PLAYED) {
             let x = keys.x + keys.w * c;
-            kit::bar(window, x - 1., r.py(LANE_END), 2., keys.y - r.py(LANE_END), 1., accent_alpha(0.6));
-            kit::txt(window, cx, &format!("played {}", note_name(PLAYED)), x - 6., r.py(LANE_END) + 2., TEXT_XS, pal.faint, TextAlign::Right);
+            kit::bar(window, x - 1., r.py(geo.lane_end), 2., keys.y - r.py(geo.lane_end), 1., accent_alpha(0.6));
+            kit::txt(window, cx, &format!("played {}", note_name(PLAYED)), x - 6., r.py(geo.lane_end) + 2., TEXT_SM, pal.faint, TextAlign::Right);
         }
         // Each voice's marker, and an arrow from where the scale moved it.
         for (v, fx, fy) in &marks {
             let x = keys.x + keys.w * *fx;
             let y = r.py(*fy);
-            kit::bar(window, x - 1., y, 2., r.py(LANE_END) - y, 1., with_alpha(colour, 0.7));
+            kit::bar(window, x - 1., y, 2., r.py(geo.lane_end) - y, 1., with_alpha(colour, 0.7));
             kit::dot(window, gpui::point(px(x), px(y)), 6., colour, Some(pal.text));
-            kit::txt(window, cx, &format!("{}", v + 1), x, y - 16., TEXT_XS, pal.text, TextAlign::Center);
+            let text = if win { names.iter().find(|(i, _)| i == v).map_or_else(|| format!("{}", v + 1), |(_, n)| n.clone()) } else { format!("{}", v + 1) };
+            kit::txt(window, cx, &text, x, y - 16., TEXT_SM, pal.text, TextAlign::Center);
         }
         for (i, key) in &out {
             let raw = (PLAYED + voices[*i].interval).clamp(0, 127);
@@ -255,11 +329,16 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 kit::line(window, &[gpui::point(px(keys.x + keys.w * a), px(y)), gpui::point(px(keys.x + keys.w * b), px(y))], 1.5, with_alpha(pal.accent2, 0.9));
             }
         }
-        kit::txt(window, cx, "double-click a key to add or remove a voice", r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "double-click a key to add or remove a voice", r.x + 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+        if win {
+            kit::txt(window, cx, &format!("{} → {}", note_name(PLAYED), summary), r.right() - 6., r.y + 4., TEXT_SM, pal.muted, TextAlign::Right);
+            kit::txt(window, cx, "level of each voice", r.x + 6., r.py(geo.lane_end) - 14., TEXT_SM, pal.faint, TextAlign::Left);
+        }
     });
 
     let mut cells = div().flex_none().flex().gap(px(SP1));
     for v in 0..VOICES {
+        let sounds = names_of.iter().find(|(i, _)| *i == v).map(|(_, n)| n.clone());
         cells = cells.child(
             div()
                 .flex_1()
@@ -270,6 +349,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .flex_col()
                 .rounded(px(r_sm()))
                 .bg(content(0.03))
+                .when(win, |d| d.child(mono(sounds.unwrap_or_else(|| "off".to_owned()), TEXT_SM, if dev.on(p::on(v)) { p().text } else { p().faint })))
                 .child(kit::pick(dev, p::on(v), cx))
                 .child(kit::num_w(ws, dev, p::interval(v), 68., cx))
                 .child(kit::num_w(ws, dev, p::level(v), 68., cx)),
@@ -294,6 +374,27 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
 mod tests {
     use super::super::testing::dev;
     use super::*;
+
+    #[test]
+    fn a_chord_is_named_from_its_notes_with_the_played_key_as_the_root() {
+        let mask = |keys: &[i32]| keys.iter().fold(0u16, |m, k| m | 1 << k.rem_euclid(12));
+        assert_eq!(chord_name(mask(&[60, 64, 67, 71]), 0).as_deref(), Some("Cmaj7"));
+        assert_eq!(chord_name(mask(&[60, 63, 67]), 0).as_deref(), Some("Cm"));
+        assert_eq!(chord_name(mask(&[60, 64, 67, 69]), 0).as_deref(), Some("C6"), "the played key wins over Am7");
+        assert_eq!(chord_name(mask(&[60, 64, 67, 69]), 9).as_deref(), Some("Am7"));
+        assert_eq!(chord_name(mask(&[60, 62, 67]), 0).as_deref(), Some("Csus2"));
+        assert_eq!(chord_name(mask(&[64, 67, 72]), 4).as_deref(), Some("C"), "an inversion is still C");
+        assert_eq!(chord_name(mask(&[60, 61, 62]), 0), None);
+        assert_eq!(chord_name(0, 0), None);
+    }
+
+    #[test]
+    fn a_window_gives_the_keyboard_the_lower_half() {
+        let (card, window) = (Geo::of(false), Geo::of(true));
+        assert_eq!((card.keys_start, card.keys_end), (KEYS_START, 1.));
+        assert!(window.keys_end - window.keys_start > card.keys_end - card.keys_start - 0.1);
+        assert!(window.lane_end < window.keys_start && card.lane_end < card.keys_start);
+    }
 
     #[test]
     fn the_keyboard_has_white_keys_side_by_side_and_black_keys_between() {

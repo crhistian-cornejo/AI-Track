@@ -73,16 +73,13 @@ pub fn filter(ws: &mut Workspace, dev: &Dev, slots: &Rc<Vec<ModSlot>>, n: u32, c
 pub fn master(ws: &mut Workspace, dev: &Dev, slots: &Rc<Vec<ModSlot>>, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let voices = dev.m(0);
-    let (l, r) = (dev.m(1), dev.m(2));
-    let peak = l.max(r);
-    let meter = div().w(px(6.)).h(px(32.)).rounded(px(2.)).bg(pal.well).flex().flex_col().justify_end().child(div().w_full().h(px(32. * peak.clamp(0., 1.))).rounded(px(2.)).bg(if peak > 0.98 { pal.meter_high } else { pal.meter_low }));
+    // No level meter here: the window frame's output rail shows it.
     div()
         .flex()
         .items_center()
         .gap(px(SP3))
         .child(div().flex().flex_col().gap(px(SP1)).child(kit::pick(dev, p::VOICE_MODE, cx)).child(kit::readout("voices", format!("{voices:.0}"), pal.text)))
         .child(mknob(ws, dev, slots, p::VOLUME, 32., cx))
-        .child(meter)
 }
 
 /// A small EQ curve of the synth's 3-band EQ (display only).

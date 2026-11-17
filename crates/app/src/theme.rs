@@ -25,19 +25,16 @@ pub const SP4: f32 = 16.;
 pub const SP6: f32 = 24.;
 
 // ── Fixed sizes (all multiples of 4) ──
+// These are the *comfortable* values, kept as constants for the surfaces
+// that do not follow the density setting (menus, dialogs, device windows).
+// The main window reads `m()`, the density table below.
 /// The title/control bar: one compact row, as Live's control bar.
 pub const TOP_BAR_H: f32 = 40.;
-/// Read-out boxes and buttons in the control bar.
-pub const BAR_FIELD_H: f32 = 24.;
-pub const STATUS_BAR_H: f32 = 24.;
 pub const TAB_BAR_H: f32 = 32.;
 pub const CONTROL_H: f32 = 28.;
 pub const ROW_H: f32 = 28.;
 pub const AI_PANEL_W: f32 = 320.;
-pub const TRACK_HEADER_W: f32 = 200.;
-pub const RULER_H: f32 = 28.;
 pub const SESSION_COL_W: f32 = 132.;
-pub const STRIP_W: f32 = 88.;
 
 // ── Type scale (multiplied by the theme's font size, see `fs`) ──
 pub const TEXT_XS: f32 = 10.;
@@ -206,11 +203,12 @@ impl Default for Colors {
 
 // ───────────────────────────── Style ─────────────────────────────
 
+/// How tightly the main window packs its rows: see [`Metrics`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Density {
-    Compact,
     #[default]
+    Compact,
     Comfortable,
 }
 
@@ -289,7 +287,7 @@ impl Default for Style {
     fn default() -> Self {
         Self {
             radius: 1.,
-            density: Density::Comfortable,
+            density: Density::Compact,
             knob: KnobStyle::Arc,
             fader: FaderStyle::Classic,
             waveform: WaveformStyle::Filled,
@@ -437,12 +435,12 @@ pub fn builtin_themes() -> Vec<Theme> {
     let mut v = vec![
         make("Midnight", true, [0x0C0D0F, 0x141518, 0x1B1C20, 0x25272C, 0x2A2C32, 0x101114], [0xE9EAED, 0x9B9DA4, 0x6A6C73], 0xF0783C, 0x58B4F0, 0x15100C, std_states, [0x17181C, 0x111215, 0xC9CACE, 0x16171A], DARK_CLIPS),
         make("Daylight", false, [0xDCDDE1, 0xEDEEF1, 0xF7F7F9, 0xFFFFFF, 0xFFFFFF, 0xE4E5E9], [0x17181B, 0x52555D, 0x8A8D95], 0xE0661F, 0x1F7AC4, 0xFFFFFF, light_states, [0xF4F4F6, 0xE3E4E8, 0xFFFFFF, 0x2A2B30], LIGHT_CLIPS),
-        make("Graphite", true, [0x1B1B1C, 0x252526, 0x2D2D2F, 0x38383B, 0x3E3E42, 0x1F1F20], [0xEDEDED, 0xABABAE, 0x77777B], 0x5AA9E6, 0xE0B050, 0x0B1620, std_states, [0x2A2A2C, 0x232324, 0xD2D2D2, 0x1C1C1D], DARK_CLIPS),
+        make("Graphite", true, [0x1B1B1C, 0x252526, 0x2D2D2F, 0x38383B, 0x3E3E42, 0x1F1F20], [0xEDEDED, 0xABABAE, 0x838387], 0x5AA9E6, 0xE0B050, 0x0B1620, std_states, [0x2A2A2C, 0x232324, 0xD2D2D2, 0x1C1C1D], DARK_CLIPS),
         make("Neon", true, [0x0B0614, 0x140B24, 0x1C1231, 0x281A45, 0x2E1F50, 0x090411], [0xF6EEFF, 0xBCA9E0, 0x7A66A0], 0xFF2E97, 0x00E5FF, 0x1A0010, [0xFF3B6B, 0x2BF5B4, 0x00D8FF, 0xFFD23F, 0xFF3B6B], [0x1A1030, 0x120A22, 0xE4DAF5, 0x150C26], ClipStyle { saturation: 1.0, brightness: 0.66 }),
         make("Ember", true, [0x120C09, 0x1B130F, 0x241A14, 0x30231B, 0x36281F, 0x0F0A07], [0xF6EAE2, 0xC2A898, 0x84695A], 0xFF7A1A, 0xFFC857, 0x1C0D02, [0xF04A3A, 0x7BD389, 0x6FA8FF, 0xF2C14E, 0xF04A3A], [0x22180F, 0x18110C, 0xE6D6CC, 0x1A120D], ClipStyle { saturation: 0.8, brightness: 0.6 }),
         make("Forest", true, [0x0B110D, 0x111914, 0x17221B, 0x203026, 0x25352B, 0x090E0B], [0xE6F0E8, 0xA0B8A7, 0x637A6A], 0x6BCB77, 0xE8C468, 0x08160B, [0xEF5B4F, 0x6BCB77, 0x5FA8E8, 0xE8C468, 0xEF5B4F], [0x16201A, 0x0F1612, 0xD7E3DA, 0x101712], ClipStyle { saturation: 0.75, brightness: 0.6 }),
         make("Oceanic", true, [0x09101A, 0x0E1822, 0x14212D, 0x1C2D3C, 0x213344, 0x070E16], [0xE4EEF6, 0x9DB4C7, 0x5F7689], 0x2EC4D6, 0xF7B267, 0x041418, [0xF0606A, 0x4CD6A5, 0x6AA8FF, 0xF7C866, 0xF0606A], [0x13202B, 0x0C1620, 0xD5E2EC, 0x0D1720], ClipStyle { saturation: 0.85, brightness: 0.6 }),
-        make("Oceanic Light", false, [0xD3DEE6, 0xE6EEF3, 0xF3F7FA, 0xFFFFFF, 0xFFFFFF, 0xDCE6ED], [0x0F1C26, 0x45596A, 0x7E91A0], 0x0E8FA3, 0xC66A12, 0xFFFFFF, light_states, [0xEEF4F8, 0xDEE8EF, 0xFFFFFF, 0x1E2C38], LIGHT_CLIPS),
+        make("Oceanic Light", false, [0xD3DEE6, 0xE6EEF3, 0xF3F7FA, 0xFFFFFF, 0xFFFFFF, 0xDCE6ED], [0x0F1C26, 0x45596A, 0x71838F], 0x0E8FA3, 0xC66A12, 0xFFFFFF, light_states, [0xEEF4F8, 0xDEE8EF, 0xFFFFFF, 0x1E2C38], LIGHT_CLIPS),
         make("Mono", true, [0x000000, 0x0A0A0A, 0x141414, 0x1F1F1F, 0x262626, 0x000000], [0xFFFFFF, 0xD6D6D6, 0x9A9A9A], 0xFFD400, 0x00C8FF, 0x000000, [0xFF4040, 0x3CFF8A, 0x40B0FF, 0xFFD400, 0xFF4040], [0x141414, 0x050505, 0xFFFFFF, 0x000000], ClipStyle { saturation: 1.0, brightness: 0.55 }),
         make("Mono Light", false, [0xFFFFFF, 0xFFFFFF, 0xF5F5F5, 0xFFFFFF, 0xFFFFFF, 0xEDEDED], [0x000000, 0x2E2E2E, 0x5C5C5C], 0x0047C2, 0xB34700, 0xFFFFFF, [0xC40000, 0x007A3D, 0x0047C2, 0x8A6100, 0xC40000], [0xFAFAFA, 0xE6E6E6, 0xFFFFFF, 0x000000], LIGHT_CLIPS),
     ];
@@ -548,16 +546,178 @@ pub fn font_ui() -> String {
     RT.with(|rt| rt.borrow().resolved.style.font_family.clone())
 }
 
-/// Row heights shrink a little in compact density.
-pub fn density(h: f32) -> f32 {
-    match RT.with(|rt| rt.borrow().resolved.style.density) {
-        Density::Compact => (h * 0.8 / 4.).round() * 4.,
-        Density::Comfortable => h,
+/// The density table: every height, padding step and text size of the main
+/// window (bars, track rows, strips, dock) in one place, one column per
+/// [`Density`]. Views read it through [`m`] and never keep their own copy of
+/// these numbers, so the whole window tightens (or relaxes) as one.
+///
+/// Compact packs rows by geometry, not by type: the text sizes stay at the
+/// legible floor (see [`Metrics::text_body`]), and every control that takes
+/// a mouse click keeps at least 20 px of target (`chip`, 20 px) with the
+/// frequent ones at 24 (`control_h`, `bar_field_h`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    /// The title and control bar.
+    pub top_bar_h: f32,
+    /// Read-outs and buttons inside the control bar.
+    pub bar_field_h: f32,
+    pub status_bar_h: f32,
+    /// The detail dock's title row (view switch and tools).
+    pub dock_bar_h: f32,
+    /// Buttons, selects, text fields and segmented controls.
+    pub control_h: f32,
+    /// A row of a list or a settings page.
+    pub row_h: f32,
+    /// The arrangement's ruler row, and the loop strip at its top.
+    pub ruler_h: f32,
+    pub ruler_loop_h: f32,
+    /// What a stored track height of 56 (the model's default) shows as.
+    pub track_scale: f32,
+    /// No track shows shorter than this.
+    pub track_min_h: f32,
+    pub auto_h: f32,
+    pub bus_h: f32,
+    pub track_header_w: f32,
+    /// Session view: a clip slot / scene row, and the column header.
+    pub session_row_h: f32,
+    pub session_head_h: f32,
+    /// Mixer strip rows: one slot (input, insert, send, output), the name
+    /// plate, the pan row and the dB read-out.
+    pub slot_h: f32,
+    pub strip_name_h: f32,
+    pub strip_pan_h: f32,
+    pub strip_db_h: f32,
+    pub strip_w: f32,
+    /// Space between the mixer's strips and around them.
+    pub strip_pad: f32,
+    /// Default heights of the detail dock and of the mixer section.
+    pub dock_h: f32,
+    pub mixer_h: f32,
+    /// Text sizes before the font-size preference scales them.
+    pub text_body: f32,
+    pub text_small: f32,
+    pub text_micro: f32,
+}
+
+impl Metrics {
+    pub const COMFORTABLE: Metrics = Metrics {
+        top_bar_h: 40.,
+        bar_field_h: 24.,
+        status_bar_h: 24.,
+        dock_bar_h: 40.,
+        control_h: 28.,
+        row_h: 28.,
+        ruler_h: 28.,
+        ruler_loop_h: 12.,
+        track_scale: 1.,
+        track_min_h: 40.,
+        auto_h: 56.,
+        bus_h: 28.,
+        track_header_w: 200.,
+        session_row_h: 28.,
+        session_head_h: 36.,
+        slot_h: 20.,
+        strip_name_h: 32.,
+        strip_pan_h: 44.,
+        strip_db_h: 16.,
+        strip_w: 88.,
+        strip_pad: 8.,
+        dock_h: 300.,
+        mixer_h: 264.,
+        text_body: TEXT_MD,
+        text_small: TEXT_SM,
+        text_micro: TEXT_XS,
+    };
+
+    pub const COMPACT: Metrics = Metrics {
+        top_bar_h: 36.,
+        bar_field_h: 24.,
+        status_bar_h: 20.,
+        dock_bar_h: 32.,
+        control_h: 24.,
+        row_h: 24.,
+        ruler_h: 24.,
+        ruler_loop_h: 10.,
+        track_scale: 0.64,
+        track_min_h: 28.,
+        auto_h: 48.,
+        bus_h: 24.,
+        track_header_w: 200.,
+        session_row_h: 24.,
+        session_head_h: 28.,
+        slot_h: 20.,
+        strip_name_h: 28.,
+        strip_pan_h: 36.,
+        strip_db_h: 16.,
+        strip_w: 88.,
+        strip_pad: 4.,
+        dock_h: 264.,
+        mixer_h: 248.,
+        text_body: TEXT_MD,
+        text_small: TEXT_SM,
+        text_micro: TEXT_XS,
+    };
+
+    pub fn of(d: Density) -> Metrics {
+        match d {
+            Density::Compact => Self::COMPACT,
+            Density::Comfortable => Self::COMFORTABLE,
+        }
+    }
+
+    /// The height a track with the stored height `stored` shows at: the
+    /// model's 56 px default scales with the density, in whole 4 px steps,
+    /// and never goes under [`Metrics::track_min_h`].
+    pub fn track_h(&self, stored: f32) -> f32 {
+        ((stored.max(24.) * self.track_scale / 4.).round() * 4.).max(self.track_min_h)
+    }
+
+    /// The stored height after dragging a header's bottom edge `dy` px from a
+    /// track that was stored at `start`: whole 4 px steps of what is shown,
+    /// between the density's minimum and 400 px.
+    pub fn dragged_track_h(&self, start: f32, dy: f32) -> f32 {
+        let shown = ((self.track_h(start) + dy) / 4.).round() * 4.;
+        self.stored_track_h(shown.clamp(self.track_min_h, 400.)).min(400.)
+    }
+
+    /// The stored height that shows as `shown` (the inverse of
+    /// [`Metrics::track_h`], for dragging a header's edge).
+    pub fn stored_track_h(&self, shown: f32) -> f32 {
+        (shown.max(self.track_min_h) / self.track_scale).round()
+    }
+}
+
+/// The density table in force.
+pub fn m() -> Metrics {
+    Metrics::of(RT.with(|rt| rt.borrow().resolved.style.density))
+}
+
+/// Which parts of a track header fit a row of the shown height `h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderLayout {
+    /// One row: name and buttons.
+    Single,
+    /// Name and volume over buttons, pan and meter.
+    Double,
+    /// As `Double`, plus a volume slider.
+    Tall,
+}
+
+impl HeaderLayout {
+    /// Two rows of 20 px controls and their gaps need 44 px; the slider another 36.
+    pub fn for_height(h: f32) -> Self {
+        if h < 44. {
+            Self::Single
+        } else if h < 80. {
+            Self::Double
+        } else {
+            Self::Tall
+        }
     }
 }
 
 pub fn session_row_h() -> f32 {
-    density(28.)
+    m().session_row_h
 }
 
 // ── Colour helpers ──
@@ -695,9 +855,104 @@ mod tests {
 
     #[test]
     fn sizes_sit_on_the_grid() {
-        for v in [TOP_BAR_H, BAR_FIELD_H, STATUS_BAR_H, TAB_BAR_H, CONTROL_H, ROW_H, AI_PANEL_W, TRACK_HEADER_W, RULER_H, SESSION_COL_W, STRIP_W, SP1, SP2, SP3, SP4, SP6] {
+        for v in [TOP_BAR_H, TAB_BAR_H, CONTROL_H, ROW_H, AI_PANEL_W, SESSION_COL_W, SP1, SP2, SP3, SP4, SP6] {
             assert_eq!(v % 4., 0., "{v} is off the 4 px grid");
         }
+    }
+
+    #[test]
+    fn both_densities_sit_on_the_grid_and_compact_is_tighter() {
+        let (c, k) = (Metrics::COMFORTABLE, Metrics::COMPACT);
+        for m in [c, k] {
+            for v in [
+                m.top_bar_h, m.bar_field_h, m.status_bar_h, m.dock_bar_h, m.control_h, m.row_h, m.ruler_h, m.track_min_h, m.auto_h, m.bus_h,
+                m.track_header_w, m.session_row_h, m.session_head_h, m.slot_h, m.strip_name_h, m.strip_pan_h, m.strip_db_h, m.strip_w, m.strip_pad, m.dock_h,
+                m.mixer_h,
+            ] {
+                assert_eq!(v % 4., 0., "{v} is off the 4 px grid");
+            }
+            // The loop strip is part of the ruler; fields sit inside the bars.
+            assert!(m.ruler_loop_h < m.ruler_h && m.bar_field_h < m.top_bar_h && m.control_h < m.dock_bar_h);
+            // Text never drops under the legible floor.
+            assert!(m.text_micro >= 10. && m.text_small >= 11. && m.text_body >= 12.);
+        }
+        assert_eq!(c.top_bar_h, TOP_BAR_H);
+        assert_eq!(c.row_h, ROW_H);
+        for (a, b) in [(k.top_bar_h, c.top_bar_h), (k.status_bar_h, c.status_bar_h), (k.dock_bar_h, c.dock_bar_h), (k.control_h, c.control_h), (k.ruler_h, c.ruler_h), (k.bus_h, c.bus_h), (k.auto_h, c.auto_h), (k.session_row_h, c.session_row_h), (k.dock_h, c.dock_h)] {
+            assert!(a < b);
+        }
+        // Click targets stay usable: frequent controls 24 px or more.
+        assert!(k.control_h >= 24. && k.bar_field_h >= 24. && k.slot_h >= 20.);
+    }
+
+    #[test]
+    fn track_heights_scale_with_density_and_round_trip() {
+        let (c, k) = (Metrics::COMFORTABLE, Metrics::COMPACT);
+        assert_eq!(c.track_h(56.), 56.);
+        assert_eq!(k.track_h(56.), 36.);
+        // The floor, and whole 4 px steps.
+        assert_eq!(k.track_h(24.), k.track_min_h);
+        assert_eq!(c.track_h(10.), c.track_min_h);
+        for stored in (24..400).step_by(7) {
+            assert_eq!(k.track_h(stored as f32) % 4., 0.);
+        }
+        // Dragging an edge: the stored height shows as what was dragged to.
+        for shown in (28..=240).step_by(4) {
+            let shown = shown as f32;
+            assert_eq!(k.track_h(k.stored_track_h(shown)), shown, "compact {shown}");
+        }
+        for shown in (40..=240).step_by(4) {
+            assert_eq!(c.track_h(c.stored_track_h(shown as f32)), shown as f32);
+        }
+    }
+
+    #[test]
+    fn dragging_a_header_edge_follows_the_pointer() {
+        let k = Metrics::COMPACT;
+        // 36 px shown, pulled 12 px down: 48 px shown.
+        assert_eq!(k.track_h(k.dragged_track_h(56., 12.)), 48.);
+        // Pushed far up it stops at the minimum, far down at 400 stored.
+        assert_eq!(k.track_h(k.dragged_track_h(56., -100.)), k.track_min_h);
+        assert!(k.dragged_track_h(56., 5_000.) <= 400. / k.track_scale);
+        let c = Metrics::COMFORTABLE;
+        assert_eq!(c.dragged_track_h(56., 8.), 64.);
+        assert_eq!(c.dragged_track_h(56., -100.), c.track_min_h);
+    }
+
+    #[test]
+    fn headers_pick_the_layout_that_fits() {
+        assert_eq!(HeaderLayout::for_height(Metrics::COMPACT.track_h(56.)), HeaderLayout::Single);
+        assert_eq!(HeaderLayout::for_height(Metrics::COMFORTABLE.track_h(56.)), HeaderLayout::Double);
+        assert_eq!(HeaderLayout::for_height(44.), HeaderLayout::Double);
+        assert_eq!(HeaderLayout::for_height(80.), HeaderLayout::Tall);
+        // A single-row header is never shorter than its 20 px controls plus padding.
+        const { assert!(Metrics::COMPACT.track_min_h >= 28.) };
+    }
+
+    /// How many default-height tracks the lanes show in a window of height `h`
+    /// with the detail dock open (and, optionally, the mixer): the window minus
+    /// bars, dock, the pinned bus rows (Main and two returns) and the ruler.
+    fn tracks_in_window(m: Metrics, h: f32, mixer: bool) -> usize {
+        // With the mixer open its strips stand in for the pinned bus rows.
+        let bus = if mixer { m.mixer_h } else { 3. * m.bus_h };
+        let chrome = m.top_bar_h + m.status_bar_h + m.dock_h + 4. * SP1 + m.ruler_h + bus;
+        ((h - chrome).max(0.) / m.track_h(56.)).floor() as usize
+    }
+
+    #[test]
+    fn compact_fits_clearly_more_tracks() {
+        let (c, k) = (Metrics::COMFORTABLE, Metrics::COMPACT);
+        for h in [720., 900., 1080.] {
+            let (before, after) = (tracks_in_window(c, h, false), tracks_in_window(k, h, false));
+            assert!(after * 2 >= before * 3, "{h}: {before} tracks comfortable, {after} compact");
+        }
+        assert!(tracks_in_window(k, 900., true) >= 5);
+    }
+
+    #[test]
+    fn compact_is_the_default() {
+        assert_eq!(Density::default(), Density::Compact);
+        assert_eq!(Style::default().density, Density::Compact);
     }
 
     #[test]
@@ -711,6 +966,9 @@ mod tests {
                 assert!(c >= 4.5, "{}: text on {name} is {c:.2}:1", t.name);
                 let c = contrast(p.muted, bg);
                 assert!(c >= 3.0, "{}: secondary text on {name} is {c:.2}:1", t.name);
+                // Hints and read-only values (the faintest text) stay readable.
+                let c = contrast(p.faint, bg);
+                assert!(c >= 2.8, "{}: hint text on {name} is {c:.2}:1", t.name);
             }
             let c = contrast(p.on_accent, p.accent);
             assert!(c >= 3.0, "{}: text on accent is {c:.2}:1", t.name);

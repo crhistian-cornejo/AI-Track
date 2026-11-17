@@ -7,6 +7,7 @@
 //! The same enum is the wire format for scripts and AI agents (via MCP), so
 //! variants are explicit and serialise as tagged JSON.
 
+use crate::groove::{Groove, GrooveSettings, PoolGroove, MAX_GROOVE_AMOUNT};
 use crate::ids::*;
 use crate::project::*;
 use crate::routing;
@@ -191,6 +192,21 @@ pub enum Command {
     /// Set (or with `None` remove) the automation lane for `target`.
     SetAutomation { track: TrackId, target: AutomationTarget, lane: Option<AutomationLane> },
 
+    /// Put a groove in the project's pool at `index` (ids come from
+    /// `Project::alloc_groove_id`). The groove is brought into range.
+    AddGroove { entry: Box<PoolGroove>, index: usize },
+    /// Take a groove out of the pool; clips that used it go back to none.
+    RemoveGroove { id: GrooveId },
+    /// Replace a pool groove's template (rename, new base, edited cells).
+    UpdateGroove { id: GrooveId, groove: Box<Groove> },
+    /// Change how strongly a pool groove acts (Quantize, Timing, Random,
+    /// Velocity); coalesces like a drag.
+    SetGrooveSettings { id: GrooveId, settings: GrooveSettings },
+    /// Point a notes clip at a pool groove (`None`: play the notes as they are).
+    SetClipGroove { clip: ClipId, groove: Option<GrooveId> },
+    /// The global groove amount, 0..=1.3 (Live's Global Groove Amount).
+    SetGrooveAmount { amount: f32 },
+
     Batch { commands: Vec<Command> },
 }
 
@@ -230,6 +246,12 @@ impl Command {
             RemoveSource { .. } | RemoveClip { .. } => "Delete clip",
             SetSourceFile { .. } => "Relink file",
             UpdateClip { .. } => "Edit clip",
+            AddGroove { .. } => "Add groove",
+            RemoveGroove { .. } => "Delete groove",
+            UpdateGroove { .. } => "Edit groove",
+            SetGrooveSettings { .. } => "Change groove",
+            SetClipGroove { .. } => "Set clip groove",
+            SetGrooveAmount { .. } => "Change groove amount",
             SetWarp { .. } => "Edit sample",
             PlaceClip { .. } => "Place clip",
             RemovePlacement { .. } => "Delete clip",
@@ -268,7 +290,7 @@ impl Command {
         use Command::*;
         match self {
             RemoveTrack { .. } | RemoveScene { .. } | RemoveSource { .. } | RemoveClip { .. }
-            | RemovePlacement { .. } | RemoveNotes { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
+            | RemovePlacement { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
             Batch { commands } => commands.iter().any(Command::is_destructive),
             _ => false,
         }
@@ -410,6 +432,60 @@ impl Command {
             UpdateClip { id, clip } => {
                 let slot = p.clips.get_mut(&id).ok_or(CommandError::ClipNotFound(id))?;
                 Ok(UpdateClip { id, clip: Box::new(std::mem::replace(slot, *clip)) })
+            }
+
+            AddGroove { entry, index } => {
+                if p.groove(entry.id).is_some() {
+                    return Err(CommandError::DuplicateId(entry.id.to_string()));
+                }
+                p.ids.observe(entry.id.0);
+                let mut entry = *entry;
+                entry.groove.normalize();
+                entry.settings = entry.settings.normalized();
+                let id = entry.id;
+                let i = index.min(p.grooves.len());
+                p.grooves.insert(i, entry);
+                Ok(RemoveGroove { id })
+            }
+            RemoveGroove { id } => {
+                let i = p.grooves.iter().position(|g| g.id == id).ok_or_else(|| CommandError::Invalid(format!("groove {id} not found")))?;
+                let entry = p.grooves.remove(i);
+                let mut restores = Vec::new();
+                let users: Vec<ClipId> = p.clip_grooves.iter().filter(|(_, g)| **g == id).map(|(c, _)| *c).collect();
+                for cid in users {
+                    p.clip_grooves.remove(&cid);
+                    restores.push(SetClipGroove { clip: cid, groove: Some(id) });
+                }
+                Ok(with_restores(AddGroove { entry: Box::new(entry), index: i }, restores))
+            }
+            UpdateGroove { id, groove } => {
+                let mut groove = *groove;
+                groove.normalize();
+                let slot = p.grooves.iter_mut().find(|g| g.id == id).ok_or_else(|| CommandError::Invalid(format!("groove {id} not found")))?;
+                Ok(UpdateGroove { id, groove: Box::new(std::mem::replace(&mut slot.groove, groove)) })
+            }
+            SetGrooveSettings { id, settings } => {
+                let slot = p.grooves.iter_mut().find(|g| g.id == id).ok_or_else(|| CommandError::Invalid(format!("groove {id} not found")))?;
+                Ok(SetGrooveSettings { id, settings: std::mem::replace(&mut slot.settings, settings.normalized()) })
+            }
+            SetClipGroove { clip, groove } => {
+                if let Some(g) = groove
+                    && p.groove(g).is_none()
+                {
+                    return Err(CommandError::Invalid(format!("groove {g} not found")));
+                }
+                if !p.clips.contains_key(&clip) {
+                    return Err(CommandError::ClipNotFound(clip));
+                }
+                let old = match groove {
+                    Some(g) => p.clip_grooves.insert(clip, g),
+                    None => p.clip_grooves.remove(&clip),
+                };
+                Ok(SetClipGroove { clip, groove: old })
+            }
+            SetGrooveAmount { amount } => {
+                let amount = if amount.is_finite() { amount.clamp(0.0, MAX_GROOVE_AMOUNT) } else { 1.0 };
+                Ok(SetGrooveAmount { amount: std::mem::replace(&mut p.groove_amount, amount) })
             }
 
             PlaceClip { track, placement } => {

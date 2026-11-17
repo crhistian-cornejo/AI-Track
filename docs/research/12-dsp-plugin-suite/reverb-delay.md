@@ -8,8 +8,13 @@
   `g = 10^(−3·L/(fs·T60))` from its own loop length `L`, split into a mid gain and low/high shelf ratios
   (bilinear one-poles), so low / mid / high decay times hold exactly (Jot's absorption-filter design,
   Schlecht & Habets on FDN design). Tank input is normalised by `sqrt(1 − ⟨g²⟩)` so longer decays ring longer,
-  not louder. Delay reads are modulated by quadrature phasors through first-order all-pass (Thiran)
-  interpolation (flat magnitude, no extra HF loss in the loop).
+  not louder. Delay reads are modulated by phasors (golden-ratio start phases, so the lines never sweep together)
+  through an 8-tap Kaiser-windowed sinc (`dsp::delay::SincKernel`, cutoff at Nyquist: a whole-sample read is exact,
+  flat to 12 kHz at any fraction). The first-order all-pass (Thiran) reader used before clicked each time its
+  fraction wrapped: −52 dB at 500 Hz, −32 dB at 5 kHz of broadband residue against −100 / −85 dB now.
+  The line lengths are stretched until the modes overlap 1.25× (a mode rings over 2.2/RT60 Hz; Σ delays modes
+  per Hz), which stops short rooms ringing like pipes; six input diffusers per side, and a share of the diffused
+  input joins the early reflections to bridge the gap before the shortest line answers.
 - *Plate*: Dattorro's figure-eight tank (Dattorro 1997, "Effect Design Part 1"), lengths scaled from 29 761 Hz,
   published output taps; decay coefficient solved from the loop length.
 
@@ -27,7 +32,11 @@ Ranges: Decay 0.1–20 s, Pre-delay 0–500 ms, Size 0–100 %, Damping 0–100 
 
 ## Delay
 
-- *Digital*: cubic Hermite reads, HP → LP → ADAA-tanh feedback (original behaviour, unchanged).
+- *Digital*: 8-tap windowed-sinc reads (`SincKernel`; Hermite left −32 dB of images at 10 kHz when the time
+  moved, sinc leaves −73 dB), HP → LP on the input *and* the feedback (so the first echo is already filtered; open
+  filters step aside), ADAA-tanh feedback. Time changes use a slope-limited glide (`Glide`): ±0.5 samples of
+  delay per sample (±0.35 and slower for tape) instead of an exponential that started a 250 → 500 ms jump at
+  a slope of 2.08, i.e. the echo played backwards for a moment.
 - *Tape* (`tape.rs`): wow (0.55 Hz sine + random drift, ≤ 5 ms) and flutter (6.3 + 9.7 Hz + 20 Hz-filtered
   jitter, ≤ 0.3 ms) move the read head (pitch deviation = dτ/dt). The record head colours input + feedback
   together: +6 dB HF pre-emphasis → asymmetric ADAA tanh (bias 0.15, even harmonics) → de-emphasis →
@@ -64,3 +73,20 @@ fx.reverb 1.31 % of a core at defaults; fx.delay 0.38 %. Per-module budget tests
 CloudSeed / CloudReverb (MIT) — the "Cloud" wash voicing idea; ChowMatrix (BSD-3) — BBD-per-tap concept;
 Valhalla-style mode/colour split (commercial, concept only); Dragonfly reverbs (GPL-3, listened to only).
 No code ported, so no NOTICE entries are needed.
+
+## Measured quality (tests `reverb::quality`, `delay::quality`)
+
+Run `cargo test -p aitrack-stock --lib reverb::quality::table -- --ignored --nocapture` for the table.
+
+| Measure | Before | After |
+|---|---|---|
+| Spectral deviation of the tail (Gaussian = 5.6 dB): small room / drum room / chamber / plate | 6.85 / 7.11 / 6.01 / 6.28 dB | 5.8 / 5.9 / 5.9 / 6.0 dB |
+| Strongest resonant peak over its surroundings (drum room / plate) | 16.6 / 15.4 dB | 13.5 / 13.7 dB |
+| Normalised echo density at 50 ms, big hall / concert hall | 0.02 / 0.59 | 0.32 / 0.77 |
+| Echo density at 200 ms, plate | 0.75 | 0.84 |
+| Level drift of a frozen tail over one minute, plate / FDN | −8.5 / −2.2 dB | −0.1 / −1.0 dB |
+| Modulation coherence of the 16 lines | 1.0 | < 0.2 |
+| Images of a 10 kHz tone with the delay time moving | −32 dB | −75 dB (plugin), −73 dB (read) |
+| Largest delay-time slope on a big jump | 2.08 | 0.5 (0.35 tape) |
+| DC offset of the tape echo on a loud sine | 13 % of the rms | < 1 % |
+

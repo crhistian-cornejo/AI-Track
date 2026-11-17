@@ -18,7 +18,7 @@ macro_rules! id_type {
     )*};
 }
 
-id_type!(TrackId, ClipId, SourceId, NoteId, DeviceId, SceneId, PlacementId);
+id_type!(TrackId, ClipId, SourceId, NoteId, DeviceId, SceneId, PlacementId, GrooveId);
 
 /// Monotonic id allocator stored in the project file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

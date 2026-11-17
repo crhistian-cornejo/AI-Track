@@ -31,6 +31,7 @@ pub mod sandbox;
 pub mod scan;
 mod strings;
 mod thread;
+pub mod thumbs;
 pub mod vst3;
 
 pub use error::HostError;

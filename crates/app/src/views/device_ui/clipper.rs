@@ -2,6 +2,7 @@
 //! down = ceiling), the clipping-reduction / input / output meters, and the
 //! curve, lift, delta and oversampling controls.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::{Dev, caption};
 use crate::theme::*;
@@ -38,6 +39,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let enabled = dev.enabled;
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
     let threshold = ceiling - drive;
+    // The signal's level now (dB), once the engine publishes it.
+    let live_in = if dev.meter.len() > 2 && dev.m(1) > -60. { Some(dev.m(1)) } else { None };
     let handles = vec![Handle {
         fx: in_frac(threshold).clamp(0.04, 0.96),
         fy: out_frac(ceiling).clamp(0.04, 0.96),
@@ -81,7 +84,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 &format!("{threshold:+.1} dB"),
                 r.px(in_frac(threshold)) + 4.,
                 r.y + 3.,
-                TEXT_XS,
+                TEXT_SM,
                 pal.muted,
                 TextAlign::Left,
             );
@@ -89,11 +92,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 window,
                 cx,
                 "IN",
-                r.x + 6.,
+                r.right() - 6.,
                 r.bottom() - 14.,
-                TEXT_XS,
+                TEXT_SM,
                 pal.faint,
-                TextAlign::Left,
+                TextAlign::Right,
             );
             kit::txt(
                 window,
@@ -101,10 +104,14 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 "OUT",
                 r.right() - 6.,
                 r.y + 3.,
-                TEXT_XS,
+                TEXT_SM,
                 pal.faint,
                 TextAlign::Right,
             );
+            // Where the signal is on the curve right now.
+            if let Some(level) = live_in {
+                kit::dot(window, r.pt(in_frac(level), out_frac(transfer(level, drive, ceiling, soft))), 3.5, pal.text, None);
+            }
             kit::dot(
                 window,
                 r.pt(
@@ -117,6 +124,33 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             );
         },
     );
+
+    if win::in_window(dev) {
+        // The frame's rails have the clipping reduction and the levels in and
+        // out; this is the curve, and what it does to a sine wave.
+        let wave = div().flex_1().min_w(px(0.)).h_full().rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(
+            canvas(
+                |_, _, _| {},
+                move |b, _, window, cx| paint_wave(Rect::of(b), drive, ceiling, soft, enabled, window, cx),
+            )
+            .size_full(),
+        );
+        let displays = div()
+            .child(win::square(ws, dev, 0, div().size_full().flex().flex_col().gap(px(SP1)).child(div().flex_1().min_h(px(0.)).child(curve)).child(caption("← DRIVE   CEILING ↑"))))
+            .child(wave);
+        let top = win::legend(&[("input", p().muted), ("clipped", p().accent)]);
+        return win::arrange(
+            ws,
+            dev,
+            640.,
+            Some(div().flex_none().flex().items_center().child(top)),
+            displays,
+            vec![win::group(dev, "Level", None, &[p::DRIVE, p::CEILING], cx), win::group(dev, "Shape", None, &[p::CURVE, p::LIFT], cx)],
+            vec![win::group(dev, "Quality", None, &[p::OVERSAMPLING, p::DELTA], cx)],
+            cx,
+        )
+        .into_any_element();
+    }
 
     let gr = dev.m(0);
     let input = dev.m(1);
@@ -161,7 +195,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     name,
                     x + 6.,
                     r.bottom() - 13.,
-                    TEXT_XS,
+                    TEXT_SM,
                     pal.faint,
                     TextAlign::Center,
                 );
@@ -200,6 +234,29 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             cx,
         ))
         .into_any_element()
+}
+
+/// Two cycles of a sine at -2 dBFS before the drive, and what the clipper
+/// makes of it, between the ceiling lines.
+fn paint_wave(r: Rect, drive: f32, ceiling: f32, soft: bool, enabled: bool, window: &mut gpui::Window, cx: &mut gpui::App) {
+    let pal = p();
+    // Vertical range: the louder of full scale and the driven peak, with headroom.
+    let peak_in = db_to_gain(-2.);
+    let top = (peak_in * db_to_gain(drive)).clamp(1., 8.) * 1.1;
+    let y_of = |v: f32| 0.5 - 0.5 * (v / top).clamp(-1., 1.);
+    kit::hline(window, r, r.py(0.5), pal.grid_bar);
+    let c = db_to_gain(ceiling);
+    for sign in [1., -1.] {
+        kit::hline(window, r, r.py(y_of(sign * c)), with_alpha(pal.record, 0.55));
+    }
+    kit::txt(window, cx, &format!("ceiling {ceiling:+.1} dB"), r.right() - 6., r.py(y_of(c)) - 13., TEXT_SM, pal.muted, TextAlign::Right);
+    let sine = |fx: f32| peak_in * (std::f32::consts::TAU * 2. * fx).sin();
+    let dry = kit::sample_curve(r, 160, |fx| y_of(sine(fx) * db_to_gain(drive)));
+    kit::line(window, &dry, 1., content(0.3));
+    let color = if enabled { pal.accent } else { pal.muted };
+    let wet = kit::sample_curve(r, 160, |fx| y_of(curve_sample(sine(fx), db_to_gain(drive), c, soft)));
+    kit::fill_to(window, &wet, r.py(0.5), with_alpha(color, 0.14));
+    kit::line(window, &wet, 2., color);
 }
 
 #[cfg(test)]

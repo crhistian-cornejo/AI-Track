@@ -391,6 +391,8 @@ pub struct Workspace {
     pub device_windows: std::collections::HashMap<DeviceId, gpui::WindowHandle<views::device_window::DeviceWindow>>,
     /// A device window the dev view asked for (opened on the first frame).
     window_pending: Option<DeviceId>,
+    /// Device windows to open on the next frame (dev view `devwins=`).
+    windows_pending: Vec<DeviceId>,
     _housekeeping: Task<()>,
 }
 
@@ -508,13 +510,13 @@ impl Workspace {
             file_recent_open: false,
             device_menu_hover: None,
             device_menu_search,
-            bottom_h: 300.,
+            bottom_h: theme::Metrics::of(look.app.density).dock_h,
             bottom_open: true,
             window_h: 920.,
             window_w: 1480.,
             palette: Default::default(),
             mixer_open: false,
-            mixer_h: 264.,
+            mixer_h: theme::Metrics::of(look.app.density).mixer_h,
             palette_pending: false,
             // Closed at start: the arrangement gets the room; the Assistant button opens it.
             ai_open: false,
@@ -545,6 +547,7 @@ impl Workspace {
             organize: OrganizeUi::default(),
             device_windows: Default::default(),
             window_pending: None,
+            windows_pending: Vec::new(),
             _housekeeping: housekeeping,
         };
         // Seed the assistant with a greeting and one reviewable proposal.
@@ -587,6 +590,11 @@ impl Workspace {
 
     fn apply_dev_view(&mut self, cx: &mut Context<Self>) {
         let Ok(spec) = std::env::var("AITRACK_DEV_VIEW") else { return };
+        self.apply_dev_words(&spec, cx);
+    }
+
+    /// The words of `AITRACK_DEV_VIEW`, applied (the frame-time benchmark passes its own).
+    pub(crate) fn apply_dev_words(&mut self, spec: &str, cx: &mut Context<Self>) {
         for word in spec.split(',').map(str::trim) {
             match word {
                 "devices" => self.s.bottom_tab = BottomTab::Devices,
@@ -613,6 +621,11 @@ impl Workspace {
                 "prefs=audio" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Audio,
+                    ))
+                }
+                "prefs=plugins" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(
+                        views::prefs::PrefsPage::Plugins,
                     ))
                 }
                 "prefs=midi" => {
@@ -992,6 +1005,20 @@ impl Workspace {
                     let ids: Vec<_> = self.s.project.tracks.iter().flat_map(|t| t.devices.iter().map(|d| d.id)).collect();
                     self.fx.big.extend(ids);
                 }
+                // `devwins=instrument.granular+fx.stutter`: those stock devices appended to the
+                // selected track, each open in its own window (frame-time runs, `AITRACK_FPS`).
+                _ if word.starts_with("devwins=") => {
+                    if let Some(track) = self.s.selected_track {
+                        for plugin in word["devwins=".len()..].split('+').filter(|s| !s.is_empty()) {
+                            let id = self.s.project.alloc_device_id();
+                            let index = self.s.project.track(track).map_or(0, |t| t.devices.len());
+                            let name = self.b.plugins.device(plugin).map_or(plugin.to_owned(), |d| d.name.to_owned());
+                            let device = Device::stock(id, plugin, name);
+                            self.s.edit("Add device", vec![Command::AddDevice { slot: aitrack_model::command::DeviceSlot::Track { track, index }, device: Box::new(device) }]);
+                            self.windows_pending.push(id);
+                        }
+                    }
+                }
                 _ if word.starts_with("palette=") => {
                     self.palette_pending = true;
                     self.palette.tab = match &word["palette=".len()..] {
@@ -1198,7 +1225,7 @@ impl Workspace {
             && let Some(k) = r.autos.iter().position(|t| *t == target)
         {
             let view_h = f32::from(self.regions.arrange.get().size.height).max(200.);
-            let (top, bottom) = (r.top, r.top + r.h + (k + 1) as f32 * views::arrangement::AUTO_H);
+            let (top, bottom) = (r.top, r.top + r.h + (k + 1) as f32 * views::arrangement::auto_h());
             let v = &mut self.s.arrange;
             if top < v.scroll_y {
                 v.scroll_y = top;
@@ -1797,10 +1824,10 @@ impl Workspace {
                 self.s.set_track_coalesced(&format!("fader-{}", id.0), id, TrackProp::VolumeDb(fader_to_db(*pos)));
             }
             Drag::TrackHeight { track, start_y, start_h } => {
-                // Whole multiples of 4 px, as every size in the interface.
-                let h = ((*start_h + y - *start_y) / 4.).round() * 4.;
+                // Whole multiples of 4 px of what is shown, as every size in the interface.
+                let h = theme::m().dragged_track_h(*start_h, y - *start_y);
                 let id = *track;
-                self.s.set_track_coalesced(&format!("height-{}", id.0), id, TrackProp::Height(h.clamp(40., 400.)));
+                self.s.set_track_coalesced(&format!("height-{}", id.0), id, TrackProp::Height(h));
             }
             Drag::Tempo { last_y, bpm } => {
                 let dy = (*last_y - y) as f64;
@@ -2534,7 +2561,7 @@ impl Workspace {
         let pending = self.s.history.proposals().len();
         let health = self.render_engine_health();
         div()
-            .h(px(STATUS_BAR_H))
+            .h(px(theme::m().status_bar_h))
             .flex_none()
             .px(px(SP3))
             .gap(px(SP4))
@@ -2693,7 +2720,7 @@ impl Workspace {
     /// height, independent of what the detail panel shows.
     /// The mixer section's height in the current window.
     pub fn mixer_h_fitted(&self) -> f32 {
-        let bottom = if self.bottom_open { self.bottom_h } else { TAB_BAR_H + SP2 };
+        let bottom = if self.bottom_open { self.bottom_h } else { theme::m().dock_bar_h };
         mixer_h_fitted(self.mixer_h, bottom, self.window_h)
     }
 
@@ -2715,7 +2742,7 @@ impl Workspace {
                 cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     if e.click_count >= 2 {
-                        this.mixer_h = 264.;
+                        this.mixer_h = theme::m().mixer_h;
                         cx.notify();
                     } else {
                         let start_h = this.mixer_h;
@@ -2823,7 +2850,7 @@ impl Workspace {
                 .child(crate::icons::icon(Icon::Device, 14., pal.record))
                 .child(div().flex_1().min_w(px(0.)).child(crate::widgets::label(text, TEXT_SM, pal.text)))
                 .child(crate::widgets::text_button("banner-plugins", "Plugin settings", None, false).on_click(cx.listener(|this, _, _, cx| {
-                    this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Audio), cx);
+                    this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Plugins), cx);
                 })))
                 .child(crate::widgets::icon_button("watchdog-close", Icon::X, false).on_click(cx.listener(|this, _, _, cx| {
                     this.b.engine.dismiss_watchdog_warning();
@@ -2844,7 +2871,7 @@ impl Workspace {
         Some(
             div()
                 .absolute()
-                .bottom(px(STATUS_BAR_H + SP4))
+                .bottom(px(theme::m().status_bar_h + SP4))
                 .left_0()
                 .right_0()
                 .flex()
@@ -3150,6 +3177,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::fps::begin(window, || "main".to_owned());
         if !self.recovery.is_empty() {
             self.offer_recovery(window, cx);
         } else if !self.pending_missing.is_empty() {
@@ -3197,6 +3225,9 @@ impl Render for Workspace {
         }
         views::device_window::close_orphans(self, cx);
         if let Some(id) = self.window_pending.take() {
+            views::device_window::open(self, id, cx);
+        }
+        for id in std::mem::take(&mut self.windows_pending) {
             views::device_window::open(self, id, cx);
         }
         let pal = p();
@@ -3254,7 +3285,7 @@ impl Render for Workspace {
 
         let editing_num = self.num_edit.is_some() && !self.palette.open && self.modal.is_none();
 
-        div()
+        crate::fps::probe(div()
             .id("workspace")
             .key_context(workspace_key_context(editing_num))
             .track_focus(&self.focus)
@@ -3432,7 +3463,7 @@ impl Render for Workspace {
             .children(menu)
             .children(chooser)
             .children(param_menu)
-            .children(palette)
+            .children(palette), window)
     }
 }
 
@@ -3447,7 +3478,7 @@ const MIN_ARRANGE_H: f32 = 200.;
 /// The mixer section's height: `mixer_h`, shrunk (down to its compact
 /// 160 px) so the arrangement keeps `MIN_ARRANGE_H` above the detail panel.
 pub fn mixer_h_fitted(mixer_h: f32, bottom_h: f32, window_h: f32) -> f32 {
-    let room = window_h - TOP_BAR_H - STATUS_BAR_H - bottom_h - MIN_ARRANGE_H - 4. * SP1;
+    let room = window_h - theme::m().top_bar_h - theme::m().status_bar_h - bottom_h - MIN_ARRANGE_H - 4. * SP1;
     mixer_h.min(room).max(160.)
 }
 

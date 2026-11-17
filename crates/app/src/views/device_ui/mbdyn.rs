@@ -12,6 +12,7 @@
 //! selected band sit under the display; the controls that act on all bands
 //! are on the right.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, Rect, ax, freq_frac};
 use super::multiband::edges;
 use super::{Dev, caption};
@@ -195,7 +196,7 @@ fn paint(r: Rect, view: View, window: &mut gpui::Window, cx: &mut gpui::App) {
         for db in [-60., -40., -20.] {
             let y = r.py(level_fy(db));
             kit::bar(window, mx0, y, mw, 1., 0., content(0.07));
-            kit::txt(window, cx, &format!("{db:.0}"), mx0 + 3., y + 1., TEXT_XS, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, &format!("{db:.0}"), mx0 + 3., y + 1., TEXT_SM, pal.faint, TextAlign::Left);
         }
         // The level now.
         if live && v.level > LV_LO {
@@ -226,7 +227,7 @@ fn paint(r: Rect, view: View, window: &mut gpui::Window, cx: &mut gpui::App) {
             (yf, pal.muted, format!("{:.0}", c.floor), 1.),
         ] {
             kit::bar(window, mx0, y - 0.5, hx - mx0, 1.5, 0., with_alpha(line, 0.9));
-            kit::txt(window, cx, &name, hx - 9., y + dy, TEXT_XS, pal.muted, TextAlign::Right);
+            kit::txt(window, cx, &name, hx - 9., y + dy, TEXT_SM, pal.muted, TextAlign::Right);
         }
         // The gain strip: zero in the middle, lifts above, cuts below.
         let (gx, gw) = (at(GAIN_X - GAIN_W / 2.), GAIN_W * cw);
@@ -250,7 +251,7 @@ fn paint(r: Rect, view: View, window: &mut gpui::Window, cx: &mut gpui::App) {
         kit::dot(window, point(px(hx), px(yf)), 5., pal.raised, Some(if here { pal.text } else { pal.muted }));
         kit::dot(window, point(px(at(GAIN_X)), px(ym)), 5., if enabled { pal.play } else { pal.muted }, ring);
         if v.mute || v.solo {
-            kit::txt(window, cx, if v.mute { "MUTE" } else { "SOLO" }, mcx, top + 3., TEXT_XS, if v.mute { pal.mute } else { pal.solo }, TextAlign::Center);
+            kit::txt(window, cx, if v.mute { "MUTE" } else { "SOLO" }, mcx, top + 3., TEXT_SM, if v.mute { pal.mute } else { pal.solo }, TextAlign::Center);
         }
     }
     // The frequency bar: the bands as segments, the crossovers as handles.
@@ -263,7 +264,7 @@ fn paint(r: Rect, view: View, window: &mut gpui::Window, cx: &mut gpui::App) {
         let x = r.px(freq_frac(f));
         kit::dot(window, point(px(x), px(y)), 6., pal.raised, Some(pal.text));
         let text = if f >= 1000. { format!("{:.1} kHz", f / 1000.) } else { format!("{f:.0} Hz") };
-        kit::txt(window, cx, &text, x + 9., y - 13., TEXT_XS, pal.muted, TextAlign::Left);
+        kit::txt(window, cx, &text, x + 9., y - 13., TEXT_SM, pal.muted, TextAlign::Left);
     }
 }
 
@@ -282,9 +283,9 @@ fn header(dev: &Dev, b: usize, gain: Option<f32>, selected: bool, cx: &mut Conte
         .rounded_t(px(r_sm()))
         .bg(with_alpha(series(b), if selected { 0.14 } else { 0.05 }))
         .child(div().flex_none().size(px(8.)).rounded_full().bg(series(b)))
-        .child(label(NAMES[b], TEXT_XS, if selected { pal.text } else { pal.muted }).font_weight(gpui::FontWeight::SEMIBOLD))
+        .child(label(NAMES[b], TEXT_SM, if selected { pal.text } else { pal.muted }).font_weight(gpui::FontWeight::SEMIBOLD))
         .child(div().flex_1())
-        .when_some(gain, |d, g| d.child(mono(format!("{g:+.1}"), TEXT_XS, if g.abs() < 0.05 { pal.faint } else if g > 0. { pal.play } else { pal.record })))
+        .when_some(gain, |d, g| d.child(mono(format!("{g:+.1}"), TEXT_SM, if g.abs() < 0.05 { pal.faint } else if g > 0. { pal.play } else { pal.record })))
         .child(kit::pick(dev, p::band(b as u32, p::MUTE), cx))
         .child(kit::pick(dev, p::band(b as u32, p::SOLO), cx))
         .on_mouse_down(
@@ -347,6 +348,33 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         heads = heads.child(header(dev, b, live.then_some(v.gain), b == sel, cx));
     }
 
+    if win::in_window(dev) {
+        // The frame has the levels in and out, the reduction and the latency;
+        // the columns keep the level, applied gain and output peak of each band.
+        let sb = sel as u32;
+        let band_ids: Vec<u32> = [p::RATIO_DOWN, p::RATIO_UP, p::MAX_UP, p::ATTACK, p::RELEASE, p::BAND_OUT, p::BAND_DEPTH].iter().map(|o| p::band(sb, *o)).collect();
+        let band_group = win::group(dev, &format!("{} band", NAMES[sel]), None, &band_ids, cx).border_color(with_alpha(series(sel), 0.7));
+        let mode = win::group_of(
+            dev,
+            "Detection",
+            None,
+            vec![win::chip_row(vec![kit::pick(dev, p::MODE, cx), kit::pick(dev, p::DETECT, cx), super::sidechain_chip(ws, dev, p::SIDECHAIN, cx)]), win::knob(dev, p::KNEE, cx)],
+            cx,
+        );
+        let column = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(heads).child(div().flex_1().min_h(px(0.)).child(plot));
+        return win::arrange(
+            ws,
+            dev,
+            900.,
+            None,
+            div().child(column),
+            vec![band_group, win::group(dev, "All bands", None, &[p::AMOUNT, p::TIME, p::DEPTH], cx)],
+            vec![win::group(dev, "Depth", None, &[p::UPWARD, p::DOWNWARD], cx), win::group(dev, "Level", None, &[p::INPUT, p::OUTPUT], cx), mode],
+            cx,
+        )
+        .into_any_element();
+    }
+
     // The selected band's ratios, times and levels.
     let sb = sel as u32;
     let mut row = div()
@@ -355,7 +383,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .items_center()
         .gap(px(SP1))
         .child(div().flex_none().size(px(8.)).rounded_full().bg(series(sel)))
-        .child(label(NAMES[sel], TEXT_XS, pal.text).font_weight(gpui::FontWeight::SEMIBOLD));
+        .child(label(NAMES[sel], TEXT_SM, pal.text).font_weight(gpui::FontWeight::SEMIBOLD));
     for off in [p::RATIO_DOWN, p::RATIO_UP, p::MAX_UP, p::ATTACK, p::RELEASE, p::BAND_OUT, p::BAND_DEPTH] {
         row = row.child(kit::num_w(ws, dev, p::band(sb, off), 64., cx));
     }
@@ -385,8 +413,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .child(mono(format!("in {:>6} out {:>6}", kit::fmt_db(dev.m(METER_IN_PEAK)), kit::fmt_db(dev.m(METER_OUT_PEAK))), TEXT_XS, pal.faint))
-                    .when(linear, |d| d.child(mono(format!("latency {:.0} smp", dev.m(METER_LATENCY)), TEXT_XS, pal.faint))),
+                    .child(mono(format!("in {:>6} out {:>6}", kit::fmt_db(dev.m(METER_IN_PEAK)), kit::fmt_db(dev.m(METER_OUT_PEAK))), TEXT_SM, pal.faint))
+                    .when(linear, |d| d.child(mono(format!("latency {:.0} smp", dev.m(METER_LATENCY)), TEXT_SM, pal.faint))),
             )
         });
 

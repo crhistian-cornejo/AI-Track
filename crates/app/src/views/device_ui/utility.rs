@@ -2,6 +2,7 @@
 //! up/down = width), output meters with the phase correlation, and the
 //! phase / mono / swap switches as buttons.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::{Dev, caption};
 use crate::theme::*;
@@ -37,17 +38,42 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let rad = a.to_radians();
             kit::line(window, &[r.pt(0.5, 0.94), r.pt(0.5 + 0.46 * rad.sin(), 0.94 - 0.84 * rad.cos())], 1., pal.grid_beat);
         }
-        kit::txt(window, cx, "L", r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, "R", r.right() - 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, "L", r.x + 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "R", r.right() - 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Right);
         let color = if enabled && !muted { pal.accent } else { pal.muted };
         let pts: Vec<Point<Pixels>> = fan(width, pan, mono).into_iter().map(|(x, y)| r.pt(x, y)).collect();
         crate::paint::polygon(window, &pts, with_alpha(color, 0.25));
         let mut outline = pts.clone();
         outline.push(pts[0]);
         kit::line(window, &outline, 1.5, color);
-        kit::txt(window, cx, &format!("width {width:.0}%  pan {pan:+.0}"), r.px(0.5), r.bottom() - 14., TEXT_XS, pal.muted, TextAlign::Center);
+        kit::txt(window, cx, &format!("width {width:.0}%  pan {pan:+.0}"), r.px(0.5), r.y + 4., TEXT_SM, pal.muted, TextAlign::Center);
         kit::dot(window, r.pt(hx, hy), 7., pal.accent, Some(pal.text));
     });
+
+    if win::in_window(dev) {
+        // The frame carries the left and right output peaks; what it does not
+        // have is the phase correlation, drawn here as a wide bar.
+        let corr = dev.m(2);
+        let panel = div().flex_1().min_w(px(0.)).h_full().rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(
+            canvas(|_, _, _| {}, move |b, _, window, cx| paint_correlation(Rect::of(b), corr, window, cx)).size_full(),
+        );
+        let displays = div().child(win::square(ws, dev, 0, field)).child(panel);
+        let chips = |ids: &[u32], cx: &mut Context<Workspace>| win::chip_row(ids.iter().map(|id| kit::pick(dev, *id, cx)).collect());
+        return win::arrange(
+            ws,
+            dev,
+            620.,
+            None,
+            displays,
+            vec![win::group(dev, "Position", None, &[p::GAIN, p::PAN, p::WIDTH], cx), win::group_of(dev, "Phase", None, vec![chips(&[p::INVERT_L, p::INVERT_R, p::SWAP], cx)], cx)],
+            vec![
+                win::group_of(dev, "Channels", None, vec![chips(&[p::MODE, p::MONO, p::MUTE], cx)], cx),
+                win::group_of(dev, "Low end", None, vec![chips(&[p::BASS_MONO, p::DC_BLOCK], cx), win::knob(dev, p::BASS_FREQ, cx)], cx),
+            ],
+            cx,
+        )
+        .into_any_element();
+    }
 
     // Output peaks and correlation.
     let (peaks, corr) = ([dev.m(0), dev.m(1)], dev.m(2));
@@ -62,7 +88,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 let x = r.x + i as f32 * 12.;
                 kit::bar(window, x, r.y, 9., r.h - 16., 2., pal.well);
                 kit::bar(window, x, r.y + (r.h - 16.) * (1. - frac), 9., (r.h - 16.) * frac, 2., if db > -0.1 { pal.meter_high } else { pal.meter_low });
-                kit::txt(window, cx, if i == 0 { "L" } else { "R" }, x + 4.5, r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Center);
+                kit::txt(window, cx, if i == 0 { "L" } else { "R" }, x + 4.5, r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Center);
             }
             // Correlation: −1 (out of phase) at the bottom, +1 at the top.
             let x = r.x + 32.;
@@ -72,7 +98,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::bar(window, x, if h > 0. { mid - h } else { mid }, 6., h.abs(), 2., if corr < 0. { pal.record } else { pal.accent2 });
             window.paint_quad(crate::paint::fill_rect(crate::paint::rect(x - 2., mid, 10., 1.), pal.muted));
             let _ = point(px(0.), px(0.));
-            kit::txt(window, cx, "φ", x + 3., r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Center);
+            kit::txt(window, cx, "φ", x + 3., r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Center);
         },
     )
     .w(px(44.))
@@ -102,6 +128,28 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     kit::panel(if dev.big { 520. } else { 420. })
         .child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(div().flex_none().w(px(if dev.big { 240. } else { 176. })).h_full().child(field)).child(meters).child(switches))
         .into_any_element()
+}
+
+/// A wide correlation bar: -1 (out of phase) to +1 (mono), with the value and what it means.
+fn paint_correlation(r: Rect, corr: f32, window: &mut gpui::Window, cx: &mut gpui::App) {
+    let pal = p();
+    let corr = corr.clamp(-1., 1.);
+    kit::txt(window, cx, "PHASE CORRELATION", r.x + 12., r.y + 10., TEXT_SM, pal.faint, TextAlign::Left);
+    let (x0, x1, y, h) = (r.x + 16., r.right() - 16., r.py(0.5) - 10., 20.);
+    kit::bar(window, x0, y, x1 - x0, h, 4., content(0.07));
+    let mid = (x0 + x1) / 2.;
+    let x = mid + corr * (x1 - x0) / 2.;
+    let color = if corr < 0. { pal.record } else if corr < 0.3 { pal.meter_mid } else { pal.accent2 };
+    kit::bar(window, mid.min(x), y, (x - mid).abs(), h, 4., color);
+    kit::bar(window, mid - 0.5, y - 4., 1., h + 8., 0., pal.muted);
+    for (v, name) in [(-1., "-1"), (0., "0"), (1., "+1")] {
+        kit::txt(window, cx, name, mid + v * (x1 - x0) / 2., y + h + 6., TEXT_SM, pal.faint, if v < 0. { TextAlign::Left } else if v > 0. { TextAlign::Right } else { TextAlign::Center });
+    }
+    kit::txt(window, cx, "out of phase", x0, y - 18., TEXT_SM, pal.faint, TextAlign::Left);
+    kit::txt(window, cx, "mono", x1, y - 18., TEXT_SM, pal.faint, TextAlign::Right);
+    let verdict = if corr < 0. { "out of phase: it will cancel in mono" } else if corr < 0.3 { "wide: check it in mono" } else { "safe in mono" };
+    kit::txt(window, cx, &format!("{corr:+.2}"), r.px(0.5), r.py(0.5) + 34., 22., pal.text, TextAlign::Center);
+    kit::txt(window, cx, verdict, r.px(0.5), r.py(0.5) + 64., TEXT_SM, pal.muted, TextAlign::Center);
 }
 
 fn label_gap() -> gpui::Div {

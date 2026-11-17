@@ -30,7 +30,8 @@ use crate::sample_cache::{DecodedAudio, SampleCache};
 use aitrack_dsp::event::Expression;
 use aitrack_dsp::warp::{sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
-use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
+use aitrack_model::groove::{grooved_velocity, random_unit, Groove, GrooveParams, GrooveSettings, NoteGroove, PoolGroove, MAX_GROOVE_AMOUNT};
+use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, GrooveId, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
 use std::sync::Arc;
 
 /// Musical-time context of one processing segment.
@@ -46,6 +47,19 @@ impl TimeCtx<'_> {
     #[inline]
     pub fn sample_of(&self, tick: Tick) -> i64 {
         (self.tempo.tick_to_samples(tick, self.sr) - 1e-6).ceil() as i64
+    }
+
+    /// [`sample_of`](Self::sample_of) for a fractional tick (a groove moves
+    /// notes by less than a tick): the first sample at or after it.
+    #[inline]
+    pub fn sample_of_f(&self, tick: f64) -> i64 {
+        let whole = tick.floor();
+        if whole == tick {
+            return self.sample_of(whole as Tick);
+        }
+        let ti = whole as Tick;
+        let secs = self.tempo.tick_to_seconds(ti) + (tick - whole) * 60.0 / (self.tempo.bpm_at(ti) * PPQ as f64);
+        (secs * self.sr - 1e-6).ceil() as i64
     }
 
     #[inline]
@@ -107,7 +121,8 @@ fn priority(kind: &EventKind) -> u8 {
 pub(crate) struct ActiveNote {
     pub key: u8,
     pub note_id: i32,
-    pub off_tick: Tick,
+    /// Where the note ends, in ticks (fractional: a groove moves it by less than a tick).
+    pub off_tick: f64,
     /// Never release before this sample (zero-length notes).
     pub min_off: i64,
     pub release: f32,
@@ -133,7 +148,7 @@ impl ActiveNotes {
         let mut i = 0;
         while i < self.notes.len() {
             let n = self.notes[i];
-            let at = ctx.sample_of(n.off_tick).max(n.min_off);
+            let at = ctx.sample_of_f(n.off_tick).max(n.min_off);
             if at < hi {
                 let offset = (at - ctx.seg_start).max(0) as u32;
                 out.push(offset, EventKind::NoteOff { channel: 0, key: n.key, velocity: n.release, note_id: n.note_id });
@@ -208,6 +223,9 @@ pub(crate) struct SNote {
     pub note_id: i32,
     pub pan: f32,
     pub fine_pitch: f32,
+    /// What the clip's groove does to this note, before settings and amount
+    /// (all zero without a groove).
+    pub groove: NoteGroove,
 }
 
 #[derive(Debug, Default)]
@@ -217,7 +235,7 @@ pub(crate) struct Section {
 }
 
 impl Section {
-    fn from_notes(src: &NoteSource, from: Tick, to: Tick) -> Self {
+    fn from_notes(src: &NoteSource, from: Tick, to: Tick, groove: Option<&Groove>) -> Self {
         let mut notes: Vec<SNote> = src
             .notes
             .iter()
@@ -232,6 +250,7 @@ impl Section {
                 note_id: n.id.0 as i32,
                 pan: n.pan,
                 fine_pitch: n.fine_pitch,
+                groove: groove.map_or_else(NoteGroove::default, |g| g.terms(n.start)),
             })
             .collect();
         notes.sort_by_key(|n| (n.start, n.key));
@@ -562,19 +581,116 @@ pub(crate) struct CompiledClip {
     pub content: ClipContent,
     /// Fades and volume envelope (audio clips; empty for MIDI).
     pub shape: ClipShape,
+    /// The groove the notes are played with, if the clip has one.
+    pub groove: Option<ClipGroove>,
+}
+
+/// A clip's groove while it plays: the pool groove's grid and the live
+/// settings and amount. The notes carry their own terms ([`SNote::groove`]);
+/// everything else is applied when they are scheduled, so changing the
+/// amount or a setting is a few stores, not a compile.
+///
+/// A change does not move notes that are already on their way: it applies
+/// from `switch_tick` on (a little ahead of the playhead), to the notes whose
+/// *nominal* position is at or after it, and the old values go on for the
+/// ones before. A note's moment is then always a function of its position
+/// and of one of two parameter sets, so it never plays twice or not at all
+/// when a slider moves.
+#[derive(Clone, Debug)]
+pub(crate) struct ClipGroove {
+    pub id: GrooveId,
+    pub base: Tick,
+    pub seed: u64,
+    /// The farthest a note can be moved from its nominal place, in ticks.
+    pub margin: Tick,
+    pub settings: GrooveSettings,
+    pub amount: f32,
+    cur: GrooveParams,
+    prev: GrooveParams,
+    switch_tick: Tick,
+}
+
+impl ClipGroove {
+    pub fn new(entry: &PoolGroove, amount: f32) -> Self {
+        let params = GrooveParams::new(&entry.settings, amount);
+        let base = entry.groove.base.max(1);
+        Self {
+            id: entry.id,
+            base,
+            seed: entry.id.0,
+            // pull ≤ ½ cell, timing ≤ 1.3 × 1.3 cells, random ≤ ½ × 1.3 cells, plus rounding.
+            margin: 3 * base + 2,
+            settings: entry.settings,
+            amount: params.amount,
+            cur: params,
+            prev: params,
+            switch_tick: Tick::MIN,
+        }
+    }
+
+    /// The parameters for a note whose nominal place on the timeline is `tick`.
+    #[inline]
+    pub fn params_at(&self, tick: Tick) -> &GrooveParams {
+        if tick >= self.switch_tick { &self.cur } else { &self.prev }
+    }
+
+    fn retune(&mut self, now: Tick) {
+        let next = GrooveParams::new(&self.settings, self.amount);
+        if next == self.cur {
+            return;
+        }
+        if now >= self.switch_tick {
+            self.prev = self.cur;
+        }
+        self.cur = next;
+        // Past every note that may already have been scheduled: a block's
+        // worth of ticks and the farthest a note moves.
+        self.switch_tick = now + self.margin + PPQ / 2 + 1;
+    }
+
+    pub fn set_amount(&mut self, amount: f32, now: Tick) {
+        self.amount = amount.clamp(0.0, MAX_GROOVE_AMOUNT);
+        self.retune(now);
+    }
+
+    pub fn set_settings(&mut self, settings: GrooveSettings, now: Tick) {
+        self.settings = settings.normalized();
+        self.retune(now);
+    }
+
+    /// Every note takes the current values (the transport jumped).
+    pub fn settle(&mut self) {
+        self.prev = self.cur;
+        self.switch_tick = Tick::MIN;
+    }
 }
 
 impl CompiledClip {
+    #[cfg(test)]
     pub fn midi(id: ClipId, clip: &Clip, notes: &NoteSource) -> Self {
+        Self::midi_grooved(id, clip, notes, None)
+    }
+
+    /// A MIDI clip played with `groove` (the pool entry and the project's
+    /// global amount), when it has one.
+    pub fn midi_grooved(id: ClipId, clip: &Clip, notes: &NoteSource, groove: Option<(&PoolGroove, f32)>) -> Self {
+        let g = groove.map(|(e, _)| {
+            let mut g = e.groove.clone();
+            g.normalize();
+            g
+        });
+        let g = g.as_ref();
         let looping = clip.looping.filter(|l| l.end > l.start).map(|l| (l.start, l.end));
         let (intro, cycle) = match looping {
             Some((ls, le)) => {
-                let intro = if clip.offset < le { Section::from_notes(notes, clip.offset, le) } else { Section::default() };
-                (intro, Some(Section::from_notes(notes, ls, le)))
+                let intro = if clip.offset < le { Section::from_notes(notes, clip.offset, le, g) } else { Section::default() };
+                (intro, Some(Section::from_notes(notes, ls, le, g)))
             }
-            None => (Section::from_notes(notes, clip.offset, clip.offset + clip.length.max(0)), None),
+            None => (Section::from_notes(notes, clip.offset, clip.offset + clip.length.max(0), g), None),
         };
-        Self::base(id, clip, looping, ClipContent::Midi { intro, cycle })
+        let mut c = Self::base(id, clip, looping, ClipContent::Midi { intro, cycle });
+        c.groove = groove.map(|(e, amount)| ClipGroove::new(e, amount));
+        c
     }
 
     pub fn audio(id: ClipId, clip: &Clip, data: AudioClipData) -> Self {
@@ -595,6 +711,7 @@ impl CompiledClip {
             follow: clip.launch.follow,
             content,
             shape: ClipShape::default(),
+            groove: None,
         }
     }
 
@@ -628,19 +745,53 @@ impl CompiledClip {
         }
         let wa = ctx.tick_of(lo).floor() as Tick - 1 - start;
         let wb = ctx.tick_of(hi).ceil() as Tick + 1 - start;
+        // A groove can move a note away from its nominal place: look that far
+        // on both sides of the block.
+        let reach = self.groove.as_ref().map_or(0, |g| g.margin);
+        let groove = self.groove.as_ref();
         let mut emit = |sec_start: Tick, sec: &Section| {
-            let from = wa - sec_start;
-            let to = wb - sec_start;
+            let from = wa - sec_start - reach;
+            let to = wb - sec_start + reach;
             let i0 = sec.notes.partition_point(|n| n.start < from);
             for n in &sec.notes[i0..] {
                 if n.start >= to {
                     break;
                 }
                 let on = sec_start + n.start;
-                if on < 0 || limit.is_some_and(|l| on >= l) {
+                if on < 0 {
                     continue;
                 }
-                let at = ctx.sample_of(start + on);
+                // Where it really starts, how loud, and where it ends (ticks).
+                let (begin, velocity, off_f) = match groove {
+                    None => {
+                        if limit.is_some_and(|l| on >= l) {
+                            continue;
+                        }
+                        let mut off = sec_start + n.end;
+                        if let Some(l) = limit {
+                            off = off.min(l);
+                        }
+                        (on as f64, n.velocity, off as f64)
+                    }
+                    Some(g) => {
+                        let params = g.params_at(start + on);
+                        let rand = if params.random > 0.0 { random_unit(g.seed, on, n.key) } else { 0.0 };
+                        // The section of the clip the note belongs to: it stays inside it.
+                        let (lo_t, hi_t) = (sec_start as f64, (sec_start + sec.len) as f64);
+                        let b = (on as f64 + params.shift(&n.groove, g.base, rand)).clamp(lo_t, (hi_t - 1.0).max(lo_t));
+                        if limit.is_some_and(|l| b >= l as f64) {
+                            continue;
+                        }
+                        let len = (n.end - n.start) as f64;
+                        let wanted = if len > 0.0 { (len + params.length_delta(&n.groove)).max(1.0) } else { 0.0 };
+                        let mut off = (b + wanted).min(hi_t.max(b));
+                        if let Some(l) = limit {
+                            off = off.min(l as f64);
+                        }
+                        (b, grooved_velocity(n.velocity, params.velocity_factor(&n.groove)), off)
+                    }
+                };
+                let at = ctx.sample_of_f(start as f64 + begin);
                 if at < lo || at >= hi {
                     continue;
                 }
@@ -648,16 +799,12 @@ impl CompiledClip {
                     continue;
                 }
                 let offset = (at - ctx.seg_start) as u32;
-                let mut off = sec_start + n.end;
-                if let Some(l) = limit {
-                    off = off.min(l);
-                }
                 let events = 1 + usize::from(n.fine_pitch != 0.0) + usize::from(n.pan != 0.0);
-                let note = ActiveNote { key: n.key, note_id: n.note_id, off_tick: start + off, min_off: at + 1, release: n.release };
+                let note = ActiveNote { key: n.key, note_id: n.note_id, off_tick: start as f64 + off_f, min_off: at + 1, release: n.release };
                 if !active.start(note, out, offset, events) {
                     continue;
                 }
-                out.push(offset, EventKind::NoteOn { channel: 0, key: n.key, velocity: n.velocity, note_id: n.note_id });
+                out.push(offset, EventKind::NoteOn { channel: 0, key: n.key, velocity, note_id: n.note_id });
                 if n.fine_pitch != 0.0 {
                     out.push(
                         offset,
@@ -1007,7 +1154,7 @@ mod tests {
         let cap = active.notes.capacity();
         let mut out = EventList::with_capacity(64);
         for key in 0..(cap as u8 + 3) {
-            let note = ActiveNote { key, note_id: key as i32, off_tick: PPQ, min_off: 1, release: 0.0 };
+            let note = ActiveNote { key, note_id: key as i32, off_tick: PPQ as f64, min_off: 1, release: 0.0 };
             if active.start(note, &mut out, 0, 1) {
                 out.push(0, EventKind::NoteOn { channel: 0, key, velocity: 1.0, note_id: key as i32 });
             }

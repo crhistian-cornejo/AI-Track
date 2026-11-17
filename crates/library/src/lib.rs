@@ -14,6 +14,7 @@
 //! - [`install`]: one-click download of the optional packs, with progress.
 //! - [`reanalyse`]: key/BPM from audio for samples that miss them, cached by file hash.
 //! - [`cover`]: sample pack artwork found in the pack's folders.
+//! - [`text`]: folding and word scoring shared by every search box.
 //! - [`labels`]: a static catalogue of popular sample labels by genre.
 //! - `ai` (feature `ai`): [`AiDetector`](ai::AiDetector), the `aitrack-ai` detector.
 
@@ -35,7 +36,9 @@ pub mod plugins;
 pub mod query;
 pub mod reanalyse;
 pub mod scan;
+pub mod splice;
 pub mod taxonomy;
+pub mod text;
 pub mod tree;
 pub mod watch;
 
@@ -58,7 +61,7 @@ pub use labels::{Genre, LABELS, Label};
 pub use organize::{OrganizeJournal, OrganizeLayout, OrganizeMode, OrganizePlan};
 pub use parse::{KeyHint, NameHints, parse_name, parse_path};
 pub use query::{
-    BpmFilter, Filters, KeyFilter, KeyMatch, RecommendQuery, Recommendation, SearchQuery, SortBy, key_compat,
+    BpmFilter, Filters, KeyFilter, KeyMatch, RecommendQuery, Recommendation, SearchQuery, SortBy, browse_folders, key_compat, relevance,
 };
 pub use reanalyse::{
     Detection, KeyBpmDetector, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, ReanalyseProgress, ReanalyseSource, ReanalyseStats,

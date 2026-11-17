@@ -6,7 +6,7 @@
 //! handle: it moves the time (fixed), the gate (sync) or the stretch.
 
 use super::Dev;
-use super::kit::{self, Handle, PlotCfg, ax};
+use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::midi_kit as mk;
 use crate::paint;
 use crate::theme::*;
@@ -76,6 +76,34 @@ pub fn shape(c: &Cfg, played: f32, next: f32) -> Shape {
     Shape { played, out, target, next, min: c.min, max: c.max }
 }
 
+/// The run of notes a window plays through the device: `(start, length)` in beats.
+const RUN: [(f32, f32); 5] = [(0., 0.75), (1., 0.5), (1.75, 0.25), (2.5, 0.75), (3.5, 0.5)];
+/// Beats the run is drawn over.
+const RUN_BEATS: f32 = 5.;
+/// The share of a window's plot the single note has; the run has the rest.
+const SPLIT: f32 = 0.5;
+
+/// One note of the run before and after.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RunNote {
+    pub start: f32,
+    pub played: f32,
+    /// The length it comes out as, in beats.
+    pub out: f32,
+}
+
+/// What the device makes of every note of [`RUN`] (the last is followed by a note a beat later).
+pub fn run(c: &Cfg) -> Vec<RunNote> {
+    RUN.iter()
+        .enumerate()
+        .map(|(i, (start, len))| {
+            let next = RUN.get(i + 1).map_or(start + 1., |n| n.0) - start;
+            let s = shape(c, mk::beats_ms(*len, c.bpm), mk::beats_ms(next, c.bpm));
+            RunNote { start: *start, played: *len, out: mk::ms_beats(s.out, c.bpm) }
+        })
+        .collect()
+}
+
 /// A round tick spacing (ms) giving at most eight lines over `span`.
 pub fn tick_step(span: f32) -> f32 {
     [5., 10., 20., 50., 100., 200., 500., 1_000., 2_000., 5_000., 10_000., 20_000.].into_iter().find(|s| span / s <= 8.).unwrap_or(50_000.)
@@ -117,23 +145,29 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let c = cfg(dev);
     let s = shape(&c, mk::beats_ms(PLAYED_BEATS, dev.bpm), mk::beats_ms(NEXT_BEATS, dev.bpm));
     let (span, tick) = domain(&s);
-    let h = mk::plot_h(dev);
+    let win = mk::windowed(dev);
+    let full = if win { mk::seen_h(ws, dev, 0, mk::plot_h(dev)) } else { mk::plot_h(dev) };
+    let split = if win { SPLIT } else { 1. };
+    let h = full * split;
     let (_, y2, rh) = rows(h);
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
     // The end of the result drags the parameter that sets it.
     let handle = match c.mode {
-        FIXED => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / h, x: ax(p::TIME, span / s.out / 4_000f32.ln()), alt: ax(p::GATE, -1.), reset: vec![default(p::TIME)], ..Default::default() }),
-        SYNC => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / h, x: ax(p::GATE, span / s.out / 80f32.ln()), reset: vec![default(p::GATE)], ..Default::default() }),
-        STRETCH => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / h, x: ax(p::STRETCH, span / s.played / 7.), reset: vec![default(p::STRETCH)], ..Default::default() }),
+        FIXED => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / full, x: ax(p::TIME, span / s.out / 4_000f32.ln()), alt: ax(p::GATE, -1.), reset: vec![default(p::TIME)], ..Default::default() }),
+        SYNC => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / full, x: ax(p::GATE, span / s.out / 80f32.ln()), reset: vec![default(p::GATE)], ..Default::default() }),
+        STRETCH => Some(Handle { fx: (s.out / span).min(1.), fy: (y2 + rh / 2.) / full, x: ax(p::STRETCH, span / s.played / 7.), reset: vec![default(p::STRETCH)], ..Default::default() }),
         _ => None,
     };
     let marks: Vec<(f32, f32)> = handle.iter().map(|h| (h.fx, h.fy)).collect();
     let enabled = dev.enabled;
     let left = summary(dev, &c);
     let played_text = format!("example note {}", mk::fmt_ms(s.played));
+    let notes = run(&c);
 
-    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles: handle.into_iter().collect(), keys: true, ..Default::default() }, cx, move |r, window, cx| {
+    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles: handle.into_iter().collect(), keys: true, ..Default::default() }, cx, move |whole: Rect, window, cx| {
         let pal = p();
+        // The single note has the top of the plot; a window's run of notes has the rest.
+        let r = Rect { h: whole.h * split, ..whole };
         let lit = |c: Hsla| if enabled { c } else { pal.muted };
         let (y1, y2, rh) = rows(r.h);
         let x_of = |ms: f32| r.x + r.w * (ms / span).min(1.);
@@ -142,18 +176,18 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         while t <= span + 1e-3 {
             let x = r.x + r.w * t / span;
             kit::vline(window, r, x, if t == 0. { pal.grid_bar } else { pal.grid_beat });
-            kit::txt(window, cx, &format!("{t:.0}"), x + 3., r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, &format!("{t:.0}"), x + 3., r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Left);
             t += tick;
         }
-        kit::txt(window, cx, "ms", r.right() - 6., r.bottom() - 13., TEXT_XS, pal.faint, TextAlign::Right);
-        let head = paint::text(window, cx, &left, px(r.x + 6.), px(r.y + 3.), TEXT_XS, pal.muted, FontWeight::MEDIUM, TextAlign::Left);
+        kit::txt(window, cx, "ms", r.right() - 6., r.bottom() - 13., TEXT_SM, pal.faint, TextAlign::Right);
+        let head = paint::text(window, cx, &left, px(r.x + 6.), px(r.y + 3.), TEXT_SM, pal.muted, FontWeight::MEDIUM, TextAlign::Left);
         // A bar's label: after its end when there is room, else inside it.
         let name = |window: &mut gpui::Window, cx: &mut gpui::App, text: &str, end: f32, y: f32, fill: Hsla| {
-            let width = text.len() as f32 * 5.6;
+            let width = text.len() as f32 * 6.2;
             if end + 6. + width < r.right() {
-                kit::txt(window, cx, text, end + 6., y + rh / 2. - 6., TEXT_XS, pal.muted, TextAlign::Left);
+                kit::txt(window, cx, text, end + 6., y + rh / 2. - 6., TEXT_SM, pal.muted, TextAlign::Left);
             } else {
-                kit::txt(window, cx, text, end - 5., y + rh / 2. - 6., TEXT_XS, kit::ink_on(fill), TextAlign::Right);
+                kit::txt(window, cx, text, end - 5., y + rh / 2. - 6., TEXT_SM, kit::ink_on(fill), TextAlign::Right);
             }
         };
         // The note as played, and the one that follows it.
@@ -162,7 +196,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         name(window, cx, &played_text, x_of(s.played), r.y + y1, played);
         if let Some(next) = s.next {
             kit::bar(window, x_of(next), r.y + y1, 3., rh, 1.5, lit(series(1)));
-            kit::txt(window, cx, "next", x_of(next) + 7., r.y + y1 + rh / 2. - 6., TEXT_XS, pal.muted, TextAlign::Left);
+            kit::txt(window, cx, "next", x_of(next) + 7., r.y + y1 + rh / 2. - 6., TEXT_SM, pal.muted, TextAlign::Left);
         }
         // The result, over the target before the caps.
         let accent = lit(pal.accent);
@@ -174,7 +208,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         name(window, cx, &format!("result {}", mk::fmt_ms(s.out)), x_of(s.out).max(r.x + 2.) + 8., r.y + y2, ink);
         // The caps, through both bars.
         let (top, bottom) = (r.y + y1 - 5., r.y + y2 + rh + 5.);
-        let wide = |t: &str| t.len() as f32 * 5.6;
+        let wide = |t: &str| t.len() as f32 * 6.2;
         let after_header = r.x + head + 14.;
         let min_label = (s.min > 0.).then(|| format!("min {}", mk::fmt_ms(s.min)));
         let mut min_end = after_header;
@@ -183,10 +217,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::bar(window, x, top, 1.5, bottom - top, 0., lit(series(2)));
             // To the left of its line when there is room, else to the right.
             if x - 4. - wide(label) > after_header {
-                kit::txt(window, cx, label, x - 4., r.y + 3., TEXT_XS, lit(series(2)), TextAlign::Right);
+                kit::txt(window, cx, label, x - 4., r.y + 3., TEXT_SM, lit(series(2)), TextAlign::Right);
                 min_end = x;
             } else {
-                kit::txt(window, cx, label, x + 4., r.y + 3., TEXT_XS, lit(series(2)), TextAlign::Left);
+                kit::txt(window, cx, label, x + 4., r.y + 3., TEXT_SM, lit(series(2)), TextAlign::Left);
                 min_end = x + 4. + wide(label);
             }
         }
@@ -196,9 +230,33 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::bar(window, x - 1., top, 1.5, bottom - top, 0., lit(series(3)));
             let label = format!("max {}{}", mk::fmt_ms(s.max), if beyond { " ›" } else { "" });
             if x + 4. + wide(&label) < r.right() - 4. {
-                kit::txt(window, cx, &label, x + 4., r.y + 3., TEXT_XS, lit(series(3)), TextAlign::Left);
+                kit::txt(window, cx, &label, x + 4., r.y + 3., TEXT_SM, lit(series(3)), TextAlign::Left);
             } else if x - 5. - wide(&label) > min_end + 6. {
-                kit::txt(window, cx, &label, x - 5., r.y + 3., TEXT_XS, lit(series(3)), TextAlign::Right);
+                kit::txt(window, cx, &label, x - 5., r.y + 3., TEXT_SM, lit(series(3)), TextAlign::Right);
+            }
+        }
+        if win {
+            let q = Rect { y: r.bottom(), h: whole.h - r.h, ..whole };
+            kit::hline(window, q, q.y, pal.grid_bar);
+            kit::txt(window, cx, "five notes in a row", q.x + 6., q.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+            let gutter = 52.;
+            let (x0, w) = (q.x + gutter, q.w - gutter - 8.);
+            let x_of = |beat: f32| x0 + w * (beat / RUN_BEATS).clamp(0., 1.);
+            let (top, bottom) = (q.y + 22., q.bottom() - 18.);
+            let row = ((bottom - top - SP1) / 2.).clamp(8., 56.);
+            let (y_in, y_out) = (top, top + row + SP1);
+            for beat in 0..=(RUN_BEATS as i32) {
+                kit::vline(window, q, x_of(beat as f32), if beat % 4 == 0 { pal.grid_bar } else { pal.grid_beat });
+                if (beat as f32) < RUN_BEATS {
+                    kit::txt(window, cx, &format!("{}", beat + 1), x_of(beat as f32) + 3., q.bottom() - 14., TEXT_SM, pal.faint, TextAlign::Left);
+                }
+            }
+            kit::txt(window, cx, "beat", q.x + 6., q.bottom() - 14., TEXT_SM, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, "played", q.x + 6., y_in + row / 2. - 6., TEXT_SM, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, "result", q.x + 6., y_out + row / 2. - 6., TEXT_SM, pal.faint, TextAlign::Left);
+            for n in &notes {
+                kit::bar(window, x_of(n.start), y_in, (x_of(n.start + n.played) - x_of(n.start) - 1.).max(2.), row, 2., with_alpha(pal.text, 0.3));
+                kit::bar(window, x_of(n.start), y_out, (x_of(n.start + n.out) - x_of(n.start) - 1.).max(2.), row, 2., with_alpha(accent, 0.75));
             }
         }
         for (fx, fy) in &marks {
@@ -288,6 +346,27 @@ mod tests {
         assert_eq!(summary(&d, &c), "1/16 × 100%");
         let fixed = dev("midi.length", &[(p::MODE, 0.), (p::TIME, 80.)]);
         assert!((cfg(&fixed).base - 80.).abs() < 1e-2);
+    }
+
+    #[test]
+    fn the_run_of_notes_comes_out_as_each_mode_says() {
+        let c = |mode: usize, f: &dyn Fn(&mut Cfg)| {
+            let mut c = Cfg { mode, base: 125., gate: 1., stretch: 2., min: 0., max: 0., bpm: 120. };
+            f(&mut c);
+            run(&c)
+        };
+        // Sync with a sixteenth: every note is as long as one, whatever was played.
+        assert!(c(SYNC, &|_| {}).iter().all(|n| (n.out - 0.25).abs() < 1e-5));
+        // Stretch doubles each (and never shortens).
+        let stretched = c(STRETCH, &|_| {});
+        assert!(stretched.iter().zip(RUN).all(|(n, (_, len))| (n.out - 2. * len).abs() < 1e-5));
+        // Legato ends every note where the next begins; the last has a note a beat later.
+        let legato = c(LEGATO, &|_| {});
+        for (n, next) in legato.iter().zip(RUN.iter().skip(1).map(|r| r.0).chain([4.5])) {
+            assert!((n.start + n.out - next).abs() < 1e-5, "{n:?}");
+        }
+        assert_eq!(legato.len(), RUN.len());
+        assert!(RUN.iter().all(|(start, len)| start + len <= RUN_BEATS));
     }
 
     #[test]

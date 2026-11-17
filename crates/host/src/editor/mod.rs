@@ -15,6 +15,8 @@
 //! windows. Standalone processes (the sandbox host, tests) call
 //! [`pump_messages`] periodically.
 
+pub mod placement;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -26,6 +28,7 @@ use macos as imp;
 use windows as imp;
 
 use crate::error::{HostError, Result};
+use placement::{Saved, Screen};
 
 /// A copyable reference to an editor window, for host callbacks (VST3
 /// `IPlugFrame::resizeView`) that must resize it. Only meaningful on the
@@ -76,6 +79,20 @@ impl EditorWindow {
         }
     }
 
+    /// A picture of the editor as drawn now: RGBA (alpha premultiplied), width,
+    /// height. Main thread. `None` where it cannot be taken (Windows, for now,
+    /// and editors AppKit cannot draw to a bitmap).
+    pub fn snapshot(&self) -> Option<(Vec<u8>, u32, u32)> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.snapshot()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     pub fn raw(&self) -> RawWindow {
         #[cfg(any(windows, target_os = "macos"))]
         {
@@ -113,6 +130,53 @@ impl EditorWindow {
         }
     }
 
+    /// The top-left corner of the window frame, in screen space (macOS: y
+    /// grows upwards; elsewhere downwards, see [`Y_UP`]).
+    pub fn top_left(&self) -> (f64, f64) {
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            self.inner.top_left()
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            (0.0, 0.0)
+        }
+    }
+
+    /// Move the window so its frame's top-left corner is at `(x, y)`, and
+    /// keep it there when it is shown (otherwise it opens centred).
+    pub fn place(&self, x: f64, y: f64) {
+        #[cfg(any(windows, target_os = "macos"))]
+        self.inner.place(x, y);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = (x, y);
+    }
+
+    /// Allow or forbid dragging the window's edges (a plugin may only know
+    /// whether it can be resized once its view is attached).
+    pub fn set_resizable(&self, resizable: bool) {
+        #[cfg(any(windows, target_os = "macos"))]
+        self.inner.set_resizable(resizable);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = resizable;
+    }
+
+    /// The smallest and (when the plugin has one) largest content size the
+    /// user can drag the window to.
+    pub fn set_limits(&self, min: (u32, u32), max: Option<(u32, u32)>) {
+        #[cfg(any(windows, target_os = "macos"))]
+        self.inner.set_limits(min, max);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = (min, max);
+    }
+
+    /// What to remember about the window now: its place and content size.
+    pub fn placement(&self) -> Saved {
+        let (x, y) = self.top_left();
+        let (w, h) = self.client_size();
+        Saved { x, y, w, h }
+    }
+
     /// The user clicked the close button. The window is hidden but still
     /// exists, so the host can detach the plugin view before destroying it.
     pub fn user_closed(&self) -> bool {
@@ -137,6 +201,28 @@ impl EditorWindow {
             1.0
         }
     }
+}
+
+/// Whether the screen space of [`EditorWindow::top_left`] grows upwards
+/// (macOS) or downwards (Windows).
+pub const Y_UP: bool = cfg!(target_os = "macos");
+
+/// The displays' rectangles in the space of [`EditorWindow::top_left`].
+pub fn screens() -> Vec<Screen> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        imp::screens()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Where a window of `size` should be placed to restore `saved`: its corner
+/// when enough of the title bar is on a display, else `None` (open centred).
+pub fn restorable(saved: &Saved) -> Option<(f64, f64)> {
+    placement::is_reachable(saved.x, saved.y, f64::from(saved.w), &screens(), Y_UP).then_some((saved.x, saved.y))
 }
 
 /// Dispatch pending window messages for this thread (for processes that do

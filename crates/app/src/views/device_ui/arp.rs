@@ -11,6 +11,7 @@
 //! preview of the order, not the device's own draws.
 
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
+use super::midi_kit as mk;
 use super::Dev;
 use crate::theme::*;
 use crate::workspace::Workspace;
@@ -135,6 +136,51 @@ pub fn preview(style: usize, keys: &[i32], octaves: usize, distance: i32, note_r
     steps.into_iter().enumerate().flat_map(|(pos, notes)| (0..note_repeat.max(1)).map(move |_| Col { notes: notes.clone(), pos })).take(MAX_COLS).collect()
 }
 
+/// Columns a window shows, at most (the pattern repeats to fill them).
+const WINDOW_COLS: usize = 32;
+
+/// `want` columns (never fewer than one whole cycle) made of the cycle
+/// `cols` over and over, each with the number of the cycle it belongs to.
+pub fn tiled(cols: &[Col], want: usize) -> Vec<(usize, Col)> {
+    if cols.is_empty() {
+        return Vec::new();
+    }
+    let total = want.max(cols.len());
+    (0..total).map(|i| (i / cols.len(), cols[i % cols.len()].clone())).collect()
+}
+
+/// Where the pattern sits in the plot, as fractions of it: room on the left
+/// for the keys that come in, on the right, and under it for the velocities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geo {
+    pub left: f32,
+    pub right: f32,
+    pub vel: f32,
+}
+
+impl Geo {
+    /// The dock's: the pattern takes the whole plot.
+    pub const CARD: Geo = Geo { left: 0., right: 0., vel: 0. };
+
+    /// A window's, for a plot `w` pixels wide.
+    pub fn window(w: f32) -> Geo {
+        Geo { left: (64. / w.max(200.)).min(0.2), right: 8. / w.max(200.), vel: 0.2 }
+    }
+
+    pub fn width(&self) -> f32 {
+        1. - self.left - self.right
+    }
+
+    /// Plot fractions of a fraction of the pattern area.
+    pub fn x(&self, f: f32) -> f32 {
+        self.left + f * self.width()
+    }
+
+    pub fn y(&self, f: f32) -> f32 {
+        f * (1. - self.vel)
+    }
+}
+
 /// The columns of the pattern position the device reports (all its repeats).
 pub fn head_columns(cols: &[Col], pos: usize) -> std::ops::Range<usize> {
     let first = cols.iter().position(|c| c.pos == pos).unwrap_or(0);
@@ -167,10 +213,17 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let live = dev.meter.len() >= METER_LEN;
     let held = if live { dev.m(HELD) as usize } else { 0 };
     let keys = example_keys(held, style);
-    let cols = preview(style, &keys, octaves, distance, note_repeat, seed);
-    let head = live.then(|| head_columns(&cols, dev.m(POS) as usize)).filter(|r| !r.is_empty());
+    let win = mk::windowed(dev);
+    let geo = if win { Geo::window(mk::seen_w(ws, dev, 0, 640.)) } else { Geo::CARD };
+    let cycle = preview(style, &keys, octaves, distance, note_repeat, seed);
+    let cycle_cols = cycle.len().max(1);
+    // A window shows the pattern come round again (as many cycles as the Repeats allow).
+    let cols: Vec<Col> = if win { tiled(&cycle, WINDOW_COLS).into_iter().map(|(_, c)| c).collect() } else { cycle };
+    let cycles_played = if dev.choice(p::REPEATS) < 8 { dev.choice(p::REPEATS) + 1 } else { usize::MAX };
+    let head = live.then(|| head_columns(&cols[..cycle_cols.min(cols.len())], dev.m(POS) as usize)).filter(|r| !r.is_empty());
     let _ = LEN;
     let (lo, hi) = (cols.iter().flat_map(|c| c.notes.iter()).copied().min().unwrap_or(60) - 2, cols.iter().flat_map(|c| c.notes.iter()).copied().max().unwrap_or(72) + 2);
+    let (lo, hi) = (lo.min(keys.iter().copied().min().unwrap_or(lo) - 2), hi.max(keys.iter().copied().max().unwrap_or(hi) + 2));
     let n = cols.len().max(1) as f32;
     let enabled = dev.enabled;
     let repeats = dev.choice(p::REPEATS);
@@ -182,52 +235,100 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         if repeats < 8 { format!(" · {} cycle{}", repeats + 1, if repeats == 0 { "" } else { "s" }) } else { String::new() },
     );
     let y_of = move |pitch: i32| 1. - 0.12 - 0.76 * (pitch - lo) as f32 / (hi - lo).max(1) as f32;
+    let cycle_cols_n = cycle_cols;
+    let in_keys = keys.clone();
+    let vel_name = ["as played", "fixed", "per step"][vel_mode.min(2)];
     // The Gate: the end of the first bar.
     let first = cols.first().and_then(|c| c.notes.first().copied()).unwrap_or(60);
     let cell = 1. / n;
     let handle_fx = ((offset.max(0.) + gate.min(1.9)) * cell).min(0.98);
     let handles = vec![Handle {
-        fx: handle_fx,
-        fy: y_of(first),
-        x: ax(p::GATE, 100. / (199. * cell)),
+        fx: geo.x(handle_fx),
+        fy: geo.y(y_of(first)),
+        x: ax(p::GATE, 100. / (199. * cell) / geo.width()),
         index: 0,
         reset: vec![(p::GATE, dev.info(p::GATE).map_or(0.4, |i| i.default_normalized()))],
         ..Default::default()
     }];
 
-    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r: Rect, window, cx| {
+    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |full: Rect, window, cx| {
         let pal = p();
         let colour = if enabled { pal.accent } else { pal.muted };
+        // The pattern's own area; a window keeps the left for the keys that come in and the bottom for velocities.
+        let r = Rect { x: full.px(geo.left), y: full.y, w: full.w * geo.width(), h: full.h * (1. - geo.vel) };
+        let row_h = r.h * 0.76 / (hi - lo).max(1) as f32;
+        // The keys of the keyboard behind the notes: the black ones a shade darker.
+        if win {
+            for pitch in lo..=hi {
+                if mk::is_black(pitch) {
+                    kit::bar(window, r.x, r.py(y_of(pitch)) - row_h / 2., r.w, row_h, 0., content(0.035));
+                }
+            }
+        }
         // The octaves (every C).
         for pitch in lo..=hi {
             if pitch.rem_euclid(12) == 0 {
                 kit::hline(window, r, r.py(y_of(pitch)), pal.grid_bar);
-                kit::txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), r.x + 4., r.py(y_of(pitch)) - 14., TEXT_XS, pal.faint, TextAlign::Left);
+                // In a window the keys that come in are named on the left, so the octaves go on the right.
+                if win {
+                    kit::txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), r.right() - 4., r.py(y_of(pitch)) - 14., TEXT_SM, pal.faint, TextAlign::Right);
+                } else {
+                    kit::txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), r.x + 4., r.py(y_of(pitch)) - 14., TEXT_SM, pal.faint, TextAlign::Left);
+                }
             }
         }
-        // The step grid, and the head on the step it is on.
+        // The step grid, the cycles of the pattern and the head on the step it is on.
         for i in 0..cols.len() {
             if i % 4 == 0 {
                 kit::vline(window, r, r.px(i as f32 * cell), pal.grid_beat);
             }
+        }
+        if win {
+            for k in (cycle_cols_n..cols.len()).step_by(cycle_cols_n) {
+                kit::vline(window, r, r.px(k as f32 * cell), pal.grid_bar);
+            }
+            // The keys that come in: a name on each at its height, a faint line along it.
+            kit::txt(window, cx, "in", full.x + 6., full.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+            for key in &in_keys {
+                let y = r.py(y_of(*key));
+                kit::hline(window, r, y, content(0.08));
+                kit::bar(window, full.x + 6., y - 6., 30., 12., 3., with_alpha(pal.text, 0.28));
+                kit::txt(window, cx, &mk::note_name(*key), full.x + 21., y - 6., TEXT_SM, pal.text, TextAlign::Center);
+            }
+            kit::vline(window, full, r.x - 4., pal.grid_bar);
         }
         if let Some(range) = &head {
             kit::bar(window, r.px(range.start as f32 * cell), r.y, r.w * cell * range.len() as f32, r.h, 0., accent_alpha(0.14));
         }
         // The notes.
         let steps = vel_steps;
+        let thick = if win { (row_h * 0.8).clamp(6., 18.) } else { 6. };
         for (i, c) in cols.iter().enumerate() {
             let start = (i as f32 + offset + if i % 2 == 1 { swing * 0.5 } else { 0. }) * cell;
             let v = column_velocity(vel_mode, vel_fixed, &steps, vel_len, i);
+            // After the Repeats have run out the pattern is shown as a ghost.
+            let silent = win && i / cycle_cols_n >= cycles_played;
             for pitch in &c.notes {
                 let w = (gate.min(1.9) * cell * r.w).max(3.);
                 let playing = head.as_ref().is_some_and(|h| h.contains(&i));
-                let fill = with_alpha(if playing { pal.text } else { colour }, 0.3 + 0.7 * v);
-                kit::bar(window, r.px(start), r.py(y_of(*pitch)) - 3., w, 6., 2., fill);
+                let fill = with_alpha(if playing { pal.text } else { colour }, if silent { 0.1 } else { 0.3 + 0.7 * v });
+                kit::bar(window, r.px(start), r.py(y_of(*pitch)) - thick / 2., w, thick, 2., fill);
+            }
+            if win {
+                // The velocity of the step, under the grid.
+                let lane = Rect { x: r.x, y: full.y + full.h * (1. - geo.vel) + 20., w: r.w, h: full.h * geo.vel - 24. };
+                let bw = (cell * r.w - 3.).max(2.);
+                let bh = (lane.h * v).max(2.);
+                kit::bar(window, r.px(i as f32 * cell) + 1., lane.bottom() - bh, bw, bh, 1., with_alpha(if silent { pal.muted } else { colour }, if silent { 0.2 } else { 0.55 }));
             }
         }
+        if win {
+            let ly = full.y + full.h * (1. - geo.vel);
+            kit::hline(window, Rect { x: full.x, w: full.w, ..r }, ly, pal.grid_bar);
+            kit::txt(window, cx, &format!("velocity · {vel_name}"), full.x + 6., ly + 4., TEXT_SM, pal.faint, TextAlign::Left);
+        }
         kit::dot(window, r.pt(handle_fx, y_of(first)), 5.5, pal.accent, Some(pal.text));
-        kit::txt(window, cx, &title, r.right() - 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, &title, r.right() - 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Right);
     });
 
     let mut style_card = vec![kit::ctl(ws, dev, p::STYLE, cx), kit::ctl(ws, dev, p::RATE, cx), kit::ctl(ws, dev, p::OCTAVES, cx), kit::ctl(ws, dev, p::DISTANCE, cx), kit::ctl(ws, dev, p::NOTE_REPEAT, cx)];

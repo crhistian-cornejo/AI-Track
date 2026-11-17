@@ -6,20 +6,25 @@
 //! `Workspace::chat_log` (job, proposal, licence and sample cards land there)
 //! so both read as one timeline.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aitrack_ai::generate::spec::{Kind, Role};
+use aitrack_ai::generate::{self as gen_core, Source as SpecSource};
 use aitrack_ai::llm::{self, context::Focus, mix::MixPlan};
 use aitrack_model::{ClipId, Origin, Source, TrackId};
 use gpui::{AppContext, ClipboardEntry, Context, Entity, Global, ImageFormat, ScrollHandle, Subscription, Task};
 
+use super::midi_gen::{self, Prepared};
+use super::part::{self, Session};
 use super::{mix, slash};
 use crate::bridge::{AgentKind, LibraryItem};
 use crate::icons::Icon;
 use crate::views::browser::short_key;
 use crate::widgets::{InputEvent, TextInput};
-use crate::workspace::{ChatEntry, ProposalStatus, Workspace};
+use crate::workspace::{ChatEntry, PartCard, ProposalStatus, Workspace};
 
 /// Who answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,11 +83,13 @@ pub enum ReplyState {
 #[derive(Clone, Debug)]
 pub enum Item {
     User { text: String, chips: Vec<(Icon, String)> },
-    Reply { text: String, model: &'static str, state: ReplyState, mix: Option<TrackId> },
+    Reply { text: String, model: &'static str, state: ReplyState, mix: Option<TrackId>, is_part: bool },
     /// A `/` action that ran: its card, followed by its job/result cards.
     Action { icon: Icon, title: &'static str, detail: String },
     /// A short line from the assistant itself (no model involved).
     Note(String),
+    /// Claude working as an agent: thinking, text and tool calls.
+    Agent(super::agent::Reply),
 }
 
 #[derive(Clone, Debug)]
@@ -138,7 +145,26 @@ pub struct Assistant {
     pub scroll: ScrollHandle,
     live: Option<Live>,
     poll: Option<Task<()>>,
+    /// Generated MIDI parts by card id.
+    pub parts: HashMap<u64, Session>,
+    next_part: u64,
+    /// The part a model is writing right now.
+    gen_job: Option<GenJob>,
     _subs: Vec<Subscription>,
+}
+
+/// A part a model is writing: what to fall back to and where the result goes.
+struct GenJob {
+    prepared: Prepared,
+    seed: u64,
+    model: &'static str,
+    mode: GenMode,
+}
+
+enum GenMode {
+    New,
+    /// A new take for the card with this id.
+    Again(u64),
 }
 
 impl Assistant {
@@ -165,7 +191,7 @@ pub fn get(cx: &mut Context<Workspace>) -> Entity<Assistant> {
     if let Some(h) = cx.try_global::<Handle>() {
         return h.0.clone();
     }
-    let input = cx.new(|cx| TextInput::new(cx, "Ask, or type / for actions", Some(Icon::Sparkles)));
+    let input = cx.new(|cx| TextInput::new(cx, "Ask for anything, or / for actions", None).bare());
     let sub = cx.subscribe(&input, |ws, _, e: &InputEvent, cx| on_input(ws, e, cx));
     let entity = cx.new(|_| Assistant {
         input,
@@ -179,6 +205,9 @@ pub fn get(cx: &mut Context<Workspace>) -> Entity<Assistant> {
         scroll: ScrollHandle::new(),
         live: None,
         poll: None,
+        parts: HashMap::new(),
+        next_part: 0,
+        gen_job: None,
         _subs: vec![sub],
     });
     cx.set_global(Handle(entity.clone()));
@@ -210,7 +239,7 @@ fn anchor(ws: &Workspace) -> usize {
     ws.chat_log.len()
 }
 
-fn push(ws: &Workspace, a: &mut Assistant, item: Item) -> usize {
+pub(super) fn push(ws: &Workspace, a: &mut Assistant, item: Item) -> usize {
     a.items.push(Placed { anchor: anchor(ws), item });
     a.scroll.scroll_to_bottom();
     a.items.len() - 1
@@ -240,7 +269,7 @@ fn on_input(ws: &mut Workspace, e: &InputEvent, cx: &mut Context<Workspace>) {
                 }
             } else if !text.is_empty() {
                 clear_input(&a, cx);
-                send(ws, text, None, cx);
+                submit_text(ws, text, cx);
             }
         }
     }
@@ -278,8 +307,11 @@ pub fn set_tab(tab: slash::Tab, cx: &mut Context<Workspace>) {
 /// Run a `/` entry chosen from the menu (Enter or click).
 pub fn choose(ws: &mut Workspace, action: slash::Action, cx: &mut Context<Workspace>) {
     let a = get(cx);
+    // `/bass rolling in A minor`: the words after the command refine the action.
+    let text = a.read(cx).input_text(cx);
+    let args = slash::query(&text).map(|q| slash::split(q).1.to_owned()).unwrap_or_default();
     clear_input(&a, cx);
-    run(ws, action, cx);
+    run_with(ws, action, &args, cx);
 }
 
 /// The selected audio clip (else the first in the project) and its file.
@@ -300,7 +332,7 @@ fn target_track(ws: &Workspace, a: &Assistant) -> Option<TrackId> {
     a.attachments.iter().find_map(|x| if let Attachment::Track(id, _) = x { Some(*id) } else { None }).or(ws.s.selected_track).filter(|id| ws.s.project.track(*id).is_some())
 }
 
-pub fn run(ws: &mut Workspace, action: slash::Action, cx: &mut Context<Workspace>) {
+fn run_with(ws: &mut Workspace, action: slash::Action, args: &str, cx: &mut Context<Workspace>) {
     use slash::Action as A;
     let a = get(cx);
     let entry = slash::ENTRIES.iter().find(|e| e.action == action).copied();
@@ -343,6 +375,7 @@ pub fn run(ws: &mut Workspace, action: slash::Action, cx: &mut Context<Workspace
             ws.find_samples_in_key(cx);
         }
         A::MixTrack => mix_track(ws, cx),
+        A::Generate(kind) => generate(ws, Some(kind), args, cx),
         A::AttachSelection => attach_selection(ws, cx),
         A::AttachFile => pick_files(cx),
         A::Overview => send(ws, "Give me a quick overview of this project: what is there, what stands out, and three concrete things to try next.".into(), None, cx),
@@ -353,10 +386,302 @@ pub fn run(ws: &mut Workspace, action: slash::Action, cx: &mut Context<Workspace
                 a.attachments.clear();
             });
             // Keep cards still waiting for an answer (proposals, licences).
-            ws.chat_log.retain(|e| matches!(e, ChatEntry::Proposal { status: ProposalStatus::Pending, .. } | ChatEntry::License { status: ProposalStatus::Pending, .. }));
+            ws.chat_log.retain(|e| matches!(e, ChatEntry::Proposal { status: ProposalStatus::Pending, .. } | ChatEntry::License { status: ProposalStatus::Pending, .. }) || matches!(e, ChatEntry::Part(c) if matches!(c.status, part::Status::Pending | part::Status::Trying)));
         }
     }
     cx.notify();
+}
+
+/// The model that should write a part, if the assistant is set to one that
+/// can answer: the same choice the chat uses, with no setting of its own.
+fn model_choice(a: &Entity<Assistant>, cx: &mut Context<Workspace>) -> Option<usize> {
+    match a.read_with(cx, |a, _| (a.backend, a.key)) {
+        (Backend::Claude(i), key) if key != KeyState::Missing => Some(i),
+        _ => None,
+    }
+}
+
+/// Write a part (`/bass`, `/chords`, `/beat`, `/arp`, `/melody`, `/perc`, or
+/// free text naming one) and offer it as one card. With a model connected it
+/// writes the spec (structured output) and the rules play it; without one,
+/// or when its answer is no use, the rules write the spec as well.
+pub fn generate(ws: &mut Workspace, kind: Option<Kind>, text: &str, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    let selected = target_track(ws, a.read(cx));
+    let prepared = match midi_gen::prepare(&ws.s.project, selected, ws.s.selected_clip, kind, text) {
+        Ok(p) => p,
+        Err(e) => return note(ws, e, cx),
+    };
+    let seed = prepared.req.seed.unwrap_or_else(fresh_seed);
+    let entry = kind.and_then(|k| slash::ENTRIES.iter().find(|e| e.action == slash::Action::Generate(k)).copied());
+    let (icon, title) = entry.map_or((Icon::Sparkles, "Generate a part"), |e| (e.icon, e.title));
+    let model = model_choice(&a, cx);
+    let what = format!("{} · {} bar{}", prepared.req.kind.label(), prepared.req.bars, if prepared.req.bars == 1 { "" } else { "s" });
+    let how = model.map_or("written by rules".to_owned(), |i| format!("asking {}", llm::MODELS[i].name));
+    a.update(cx, |a, _| push(ws, a, Item::Action { icon, title, detail: format!("{what} · {how}") }));
+    match model {
+        Some(i) => start_model(ws, prepared, seed, GenMode::New, None, i, cx),
+        None => {
+            let g = gen_core::generate(&prepared.req, &prepared.ctx, seed);
+            present(ws, prepared, g, "Rules".to_owned(), cx);
+        }
+    }
+}
+
+/// Ask the model for the spec. The reply is JSON only (the schema is
+/// enforced; the provider retries once as plain text if the API refuses it).
+fn start_model(ws: &mut Workspace, prepared: Prepared, seed: u64, mode: GenMode, previous: Option<&gen_core::MidiSpec>, model: usize, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    if a.read(cx).streaming() {
+        stop(ws, cx);
+    }
+    let choice = llm::MODELS[model];
+    let focus = Focus { selected_track: ws.s.selected_track, selected_clip: ws.s.selected_clip, ..Default::default() };
+    let mut system = llm::context::producer_context(&ws.s.project, &focus);
+    system.push_str("\n\n");
+    system.push_str(llm::midigen::INSTRUCTIONS);
+    system.push_str("\n\n");
+    system.push_str(&prepared.ctx.to_prompt(prepared.req.bars));
+    let user = llm::midigen::user_prompt(&prepared.req, previous);
+    let request = llm::Request { model: choice.id.to_owned(), system, messages: vec![llm::Message::text(llm::Role::User, user)], max_tokens: 4_000, schema: Some(llm::midigen::schema()) };
+    let stream = llm::spawn(request, None);
+    a.update(cx, |a, _| {
+        let item = push(ws, a, Item::Reply { text: String::new(), model: choice.name, state: ReplyState::Waiting, mix: None, is_part: true });
+        a.live = Some(Live { item, stream });
+        a.gen_job = Some(GenJob { prepared, seed, model: choice.name, mode });
+    });
+    ensure_poll(&a, cx);
+    cx.notify();
+}
+
+/// The model finished (or failed): turn its spec into a part, or let the
+/// rules write it and say so on the card.
+fn finish_model(ws: &mut Workspace, result: Result<String, String>, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    let Some(job) = a.update(cx, |a, _| a.gen_job.take()) else { return };
+    let (spec, why) = match &result {
+        Ok(text) => match llm::midigen::parse_reply(text) {
+            Some(spec) => (Some(spec), None),
+            None => (None, Some("The model's reply was not a usable spec".to_owned())),
+        },
+        Err(m) if m.is_empty() => (None, Some("The model did not answer".to_owned())),
+        Err(m) => (None, Some(format!("The model could not answer: {m}"))),
+    };
+    match job.mode {
+        GenMode::New => {
+            let mut g = match spec {
+                Some(spec) => gen_core::generate_from_spec(&job.prepared.req, &job.prepared.ctx, spec, job.seed),
+                None => gen_core::generate(&job.prepared.req, &job.prepared.ctx, job.seed),
+            };
+            if g.fallback.is_none() {
+                g.fallback = why;
+            }
+            let origin = if g.source == SpecSource::Model { job.model.to_owned() } else { "Rules".to_owned() };
+            present(ws, job.prepared, g, origin, cx);
+        }
+        GenMode::Again(sid) => {
+            let Some(mut s) = a.update(cx, |a, _| a.parts.remove(&sid)) else { return };
+            let mut g = aitrack_ai::generate::lock::regenerate(&s.generated, &s.req, &s.ctx, &s.locks, job.seed, spec);
+            if g.source == SpecSource::Template && g.fallback.is_none() {
+                g.fallback = why;
+            }
+            s.origin = if g.source == SpecSource::Model { job.model.to_owned() } else { "Rules".to_owned() };
+            if let Err(e) = s.revise(g, &mut ws.s.project, &mut ws.s.history) {
+                ws.toast(e, cx);
+            }
+            put_back(ws, sid, s, false, cx);
+        }
+    }
+}
+
+/// A seed for a new part: the clock mixed with a counter, so two requests in
+/// the same instant still differ. It is shown on the card.
+fn fresh_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    aitrack_ai::generate::rng::splitmix64(now ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9))
+}
+
+fn card_of(sid: u64, s: &Session, busy: bool) -> PartCard {
+    let bars = if s.generated.bars > 1 { (0..s.generated.bars).map(|b| s.locks.bars.contains(&b)).collect() } else { Vec::new() };
+    PartCard {
+        sid,
+        label: s.label(),
+        origin: s.origin.clone(),
+        summary: s.summary.iter().take(6).cloned().collect(),
+        seed: s.seed() % 100_000,
+        layers: s.layers(),
+        bars,
+        status: s.status,
+        destructive: s.destructive,
+        notice: s.generated.fallback.clone(),
+        busy,
+    }
+}
+
+/// Make a card for a new part and offer it.
+fn present(ws: &mut Workspace, prepared: Prepared, g: gen_core::Generated, origin: String, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    if g.draft.notes.is_empty() {
+        return note(ws, "Nothing came out of that request; try other words.", cx);
+    }
+    let sid = a.update(cx, |a, _| {
+        a.next_part += 1;
+        a.next_part
+    });
+    let mut s = Session::new(prepared, g, origin);
+    if let Err(e) = s.offer(&mut ws.s.project, &mut ws.s.history) {
+        return note(ws, format!("That part did not fit the project: {e}"), cx);
+    }
+    ws.chat_log.push(ChatEntry::Part(card_of(sid, &s, false)));
+    a.update(cx, |a, _| {
+        a.parts.insert(sid, s);
+        a.scroll.scroll_to_bottom();
+    });
+    cx.notify();
+}
+
+/// Store `s` again and redraw its card.
+fn put_back(ws: &mut Workspace, sid: u64, s: Session, busy: bool, cx: &mut Context<Workspace>) {
+    let card = card_of(sid, &s, busy);
+    for e in &mut ws.chat_log {
+        if let ChatEntry::Part(c) = e
+            && c.sid == sid
+        {
+            *c = card.clone();
+        }
+    }
+    get(cx).update(cx, |a, _| {
+        a.parts.insert(sid, s);
+    });
+    cx.notify();
+}
+
+/// What the buttons of a part card do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartAction {
+    /// Apply it as a normal step with the loop on it, and play.
+    Listen,
+    Accept,
+    Keep,
+    Discard,
+    /// Take the listened part off again.
+    Undo,
+    Vary,
+    Regenerate,
+    HoldLayer(Role),
+    HoldBar(u32),
+}
+
+pub fn part_action(ws: &mut Workspace, sid: u64, action: PartAction, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    if ws.chat_log.iter().any(|e| matches!(e, ChatEntry::Part(c) if c.sid == sid && c.busy)) {
+        return;
+    }
+    let Some(mut s) = a.update(cx, |a, _| a.parts.remove(&sid)) else { return };
+    let mut busy = false;
+    let mut said: Option<String> = None;
+    match action {
+        PartAction::Listen => match s.listen(&mut ws.s.project, &mut ws.s.history) {
+            Ok((start, _)) => {
+                let engine = ws.b.engine.as_mut();
+                engine.set_looping(true);
+                engine.locate(start);
+                engine.play();
+            }
+            Err(e) => said = Some(e),
+        },
+        PartAction::Accept | PartAction::Keep => match s.accept(&mut ws.s.project, &mut ws.s.history) {
+            Ok(()) => said = Some("Part applied — one undo step".to_owned()),
+            Err(e) => said = Some(e),
+        },
+        PartAction::Discard => {
+            s.discard(&mut ws.s.project, &mut ws.s.history);
+            if s.status == part::Status::Accepted {
+                said = Some("You edited the project since, so the part stays; undo it with Cmd+Z".to_owned());
+            }
+        }
+        PartAction::Undo => match s.undo_trial(&mut ws.s.project, &mut ws.s.history) {
+            Ok(()) => {
+                ws.b.engine.stop();
+                if let Err(e) = s.offer(&mut ws.s.project, &mut ws.s.history) {
+                    said = Some(e);
+                }
+            }
+            Err(e) => said = Some(e),
+        },
+        PartAction::Vary => {
+            if let Err(e) = s.vary(fresh_seed(), &mut ws.s.project, &mut ws.s.history) {
+                said = Some(e);
+            }
+        }
+        PartAction::Regenerate => match model_choice(&a, cx) {
+            Some(i) if s.can_revise() => {
+                let prepared = Prepared { req: s.req.clone(), ctx: s.ctx.clone(), dest: s.dest, start: s.start };
+                start_model(ws, prepared, fresh_seed(), GenMode::Again(sid), Some(&s.generated.spec), i, cx);
+                busy = true;
+            }
+            _ => {
+                if let Err(e) = s.regenerate(fresh_seed(), None, &mut ws.s.project, &mut ws.s.history) {
+                    said = Some(e);
+                }
+            }
+        },
+        PartAction::HoldLayer(role) => s.locks.toggle_role(role),
+        PartAction::HoldBar(bar) => s.locks.toggle_bar(bar),
+    }
+    put_back(ws, sid, s, busy, cx);
+    if let Some(t) = said {
+        ws.toast(t, cx);
+    }
+}
+
+/// Notice Cmd+Z (or edits) made while a part is being listened to. Called
+/// when the panel is drawn.
+pub fn sync_parts(ws: &mut Workspace, cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    let listening = a.read_with(cx, |a, _| a.parts.values().any(|s| s.status == part::Status::Trying));
+    if !listening {
+        return;
+    }
+    a.update(cx, |a, _| {
+        for s in a.parts.values_mut() {
+            s.sync(&ws.s.history);
+        }
+        for e in &mut ws.chat_log {
+            if let ChatEntry::Part(c) = e
+                && let Some(s) = a.parts.get(&c.sid)
+            {
+                c.status = s.status;
+            }
+        }
+    });
+}
+
+/// Typed text without a slash. With no model connected, a plain request for
+/// a part ("un bajo rodante en La menor de 2 compases") is written by rules;
+/// anything else, and everything when a model is connected, goes to the chat.
+pub fn submit_text(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
+    super::agent::init(ws, cx);
+    if super::agent::ready(cx) {
+        return super::agent::submit(ws, text, cx);
+    }
+    let a = get(cx);
+    let (backend, key) = a.read_with(cx, |a, _| (a.backend, a.key));
+    let offline = matches!(backend, Backend::Claude(_)) && key == KeyState::Missing;
+    if offline && is_request_for_a_part(&text) {
+        a.update(cx, |a, _| push(ws, a, Item::User { text: text.clone(), chips: Vec::new() }));
+        return generate(ws, None, &text, cx);
+    }
+    send(ws, text, None, cx);
+}
+
+/// Whether `text` asks for a part rather than asking a question about one.
+fn is_request_for_a_part(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    let question = lower.ends_with('?') || ["how ", "what ", "why ", "which ", "can you explain", "como ", "cómo ", "qué ", "que ", "por qué", "cuál ", "cual "].iter().any(|w| lower.starts_with(w));
+    !question && aitrack_ai::generate::request::parse(text, &aitrack_ai::generate::GenContext::default()).is_some()
 }
 
 fn mix_track(ws: &mut Workspace, cx: &mut Context<Workspace>) {
@@ -602,20 +927,6 @@ pub fn set_backend(ws: &mut Workspace, backend: Backend, cx: &mut Context<Worksp
     cx.notify();
 }
 
-pub fn toggle_model_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) {
-    let a = get(cx);
-    let open = a.update(cx, |a, _| {
-        a.model_menu = !a.model_menu;
-        a.model_menu
-    });
-    if open {
-        ws.b.ai.refresh_agents();
-        ws.ensure_ai_poll(cx);
-        refresh_key(cx);
-    }
-    cx.notify();
-}
-
 // ── Sending and streaming ──
 
 /// The conversation so far as API messages (text only; images ride on the
@@ -712,10 +1023,10 @@ pub fn send(ws: &mut Workspace, text: String, mix: Option<TrackId>, cx: &mut Con
         parts.append(&mut last.parts);
         last.parts = parts;
     }
-    let request = llm::Request { model: model.id.to_owned(), system, messages, max_tokens: 16_000 };
+    let request = llm::Request { model: model.id.to_owned(), system, messages, max_tokens: 16_000, schema: None };
     let stream = llm::spawn(request, None);
     a.update(cx, |a, _| {
-        let item = push(ws, a, Item::Reply { text: String::new(), model: model.name, state: ReplyState::Waiting, mix });
+        let item = push(ws, a, Item::Reply { text: String::new(), model: model.name, state: ReplyState::Waiting, mix, is_part: false });
         a.live = Some(Live { item, stream });
     });
     ensure_poll(&a, cx);
@@ -741,7 +1052,7 @@ fn ensure_poll(a: &Entity<Assistant>, cx: &mut Context<Workspace>) {
 /// Drain the stream; `false` once it is over.
 fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     let a = get(cx);
-    let mut finished: Option<(Option<TrackId>, Result<String, String>)> = None;
+    let mut finished: Option<(Option<TrackId>, bool, Result<String, String>)> = None;
     let mut changed = false;
     let keep = a.update(cx, |a, _| {
         let Some(live) = &a.live else {
@@ -761,7 +1072,7 @@ fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
                 }
             }
         }
-        let Some(Placed { item: Item::Reply { text, state, mix, .. }, .. }) = a.items.get_mut(index) else {
+        let Some(Placed { item: Item::Reply { text, state, mix, is_part, .. }, .. }) = a.items.get_mut(index) else {
             a.live = None;
             a.poll = None;
             return false;
@@ -779,11 +1090,11 @@ fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
                     } else {
                         ReplyState::Done
                     };
-                    finished = Some((*mix, Ok(text.clone())));
+                    finished = Some((*mix, *is_part, Ok(text.clone())));
                 }
                 llm::Event::Error(m) => {
                     *state = ReplyState::Failed(m.clone());
-                    finished = Some((*mix, Err(m)));
+                    finished = Some((*mix, *is_part, Err(m)));
                 }
             }
             if finished.is_some() {
@@ -792,7 +1103,7 @@ fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
         }
         if finished.is_none() && gone {
             *state = ReplyState::Failed("The request ended without an answer.".into());
-            finished = Some((*mix, Err(String::new())));
+            finished = Some((*mix, *is_part, Err(String::new())));
             changed = true;
         }
         if changed {
@@ -805,7 +1116,9 @@ fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
         }
         true
     });
-    if let Some((Some(track), result)) = finished {
+    if let Some((_, true, result)) = finished {
+        finish_model(ws, result, cx);
+    } else if let Some((Some(track), _, result)) = finished {
         let model = a.read(cx).backend.name();
         let plan = result.as_ref().ok().and_then(|t| llm::mix::parse_reply(t));
         match plan {
@@ -826,9 +1139,11 @@ fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
 }
 
 /// The Stop button: cancel the request, keep what arrived.
-pub fn stop(_ws: &mut Workspace, cx: &mut Context<Workspace>) {
+pub fn stop(ws: &mut Workspace, cx: &mut Context<Workspace>) {
+    super::agent::stop(ws, cx);
     let a = get(cx);
     a.update(cx, |a, _| {
+        a.gen_job = None;
         if let Some(live) = a.live.take() {
             live.stream.cancel.cancel();
             if let Some(Placed { item: Item::Reply { state, .. }, .. }) = a.items.get_mut(live.item) {
@@ -862,6 +1177,16 @@ mod tests {
         assert_eq!(visible_reply(t, true), "- cut lows\n- glue");
         assert_eq!(visible_reply(t, false), t);
         assert_eq!(visible_reply("no plan yet", true), "no plan yet");
+    }
+
+    #[test]
+    fn plain_requests_for_a_part_are_told_from_questions() {
+        assert!(is_request_for_a_part("un bajo rodante en La menor de 2 compases"));
+        assert!(is_request_for_a_part("acordes para el drop"));
+        assert!(is_request_for_a_part("make me a deep house bass in F# minor"));
+        assert!(!is_request_for_a_part("how do I EQ the bass?"));
+        assert!(!is_request_for_a_part("por qué suena mal el bajo?"));
+        assert!(!is_request_for_a_part("hello there"));
     }
 
     #[test]

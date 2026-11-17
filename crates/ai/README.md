@@ -43,6 +43,7 @@ Legend: purple = pure DSP (instant, no download); orange = ONNX models downloade
 | `split_stems(path, out_dir, &StemOptions, progress, &cancel) -> Result<Vec<PathBuf>>` | Demucs stems as WAV. |
 | `detect_chords(samples, sr, &ChordOptions) -> Vec<ChordSegment>`, `chords::chords_per_bar(..)` | Chord symbols per beat segment / per bar for the Chord Track. |
 | `theory::{parse_roman, progression, bassline, arp, drum_pattern, ProgressionPreset, BassStyle, ArpPattern, DrumStyle}` | Rule-based generation in a `Scale`, returning `Note`s (local ids 1..n). |
+| `generate::{generate, generate_from_spec, digest, request::parse, MidiSpec, GenRequest, GenContext}` | The MIDI generator without a model: a request becomes a `MidiSpec` (templates, later a model), `realize` makes the notes and `validate` repairs them. Pure and seeded; the app turns a `Generated` into commands. Tunable tables in `generate/tables.rs` and `generate/patterns.rs`. The app uses this, not `theory`, which stays unused for now. |
 | `worker::{Worker, Job, JobOutput, run_job, serve, ProcessWorker}` | Thread pool and the `aitrack-ml-worker` process protocol. |
 
 Notes returned by this crate carry local ids (`NoteId(1..=n)`); insert them through

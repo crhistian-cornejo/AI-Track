@@ -30,7 +30,7 @@ impl Anthropic {
 }
 
 /// Whether `model` takes the `fallbacks: "default"` parameter.
-fn takes_fallbacks(model: &str) -> bool {
+pub(crate) fn takes_fallbacks(model: &str) -> bool {
     matches!(model, "claude-opus-5-5" | "claude-sonnet-5-5")
 }
 
@@ -66,7 +66,17 @@ pub fn body(request: &Request) -> Value {
     if takes_fallbacks(&request.model) {
         body["fallbacks"] = json!("default");
     }
+    if let Some(schema) = &request.schema {
+        body["output_config"] = json!({ "format": { "type": "json_schema", "schema": schema } });
+    }
     body
+}
+
+/// Whether a failed reply is the API refusing the output schema, which is
+/// worth one retry without it (the prompt asks for the JSON as well).
+pub fn rejects_schema(status: u16, message: &str) -> bool {
+    let m = message.to_lowercase();
+    status == 400 && ["schema", "output_config", "structured", "json_schema", "format"].iter().any(|w| m.contains(w))
 }
 
 /// Turns the SSE events of one reply into [`Event`]s.
@@ -110,7 +120,7 @@ impl Decoder {
     }
 }
 
-fn error_message(v: &Value) -> String {
+pub(crate) fn error_message(v: &Value) -> String {
     let e = &v["error"];
     match (e["type"].as_str(), e["message"].as_str()) {
         (Some("authentication_error"), _) => "The API key was rejected. Check ANTHROPIC_API_KEY or paste a new key.".into(),
@@ -121,7 +131,7 @@ fn error_message(v: &Value) -> String {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig};
     ureq::Agent::config_builder()
         .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
@@ -139,6 +149,24 @@ impl Provider for Anthropic {
     }
 
     fn stream(&self, request: &Request, cancel: &CancelToken, tx: &Sender<Event>) {
+        if self.attempt(request, cancel, tx) == Attempt::SchemaRefused {
+            // Once more as plain text: the system prompt already asks for the JSON.
+            let plain = Request { schema: None, ..request.clone() };
+            self.attempt(&plain, cancel, tx);
+        }
+    }
+}
+
+/// How one request ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    Finished,
+    /// The API said 400 about the output schema; nothing was sent to the caller.
+    SchemaRefused,
+}
+
+impl Anthropic {
+    fn attempt(&self, request: &Request, cancel: &CancelToken, tx: &Sender<Event>) -> Attempt {
         let mut req = agent()
             .post(&self.url)
             .header("x-api-key", &self.key)
@@ -152,7 +180,7 @@ impl Provider for Anthropic {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Event::Error(format!("Could not reach the model: {e}")));
-                return;
+                return Attempt::Finished;
             }
         };
         let status = resp.status().as_u16();
@@ -161,22 +189,25 @@ impl Provider for Anthropic {
             let mut text = String::new();
             let _ = reader.take(64 * 1024).read_to_string(&mut text);
             let msg = serde_json::from_str::<Value>(&text).map(|v| error_message(&v)).unwrap_or_else(|_| text.trim().to_owned());
+            if request.schema.is_some() && rejects_schema(status, &msg) {
+                return Attempt::SchemaRefused;
+            }
             let _ = tx.send(Event::Error(format!("HTTP {status}: {msg}")));
-            return;
+            return Attempt::Finished;
         }
         let mut parser = Parser::new();
         let mut decoder = Decoder::new();
         let mut buf = [0u8; 4096];
         loop {
             if cancel.is_cancelled() {
-                return;
+                return Attempt::Finished;
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
                     let _ = tx.send(Event::Error(format!("The connection dropped: {e}")));
-                    return;
+                    return Attempt::Finished;
                 }
             };
             for ev in parser.feed(&buf[..n]) {
@@ -185,7 +216,7 @@ impl Provider for Anthropic {
                 }
             }
             if decoder.finished() {
-                return;
+                return Attempt::Finished;
             }
         }
         if let Some(out) = parser.finish().and_then(|ev| decoder.decode(&ev)) {
@@ -194,8 +225,10 @@ impl Provider for Anthropic {
         if !decoder.finished() {
             let _ = tx.send(Event::Error("The reply ended early.".into()));
         }
+        Attempt::Finished
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -251,6 +284,7 @@ mod tests {
                 parts: vec![Part::Image { media_type: "image/png".into(), data: Arc::new(b"foo".to_vec()) }, Part::Text("what is this?".into())],
             }],
             max_tokens: 4096,
+            schema: None,
         };
         let b = body(&req);
         assert_eq!(b["stream"], true);
@@ -258,7 +292,27 @@ mod tests {
         assert_eq!(b["fallbacks"], "default");
         assert_eq!(b["messages"][0]["content"][0]["source"]["data"], "Zm9v");
         assert_eq!(b["messages"][0]["content"][1]["text"], "what is this?");
-        let haiku = body(&Request { model: "claude-haiku-5-5".into(), ..req });
+        let haiku = body(&Request { model: "claude-haiku-5-5".into(), ..req.clone() });
         assert!(haiku.get("fallbacks").is_none());
+        assert!(b.get("output_config").is_none(), "no schema, no structured output");
+    }
+
+    #[test]
+    fn a_schema_goes_out_as_structured_output() {
+        let schema = json!({ "type": "object", "properties": { "bars": { "type": "integer" } }, "additionalProperties": false });
+        let req = Request { model: "claude-sonnet-5-5".into(), system: String::new(), messages: vec![Message::text(Role::User, "bass")], max_tokens: 2000, schema: Some(schema.clone()) };
+        let b = body(&req);
+        assert_eq!(b["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(b["output_config"]["format"]["schema"], schema);
+        assert_eq!(b["stream"], true, "it still streams; the caller collects the whole reply");
+    }
+
+    #[test]
+    fn only_a_schema_complaint_is_retried() {
+        assert!(rejects_schema(400, "output_config.format: schema is not supported"));
+        assert!(rejects_schema(400, "Invalid JSON schema: minimum is not allowed"));
+        assert!(!rejects_schema(400, "max_tokens must be positive"));
+        assert!(!rejects_schema(401, "invalid schema"), "other statuses are real errors");
+        assert!(!rejects_schema(529, "overloaded format"));
     }
 }

@@ -7,12 +7,17 @@
 //! on its own thread and hands the tokens back on a channel; a
 //! [`CancelToken`] stops it between chunks.
 
+pub mod agent;
 pub mod anthropic;
+pub mod cli;
 mod base64;
 pub mod context;
 pub mod keychain;
+pub mod markdown;
+pub mod midigen;
 pub mod mix;
 pub mod sse;
+pub mod tools;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::sync::Arc;
@@ -54,6 +59,10 @@ pub struct Request {
     pub system: String,
     pub messages: Vec<Message>,
     pub max_tokens: u32,
+    /// A JSON schema the reply must follow (structured output). The reply
+    /// is then JSON only; the provider drops the schema and retries once if
+    /// the API refuses it, so the system prompt must also ask for the JSON.
+    pub schema: Option<serde_json::Value>,
 }
 
 /// What a running request reports.
@@ -149,7 +158,7 @@ mod tests {
 
     #[test]
     fn offline_says_no_model() {
-        let req = Request { model: MODELS[0].id.into(), system: String::new(), messages: vec![Message::text(Role::User, "hi")], max_tokens: 16 };
+        let req = Request { model: MODELS[0].id.into(), system: String::new(), messages: vec![Message::text(Role::User, "hi")], max_tokens: 16, schema: None };
         let s = spawn(req, Some(Arc::new(Offline)));
         let first = s.events.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(first, Event::Delta(NO_MODEL.to_owned()));

@@ -602,6 +602,17 @@ pub fn accent_alpha(alpha: f32) -> Hsla {
     with_alpha(p().accent, alpha)
 }
 
+/// A model vendor's brand colour, for the tile behind its logo in the
+/// assistant's model picker (the logo itself is drawn white on it).
+pub fn brand(vendor: aitrack_ai::llm::cli::Vendor) -> Hsla {
+    use aitrack_ai::llm::cli::Vendor;
+    let c = match vendor {
+        Vendor::Anthropic => 0xD97757,
+        Vendor::OpenAi => 0x4A55FF,
+    };
+    gpui::rgb(c).into()
+}
+
 pub fn shadow(alpha: f32) -> Hsla {
     with_alpha(p().shadow, alpha)
 }

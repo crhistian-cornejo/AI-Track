@@ -726,6 +726,8 @@ pub struct TextInput {
     placeholder: SharedString,
     leading: Option<Icon>,
     focus: FocusHandle,
+    /// No well or border: the field sits inside a box drawn by its owner.
+    bare: bool,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -738,7 +740,13 @@ impl Focusable for TextInput {
 
 impl TextInput {
     pub fn new(cx: &mut Context<Self>, placeholder: &'static str, leading: Option<Icon>) -> Self {
-        Self { text: String::new(), placeholder: placeholder.into(), leading, focus: cx.focus_handle() }
+        Self { text: String::new(), placeholder: placeholder.into(), leading, focus: cx.focus_handle(), bare: false }
+    }
+
+    /// Draw only the text and caret (the chat composer frames it itself).
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -799,9 +807,7 @@ impl Render for TextInput {
             .flex()
             .items_center()
             .rounded(px(r_md()))
-            .bg(pal.well)
-            .border_1()
-            .border_color(if focused { accent_alpha(0.7) } else { border() })
+            .when(!self.bare, |d| d.bg(pal.well).border_1().border_color(if focused { accent_alpha(0.7) } else { border() }))
             .cursor_text()
             .when_some(self.leading, |d, i| d.child(icon(i, 14., pal.faint)))
             .child(

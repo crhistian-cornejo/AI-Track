@@ -79,7 +79,13 @@ pub fn describe_clip(p: &Project, id: ClipId) -> Option<String> {
     let what = match p.sources.get(&c.source) {
         Some(Source::Notes(n)) => {
             let (lo, hi) = n.notes.iter().fold((u8::MAX, 0u8), |(lo, hi), n| (lo.min(n.key), hi.max(n.key)));
-            if n.notes.is_empty() { "MIDI, empty".to_owned() } else { format!("MIDI, {} notes, keys {lo}–{hi}", n.notes.len()) }
+            if n.notes.is_empty() {
+                "MIDI, empty".to_owned()
+            } else {
+                // What it plays, not only how much: chords per bar and the rhythm of the first bar.
+                let more = crate::generate::context::describe_notes(p, c).map(|d| format!("; {d}")).unwrap_or_default();
+                format!("MIDI, {} notes, keys {lo}–{hi}{more}", n.notes.len())
+            }
         }
         Some(Source::Audio(a)) => {
             let file = a.path.file_name().map_or_else(|| "audio".into(), |f| f.to_string_lossy().into_owned());
@@ -90,6 +96,13 @@ pub fn describe_clip(p: &Project, id: ClipId) -> Option<String> {
         None => "missing source".to_owned(),
     };
     Some(format!("\"{}\" ({:.1} bars{}, gain {:+.1} dB): {what}", c.name, bars(p, c.length), if c.looping.is_some() { ", looping" } else { "" }, c.gain_db))
+}
+
+/// The `# MIDI context` block for a generation request: key, tempo, meter,
+/// the target track and what the other tracks play in the region (their
+/// rhythm and chords), so a new part can fit the song.
+pub fn midi_context(p: &Project, target: Option<TrackId>, region_start: aitrack_model::Tick, bars: u32) -> String {
+    crate::generate::digest(p, target, region_start, bars).to_prompt(bars)
 }
 
 /// A track in full: type, level, routing, devices and clips.
@@ -252,7 +265,23 @@ mod tests {
         assert!(s.contains("Selected track (\"this track\"): Kick"), "{s}");
         let c = describe_clip(&p, clip).unwrap();
         assert!(c.contains("1.0 bars") && c.contains("4 notes, keys 36–36"), "{c}");
+        assert!(c.contains("rhythm of bar 1 x...x...x...x..."), "the clip says where its notes fall: {c}");
         assert!(!s.contains("# Attached"), "nothing attached");
+    }
+
+    #[test]
+    fn a_generation_request_gets_the_midi_context() {
+        let (p, kick, _) = project();
+        let bass = {
+            let mut p2 = p.clone();
+            let id = p2.alloc_track_id();
+            p2.tracks.insert(0, Track::new(id, TrackKind::Instrument, "Bass", Color::palette(3)));
+            (p2, id)
+        };
+        let s = midi_context(&bass.0, Some(bass.1), 3840, 2);
+        assert!(s.starts_with("# MIDI context") && s.contains("Key: A Minor") && s.contains("\"Kick\" kick"), "{s}");
+        assert!(s.contains("Kick steps in bar 1 (0-15): 0 4 8 12"), "{s}");
+        let _ = kick;
     }
 
     #[test]

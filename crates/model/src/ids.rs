@@ -37,4 +37,9 @@ impl IdAllocator {
     pub fn observe(&mut self, seen: u64) {
         self.next = self.next.max(seen);
     }
+
+    /// The last id handed out (0 before the first).
+    pub fn last(&self) -> u64 {
+        self.next
+    }
 }

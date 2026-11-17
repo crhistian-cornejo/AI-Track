@@ -1,6 +1,8 @@
 //! The `/` menu: every assistant action, grouped in tabs and filtered by
 //! what follows the slash.
 
+use aitrack_ai::generate::spec::Kind;
+
 use crate::bridge::MidiMode;
 use crate::icons::Icon;
 
@@ -46,6 +48,8 @@ pub enum Action {
     AnalyseKeyBpm,
     FindSamplesInKey,
     MixTrack,
+    /// Write a part (bass, chords, beat...) as a proposal; text after the command refines it.
+    Generate(Kind),
     AttachSelection,
     AttachFile,
     Overview,
@@ -74,6 +78,12 @@ pub static ENTRIES: &[Entry] = &[
     Entry { action: Action::ImportAudio, command: "import", title: "Import audio", hint: "New track, detects key and BPM", icon: Icon::FolderOpen, tab: Tab::Audio, keywords: &["file", "add", "open", "load"] },
     Entry { action: Action::AnalyseKeyBpm, command: "analyse", title: "Analyse key / BPM", hint: "Of the selected audio clip", icon: Icon::Gauge, tab: Tab::Audio, keywords: &["analyze", "tempo", "detect", "key", "bpm", "scale"] },
     Entry { action: Action::FindSamplesInKey, command: "samples", title: "Find samples in key", hint: "From the library, in the project key", icon: Icon::Search, tab: Tab::Library, keywords: &["browse", "loops", "one-shots", "library", "match"] },
+    Entry { action: Action::Generate(Kind::Bass), command: "bass", title: "Generate a bass line", hint: "Leaves room for the kick; follows the chords · add words after it", icon: Icon::MusicNote, tab: Tab::Midi, keywords: &["bajo", "rolling", "offbeat", "808", "sub", "line"] },
+    Entry { action: Action::Generate(Kind::Chords), command: "chords", title: "Generate chords", hint: "Sevenths and ninths with smooth voice leading", icon: Icon::Piano, tab: Tab::Midi, keywords: &["acordes", "progression", "harmony", "stabs", "pad"] },
+    Entry { action: Action::Generate(Kind::Drums), command: "beat", title: "Generate a drum pattern", hint: "Kick, backbeat, hats, swing and ghost notes · \"hats\" for hats only", icon: Icon::Drum, tab: Tab::Midi, keywords: &["bateria", "drums", "groove", "hats", "kick", "pattern", "ritmo"] },
+    Entry { action: Action::Generate(Kind::Arp), command: "arp", title: "Generate an arpeggio", hint: "Over the chords in the project; accents grouped 3-3-2", icon: Icon::Arpeggio, tab: Tab::Midi, keywords: &["arpegio", "arpeggio", "pluck", "sequence"] },
+    Entry { action: Action::Generate(Kind::Melody), command: "melody", title: "Generate a melody", hint: "Short motif, repeated and varied, on the chord tones", icon: Icon::Sparkles, tab: Tab::Midi, keywords: &["melodia", "lead", "hook", "motif"] },
+    Entry { action: Action::Generate(Kind::Perc), command: "perc", title: "Generate percussion", hint: "Shakers, rims and hats to sit on top of the kick", icon: Icon::Strum, tab: Tab::Midi, keywords: &["percusion", "shaker", "rim", "percussion", "toppers"] },
     Entry { action: Action::MixTrack, command: "mix", title: "Mix this track", hint: "Fader, pan, EQ and compression as a proposal", icon: Icon::Sliders, tab: Tab::Mix, keywords: &["eq", "compress", "balance", "level", "mixdown", "engineer"] },
     Entry { action: Action::AttachSelection, command: "attach", title: "Attach selection", hint: "The selected track and clip as context", icon: Icon::Link, tab: Tab::Chat, keywords: &["context", "track", "clip", "selected"] },
     Entry { action: Action::AttachFile, command: "file", title: "Attach a file", hint: "A sample or a screenshot", icon: Icon::File, tab: Tab::Chat, keywords: &["image", "screenshot", "picture", "sample", "upload"] },
@@ -84,6 +94,21 @@ pub static ENTRIES: &[Entry] = &[
 /// The query of an input that opens the menu: the text after a leading `/`.
 pub fn query(input: &str) -> Option<&str> {
     input.strip_prefix('/')
+}
+
+/// Whether an action reads the words typed after its command.
+fn takes_text(action: Action) -> bool {
+    matches!(action, Action::Generate(_))
+}
+
+/// Split `bass rolling in A minor, 2 bars` into the command and the words
+/// after it, when the command is one that reads them.
+pub fn split(query: &str) -> (&str, &str) {
+    let q = query.trim_start();
+    match q.split_once(char::is_whitespace) {
+        Some((cmd, rest)) if ENTRIES.iter().any(|e| e.command == cmd.to_lowercase() && takes_text(e.action)) => (cmd, rest.trim()),
+        _ => (q.trim_end(), ""),
+    }
 }
 
 /// How well `entry` matches `q` (higher is better); `None` hides it.
@@ -117,7 +142,7 @@ fn score(entry: &Entry, q: &str) -> Option<u32> {
 
 /// The entries for `query` in `tab`, best first (stable for ties).
 pub fn filter(query: &str, tab: Tab) -> Vec<&'static Entry> {
-    let q = query.trim().to_lowercase();
+    let q = split(query).0.trim().to_lowercase();
     let mut hits: Vec<(u32, usize, &'static Entry)> =
         ENTRIES.iter().enumerate().filter(|(_, e)| tab == Tab::All || e.tab == tab).filter_map(|(i, e)| score(e, &q).map(|s| (s, i, e))).collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -169,6 +194,17 @@ mod tests {
         assert_eq!(filter("", Tab::Mix).len(), 1);
         assert!(actions("mix", Tab::Audio).is_empty());
         assert_eq!(Tab::Chat.next(), Tab::All);
+    }
+
+    #[test]
+    fn generate_commands_read_the_words_after_them() {
+        assert_eq!(split("bass rolling in A minor, 2 bars"), ("bass", "rolling in A minor, 2 bars"));
+        assert_eq!(split("chords"), ("chords", ""));
+        assert_eq!(split("mix this"), ("mix this", ""), "other commands keep the whole query");
+        assert_eq!(actions("bass rolling in A minor", Tab::All)[0], Action::Generate(Kind::Bass));
+        assert_eq!(actions("beat hats only", Tab::All)[0], Action::Generate(Kind::Drums));
+        assert_eq!(actions("drums", Tab::All)[0], Action::ExtractDrums, "the old command keeps its name");
+        assert_eq!(filter("", Tab::Midi).iter().filter(|e| matches!(e.action, Action::Generate(_))).count(), 6);
     }
 
     #[test]

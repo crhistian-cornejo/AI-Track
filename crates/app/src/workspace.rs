@@ -237,9 +237,33 @@ pub enum ProposalStatus {
     Discarded,
 }
 
+/// The card of a generated MIDI part. The part itself (notes, spec, locks)
+/// lives in the assistant's `parts`, keyed by `sid`; this is what is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartCard {
+    pub sid: u64,
+    pub label: String,
+    pub origin: String,
+    pub summary: Vec<String>,
+    /// Shown on the card so a take can be named and found again.
+    pub seed: u64,
+    /// The layers that can be held, and whether each is.
+    pub layers: Vec<(aitrack_ai::generate::spec::Role, bool)>,
+    /// The bars that can be held (empty for one bar), and whether each is.
+    pub bars: Vec<bool>,
+    pub status: views::ai_panel::part::Status,
+    pub destructive: bool,
+    /// Why this is not what was asked for (the rules wrote it after a model failed).
+    pub notice: Option<String>,
+    /// A model is writing the next take.
+    pub busy: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum ChatEntry {
     Assistant(String),
+    /// A generated MIDI part with Listen, Vary, Regenerate and holds.
+    Part(PartCard),
     Proposal { id: u64, label: String, origin: String, summary: Vec<String>, destructive: bool, status: ProposalStatus },
     Job { id: JobId, label: String, fraction: f32, done: bool },
     Samples { title: String, items: Vec<LibraryItem> },
@@ -2659,7 +2683,7 @@ impl Workspace {
         self.project_path = path;
         self.drag = None;
         self.menu = None;
-        self.chat_log.retain(|e| !matches!(e, ChatEntry::Proposal { .. }));
+        self.chat_log.retain(|e| !matches!(e, ChatEntry::Proposal { .. } | ChatEntry::Part(_)));
         self.synced_revision = None;
         self.fx = views::device_ui::UiState::default();
         cx.notify();

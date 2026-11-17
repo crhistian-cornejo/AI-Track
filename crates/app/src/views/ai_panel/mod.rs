@@ -6,23 +6,26 @@
 //! results, and proposals accepted or discarded through `History::accept` /
 //! `discard`. Tracks, clips, samples and screenshots ride along as chips.
 
+mod agent;
+mod markdown;
+mod midi_gen;
 mod mix;
+pub mod part;
 pub mod slash;
 pub mod state;
 
-use crate::bridge::{AgentKind, ModelNotice};
+use crate::bridge::ModelNotice;
 use crate::icons::{Icon, icon};
 use crate::motion;
 use crate::theme::*;
 use crate::views::browser::short_key;
 use crate::widgets::{self, badge, label, mono, text_button};
-use crate::workspace::{ChatEntry, ProposalStatus, Workspace};
-use aitrack_ai::llm;
+use crate::workspace::{ChatEntry, PartCard, ProposalStatus, Workspace};
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, ExternalPaths, FontWeight, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, StatefulInteractiveElement, Styled, StyledText, Window, div, prelude::FluentBuilder, px,
+    Animation, AnimationExt, AnyElement, Context, ExternalPaths, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use state::{Backend, Item, KeyState, Placed, ReplyState};
+use state::{Backend, Item, PartAction, Placed, ReplyState};
 
 /// Whether the assistant panel needs a frame every vsync. The loader and
 /// the caret animate on their own and the stream polls on a timer, so no.
@@ -36,18 +39,18 @@ const CARD_W: f32 = AI_PANEL_W - 2. * SP3;
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    state::sync_parts(ws, cx);
+    agent::init(ws, cx);
     let a = state::get(cx);
     let target = if ws.ai_open { AI_PANEL_W } else { 0. };
-    let (backend, key, menu_open, streaming, items, attachments, scroll, input, sel, tab) = {
+    let (backend, streaming, items, attachments, scroll, input, sel, tab) = {
         let s = a.read(cx);
-        (s.backend, s.key, s.model_menu, s.streaming(), s.items.clone(), s.attachments.clone(), s.scroll.clone(), s.input.clone(), s.slash_sel, s.slash_tab)
+        (s.backend, s.streaming(), s.items.clone(), s.attachments.clone(), s.scroll.clone(), s.input.clone(), s.slash_sel, s.slash_tab)
     };
+    let streaming = streaming || agent::running(cx);
     let text = input.read(cx).text().to_owned();
 
-    let ready = match backend {
-        Backend::Claude(_) => matches!(key, KeyState::Env | KeyState::Keychain),
-        Backend::Agent(kind) => ws.b.ai.agents().iter().any(|s| s.kind == kind && s.installed),
-    };
+    let ready = agent::ready(cx);
     let header = div()
         .flex_none()
         .h(px(HEADER_H))
@@ -57,27 +60,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .items_center()
         .border_b_1()
         .border_color(border())
-        .child(icon(Icon::Sparkles, 16., pal.accent))
-        .child(label("Assistant", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
+        .child(label("Assistant", TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
         .child(div().flex_1())
-        .child(
-            div()
-                .id("model-pick")
-                .h(px(24.))
-                .px(px(SP2))
-                .gap(px(SP1))
-                .flex()
-                .items_center()
-                .rounded(px(r_md()))
-                .cursor_pointer()
-                .bg(if menu_open { content(0.12) } else { content(0.05) })
-                .hover(|s| s.bg(content(0.12)))
-                .child(div().size(px(6.)).rounded_full().bg(if ready { pal.play } else { content(0.25) }))
-                .child(label(backend.name(), TEXT_XS, pal.text))
-                .child(icon(Icon::ChevronDown, 12., pal.muted))
-                .tooltip(widgets::tip("Model", None))
-                .on_click(cx.listener(|ws, _, _, cx| state::toggle_model_menu(ws, cx))),
-        )
+        .child(widgets::icon_button("new-chat", Icon::Add, false).tooltip(widgets::tip("New chat", None)).on_click(cx.listener(|ws, _, _, cx| state::choose(ws, slash::Action::ClearChat, cx))))
         .child(widgets::icon_button("close-ai", Icon::X, false).tooltip(widgets::tip("Close", Some("Ctrl+I"))).on_click(cx.listener(|this, _, _, cx| {
             this.ai_open = false;
             cx.notify();
@@ -99,6 +84,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             rows.push(entry(at, e.clone(), cx));
         }
     }
+    if rows.is_empty() {
+        rows.push(agent::welcome(ready, cx));
+    }
     let total = rows.len();
     for (i, el) in rows.into_iter().enumerate() {
         // The newest card rises in; the rest stay put.
@@ -115,7 +103,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let slash_menu = slash::query(&text).map(|q| slash_menu(q, tab, sel, cx));
 
     let chips = (!attachments.is_empty()).then(|| {
-        let mut row = div().flex_none().px(px(SP3)).pt(px(SP2)).flex().flex_wrap().gap(px(SP1));
+        let mut row = div().flex_none().px(px(SP2)).pt(px(SP2)).flex().flex_wrap().gap(px(SP1));
         for (i, x) in attachments.iter().enumerate() {
             let (ic, name) = x.chip();
             row = row.child(
@@ -142,28 +130,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         widgets::icon_button("stop-chat", Icon::Stop, true).tooltip(widgets::tip("Stop", Some("Esc"))).on_click(cx.listener(|ws, _, _, cx| state::stop(ws, cx)))
     } else {
         let input = input.clone();
-        widgets::icon_button("send-chat", Icon::Send, false).tooltip(widgets::tip("Send", Some("Enter"))).on_click(cx.listener(move |ws, _, _, cx| {
+        widgets::icon_button("send-chat", Icon::Send, !text.trim().is_empty()).tooltip(widgets::tip("Send", Some("Enter"))).on_click(cx.listener(move |ws, _, _, cx| {
             let text = input.read(cx).text().trim().to_owned();
             if text.is_empty() {
                 return;
             }
             input.update(cx, |i, cx| i.set_text("", cx));
             if slash::query(&text).is_none() {
-                state::send(ws, text, None, cx);
+                state::submit_text(ws, text, cx);
             }
         }))
     };
     let menu_is_open = slash::query(&text).is_some();
-    let input_row = div()
-        .flex_none()
-        .p(px(SP3))
-        .gap(px(SP1))
-        .flex()
-        .items_center()
-        .child(widgets::icon_button("attach-file", Icon::Add, false).tooltip(widgets::tip("Attach a sample or a screenshot", None)).on_click(cx.listener(|_, _, _, cx| state::pick_files(cx))))
-        .child(widgets::icon_button("attach-sel", Icon::Link, false).tooltip(widgets::tip("Attach the selected track and clip", None)).on_click(cx.listener(|ws, _, _, cx| state::attach_selection(ws, cx))))
-        .child(
-            div()
+    let input_field = div()
                 .id("chat-input")
                 .flex_1()
                 .min_w(px(0.))
@@ -183,7 +162,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                             state::paste(ws, cx);
                             true
                         }
-                        "escape" if state::get(cx).read(cx).streaming() => {
+                        "escape" if state::get(cx).read(cx).streaming() || agent::running(cx) => {
                             state::stop(ws, cx);
                             true
                         }
@@ -193,18 +172,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         cx.stop_propagation();
                     }
                 }))
-                .child(input.clone()),
-        )
+                .child(input.clone());
+    let toolbar = div()
+        .px(px(SP1))
+        .pb(px(SP1))
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .child(widgets::sized_icon_button("attach-file", Icon::Add, false, 24., 14.).tooltip(widgets::tip("Attach a sample or a screenshot", None)).on_click(cx.listener(|_, _, _, cx| state::pick_files(cx))))
+        .child(widgets::sized_icon_button("attach-sel", Icon::Link, false, 24., 14.).tooltip(widgets::tip("Attach the selected track and clip", None)).on_click(cx.listener(|ws, _, _, cx| state::attach_selection(ws, cx))))
+        .child(agent::model_pill(cx))
+        .child(agent::switches(cx))
+        .child(div().flex_1())
         .child(send_or_stop);
-
-    let hint = match (backend, key) {
-        (Backend::Claude(_), KeyState::Missing) => "No API key · answers say so · / actions still work".to_owned(),
-        (Backend::Claude(_), KeyState::Checking) => "Looking for an API key…".to_owned(),
-        (Backend::Claude(_), KeyState::Env) => "Key from ANTHROPIC_API_KEY · / for actions · ⌘V pastes a screenshot".to_owned(),
-        (Backend::Claude(_), KeyState::Keychain) => "Key in the keychain · / for actions · ⌘V pastes a screenshot".to_owned(),
-        (Backend::Agent(k), _) => format!("{} on this computer, with your own sign-in · / for actions", k.name()),
-    };
-    let footer = div().flex_none().px(px(SP3)).pb(px(SP2)).child(label(hint, TEXT_XS, pal.faint));
 
     let body = div()
         .w(px(AI_PANEL_W))
@@ -215,8 +195,22 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(header)
         .child(div().id("chat-log").flex_1().min_h(px(0.)).overflow_y_scroll().track_scroll(&scroll).child(log))
         .children(slash_menu)
-        .child(div().flex_none().border_t_1().border_color(border()).children(chips).child(input_row).child(footer))
-        .children(menu_open.then(|| model_menu(ws, backend, key, cx)));
+        .child(
+            div()
+                .flex_none()
+                .mx(px(SP3))
+                .mb(px(SP3))
+                .flex()
+                .flex_col()
+                .rounded(px(r_lg()))
+                .border_1()
+                .border_color(if streaming { accent_alpha(0.4) } else { border() })
+                .bg(content(0.03))
+                .children(chips)
+                .child(div().px(px(SP1)).pt(px(SP1)).child(input_field))
+                .child(toolbar),
+        )
+        .children(agent::model_menu(ws, cx));
 
     div()
         .id("ai-panel")
@@ -233,61 +227,6 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }))
         .child(body)
         .with_spring("ai-panel-width", motion::spring(motion::PANEL_SPRING, target), |d, w| d.w(px(w.max(0.))))
-        .into_any_element()
-}
-
-/// The model picker: the Claude models, the user's agent CLIs, the key.
-fn model_menu(ws: &Workspace, current: Backend, key: KeyState, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let mut card = widgets::menu_card("model-menu", 264.).child(widgets::menu_header("Claude"));
-    for (i, m) in llm::MODELS.iter().enumerate() {
-        card = card.child(
-            widgets::menu_item(("model", i), Some(Icon::Sparkles), m.name, None, current == Backend::Claude(i))
-                .tooltip(widgets::tip(m.hint, None))
-                .on_click(cx.listener(move |ws, _, _, cx| state::set_backend(ws, Backend::Claude(i), cx))),
-        );
-    }
-    card = card.child(widgets::menu_header("Your agent CLI"));
-    let found = ws.b.ai.agents();
-    for (i, kind) in AgentKind::ALL.into_iter().enumerate() {
-        let status = found.iter().find(|s| s.kind == kind);
-        let installed = status.is_some_and(|s| s.installed);
-        let el = widgets::menu_item(("agent", i), Some(Icon::Bot), kind.name(), if installed { None } else { Some("not found") }, current == Backend::Agent(kind));
-        card = card.child(if installed {
-            el.on_click(cx.listener(move |ws, _, _, cx| state::set_backend(ws, Backend::Agent(kind), cx)))
-        } else {
-            el.opacity(0.6).on_click(cx.listener(move |ws, _, _, cx| {
-                state::note(ws, format!("{} Then pick {} again. AI-Track only runs that program; it never sees your account.", kind.setup(), kind.name()), cx);
-                state::toggle_model_menu(ws, cx);
-            }))
-        });
-    }
-    let status = match key {
-        KeyState::Checking => "Checking…",
-        KeyState::Env => "From ANTHROPIC_API_KEY",
-        KeyState::Keychain => "Stored in the system keychain",
-        KeyState::Missing => "None: answers say no model is configured",
-    };
-    card = card
-        .child(widgets::menu_header("Anthropic API key"))
-        .child(div().px(px(SP2)).pb(px(SP1)).child(label(status, TEXT_XS, pal.muted)))
-        .child(widgets::menu_item("key-paste", Some(Icon::Paste), "Use API key from clipboard", None, false).on_click(cx.listener(|ws, _, _, cx| {
-            state::key_from_clipboard(ws, cx);
-            state::toggle_model_menu(ws, cx);
-        })));
-    if key == KeyState::Keychain {
-        card = card.child(widgets::menu_item("key-forget", Some(Icon::Trash), "Forget the stored key", None, false).on_click(cx.listener(|ws, _, _, cx| {
-            state::forget_key(cx);
-            state::toggle_model_menu(ws, cx);
-        })));
-    }
-    div()
-        .id("model-menu-wrap")
-        .absolute()
-        .top(px(HEADER_H - SP1))
-        .right(px(SP3))
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(motion::rise_in("model-menu-in", card, 4.))
         .into_any_element()
 }
 
@@ -380,31 +319,9 @@ fn thinking(who: Option<&str>, id: usize) -> impl IntoElement {
     div().h(px(18.)).flex().items_center().gap(px(SP1)).child(dot(0)).child(dot(1)).child(dot(2)).child(div().w(px(SP1))).child(label(who.map_or_else(|| "Thinking…".to_owned(), |w| format!("{w} is thinking…")), TEXT_SM, pal.muted))
 }
 
-/// Streaming text with a blinking caret at its end.
-fn streaming_text(text: String, id: usize) -> AnyElement {
-    let pal = p();
-    div()
-        .text_size(px(fs(TEXT_MD)))
-        .line_height(px(18.))
-        .text_color(pal.text)
-        .with_animation(("caret", id), Animation::new(motion::NORMAL * 4).repeat(), move |d, t| {
-            let caret = "▍";
-            let full = format!("{text}{caret}");
-            let start = text.len();
-            let alpha = if t < 0.5 { 1. } else { 0.15 };
-            d.child(StyledText::new(full).with_highlights([(start..start + caret.len(), HighlightStyle { color: Some(pal.accent.opacity(alpha)), ..Default::default() })]))
-        })
-        .into_any_element()
-}
-
+/// An answer: full width, no avatar.
 fn reply_row(body: AnyElement) -> AnyElement {
-    let pal = p();
-    div()
-        .flex()
-        .gap(px(SP2))
-        .child(div().size(px(24.)).flex_none().flex().items_center().justify_center().rounded_full().bg(content(0.06)).child(icon(Icon::Bot, 14., pal.accent)))
-        .child(div().flex_1().min_w(px(0.)).child(body))
-        .into_any_element()
+    div().min_w(px(0.)).child(body).into_any_element()
 }
 
 fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
@@ -420,21 +337,23 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
                 }
                 col = col.child(row);
             }
-            col.child(div().max_w(px(CARD_W - 32.)).px(px(SP3)).py(px(SP2)).rounded(px(r_lg())).bg(accent_alpha(0.16)).child(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(text)))
+            col.child(div().max_w(px(CARD_W - 32.)).px(px(SP3)).py(px(SP2)).rounded(px(r_lg())).bg(content(0.07)).child(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(text)))
                 .into_any_element()
         }
-        Item::Reply { text, model, state, mix } => {
-            let shown = state::visible_reply(&text, mix.is_some()).to_owned();
+        Item::Reply { text, model, state, mix, is_part } => {
+            // A part's reply is its JSON spec: the card below shows the result.
+            let shown = if is_part { String::new() } else { state::visible_reply(&text, mix.is_some()).to_owned() };
             let body: AnyElement = match &state {
                 ReplyState::Waiting => thinking(None, i).into_any_element(),
-                ReplyState::Streaming => streaming_text(shown.clone(), i),
-                _ => div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(shown.clone()).into_any_element(),
+                ReplyState::Streaming => markdown::view(100_000 + i, &shown, true, cx),
+                _ => markdown::view(100_000 + i, &shown, false, cx),
             };
             let footer = match &state {
                 ReplyState::Stopped => Some(label("Stopped", TEXT_XS, pal.faint)),
                 ReplyState::Failed(m) if !m.is_empty() => Some(label(m.clone(), TEXT_SM, pal.record)),
                 ReplyState::Failed(_) => Some(label("No answer", TEXT_SM, pal.record)),
                 ReplyState::Done if mix.is_some() => Some(label("Plan below as a proposal", TEXT_XS, pal.faint)),
+                ReplyState::Done if is_part => Some(label("Part below", TEXT_XS, pal.faint)),
                 _ => None,
             };
             let col = div()
@@ -459,6 +378,7 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
             .child(div().size(px(24.)).flex_none().flex().items_center().justify_center().rounded(px(r_md())).bg(accent_alpha(0.14)).child(icon(ic, 12., pal.accent)))
             .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM)).child(label(crate::paint::fit(&detail, CARD_W - 64., TEXT_XS), TEXT_XS, pal.muted)))
             .into_any_element(),
+        Item::Agent(r) => agent::view(i, &r, cx),
         Item::Note(text) => reply_row(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.muted).child(text).into_any_element()),
     }
 }
@@ -496,11 +416,102 @@ fn license_card(i: usize, notice: ModelNotice, status: ProposalStatus, cx: &mut 
 }
 
 /// A card from the workspace's log (jobs, results, proposals, licences).
+/// The card of a generated part: what it is, what can be held, and the
+/// buttons that depend on where it stands (offered, being listened to, kept).
+fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
+    use part::Status;
+    let pal = p();
+    let sid = c.sid;
+    let open = matches!(c.status, Status::Pending | Status::Trying | Status::Undone);
+    let act = |action: PartAction| cx.listener(move |this: &mut Workspace, _, _, cx| state::part_action(this, sid, action, cx));
+    let mut list = div().flex().flex_col().gap(px(2.));
+    for s in c.summary.iter().take(6) {
+        list = list.child(div().flex().items_center().gap(px(SP2)).child(div().size(px(4.)).flex_none().rounded_full().bg(pal.faint)).child(label(s.clone(), TEXT_SM, pal.muted)));
+    }
+    let mut card = div()
+        .p(px(SP3))
+        .gap(px(SP2))
+        .flex()
+        .flex_col()
+        .rounded(px(r_lg()))
+        .bg(pal.surface)
+        .border_1()
+        .border_color(if open { accent_alpha(0.45) } else { border() })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SP2))
+                .child(icon(Icon::Wand, 14., pal.accent))
+                .child(label("Part", TEXT_XS, pal.accent).font_weight(FontWeight::SEMIBOLD))
+                .child(div().flex_1())
+                .child(badge(format!("Seed {}", c.seed), pal.faint))
+                .child(badge(c.origin.clone(), pal.muted)),
+        )
+        .child(div().text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(c.label.clone()))
+        .child(list);
+    if let Some(n) = &c.notice {
+        card = card.child(label(format!("{n}; the rules wrote this instead"), TEXT_XS, pal.record));
+    }
+    if c.destructive {
+        card = card.child(label("Replaces the notes of the clip — review before keeping", TEXT_XS, pal.record));
+    }
+    if open && !c.busy {
+        if c.layers.len() > 1 || (c.layers.len() == 1 && c.bars.is_empty()) {
+            let mut row = div().flex().flex_wrap().items_center().gap(px(SP1)).child(label("Hold", TEXT_XS, pal.faint));
+            for (i, (role, held)) in c.layers.iter().enumerate() {
+                row = row.child(text_button(("part-layer", sid as usize * 64 + i), role.label(), held.then_some(Icon::Lock), *held).on_click(act(PartAction::HoldLayer(*role))));
+            }
+            card = card.child(row);
+        }
+        if !c.bars.is_empty() {
+            let mut row = div().flex().flex_wrap().items_center().gap(px(SP1)).child(label("Bars", TEXT_XS, pal.faint));
+            for (b, held) in c.bars.iter().enumerate() {
+                row = row.child(text_button(("part-bar", sid as usize * 64 + b), (b + 1).to_string(), held.then_some(Icon::Lock), *held).on_click(act(PartAction::HoldBar(b as u32))));
+            }
+            card = card.child(row);
+        }
+    }
+    let main = match c.status {
+        Status::Pending => div()
+            .flex()
+            .gap(px(SP2))
+            .child(text_button(("part-listen", sid as usize), "Listen", Some(Icon::Headphones), true).on_click(act(PartAction::Listen)))
+            .child(text_button(("part-accept", sid as usize), "Accept", Some(Icon::Check), false).on_click(act(PartAction::Accept)))
+            .child(text_button(("part-discard", sid as usize), "Discard", Some(Icon::X), false).on_click(act(PartAction::Discard)))
+            .into_any_element(),
+        Status::Trying => div()
+            .flex()
+            .gap(px(SP2))
+            .child(text_button(("part-keep", sid as usize), "Keep", Some(Icon::Check), true).on_click(act(PartAction::Keep)))
+            .child(text_button(("part-undo", sid as usize), "Undo", Some(Icon::Undo), false).on_click(act(PartAction::Undo)))
+            .child(label("Playing on the track · Cmd+Z also removes it", TEXT_XS, pal.faint))
+            .into_any_element(),
+        Status::Undone => div().flex().items_center().gap(px(SP2)).child(label("Taken off with Cmd+Z", TEXT_SM, pal.faint)).child(text_button(("part-discard", sid as usize), "Close", Some(Icon::X), false).on_click(act(PartAction::Discard))).into_any_element(),
+        Status::Accepted => div().flex().items_center().gap(px(SP1)).child(icon(Icon::Check, 12., pal.play)).child(label("Kept · one undo step", TEXT_SM, pal.play)).into_any_element(),
+        Status::Discarded => label("Discarded", TEXT_SM, pal.faint).into_any_element(),
+    };
+    card = card.child(main);
+    if open {
+        card = card.child(if c.busy {
+            label("Writing another take…", TEXT_SM, pal.accent).into_any_element()
+        } else {
+            div()
+                .flex()
+                .gap(px(SP2))
+                .child(text_button(("part-vary", sid as usize), "Vary", Some(Icon::Dice), false).on_click(act(PartAction::Vary)))
+                .child(text_button(("part-regen", sid as usize), "Regenerate", Some(Icon::Refresh), false).on_click(act(PartAction::Regenerate)))
+                .into_any_element()
+        });
+    }
+    card.into_any_element()
+}
+
 fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     match e {
         ChatEntry::License { notice, status, .. } => license_card(i, notice, status, cx),
-        ChatEntry::Assistant(text) => reply_row(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(text).into_any_element()),
+        ChatEntry::Assistant(text) => reply_row(markdown::view(200_000 + i, &text, false, cx)),
         ChatEntry::Job { label: text, fraction, done, .. } => div()
             .p(px(SP3))
             .gap(px(SP2))
@@ -566,11 +577,15 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
             }
             card.into_any_element()
         }
+        ChatEntry::Part(c) => part_card(c, cx),
         ChatEntry::Proposal { id, label: title, origin, summary, destructive, status } => {
             let pending = status == ProposalStatus::Pending;
             let mut list = div().flex().flex_col().gap(px(2.));
             for s in summary.iter().take(8) {
                 list = list.child(div().flex().items_center().gap(px(SP2)).child(div().size(px(4.)).flex_none().rounded_full().bg(pal.faint)).child(label(s.clone(), TEXT_SM, pal.muted)));
+            }
+            if summary.len() > 8 {
+                list = list.child(div().pl(px(SP3)).child(label(format!("+{} more", summary.len() - 8), TEXT_XS, pal.faint)));
             }
             div()
                 .p(px(SP3))

@@ -20,6 +20,7 @@ pub mod drum_extract;
 pub mod dsp;
 mod error;
 pub mod features;
+pub mod generate;
 pub mod key;
 pub mod llm;
 pub mod midi;

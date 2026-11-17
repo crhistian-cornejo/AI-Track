@@ -12,6 +12,11 @@ path = "src/bin/aitrack-ml-worker.rs"
 
 [dependencies]
 aitrack-model.workspace = true
+# The agent's tools read stock device parameters and factory presets.
+aitrack-stock.workspace = true
+aitrack-dsp.workspace = true
+# Markdown for the assistant's replies (MIT).
+pulldown-cmark = { version = "0.13.6", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

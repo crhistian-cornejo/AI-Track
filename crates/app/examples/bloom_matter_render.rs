@@ -11,6 +11,9 @@
 //! * `strip-{light,dark}.png`: 30 frames (1/20 s apart) of a hit and its settling;
 //! * `sheet-{light,dark}.png`: every material side by side;
 //! * `timing.txt`: GPU time per frame at 512 × 512.
+//! * with a second argument `knobs`, only `knobs-{light,dark}.png`: one sound
+//!   under each knob turned (timbre re-analysed under the knobs, then the
+//!   direct mapping), at rest and a moment after a hit.
 
 #![allow(dead_code, unused_imports)]
 
@@ -24,7 +27,8 @@ use aitrack_stock::instrument::bloom::grow::{GrowOpts, generate};
 use aitrack_stock::instrument::bloom::timbre;
 use matter::frame::{Animator, Live, Panel};
 use matter::gpu::Gpu;
-use matter::mapping::{SoundLook, sound_look};
+use matter::mapping::{Controls, SoundLook, sound_look, with_controls};
+use aitrack_stock::instrument::bloom::voice::Macros;
 use matter::material::Material;
 use std::path::{Path, PathBuf};
 
@@ -140,6 +144,10 @@ fn main() {
         return;
     }
     let target = gpu.target(W, H);
+    if only == "knobs" {
+        knobs(&gpu, &target, &scene, &dir);
+        return;
+    }
 
     // Every material at rest and during a hit.
     for light in [true, false] {
@@ -213,6 +221,35 @@ fn main() {
     }
 
     timing(&gpu, &looks_d, &dir);
+}
+
+/// One sound under each knob: a row at rest and a row after a hit.
+fn knobs(gpu: &Gpu, target: &matter::gpu::Target, scene: &aitrack_stock::instrument::bloom::genome::Scene, dir: &Path) {
+    let cases: [(&str, Controls); 8] = [
+        ("neutral", Controls::default()),
+        ("decay+", Controls { decay: 1.0, ..Controls::default() }),
+        ("decay-", Controls { decay: -1.0, ..Controls::default() }),
+        ("body+", Controls { body: 1.0, ..Controls::default() }),
+        ("tone+", Controls { tone: 1.0, ..Controls::default() }),
+        ("grit+", Controls { grit: 1.0, ..Controls::default() }),
+        ("space+", Controls { space: 1.0, ..Controls::default() }),
+        ("tune+12", Controls { tune: 12.0, ..Controls::default() }),
+    ];
+    let sel = 1;
+    for light in [true, false] {
+        let theme = if light { "light" } else { "dark" };
+        let (mut rest, mut hit) = (Vec::new(), Vec::new());
+        for (name, c) in cases {
+            let m = Macros { decay: c.decay, body: c.body, tone: c.tone, grit: c.grit };
+            let looks: [SoundLook; SOUNDS] = std::array::from_fn(|i| with_controls(&sound_look(&timbre::analyze_shaped(&scene.sounds[i], c.tune, &m), light), &c));
+            rest.push(render(gpu, target, &Shot { looks: &looks, selected: sel, material: Material::Obsidian, light, rest: 2.0, hit: None, cursor: None }, W, H));
+            hit.push(render(gpu, target, &Shot { looks: &looks, selected: sel, material: Material::Obsidian, light, rest: 2.0, hit: Some(0.08), cursor: None }, W, H));
+            println!("{name}");
+        }
+        let all: Vec<Vec<u8>> = rest.into_iter().chain(hit).collect();
+        let (g, gw, gh) = grid(&all, W, H, 8);
+        save(dir, &format!("knobs-{theme}.png"), &g, gw, gh);
+    }
 }
 
 /// GPU time per frame at 512 × 512: throughput of 120 frames, waited for at the end.

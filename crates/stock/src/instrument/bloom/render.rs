@@ -21,10 +21,17 @@ pub fn noise_seed(sound: usize, key: u8) -> u32 {
 /// Render `frames` of `genome` at `sr` into `left` / `right` (cleared first),
 /// one hit at `velocity` with neutral macros and unit gain. No allocation.
 pub fn render_into(genome: &Genome, sr: f32, velocity: f32, gain: f32, left: &mut [f32], right: &mut [f32]) {
+    render_shaped(genome, sr, velocity, gain, 0.0, &Macros::default(), left, right);
+}
+
+/// [`render_into`] as the device plays it: `transpose` semitones (its Tune)
+/// and its macro knobs. No allocation.
+#[allow(clippy::too_many_arguments)]
+pub fn render_shaped(genome: &Genome, sr: f32, velocity: f32, gain: f32, transpose: f32, macros: &Macros, left: &mut [f32], right: &mut [f32]) {
     let n = left.len().min(right.len());
     left[..n].fill(0.0);
     right[..n].fill(0.0);
-    let patch = Patch::new(genome, sr, 0.0, velocity, 1.0, &Macros::default(), gain);
+    let patch = Patch::new(genome, sr, transpose, velocity, 1.0, macros, gain);
     let mut v = Voice::blank();
     v.start(patch, 0, 60, 0, noise_seed(0, 60));
     let mut send = [0f32; 64];
@@ -41,9 +48,14 @@ pub fn render_into(genome: &Genome, sr: f32, velocity: f32, gain: f32, left: &mu
 
 /// A mono render (the mean of both sides).
 pub fn render_mono(genome: &Genome, sr: f32, frames: usize, velocity: f32) -> Vec<f32> {
+    render_mono_shaped(genome, sr, frames, velocity, 0.0, &Macros::default())
+}
+
+/// [`render_mono`] with the device's Tune and macro knobs.
+pub fn render_mono_shaped(genome: &Genome, sr: f32, frames: usize, velocity: f32, transpose: f32, macros: &Macros) -> Vec<f32> {
     let (mut l, mut r) = (vec![0.0; frames], vec![0.0; frames]);
     crate::instrument::vault::kit::init();
-    render_into(genome, sr, velocity, 1.0, &mut l, &mut r);
+    render_shaped(genome, sr, velocity, 1.0, transpose, macros, &mut l, &mut r);
     l.iter().zip(&r).map(|(a, b)| (a + b) * 0.5).collect()
 }
 

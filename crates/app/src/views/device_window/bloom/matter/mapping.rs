@@ -142,6 +142,71 @@ pub fn blend(a: &SoundLook, b: &SoundLook, t: f32) -> SoundLook {
     }
 }
 
+/// The device's knobs as the matter feels them straight away, every frame,
+/// while the timbre re-analysed under the new knobs is on its way. Space,
+/// Deviance and Volume never reach the timbre at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Controls {
+    /// The macros, each -1..1.
+    pub decay: f32,
+    pub body: f32,
+    pub tone: f32,
+    pub grit: f32,
+    /// 0..1.
+    pub space: f32,
+    pub deviance: f32,
+    /// Semitones.
+    pub tune: f32,
+    pub volume_db: f32,
+}
+
+impl Default for Controls {
+    /// The device's defaults: a look under them is the timbre's own.
+    fn default() -> Self {
+        Self { decay: 0.0, body: 0.0, tone: 0.0, grit: 0.0, space: 0.25, deviance: 1.0, tune: 0.0, volume_db: 0.0 }
+    }
+}
+
+/// `l` under the knobs `c` (the identity under [`Controls::default`]).
+///
+/// | knob | the matter |
+/// |---|---|
+/// | Decay | slower, heavier churn and a lingering vapour; hits swell longer |
+/// | Body | a bigger, lumpier mass |
+/// | Tone | the sheen moves towards gold–blue, spikes sharpen |
+/// | Grit | rougher, denser spikes, a choppier vapour, more tremble |
+/// | Space | more vapour, slower and more turbulent |
+/// | Deviance | the folds and the wobble wander as far as the sounds do |
+/// | Tune | higher, finer folds and spikes, faster wobble |
+/// | Volume | louder hits swell further |
+pub fn with_controls(l: &SoundLook, c: &Controls) -> SoundLook {
+    let d = c.decay.clamp(-1.0, 1.0);
+    let b = c.body.clamp(-1.0, 1.0);
+    let t = c.tone.clamp(-1.0, 1.0);
+    let g = c.grit.clamp(-1.0, 1.0);
+    let space = clamp01(c.space) - 0.25;
+    let dev = clamp01(c.deviance) - 1.0;
+    let fine = 2f32.powf(c.tune.clamp(-24.0, 24.0) / 48.0);
+    let loud = 2f32.powf(c.volume_db.clamp(-48.0, 6.0) / 40.0);
+    let mut o = *l;
+    o.churn = (o.churn * 2f32.powf(-0.6 * d) * (1.0 + 0.4 * g.max(0.0))).clamp(0.03, 0.3);
+    o.smoke_rise = (o.smoke_rise * 2f32.powf(-0.35 * d) * (1.0 - 0.3 * space)).clamp(0.08, 0.6);
+    o.swell = clamp01(o.swell * (1.0 + 0.3 * d) * loud);
+    o.size = (o.size * (1.0 + 0.05 * b)).clamp(0.8, 1.1);
+    o.lumps = (o.lumps * (1.0 + 0.45 * b)).clamp(0.06, 0.24);
+    o.film_shift = (o.film_shift - 0.09 * t).clamp(-0.25, 0.25);
+    o.spike_sharp = (o.spike_sharp + 0.7 * t).clamp(1.0, 6.0);
+    o.roughness = (o.roughness + 0.07 * g.max(0.0)).clamp(0.0, 0.25);
+    o.spike_count = (o.spike_count * (1.0 + 0.35 * g) * fine).clamp(30.0, 160.0);
+    o.spike_gain = clamp01(o.spike_gain * (1.0 + 0.25 * g));
+    o.turbulence = (o.turbulence * (1.0 + 0.35 * g + 0.8 * space)).clamp(0.3, 2.4);
+    o.wobble_amp = (o.wobble_amp + 0.015 * g.max(0.0)).clamp(0.0, 0.06);
+    o.smoke_amount = clamp01(o.smoke_amount + 0.5 * space + 0.12 * d.max(0.0));
+    o.fold_freq = (o.fold_freq * (1.0 + 0.3 * dev) * fine).clamp(0.7, 2.8);
+    o.wobble_freq = (o.wobble_freq * (1.0 + 0.3 * dev) * fine).clamp(1.2, 8.0);
+    o
+}
+
 impl Default for SoundLook {
     fn default() -> Self {
         sound_look(&Timbre { centroid: 900.0, noisiness: 0.3, energy: 0.4, attack_ms: 2.0, decay_ms: 120.0, inharmonic: 0.1, wobble: 0.1 }, false)
@@ -166,6 +231,52 @@ mod tests {
             && (0.8..=1.1).contains(&l.size)
             && l.film_shift.abs() <= 0.25
             && l.smoke.iter().chain(std::iter::once(&l.accent)).flatten().all(|c| (0.0..=1.0).contains(c))
+    }
+
+    fn knobs(f: impl Fn(&mut Controls)) -> Controls {
+        let mut c = Controls::default();
+        f(&mut c);
+        c
+    }
+
+    #[test]
+    fn default_knobs_leave_the_look_alone() {
+        let l = SoundLook::default();
+        assert_eq!(with_controls(&l, &Controls::default()), l);
+    }
+
+    #[test]
+    fn every_knob_at_either_end_stays_in_range() {
+        for c in [20.0, 900.0, 12_000.0] {
+            for n in [0.0, 1.0] {
+                let l = sound_look(&timbre(c, n, 0.5, 100.0, n, n), false);
+                for v in [-1.0f32, 1.0] {
+                    let all = Controls { decay: v, body: v, tone: v, grit: v, space: v.max(0.0), deviance: v.max(0.0), tune: 24.0 * v, volume_db: if v > 0.0 { 6.0 } else { -48.0 } };
+                    for k in [all, knobs(|k| k.decay = v), knobs(|k| k.grit = v), knobs(|k| k.space = v.max(0.0))] {
+                        let o = with_controls(&l, &k);
+                        assert!(all_bounded(&o), "{c} {n} {k:?}: {o:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_knob_moves_the_matter_its_own_way() {
+        let l = SoundLook::default();
+        let at = |f: &dyn Fn(&mut Controls)| with_controls(&l, &knobs(f));
+        assert!(at(&|k| k.decay = 1.0).churn < l.churn, "long decay is a slower liquid");
+        assert!(at(&|k| k.decay = -1.0).churn > l.churn);
+        assert!(at(&|k| k.body = 1.0).size > l.size);
+        assert!(at(&|k| k.tone = 1.0).spike_sharp > l.spike_sharp);
+        assert!(at(&|k| k.tone = 1.0).film_shift < l.film_shift);
+        assert!(at(&|k| k.grit = 1.0).roughness > l.roughness);
+        assert!(at(&|k| k.grit = 1.0).spike_count > l.spike_count);
+        assert!(at(&|k| k.space = 1.0).smoke_amount > l.smoke_amount);
+        assert!(at(&|k| k.space = 0.0).smoke_amount < l.smoke_amount);
+        assert!(at(&|k| k.deviance = 0.0).fold_freq < l.fold_freq);
+        assert!(at(&|k| k.tune = 12.0).wobble_freq > l.wobble_freq);
+        assert!(at(&|k| k.volume_db = -24.0).swell < l.swell);
     }
 
     #[test]

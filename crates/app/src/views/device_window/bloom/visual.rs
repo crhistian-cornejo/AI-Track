@@ -120,7 +120,7 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
     if let Some((cell, _, Some(best))) = matching {
         shown.sounds[cell] = best;
     }
-    let looks = view::looks(ws, &shown);
+    let looks = view::looks(ws, &shown, view::Shape::of(dev));
     let busy = ws.fx.bloom.busy();
     let v = ws.fx.bloom.view(device);
     let moving = view::step(v, &scene.distances, &env, &hits, reduced);

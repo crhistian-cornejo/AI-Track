@@ -309,7 +309,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let pal = p();
     let scene = view::shown(ws, dev);
     let cell = ws.fx.bloom.view(dev.id).dna_cell.unwrap_or_else(|| dev.choice(p::SELECTED)).min(SOUNDS - 1);
-    let looks = view::looks(ws, &scene);
+    let looks = view::looks(ws, &scene, view::Shape::of(dev));
     let cell_color = stage::colour(&looks[cell]);
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let sel_color = stage::colour(&looks[selected]);

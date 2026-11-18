@@ -616,7 +616,10 @@ mod tests {
 
     #[test]
     fn the_app_version_is_the_workspace_version() {
-        assert_eq!(VERSION, "0.0.1");
+        let root = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml")).unwrap();
+        let ws = root.split("[workspace.package]").nth(1).unwrap();
+        let line = ws.lines().find(|l| l.trim_start().starts_with("version")).unwrap();
+        assert_eq!(line.split('"').nth(1), Some(VERSION));
     }
 
     #[test]

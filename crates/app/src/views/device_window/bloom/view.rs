@@ -15,6 +15,7 @@ use aitrack_ai::progress::CancelToken;
 use aitrack_model::{Command, DeviceId};
 use aitrack_stock::instrument::bloom::genome::{Genome, SOUNDS, Scene, Species};
 use aitrack_stock::instrument::bloom::timbre::{self, Timbre};
+use aitrack_stock::instrument::bloom::voice::Macros;
 use aitrack_stock::instrument::bloom::{self as bloom, MAX_SEED, p};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::RenderImage;
@@ -35,51 +36,85 @@ pub struct Parsed {
     pub material: Material,
 }
 
-/// Timbre analysis on a worker thread, cached by genome hash.
+/// How the device plays its sounds: its Tune and macro knobs, rounded so a
+/// knob drag asks for a bounded number of analyses.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub transpose: f32,
+    pub macros: Macros,
+}
+
+impl Shape {
+    pub fn of(dev: &Dev) -> Self {
+        let q = |v: f32| (v / 100.0 * 25.0).round() / 25.0;
+        Self {
+            transpose: dev.plain(p::TUNE).round(),
+            macros: Macros { decay: q(dev.plain(p::DECAY)), body: q(dev.plain(p::BODY)), tone: q(dev.plain(p::TONE)), grit: q(dev.plain(p::GRIT)) },
+        }
+    }
+
+    fn key(&self) -> u64 {
+        let m = self.macros;
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+        for v in [self.transpose, m.decay, m.body, m.tone, m.grit] {
+            h = (h ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+}
+
+/// Timbre analysis on a worker thread, cached by genome and [`Shape`].
 pub struct Analyzer {
-    tx: Sender<(u64, Genome)>,
-    rx: Receiver<(u64, Timbre)>,
+    tx: Sender<(u64, u64, Genome, Shape)>,
+    rx: Receiver<(u64, u64, Timbre)>,
     pending: HashSet<u64>,
     cache: HashMap<u64, Timbre>,
+    /// The newest analysis of each genome under any shape: shown while the
+    /// one for the current knobs is on its way, so a drag never flickers.
+    last: HashMap<u64, Timbre>,
 }
 
 impl Analyzer {
     fn new() -> Self {
-        let (tx, jobs) = unbounded::<(u64, Genome)>();
+        let (tx, jobs) = unbounded::<(u64, u64, Genome, Shape)>();
         let (done, rx) = unbounded();
         let _ = std::thread::Builder::new().name("bloom-analysis".into()).spawn(move || {
-            while let Ok((h, g)) = jobs.recv() {
-                if done.send((h, timbre::analyze(&g))).is_err() {
+            while let Ok((h, gh, g, sh)) = jobs.recv() {
+                if done.send((h, gh, timbre::analyze_shaped(&g, sh.transpose, &sh.macros))).is_err() {
                     break;
                 }
             }
         });
-        Self { tx, rx, pending: HashSet::new(), cache: HashMap::new() }
+        Self { tx, rx, pending: HashSet::new(), cache: HashMap::new(), last: HashMap::new() }
     }
 
-    /// The timbre of `g` if known; otherwise it is asked for.
-    pub fn get(&mut self, g: &Genome) -> Option<Timbre> {
-        let h = g.hash();
+    /// The timbre of `g` played with `shape` if known; otherwise it is asked
+    /// for and the genome's newest timbre (if any) stands in.
+    pub fn get(&mut self, g: &Genome, shape: Shape) -> Option<Timbre> {
+        let gh = g.hash();
+        let h = gh ^ shape.key().rotate_left(17);
         if let Some(t) = self.cache.get(&h) {
             return Some(*t);
         }
         // A long queue (a drag asks for a new sound every frame) waits for
         // the worker before taking more; the estimate shows meanwhile.
         if self.pending.len() < 48 && self.pending.insert(h) {
-            let _ = self.tx.send((h, *g));
+            let _ = self.tx.send((h, gh, *g, shape));
         }
-        None
+        self.last.get(&gh).copied()
     }
 
     /// Take finished analyses; true when any arrived.
     pub fn poll(&mut self) -> bool {
         let mut any = false;
-        while let Ok((h, t)) = self.rx.try_recv() {
+        while let Ok((h, gh, t)) = self.rx.try_recv() {
             self.pending.remove(&h);
             if self.cache.len() > 4_096 {
                 self.cache.clear();
+                self.last.clear();
             }
             self.cache.insert(h, t);
+            self.last.insert(gh, t);
             any = true;
         }
         any
@@ -479,18 +514,19 @@ pub fn played(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> Scene {
 }
 
 /// The look of every sound of `scene` (estimated until analysed).
-pub fn looks(ws: &mut Workspace, scene: &Scene) -> [Look; SOUNDS] {
+pub fn looks(ws: &mut Workspace, scene: &Scene, shape: Shape) -> [Look; SOUNDS] {
     let dark = crate::theme::is_dark();
-    let t = timbres(ws, scene);
+    let t = timbres(ws, scene, shape);
     std::array::from_fn(|i| look::look(&t[i], dark))
 }
 
-/// The timbre of every sound of `scene` (estimated from the genes until analysed).
-pub fn timbres(ws: &mut Workspace, scene: &Scene) -> [Timbre; SOUNDS] {
+/// The timbre of every sound of `scene` played with `shape` (estimated from
+/// the genes until analysed).
+pub fn timbres(ws: &mut Workspace, scene: &Scene, shape: Shape) -> [Timbre; SOUNDS] {
     let an = ws.fx.bloom.analyzer();
     std::array::from_fn(|i| {
         let g = scene.sounds[i];
-        an.get(&g).unwrap_or_else(|| look::estimate(&g))
+        an.get(&g, shape).unwrap_or_else(|| look::estimate(&g))
     })
 }
 

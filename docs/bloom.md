@@ -133,11 +133,33 @@ Without a GPU adapter the CPU field below is drawn instead.
 | Energy, decay | Size and how far a hit swells it |
 | Live meter (envelope, pulse, centroid, noisiness) | The playing sound's look leans to what it sounds like now; pulses spike, shake and puff |
 
+The knobs reach the matter twice. The timbre is measured as the device plays
+it (`timbre::analyze_shaped`: its Tune and the Decay / Body / Tone / Grit
+macros, rounded to 4 % steps), so a turned knob is re-analysed on the worker;
+meanwhile the sound's newest analysis stands in, so a drag never flickers. On
+top, every frame, `mapping::with_controls` moves the look straight away (the
+identity at the device's defaults):
+
+| Knob | The matter |
+|---|---|
+| Decay | Slower, heavier churn and a lingering vapour; hits swell longer |
+| Body | A bigger, lumpier mass |
+| Tone | The sheen moves towards gold–blue, spikes sharpen |
+| Grit | Rougher, denser spikes, a choppier vapour, more tremble |
+| Space | More vapour, slower and more turbulent |
+| Deviance | The folds and the wobble wander as far as the sounds do |
+| Tune | Finer folds and spikes, faster wobble |
+| Volume | Louder hits swell further |
+
+Presets are parameter sets, so loading one moves the matter the same way;
+Seed, Species and Morph X/Y change the sounds themselves.
+
 Offline preview (headless, no window):
 `cargo run -p aitrack-app --release --example bloom_matter_render -- <out_dir>`
 writes every material at rest and on a hit, six sounds' looks, light and dark
 panels, a 30-frame strip and `timing.txt`. `MATTER_WGSL=<file>` renders with
-another copy of the shader, to tune it without rebuilding.
+another copy of the shader, to tune it without rebuilding. A second argument
+`knobs` writes only `knobs-{light,dark}.png`: one sound under each knob.
 
 ## The field (CPU fallback)
 

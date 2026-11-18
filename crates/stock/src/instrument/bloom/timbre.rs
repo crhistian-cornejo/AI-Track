@@ -3,7 +3,8 @@
 //! offline render of the genome, off the audio and UI threads.
 
 use super::genome::{Genome, g};
-use super::render::render_mono;
+use super::render::render_mono_shaped;
+use super::voice::Macros;
 use realfft::RealFftPlanner;
 
 /// Rate and length of the analysis render.
@@ -33,7 +34,13 @@ pub struct Timbre {
 
 /// Analyse `genome` (renders 200 ms at [`RATE`]).
 pub fn analyze(genome: &Genome) -> Timbre {
-    let x = render_mono(genome, RATE, FRAMES, 1.0);
+    analyze_shaped(genome, 0.0, &Macros::default())
+}
+
+/// The timbre of `genome` as the device plays it: `transpose` semitones (its
+/// Tune) and its macro knobs, so turning a knob changes what is measured.
+pub fn analyze_shaped(genome: &Genome, transpose: f32, macros: &Macros) -> Timbre {
+    let x = render_mono_shaped(genome, RATE, FRAMES, 1.0, transpose, macros);
     let mut t = analyze_signal(&x, RATE);
     let gn = genome.folded();
     let fm = (gn.plain(g::FM_INDEX) / 6.0).min(1.0) * (gn.plain(g::FM_DECAY) / 250.0).min(1.0);
@@ -137,6 +144,20 @@ mod tests {
         assert!(hat.centroid > kick.centroid * 3.0, "{} vs {}", hat.centroid, kick.centroid);
         assert!(hat.noisiness > kick.noisiness, "{} vs {}", hat.noisiness, kick.noisiness);
         assert!(hat.decay_ms < 200.0);
+    }
+
+    #[test]
+    fn the_knobs_change_what_is_measured() {
+        let s = generate(4, GrowOpts::default());
+        let hat = &s.sounds[6];
+        let plain = analyze(hat);
+        assert_eq!(analyze_shaped(hat, 0.0, &Macros::default()), plain);
+        let dark = analyze_shaped(hat, 0.0, &Macros { tone: -1.0, ..Macros::default() });
+        let bright = analyze_shaped(hat, 0.0, &Macros { tone: 1.0, ..Macros::default() });
+        assert!(bright.centroid > dark.centroid, "{} vs {}", bright.centroid, dark.centroid);
+        let kick = &s.sounds[0];
+        let up = analyze_shaped(kick, 12.0, &Macros::default());
+        assert!(up.centroid > analyze(kick).centroid, "{} vs {}", up.centroid, analyze(kick).centroid);
     }
 
     #[test]

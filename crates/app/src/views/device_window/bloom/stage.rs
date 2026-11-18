@@ -15,7 +15,7 @@
 //! it into the selected sound.
 
 use super::matter::frame::{Live, Panel};
-use super::matter::mapping::{SoundLook, blend, sound_look};
+use super::matter::mapping::{Controls, SoundLook, blend, sound_look, with_controls};
 use super::matter::service::{self, Image, Status};
 use super::matter::uniforms::Uniforms;
 use super::view::{self, CellDrag};
@@ -119,6 +119,21 @@ fn timbre_key(t: &Timbre, light: bool) -> u64 {
     h
 }
 
+/// The device's knobs as the matter feels them.
+pub fn controls(dev: &Dev) -> Controls {
+    let pc = |id: u32| dev.plain(id) / 100.0;
+    Controls {
+        decay: pc(p::DECAY),
+        body: pc(p::BODY),
+        tone: pc(p::TONE),
+        grit: pc(p::GRIT),
+        space: pc(p::SPACE),
+        deviance: pc(p::DEVIANCE),
+        tune: dev.plain(p::TUNE),
+        volume_db: dev.plain(p::VOLUME),
+    }
+}
+
 /// The live meter's centroid (0..1, 50 Hz .. 10 kHz) in Hz.
 fn live_centroid(x: f32) -> f32 {
     50.0 * 200f32.powf(x.clamp(0.0, 1.0))
@@ -168,7 +183,8 @@ pub fn available() -> Option<bool> {
 /// timbre, leaning towards what the meter hears while it plays.
 pub fn sound_looks(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> [SoundLook; SOUNDS] {
     let light = !p().dark;
-    let timbres = view::timbres(ws, scene);
+    let knobs = controls(dev);
+    let timbres = view::timbres(ws, scene, view::Shape::of(dev));
     let st = &mut ws.fx.bloom.view(dev.id).stage;
     if st.looks.len() > 1_024 {
         st.looks.clear();
@@ -179,9 +195,9 @@ pub fn sound_looks(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> [SoundLook; 
         let env = dev.m(i).clamp(0.0, 1.0);
         if env > 0.02 {
             let live = Timbre { centroid: live_centroid(dev.m(48 + i)), noisiness: dev.m(64 + i).clamp(0.0, 1.0), ..t };
-            blend(&base, &sound_look(&live, light), 0.5 * env)
+            with_controls(&blend(&base, &sound_look(&live, light), 0.5 * env), &knobs)
         } else {
-            base
+            with_controls(&base, &knobs)
         }
     })
 }
@@ -213,7 +229,7 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
         shown.sounds[cell] = best;
     }
     let looks = sound_looks(ws, dev, &shown);
-    let colours = view::looks(ws, &shown);
+    let colours = view::looks(ws, &shown, view::Shape::of(dev));
     let material = view::parsed(ws, device).material;
     let busy = ws.fx.bloom.busy();
     let v = ws.fx.bloom.view(device);

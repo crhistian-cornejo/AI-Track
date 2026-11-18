@@ -11,6 +11,7 @@ pub mod device_window;
 pub mod devices;
 pub mod export;
 pub mod hub;
+pub mod mcp;
 pub mod menus;
 pub mod meters;
 pub mod mixer;

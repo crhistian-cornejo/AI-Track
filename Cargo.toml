@@ -8,6 +8,7 @@ members = [
   "crates/host",
   "crates/library",
   "crates/ai",
+  "crates/mcp",
   "crates/splice",
   "crates/update",
   "crates/app",
@@ -38,6 +39,7 @@ aitrack-engine = { path = "crates/engine" }
 aitrack-host = { path = "crates/host" }
 aitrack-library = { path = "crates/library" }
 aitrack-ai = { path = "crates/ai" }
+aitrack-mcp = { path = "crates/mcp" }
 aitrack-splice = { path = "crates/splice" }
 aitrack-update = { path = "crates/update" }
 
@@ -53,6 +55,9 @@ rtrb = "0.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
 # Secrets in the macOS Keychain / Windows Credential Manager (MIT OR Apache-2.0).
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+# Official MCP SDK (Apache-2.0). The 3.x series broke its API between minors: keep the pin exact.
+rmcp = { version = "=3.11.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 # GPUI: Zed's framework, the same pinned + patched snapshot monoBOT uses.
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }

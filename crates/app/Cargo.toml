@@ -17,6 +17,8 @@ aitrack-engine.workspace = true
 aitrack-stock.workspace = true
 aitrack-host.workspace = true
 aitrack-ai.workspace = true
+# The external MCP server (agents outside the app) and its stdio shim binary.
+aitrack-mcp.workspace = true
 aitrack-library = { workspace = true, features = ["ai"] }
 # Opt-in Splice search in the palette (Preferences → Sounds).
 aitrack-splice.workspace = true

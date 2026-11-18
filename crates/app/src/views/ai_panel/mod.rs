@@ -7,6 +7,8 @@
 //! `discard`. Tracks, clips, samples and screenshots ride along as chips.
 
 mod agent;
+/// The pattern engine writing a part into a draft (the external MCP tools use it too).
+pub(crate) use agent::generate_part;
 mod markdown;
 pub(crate) mod midi_gen;
 mod mix;

@@ -1,7 +1,7 @@
 //! `cargo xtask package [--target mac|win] [--universal] [--sign] [--skip-build]`
 //! `cargo xtask package manifest --version X --base-url URL [--dir D] [--notes-file F]`
 //!
-//! Builds the four release binaries and assembles the installable artifacts in
+//! Builds the five release binaries and assembles the installable artifacts in
 //! `target/dist/` (see `docs/release-0.0.1.md`; the update contract is `docs/updater.md`).
 //! Signing and notarization steps run only when their credentials are in the environment;
 //! without them the output is still complete (ad-hoc signed on macOS, unsigned on Windows).
@@ -15,7 +15,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bundle identifier; also the window's `app_id`.
 const BUNDLE_ID: &str = "dev.aitrack.daw";
 /// The executables that ship together. The helpers must sit next to `aitrack`.
-const BINARIES: [&str; 4] = ["aitrack", "aitrack-plugin-host", "aitrack-plugin-scanner", "aitrack-ml-worker"];
+const BINARIES: [&str; 5] = ["aitrack", "aitrack-plugin-host", "aitrack-plugin-scanner", "aitrack-ml-worker", "aitrack-mcp"];
 const MAC_TRIPLES: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,10 +110,10 @@ fn env_set(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// `cargo build --release` of the four binaries; `triple` None = the host.
+/// `cargo build --release` of the five binaries; `triple` None = the host.
 fn build(root: &Path, triple: Option<&str>) -> Result<()> {
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.current_dir(root).args(["build", "--release", "-p", "aitrack-app", "-p", "aitrack-host", "-p", "aitrack-ai"]);
+    cmd.current_dir(root).args(["build", "--release", "-p", "aitrack-app", "-p", "aitrack-host", "-p", "aitrack-ai", "-p", "aitrack-mcp"]);
     for bin in BINARIES {
         cmd.args(["--bin", bin]);
     }
@@ -360,6 +360,7 @@ fn package_mac(root: &Path, dist: &Path, opts: &Opts, signer: &Signer) -> Result
     mac.codesign(&macos_dir.join("aitrack-plugin-host"), Some(&ent_host), Some(&format!("{BUNDLE_ID}.plugin-host")))?;
     mac.codesign(&macos_dir.join("aitrack-plugin-scanner"), Some(&ent_host), Some(&format!("{BUNDLE_ID}.plugin-scanner")))?;
     mac.codesign(&macos_dir.join("aitrack-ml-worker"), Some(&ent_app), Some(&format!("{BUNDLE_ID}.ml-worker")))?;
+    mac.codesign(&macos_dir.join("aitrack-mcp"), Some(&ent_app), Some(&format!("{BUNDLE_ID}.mcp-shim")))?;
     mac.codesign(&app, Some(&ent_app), Some(BUNDLE_ID))?;
     run_cmd(Command::new("codesign").args(["--verify", "--deep", "--strict", "--verbose=2"]).arg(&app))?;
 

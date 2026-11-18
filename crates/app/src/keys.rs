@@ -275,6 +275,7 @@ pub static TABLE: &[Entry] = &[
     main("SaveProjectAs", "Save As…", "Save the project to a new file.", C::Project, W, &["mod-shift-s"]),
     main("CollectAndSave", "Collect All and Save", "Copy every audio file the project uses from outside its folder into its Samples folder, then save.", C::Project, W, &[]),
     main("FindMissingFiles", "Find Missing Files…", "Look for the audio files this project cannot find in a folder you pick.", C::Project, W, &[]),
+    main("CheckForUpdates", "Check for Updates…", "Look for a newer version of AI-Track and download it.", C::Project, W, &[]),
     main("ExportAudio", "Export Audio…", "Render the song to an audio file.", C::Project, W, &["mod-shift-e"]),
     main("OpenPreferences", "Preferences…", "Audio device, appearance and plugins.", C::Project, W, &["mod-,"]),
     main("Quit", "Quit", "Close AI-Track.", C::Project, Scope::App, &["mod-q"]),
@@ -448,7 +449,7 @@ mod tests {
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
         const KEYLESS: &[Bound] =
-            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Cmd(Cmd::SliceToDrumRack)];
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack)];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

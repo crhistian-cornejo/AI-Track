@@ -20,6 +20,8 @@ aitrack-ai.workspace = true
 aitrack-library = { workspace = true, features = ["ai"] }
 # Opt-in Splice search in the palette (Preferences → Sounds).
 aitrack-splice.workspace = true
+# In-app updater: manifest, verified download, install (docs/updater.md).
+aitrack-update.workspace = true
 rtrb.workspace = true
 # Browser preview voice on the default output (Apache-2.0).
 cpal = "0.18"

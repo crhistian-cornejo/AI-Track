@@ -127,6 +127,7 @@ dependencies = [
  "aitrack-model",
  "aitrack-splice",
  "aitrack-stock",
+ "aitrack-update",
  "async-channel",
  "cpal",
  "crossbeam-channel",

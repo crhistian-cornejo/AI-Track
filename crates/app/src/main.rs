@@ -11,6 +11,7 @@ mod fps;
 mod freeze;
 mod gesture;
 mod keys;
+mod logging;
 mod nav;
 mod audition;
 mod autosave;
@@ -31,6 +32,7 @@ mod session_edit;
 mod state;
 mod take_lanes;
 mod theme;
+mod updater;
 mod usage;
 mod views;
 mod waveform;
@@ -46,12 +48,19 @@ fn bridges() -> bridge::Bridges {
 }
 
 fn main() {
+    logging::init();
     let platform = gpui_platform::current_platform(false);
     gpui::Application::with_platform(platform).with_assets(assets::Assets).run(|cx: &mut App| {
         fps::install(cx);
         assets::load_fonts(cx);
         actions::bind(cx);
         keys::bind(cx);
+        // An update that is ready installs as the app closes (when the user allows it).
+        cx.on_app_quit(|_| {
+            updater::install_on_quit();
+            async {}
+        })
+        .detach();
         // Quit with the main window: device windows alone do not keep the app open.
         cx.on_window_closed(|cx, _| {
             if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {

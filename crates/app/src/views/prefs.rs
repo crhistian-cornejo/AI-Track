@@ -30,6 +30,8 @@ pub enum PrefsPage {
     /// MIDI input ports and the track live MIDI goes to.
     Midi,
     Performance,
+    /// Update checks and the installed version.
+    Updates,
     /// VST3/CLAP plugins: folders searched, what was found and what was left out.
     Plugins,
 }
@@ -289,6 +291,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
         PrefsPage::Midi => midi_page(ws, window, cx),
         PrefsPage::Performance => performance_page(ws, cx),
         PrefsPage::Plugins => plugins_page(ws, cx),
+        PrefsPage::Updates => super::updates::updates_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
         let on = page == target;
@@ -325,7 +328,8 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .child(nav("nav-sounds", Icon::Sample, "Sounds", PrefsPage::Sounds))
                 .child(nav("nav-midi", Icon::Piano, "MIDI", PrefsPage::Midi))
                 .child(nav("nav-plugins", Icon::Plug, "Plugins", PrefsPage::Plugins))
-                .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance)),
+                .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance))
+                .child(nav("nav-updates", Icon::Download, "Updates", PrefsPage::Updates)),
         )
         .child(
             div()
@@ -336,6 +340,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                     PrefsPage::Midi => "midi-scroll",
                     PrefsPage::Performance => "perf-scroll",
                     PrefsPage::Plugins => "plugins-scroll",
+                    PrefsPage::Updates => "updates-scroll",
                 })
                 .flex_1()
                 .min_w(px(0.))

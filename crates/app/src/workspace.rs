@@ -364,6 +364,11 @@ pub struct Workspace {
     pub chat_log: Vec<ChatEntry>,
     pub regions: Rc<Regions>,
     pub toast: Option<(String, Instant)>,
+    /// Update checks, downloads and installs (`updater.rs`).
+    pub updater: crate::updater::Updater,
+    /// A crash report from the last run, offered once (`logging.rs`).
+    pub crash_notice: Option<crate::logging::CrashNotice>,
+    pub(crate) crash_rx: crossbeam_channel::Receiver<crate::logging::CrashNotice>,
     /// The shortcuts sheet and the Rename field.
     pub ui: crate::commands::EditUi,
     synced_revision: Option<u64>,
@@ -537,6 +542,9 @@ impl Workspace {
             chat_log: Vec::new(),
             regions: Rc::new(Regions::default()),
             toast: None,
+            updater: crate::updater::Updater::new(Instant::now(), crate::updater::Config::from_env(), crate::updater::UpdatePrefs::load()),
+            crash_notice: None,
+            crash_rx: crate::logging::spawn_crash_lookup(),
             ui: crate::commands::EditUi::new(cx),
             synced_revision: None,
             fast_at: None,
@@ -648,6 +656,9 @@ impl Workspace {
                         self.palette.similar = Some(views::palette::SimilarTo { id: it.id, name: it.name.clone() });
                     }
                 }
+                // The updater in a state, without the network: `update=available|ready|failed`.
+                "update=available" | "update=ready" | "update=failed" => views::updates::seed_dev(self, word),
+                "prefs=updates" => self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Updates)),
                 "prefs=sounds" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Sounds,
@@ -1242,6 +1253,7 @@ impl Workspace {
     /// Timer tick: plugin main-thread work, scan progress, engine messages.
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         self.autosave_tick();
+        self.updater_tick(cx);
         // A take being played, or one that just ended: clips from the notes.
         let rec = self.s.poll_recording(&mut *self.b.engine);
         let clips = rec.committed + rec.audio_clips;
@@ -2785,6 +2797,7 @@ impl Workspace {
                 )
             })
             .when_some(health, |d, h| d.child(h))
+            .children(views::updates::status_item(self, cx))
             .child(div().flex_1())
             .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
             .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))
@@ -3471,6 +3484,7 @@ impl Render for Workspace {
         let meter_strip = views::meters::render(self, cx);
         let meter_layers = views::meters::overlay(self, cx);
         let toast = self.render_toast();
+        let crash_banner = views::updates::crash_banner(self, cx);
         let status = self.render_status(cx);
         let banner = self.render_banner(cx);
         let watchdog_banner = self.render_watchdog_banner(cx);
@@ -3517,6 +3531,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DeleteTrack, _, cx| this.delete_selected_tracks(cx)))
             .on_action(cx.listener(|this, _: &CollectAndSave, _, cx| this.collect_and_save(cx)))
             .on_action(cx.listener(|this, _: &FindMissingFiles, _, cx| this.find_missing_files(cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             .on_action(cx.listener(|this, _: &ToggleGroupFold, _, cx| crate::editing::toggle_group_fold(this, cx)))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| views::palette::toggle(this, window, cx)))
             .on_action(cx.listener(|this, _: &AddLibraryFolder, window, cx| views::palette::open_add_library(this, window, cx)))
@@ -3637,6 +3652,7 @@ impl Render for Workspace {
             .child(views::topbar::render(self, window, cx))
             .children(banner)
             .children(watchdog_banner)
+            .children(crash_banner)
             .children(meter_strip)
             .child(
                 div()

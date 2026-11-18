@@ -23,4 +23,5 @@ pub mod session;
 pub mod sounds;
 pub mod steps;
 pub mod topbar;
+pub mod updates;
 pub mod shortcuts;

@@ -232,6 +232,13 @@ fn file_menu(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace
             cx,
         ))
         .child(close_recent(
+            menu_item("file-updates", Some(Icon::Download), "Check for updates…", None, false).on_click(cx.listener(|this, _, _, cx| {
+                this.close_menu(cx);
+                this.check_for_updates(cx);
+            })),
+            cx,
+        ))
+        .child(close_recent(
             menu_item("file-shortcuts", Some(Icon::Keyboard), "Keyboard shortcuts…", key("Ctrl+/", "⌘/"), false).on_click(cx.listener(|this, _, window, cx| {
                 this.close_menu(cx);
                 crate::commands::run(this, crate::keys::Cmd::Shortcuts, window, cx);

@@ -62,6 +62,7 @@ actions!(
         DeleteTrack,
         CollectAndSave,
         FindMissingFiles,
+        CheckForUpdates,
         ToggleSounds,
         Quit,
     ]

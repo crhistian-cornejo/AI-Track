@@ -412,7 +412,7 @@ impl AppState {
         if self.ed.area != Area::Arrange {
             return false;
         }
-        let ids: Vec<PlacementId> = self.project.tracks.iter().flat_map(|t| t.arrangement.iter().map(|p| p.id)).collect();
+        let ids: Vec<PlacementId> = self.project.tracks.iter().flat_map(|t| t.arrangement.iter().filter(|p| p.lane == 0).map(|p| p.id)).collect();
         let last = self.selected_placement.map(|(_, id)| id);
         self.select_clips(ids, last);
         true

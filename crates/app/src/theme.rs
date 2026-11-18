@@ -576,6 +576,8 @@ pub struct Metrics {
     /// No track shows shorter than this.
     pub track_min_h: f32,
     pub auto_h: f32,
+    /// A take lane under a track (comping).
+    pub take_h: f32,
     pub bus_h: f32,
     pub track_header_w: f32,
     /// Session view: a clip slot / scene row, and the column header.
@@ -612,6 +614,7 @@ impl Metrics {
         track_scale: 1.,
         track_min_h: 40.,
         auto_h: 56.,
+        take_h: 32.,
         bus_h: 28.,
         track_header_w: 200.,
         session_row_h: 28.,
@@ -641,6 +644,7 @@ impl Metrics {
         track_scale: 0.64,
         track_min_h: 28.,
         auto_h: 48.,
+        take_h: 28.,
         bus_h: 24.,
         track_header_w: 200.,
         session_row_h: 24.,
@@ -865,7 +869,7 @@ mod tests {
         let (c, k) = (Metrics::COMFORTABLE, Metrics::COMPACT);
         for m in [c, k] {
             for v in [
-                m.top_bar_h, m.bar_field_h, m.status_bar_h, m.dock_bar_h, m.control_h, m.row_h, m.ruler_h, m.track_min_h, m.auto_h, m.bus_h,
+                m.top_bar_h, m.bar_field_h, m.status_bar_h, m.dock_bar_h, m.control_h, m.row_h, m.ruler_h, m.track_min_h, m.auto_h, m.take_h, m.bus_h,
                 m.track_header_w, m.session_row_h, m.session_head_h, m.slot_h, m.strip_name_h, m.strip_pan_h, m.strip_db_h, m.strip_w, m.strip_pad, m.dock_h,
                 m.mixer_h,
             ] {

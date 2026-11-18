@@ -331,6 +331,30 @@ pub struct Track {
     /// Whether this Instrument track receives notes from the computer MIDI keyboard.
     #[serde(default)]
     pub keyboard_input: bool,
+    /// Take lanes (comping): rows under the track holding takes that stay
+    /// silent. The placements of take lane `i` have `lane == i + 1`; the
+    /// track's main lane (`lane == 0`) is the comp, the only one that plays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub take_lanes: Vec<TakeLane>,
+    /// Which take lane each stretch of the main lane was promoted from (the
+    /// parts of the takes the arrangement highlights). Sorted, never overlapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comp: Vec<CompSpan>,
+}
+
+/// A take lane of a track (see [`Track::take_lanes`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TakeLane {
+    pub name: String,
+}
+
+/// A stretch of the main lane that was promoted from a take lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompSpan {
+    /// The placement lane of the take: 1 + the index in [`Track::take_lanes`].
+    pub lane: u16,
+    pub start: Tick,
+    pub end: Tick,
 }
 
 impl Track {
@@ -360,6 +384,8 @@ impl Track {
             reported_latency: 0,
             scale: None,
             keyboard_input: false,
+            take_lanes: Vec::new(),
+            comp: Vec::new(),
         }
     }
 }
@@ -407,7 +433,8 @@ pub struct Placement {
     pub id: PlacementId,
     pub clip: ClipId,
     pub start: Tick,
-    /// Take lane for comping (0 = the playing lane).
+    /// 0 = the main lane, the one that plays; `i + 1` = take lane `i` of
+    /// the track (silent, see [`Track::take_lanes`]).
     #[serde(default)]
     pub lane: u16,
 }

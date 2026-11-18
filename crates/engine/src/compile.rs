@@ -940,12 +940,12 @@ pub(crate) fn param_patches(old: &Project, new: &Project) -> Option<Vec<Patch>> 
         }
         let Track {
             id, kind, name: _, color: _, volume_db, pan, mute, solo, arm, monitor, input, output, sends, parent, vca, collapsed: _, height: _, devices, session_slots, arrangement, automation,
-            reported_latency: _, scale: _, keyboard_input: _,
+            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _,
         } = a;
         let Track {
             id: id_b, kind: kind_b, name: _, color: _, volume_db: volume_b, pan: pan_b, mute: mute_b, solo: solo_b, arm: arm_b, monitor: monitor_b, input: input_b, output: output_b, sends: sends_b,
             parent: parent_b, vca: vca_b, collapsed: _, height: _, devices: devices_b, session_slots: session_b, arrangement: arrangement_b, automation: automation_b,
-            reported_latency: _, scale: _, keyboard_input: _,
+            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _,
         } = b;
         if id != id_b
             || kind != kind_b

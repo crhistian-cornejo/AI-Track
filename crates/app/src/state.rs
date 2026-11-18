@@ -324,6 +324,8 @@ pub struct AppState {
     /// The lanes each track shows, top to bottom, while its automation is
     /// shown (kept while hidden, as Live remembers them). See [`AppState::shown_lanes`].
     pub auto_lanes: BTreeMap<TrackId, Vec<AutomationTarget>>,
+    /// Which tracks show their take lanes, and the range picked on one.
+    pub takes: crate::take_lanes::TakeView,
     /// Live's Automation Arm: while recording, moving a control in a
     /// plugin's window writes its automation.
     pub automation_arm: bool,
@@ -362,6 +364,7 @@ impl AppState {
             selected_notes: BTreeSet::new(),
             automation_shown: BTreeSet::new(),
             auto_lanes: BTreeMap::new(),
+            takes: Default::default(),
             tempo_base: None,
             fast: FastLog::default(),
             engine_behind: false,
@@ -401,6 +404,7 @@ impl AppState {
                 s.auto_lanes.insert(t.id, t.automation.iter().map(|l| l.target).collect());
             }
         }
+        s.show_saved_take_lanes();
         // Centre the piano roll on the notes (or middle C).
         let mid = s.selected_clip.and_then(|c| s.clip_notes(c)).map_or(60., |(_, n)| {
             if n.notes.is_empty() { 60. } else { n.notes.iter().map(|n| n.key as f32).sum::<f32>() / n.notes.len() as f32 }
@@ -515,11 +519,16 @@ impl AppState {
                 continue;
             }
             let file = AudioSource { path: t.path.clone(), hash: None, sample_rate: t.sample_rate, channels: t.channels, frames: t.frames, warp: Warp::default(), key: None };
-            let (start, offset, length) = audio_take_span(t.start_tick.max(0), file.length_ticks(bpm).max(PPQ), looped);
+            let file_ticks = file.length_ticks(bpm).max(PPQ);
+            let (start, offset, length) = audio_take_span(t.start_tick.max(0), file_ticks, looped);
             let (source, clip, placement) = (self.project.alloc_source_id(), self.project.alloc_clip_id(), self.project.alloc_placement_id());
             let mut c = Clip::new("Recorded", color, source, length);
             c.offset = offset;
             cmds.push(Command::AddSource { id: source, source: Box::new(Source::Audio(file)) });
+            // With the track's take lanes shown, every whole pass of a loop recording is a take lane.
+            if let Some((ls, len, offsets)) = self.takes.shown.contains(&t.track).then(|| crate::take_lanes::audio_passes(t.start_tick.max(0), file_ticks, looped)).flatten() {
+                cmds.extend(self.audio_pass_lanes(t.track, source, color, ls, len, &offsets));
+            }
             cmds.push(Command::AddClip { id: clip, clip: Box::new(c) });
             cmds.push(Command::PlaceClip { track: t.track, placement: Placement { id: placement, clip, start, lane: 0 } });
             clips += 1;
@@ -579,10 +588,24 @@ impl AppState {
         let mut cmds = Vec::new();
         let tracks = by_track.len();
         for (track, played) in by_track {
-            let mut notes = Vec::new();
+            let mut notes_by_pass = Vec::new();
             for n in played {
                 let at = (n.start_tick - start).clamp(0, len - 1);
-                notes.push(Note::new(self.project.alloc_note_id(), n.key, at, n.length_ticks.clamp(1, (len - at).max(1)), n.velocity.clamp(0.01, 1.)));
+                notes_by_pass.push((n.pass, Note::new(self.project.alloc_note_id(), n.key, at, n.length_ticks.clamp(1, (len - at).max(1)), n.velocity.clamp(0.01, 1.))));
+            }
+            let notes: Vec<Note> = notes_by_pass.iter().map(|n| n.1.clone()).collect();
+            // With the track's take lanes shown, each pass of a loop recording is a take lane.
+            if looped && self.takes.shown.contains(&track) {
+                let mut passes: BTreeMap<u32, Vec<Note>> = BTreeMap::new();
+                for n in &notes_by_pass {
+                    passes.entry(n.0).or_default().push(n.1.clone());
+                }
+                if passes.len() >= 2 {
+                    let color = self.project.track(track).map_or(Color(0), |t| t.color);
+                    let passes: Vec<Vec<Note>> = passes.into_values().collect();
+                    cmds.extend(self.midi_pass_lanes(track, color, start, len, &passes));
+                    continue;
+                }
             }
             // A clip over the same stretch, from an earlier take: add to it.
             let existing = looped
@@ -703,6 +726,7 @@ impl AppState {
         let p = &self.project;
         self.automation_shown.retain(|t| p.track(*t).is_some());
         self.auto_lanes.retain(|t, _| p.track(*t).is_some());
+        self.prune_take_view();
         if let Some(c) = self.selected_clip
             && !self.project.clips.contains_key(&c) {
                 self.selected_clip = None;

@@ -69,12 +69,18 @@ impl Plan {
         }
     }
 
-    /// The placements of `track` that satisfy `keep` (start, end).
+    /// The placements of the main lane of `track` that satisfy `keep` (start,
+    /// end); the take lanes under it are not part of what edits cut and replace.
     pub fn placements(&self, track: TrackId, keep: impl Fn(Tick, Tick) -> bool) -> Vec<Placement> {
+        self.placements_in(track, 0, keep)
+    }
+
+    /// The placements of lane `lane` of `track` that satisfy `keep` (start, end).
+    pub fn placements_in(&self, track: TrackId, lane: u16, keep: impl Fn(Tick, Tick) -> bool) -> Vec<Placement> {
         let Some(t) = self.p.track(track) else { return Vec::new() };
         t.arrangement
             .iter()
-            .filter(|pl| self.p.clips.get(&pl.clip).is_some_and(|c| keep(pl.start, pl.start + c.length)))
+            .filter(|pl| pl.lane == lane && self.p.clips.get(&pl.clip).is_some_and(|c| keep(pl.start, pl.start + c.length)))
             .cloned()
             .collect()
     }

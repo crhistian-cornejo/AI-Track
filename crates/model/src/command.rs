@@ -11,6 +11,7 @@ use crate::groove::{Groove, GrooveSettings, PoolGroove, MAX_GROOVE_AMOUNT};
 use crate::ids::*;
 use crate::project::*;
 use crate::routing;
+use crate::takes;
 use crate::scale::Scale;
 use crate::time::{Tick, TempoMap};
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,18 @@ pub enum Command {
     MovePlacement { track: TrackId, id: PlacementId, to_track: TrackId, start: Tick, lane: u16 },
     SetSessionSlot { track: TrackId, scene: SceneId, clip: Option<ClipId> },
 
+    /// Add a take lane to a track at `index` among its take lanes (comping,
+    /// see [`crate::takes`]). The placements of the lanes after it keep their lane.
+    AddTakeLane { track: TrackId, index: usize, name: String },
+    /// Delete take lane `index` with the takes on it; undo brings them back.
+    RemoveTakeLane { track: TrackId, index: usize },
+    RenameTakeLane { track: TrackId, index: usize, name: String },
+    /// Move take lane `from` to position `to` (the takes follow it).
+    MoveTakeLane { track: TrackId, from: usize, to: usize },
+    /// Replace which stretches of the main lane were promoted from which take
+    /// lane (what the arrangement highlights).
+    SetComp { track: TrackId, spans: Vec<CompSpan> },
+
     AddNotes { source: SourceId, notes: Vec<Note> },
     RemoveNotes { source: SourceId, ids: Vec<NoteId> },
     /// Replace notes with the same ids (move, resize, velocity…).
@@ -257,6 +270,11 @@ impl Command {
             RemovePlacement { .. } => "Delete clip",
             MovePlacement { .. } => "Move clip",
             SetSessionSlot { .. } => "Set clip slot",
+            AddTakeLane { .. } => "Add take lane",
+            RemoveTakeLane { .. } => "Delete take lane",
+            RenameTakeLane { .. } => "Rename take lane",
+            MoveTakeLane { .. } => "Move take lane",
+            SetComp { .. } => "Comp",
             AddNotes { .. } => "Add notes",
             RemoveNotes { .. } => "Delete notes",
             UpdateNotes { .. } => "Edit notes",
@@ -290,7 +308,7 @@ impl Command {
         use Command::*;
         match self {
             RemoveTrack { .. } | RemoveScene { .. } | RemoveSource { .. } | RemoveClip { .. }
-            | RemovePlacement { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
+            | RemovePlacement { .. } | RemoveTakeLane { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
             Batch { commands } => commands.iter().any(Command::is_destructive),
             _ => false,
         }
@@ -520,6 +538,11 @@ impl Command {
                 dest.arrangement.insert(j, placement);
                 Ok(inverse)
             }
+            AddTakeLane { track, index, name } => takes::add_lane(p, track, index, name),
+            RemoveTakeLane { track, index } => takes::remove_lane(p, track, index),
+            RenameTakeLane { track, index, name } => takes::rename_lane(p, track, index, name),
+            MoveTakeLane { track, from, to } => takes::move_lane(p, track, from, to),
+            SetComp { track, spans } => takes::set_comp(p, track, spans),
             SetSessionSlot { track, scene, clip } => {
                 if !p.scenes.iter().any(|s| s.id == scene) {
                     return Err(CommandError::SceneNotFound(scene));

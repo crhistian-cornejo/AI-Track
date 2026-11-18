@@ -88,7 +88,7 @@ impl BandSpec {
     pub fn response(&self, matched: bool, dynamic_db: f32, sample_rate: f64) -> BandResponse {
         let dynamic = self.dynamic && self.can_be_dynamic();
         let gain = if dynamic { self.gain + dynamic_db } else { self.gain };
-        BandResponse::design(self.kind, self.freq, gain, self.q, self.order, matched && !dynamic, sample_rate)
+        BandResponse::design(self.kind, self.freq, gain, self.q, self.order, matched, sample_rate)
     }
 
     /// The band's curve in phase mode `phase` (0 minimum, 1 natural, 2 linear).

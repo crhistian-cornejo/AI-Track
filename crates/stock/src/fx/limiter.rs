@@ -11,8 +11,11 @@
 //! (single box vs. second-order S-curve), its length, and the fast/slow
 //! release ratios and blend — not just a time multiplier.
 //!
-//! With true peak on, detection uses a 4× polyphase interpolator (BS.1770
-//! method) plus the sample values, held over the interpolator's span. With
+//! With true peak on, detection uses an 8× polyphase interpolator (BS.1770
+//! method, 8 × 24 taps, flat to 0.9 of Nyquist) plus the sample values, held
+//! over the interpolator's span. True Peak is on by default and so is 2×
+//! oversampling: the gain computer then sees the peaks between samples at a
+//! rate where its own attack and release are smooth. With
 //! oversampling (2×/4×, polyphase IIR) the whole limiter runs at the high
 //! rate; a short base-rate true-peak stage then catches what the decimation
 //! filter's ringing adds. A final clamp at the ceiling guarantees the sample
@@ -82,8 +85,8 @@ const MAX_LOOKAHEAD_MS: f32 = 10.0;
 /// Internal target below the ceiling.
 const MARGIN_DB: f32 = 0.02;
 const CONTROL: usize = 16;
-/// Span of the true-peak hold (covers the interpolator's 16 taps).
-const HOLD: usize = 17;
+/// Span of the true-peak hold (covers the interpolator's taps).
+const HOLD: usize = TruePeak::SPAN + 1;
 
 pub fn params() -> Vec<ParamInfo> {
     vec![
@@ -93,7 +96,7 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::AUTO_RELEASE, "Auto Release", 0.0, 1.0, 1.0).choices(OFF_ON).short("Auto"),
         ParamInfo::new(p::LOOKAHEAD, "Lookahead", 0.5, MAX_LOOKAHEAD_MS, 1.5).unit("ms").short("Look"),
         ParamInfo::new(p::TRUE_PEAK, "True Peak", 0.0, 1.0, 1.0).choices(OFF_ON).short("TP"),
-        ParamInfo::new(p::OVERSAMPLING, "Oversampling", 0.0, 2.0, 0.0).choices(OS).short("OS"),
+        ParamInfo::new(p::OVERSAMPLING, "Oversampling", 0.0, 2.0, 1.0).choices(OS).short("OS"),
         ParamInfo::new(p::LINK, "Stereo Link", 0.0, 100.0, 100.0).unit("%").short("Link"),
         ParamInfo::new(p::STYLE, "Style", 0.0, 5.0, style::ALLROUND).choices(STYLES),
         ParamInfo::new(p::ATTACK, "Attack", 0.1, 10.0, 1.0).unit("ms").log().short("Att"),
@@ -900,6 +903,79 @@ mod tests {
         println!("worst true peak relative to the ceiling: {excess:+.3} dB");
     }
 
+    /// True peak (dB) of `x[from..to]` by an 8× windowed-sinc reconstruction
+    /// (half-width 48 samples, Blackman–Harris): independent of the detector
+    /// under test, the report's "reference" reading.
+    fn reference_true_peak_db(x: &[f32], from: usize, to: usize) -> f32 {
+        const W: isize = 48;
+        const SUB: usize = 8;
+        let kernel: Vec<f64> = (0..SUB)
+            .flat_map(|j| {
+                (-W + 1..=W).map(move |k| {
+                    let t = k as f64 - j as f64 / SUB as f64;
+                    let sinc = if t.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) };
+                    let u = std::f64::consts::PI * (t / W as f64 + 1.0);
+                    sinc * (0.358_75 - 0.488_29 * u.cos() + 0.141_28 * (2.0 * u).cos() - 0.011_68 * (3.0 * u).cos())
+                })
+            })
+            .collect();
+        let mut peak = 0.0f64;
+        for n in from..to {
+            for j in 0..SUB {
+                let row = &kernel[j * 2 * W as usize..(j + 1) * 2 * W as usize];
+                let mut acc = 0.0;
+                for (i, c) in row.iter().enumerate() {
+                    acc += c * x[(n as isize + i as isize - W + 1) as usize] as f64;
+                }
+                peak = peak.max(acc.abs());
+            }
+        }
+        20.0 * peak.log10() as f32
+    }
+
+    /// Report 24/01 §3.2: at a −1 dB ceiling with True Peak on, the 1× limiter let
+    /// a 45° fs/4 sine out at −0.85 dBTP and a clipped saw at −0.65 dBTP. With
+    /// the 8× interpolator, every worst case (ISP-heavy signals at +6…+12 dB)
+    /// must stay within 0.05 dB of the ceiling at every oversampling factor,
+    /// measured with an independent reconstruction.
+    #[test]
+    fn inter_sample_peaks_stay_under_the_ceiling() {
+        type Signal = Box<dyn Fn(usize) -> f32>;
+        let tau = std::f32::consts::TAU;
+        let mut signals: Vec<(String, Signal)> = Vec::new();
+        for deg in [0.0f32, 22.5, 45.0, 67.5, 90.0] {
+            let ph = deg.to_radians();
+            signals.push((format!("fs/4 {deg}°"), Box::new(move |i| 2.0 * (std::f32::consts::FRAC_PI_2 * i as f32 + ph).sin())));
+        }
+        signals.push(("11 kHz".into(), Box::new(move |i| 2.0 * (tau * 11_000.0 * i as f32 / 48_000.0).sin())));
+        signals.push(("19 kHz".into(), Box::new(move |i| 2.0 * (tau * 19_000.0 * i as f32 / 48_000.0 + 0.3).sin())));
+        // A 3 kHz saw already clipped at full scale, then +12 dB.
+        signals.push((
+            "clipped saw".into(),
+            Box::new(move |i| {
+                let ph = (i as f32 * 3_000.0 / 48_000.0).fract();
+                (2.0 * (2.0 * ph - 1.0) * 1.5).clamp(-1.0, 1.0) * 4.0
+            }),
+        ));
+        signals.push(("clipped square".into(), Box::new(|i| if (i / 5) % 2 == 0 { 1.9 } else { -1.9 })));
+        let n = 8192;
+        let mut worst_excess = f32::MIN;
+        for os in [0.0f32, 1.0, 2.0] {
+            for (name, f) in &signals {
+                let mut lim = Limiter::new();
+                set_plain(&mut lim, p::OVERSAMPLING, os);
+                set_plain(&mut lim, p::CEILING, -1.0);
+                let (l, _) = process_stereo(&mut lim, |i| (f(i), f(i)), n);
+                let from = lim.latency() as usize + 1024;
+                let tp = reference_true_peak_db(&l, from, n - 64);
+                worst_excess = worst_excess.max(tp + 1.0);
+                eprintln!("os {os} {name}: {tp:+.3} dBTP");
+                assert!(tp <= -1.0 + 0.05, "{name} os {os}: {tp} dBTP");
+            }
+        }
+        eprintln!("worst excess over the ceiling: {worst_excess:+.3} dB");
+    }
+
     #[test]
     fn ceiling_is_kept_in_every_channel_mode() {
         let n = 24_000;
@@ -928,6 +1004,7 @@ mod tests {
     #[test]
     fn quiet_signal_passes_unchanged_after_latency() {
         let mut lim = Limiter::new();
+        set_plain(&mut lim, p::OVERSAMPLING, 0.0);
         let lat = lim.latency() as usize;
         let sig = |i: usize| {
             let v = 0.3 * (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin();
@@ -949,13 +1026,13 @@ mod tests {
                 set_plain(&mut lim, p::AUTO_GAIN, 0.0);
                 let lat = lim.latency() as usize;
                 // Exact base-rate PDC at 48 kHz for the default 1.5 ms
-                // lookahead: 1×/2×/4× = 87/123/120 samples; Mid/Side adds
-                // the 39-sample base-rate safety stage at 1×.
+                // lookahead: 1×/2×/4× = 95/135/130 samples; Mid/Side adds
+                // the 47-sample base-rate safety stage at 1×.
                 let want_lat = match (os as usize, mode as usize) {
-                    (0, 0) => 87,
-                    (0, 2) => 126,
-                    (1, 0) | (1, 2) => 123,
-                    (2, 0) | (2, 2) => 120,
+                    (0, 0) => 95,
+                    (0, 2) => 142,
+                    (1, 0) | (1, 2) => 135,
+                    (2, 0) | (2, 2) => 130,
                     _ => unreachable!(),
                 };
                 assert_eq!(lat, want_lat, "os {os} mode {mode}: declared latency");
@@ -970,6 +1047,7 @@ mod tests {
     #[test]
     fn latency_reports_lookahead() {
         let mut lim = Limiter::new();
+        set_plain(&mut lim, p::OVERSAMPLING, 0.0);
         set_plain(&mut lim, p::TRUE_PEAK, 0.0);
         set_plain(&mut lim, p::LOOKAHEAD, 2.0);
         assert_eq!(lim.latency(), 95);

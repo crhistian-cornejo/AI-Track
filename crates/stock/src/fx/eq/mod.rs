@@ -11,11 +11,15 @@
 //! (upward compression) — with its own threshold, ratio, knee and times.
 //!
 //! Phase modes (`Phase`):
-//! * **Minimum** — zero latency IIR. In **Matched** processing static bells,
-//!   shelves and band-passes are magnitude-matched biquads (Vicanek), no
-//!   cramping near Nyquist; dynamic bands, cuts, notches and tilt run on TPT
-//!   SVFs, which stay clean under modulation. **Classic** runs every band on
-//!   SVFs.
+//! * **Minimum** — zero latency IIR. **Matched** processing makes every band
+//!   (bells, shelves, band-passes, notches, cuts, tilt, dynamic or not) a
+//!   magnitude-matched design (Vicanek's matched second-order filters, first
+//!   order sections matched at DC and Nyquist): no cramping near Nyquist, so
+//!   the curve is the analogue one up to 20 kHz. Second-order sections run on
+//!   the TPT SVF structure with the biquad's poles and numerator (see
+//!   `SvfCoeffs::from_biquad`), which stays clean under fast automation and
+//!   dynamics. **Classic** runs every band as the plain bilinear SVF, cramped
+//!   near Nyquist like a classic digital EQ.
 //! * **Natural** — the analogue prototypes' magnitude *and* phase, sampled to
 //!   Nyquist and run as an FIR (see [`fir`]): no cramping and the phase of an
 //!   analogue EQ, for `b + D_nat` samples of latency (512 at 48 kHz).
@@ -47,7 +51,7 @@ pub mod analog;
 pub mod fir;
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, sidechain_frame, write_meter};
-use aitrack_dsp::biquad::{Biquad32, BiquadCoeffs, BiquadShape, BiquadState};
+use aitrack_dsp::biquad::{BiquadCoeffs, BiquadShape, FirstOrder, FirstOrderState};
 use aitrack_dsp::delay::DelayLine;
 use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower, gain_computer};
 use aitrack_dsp::smooth::Smoother;
@@ -300,7 +304,6 @@ pub fn dynamic_gain(direction: usize, level_db: f32, threshold: f32, ratio: f32,
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
-    Biquad,
     Svf,
     Cut,
     Tilt,
@@ -308,7 +311,7 @@ enum Engine {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ChState {
-    bq: BiquadState,
+    fo: FirstOrderState,
     svf: SvfState,
     cut: [SvfState; 8],
     op: OnePole,
@@ -341,13 +344,15 @@ struct Band {
     /// Output gain of a dynamic band-pass.
     out_gain: f32,
     engine: Engine,
-    bq64: BiquadCoeffs,
-    bq: Biquad32,
     svf: SvfCoeffs,
     cut: [SvfCoeffs; 8],
     n_cut2: usize,
     cut_first: bool,
     high_cut: bool,
+    /// Matched design: the first-order part (odd cuts, tilt) runs on `fo`
+    /// instead of the bilinear one-pole.
+    matched_fo: bool,
+    fo: FirstOrder,
     tilt_gl: f32,
     tilt_gh: f32,
     st: [ChState; 2],
@@ -377,13 +382,13 @@ impl Band {
             delta: 0.0,
             out_gain: 1.0,
             engine: Engine::Svf,
-            bq64: BiquadCoeffs::identity(),
-            bq: Biquad32::default(),
             svf: SvfCoeffs::passthrough(),
             cut: [SvfCoeffs::passthrough(); 8],
             n_cut2: 0,
             cut_first: false,
             high_cut: false,
+            matched_fo: false,
+            fo: FirstOrder::default(),
             tilt_gl: 1.0,
             tilt_gh: 1.0,
             st: [ChState::default(); 2],
@@ -413,13 +418,16 @@ impl Band {
         analog::Proto::new(self.ty, self.freq() as f64, g as f64, self.q.value() as f64, self.order)
     }
 
-    /// Recompute coefficients from the smoothed values.
+    /// Recompute coefficients from the smoothed values. With `matched` every
+    /// shape is the magnitude-matched design (no cramping towards Nyquist) —
+    /// second-order sections as matched biquads realised on the SVF, so they
+    /// stay clean under automation and dynamics — otherwise the bilinear SVF
+    /// of Classic mode.
     fn design(&mut self, matched: bool, sr: f64) {
         let f = self.freq();
         let q = self.q.value();
         let delta = if self.dynamic { self.delta } else { 0.0 };
         let g = if self.fir { delta } else { self.gain.value() + delta };
-        let static_ok = matched && !self.dynamic && !self.fir;
         let prev = self.engine;
         self.out_gain = 1.0;
         let shape = match self.ty {
@@ -431,23 +439,26 @@ impl Band {
             6 => Some((BiquadShape::Bandpass, SvfMode::Bandpass)),
             _ => None,
         };
+        self.matched_fo = matched;
         match (self.ty, shape) {
             (_, Some((bs, sm))) => {
-                if static_ok {
-                    self.bq64 = BiquadCoeffs::matched(bs, f as f64, q as f64, g as f64, sr);
-                    self.bq = self.bq64.into();
-                    self.engine = Engine::Biquad;
+                self.svf = if matched {
+                    SvfCoeffs::from_biquad(&BiquadCoeffs::matched(bs, f as f64, q as f64, g as f64, sr))
                 } else {
-                    self.svf = SvfCoeffs::new(sm, f, q, g, sr);
-                    self.engine = Engine::Svf;
-                    if self.ty == 6 && !self.fir {
-                        // A dynamic band-pass turns its whole output up or down.
-                        self.out_gain = db_to_gain(delta);
-                    }
+                    SvfCoeffs::new(sm, f, q, g, sr)
+                };
+                self.engine = Engine::Svf;
+                if self.ty == 6 && !self.fir {
+                    // A dynamic band-pass turns its whole output up or down.
+                    self.out_gain = db_to_gain(delta);
                 }
             }
             (5, _) => {
-                self.svf = SvfCoeffs::new(SvfMode::Notch, f, q, 0.0, sr);
+                self.svf = if matched {
+                    SvfCoeffs::from_biquad(&BiquadCoeffs::matched(BiquadShape::Notch, f as f64, q as f64, 0.0, sr))
+                } else {
+                    SvfCoeffs::new(SvfMode::Notch, f, q, 0.0, sr)
+                };
                 self.engine = Engine::Svf;
             }
             (3 | 4, _) => {
@@ -456,27 +467,37 @@ impl Band {
                 self.n_cut2 = n / 2;
                 self.cut_first = n % 2 == 1;
                 let mode = if self.high_cut { SvfMode::Lowpass } else { SvfMode::Highpass };
+                let shape = if self.high_cut { BiquadShape::Lowpass } else { BiquadShape::Highpass };
                 for k in 0..self.n_cut2 {
-                    self.cut[k] = SvfCoeffs::new(mode, f, bw_q(n, k), 0.0, sr);
+                    let sq = bw_q(n, k);
+                    self.cut[k] = if matched { SvfCoeffs::from_biquad(&BiquadCoeffs::matched(shape, f as f64, sq as f64, 0.0, sr)) } else { SvfCoeffs::new(mode, f, sq, 0.0, sr) };
                 }
-                for c in &mut self.st {
-                    c.op.set_freq(f, sr);
+                if matched {
+                    self.fo = FirstOrder::cut(!self.high_cut, f as f64, sr);
+                } else {
+                    for c in &mut self.st {
+                        c.op.set_freq(f, sr);
+                    }
                 }
                 self.engine = Engine::Cut;
             }
             _ => {
                 // Tilt: ±half the gain either side of the pivot.
-                for c in &mut self.st {
-                    c.op.set_freq(f, sr);
-                }
                 self.tilt_gl = db_to_gain(-0.5 * g);
                 self.tilt_gh = db_to_gain(0.5 * g);
+                if matched {
+                    self.fo = FirstOrder::matched(self.tilt_gl as f64, self.tilt_gh as f64, f as f64, sr);
+                } else {
+                    for c in &mut self.st {
+                        c.op.set_freq(f, sr);
+                    }
+                }
                 self.engine = Engine::Tilt;
             }
         }
         if self.engine != prev {
             for c in &mut self.st {
-                c.bq.reset();
+                c.fo.reset();
                 c.svf.reset();
                 c.cut = [SvfState::default(); 8];
             }
@@ -492,7 +513,6 @@ impl Band {
     fn tick(&mut self, c: usize, x: f32) -> f32 {
         let st = &mut self.st[c];
         match self.engine {
-            Engine::Biquad => st.bq.process(&self.bq, x),
             Engine::Svf => st.svf.process(&self.svf, x) * self.out_gain,
             Engine::Cut => {
                 let mut y = x;
@@ -500,14 +520,22 @@ impl Band {
                     y = st.cut[k].process(&self.cut[k], y);
                 }
                 if self.cut_first {
-                    let (lp, hp) = st.op.tick(y);
-                    y = if self.high_cut { lp } else { hp };
+                    if self.matched_fo {
+                        y = st.fo.process(&self.fo, y);
+                    } else {
+                        let (lp, hp) = st.op.tick(y);
+                        y = if self.high_cut { lp } else { hp };
+                    }
                 }
                 y
             }
             Engine::Tilt => {
-                let (lp, hp) = st.op.tick(x);
-                self.tilt_gl * lp + self.tilt_gh * hp
+                if self.matched_fo {
+                    st.fo.process(&self.fo, x)
+                } else {
+                    let (lp, hp) = st.op.tick(x);
+                    self.tilt_gl * lp + self.tilt_gh * hp
+                }
             }
         }
     }
@@ -572,7 +600,6 @@ impl Band {
     /// Complex response of the band as designed now.
     fn response(&self, f: f64, sr: f64) -> (f64, f64) {
         match self.engine {
-            Engine::Biquad => self.bq64.response(f, sr),
             Engine::Svf => {
                 let r = self.svf.response(f, sr);
                 let g = self.out_gain as f64;
@@ -584,12 +611,17 @@ impl Band {
                     acc = cmul(acc, self.cut[k].response(f, sr));
                 }
                 if self.cut_first {
-                    let lp = self.st[0].op.lowpass_response(f, sr);
-                    let r = if self.high_cut { lp } else { (1.0 - lp.0, -lp.1) };
-                    acc = cmul(acc, r);
+                    if self.matched_fo {
+                        acc = cmul(acc, self.fo.response(f, sr));
+                    } else {
+                        let lp = self.st[0].op.lowpass_response(f, sr);
+                        let r = if self.high_cut { lp } else { (1.0 - lp.0, -lp.1) };
+                        acc = cmul(acc, r);
+                    }
                 }
                 acc
             }
+            Engine::Tilt if self.matched_fo => self.fo.response(f, sr),
             Engine::Tilt => {
                 let lp = self.st[0].op.lowpass_response(f, sr);
                 let (gl, gh) = (self.tilt_gl as f64, self.tilt_gh as f64);
@@ -1121,3 +1153,6 @@ impl Processor for Eq {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod matched_tests;

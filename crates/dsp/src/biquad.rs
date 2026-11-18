@@ -88,8 +88,10 @@ impl BiquadCoeffs {
         Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
     }
 
-    /// Magnitude-matched design (no cramping near Nyquist). Notch and
-    /// all-pass have no meaningful magnitude fit and fall back to RBJ.
+    /// Magnitude-matched design (no cramping near Nyquist). The notch has its
+    /// zeros on the unit circle at the centre frequency and the poles of the
+    /// analogue prototype by impulse invariance, with unity gain at DC; the
+    /// all-pass has no magnitude to fit and falls back to RBJ.
     pub fn matched(shape: BiquadShape, freq: f64, q: f64, gain_db: f64, sample_rate: f64) -> Self {
         let f = freq.clamp(1.0, sample_rate * 0.4999);
         let q = q.clamp(0.025, 200.0);
@@ -97,7 +99,13 @@ impl BiquadCoeffs {
         let g = 10f64.powf(gain_db / 20.0);
         let a = g.sqrt();
         match shape {
-            BiquadShape::Notch | BiquadShape::Allpass => Self::rbj(shape, freq, q, gain_db, sample_rate),
+            BiquadShape::Allpass => Self::rbj(shape, freq, q, gain_db, sample_rate),
+            BiquadShape::Notch => {
+                let (a1, a2) = matched_poles(w0, q);
+                let c = w0.cos();
+                let k = (1.0 + a1 + a2) / (2.0 - 2.0 * c);
+                Self { b0: k, b1: -2.0 * c * k, b2: k, a1, a2 }
+            }
             BiquadShape::Lowpass => {
                 let (a1, a2) = matched_poles(w0, q);
                 let (aa0, aa1, aa2) = pole_terms(a1, a2);
@@ -190,6 +198,76 @@ impl BiquadCoeffs {
     pub fn magnitude_db(&self, freq: f64, sample_rate: f64) -> f64 {
         let (r, i) = self.response(freq, sample_rate);
         10.0 * (r * r + i * i).max(1e-30).log10()
+    }
+}
+
+/// First-order section `(b0 + b1 z⁻¹) / (1 + a1 z⁻¹)` for the cuts of odd
+/// order and the tilt, magnitude-matched like the second-order ones: the
+/// pole is the analogue pole by impulse invariance and the numerator is fixed
+/// by the analogue gain at DC and at Nyquist. Transposed direct form II.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FirstOrder {
+    b0: f32,
+    b1: f32,
+    a1: f32,
+}
+
+impl Default for FirstOrder {
+    fn default() -> Self {
+        Self { b0: 1.0, b1: 0.0, a1: 0.0 }
+    }
+}
+
+impl FirstOrder {
+    /// `(gl + gh s) / (1 + s)` with `s` normalised to `freq`: a low-pass is
+    /// `(1, 0)`, a high-pass `(0, 1)`, a tilt `(10^(-g/40), 10^(g/40))`.
+    pub fn matched(gl: f64, gh: f64, freq: f64, sample_rate: f64) -> Self {
+        let f = freq.clamp(0.1, sample_rate * 0.4999);
+        let w0 = 2.0 * PI * f / sample_rate;
+        let p = (-w0).exp();
+        let x = PI / w0;
+        let nyquist = ((gl * gl + gh * gh * x * x) / (1.0 + x * x)).sqrt();
+        let sum = gl * (1.0 - p);
+        let diff = nyquist * (1.0 + p);
+        Self { b0: (0.5 * (sum + diff)) as f32, b1: (0.5 * (sum - diff)) as f32, a1: (-p) as f32 }
+    }
+
+    /// Low-pass (`high == false`) or high-pass at `freq`.
+    pub fn cut(high: bool, freq: f64, sample_rate: f64) -> Self {
+        if high { Self::matched(0.0, 1.0, freq, sample_rate) } else { Self::matched(1.0, 0.0, freq, sample_rate) }
+    }
+
+    /// Complex response at `freq`, `(re, im)`.
+    pub fn response(&self, freq: f64, sample_rate: f64) -> (f64, f64) {
+        let w = 2.0 * PI * freq / sample_rate;
+        let (s, c) = w.sin_cos();
+        let (b0, b1, a1) = (self.b0 as f64, self.b1 as f64, self.a1 as f64);
+        let (nr, ni) = (b0 + b1 * c, -b1 * s);
+        let (dr, di) = (1.0 + a1 * c, -a1 * s);
+        let den = dr * dr + di * di;
+        ((nr * dr + ni * di) / den, (ni * dr - nr * di) / den)
+    }
+}
+
+/// State of one channel of a [`FirstOrder`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FirstOrderState {
+    s: f32,
+}
+
+impl FirstOrderState {
+    #[inline]
+    pub fn process(&mut self, c: &FirstOrder, x: f32) -> f32 {
+        let y = c.b0 * x + self.s;
+        self.s = c.b1 * x - c.a1 * y;
+        if self.s.abs() < 1e-20 {
+            self.s = 0.0;
+        }
+        y
+    }
+
+    pub fn reset(&mut self) {
+        self.s = 0.0;
     }
 }
 
@@ -397,6 +475,52 @@ mod tests {
             let mut st = BiquadState::default();
             let m = measure_gain_db(|x| st.process(&c32, x), f, sr);
             assert!((m - c.magnitude_db(f, sr)).abs() < 0.05);
+        }
+    }
+
+    #[test]
+    fn first_order_sections_track_the_analogue() {
+        for sr in [44_100.0, 48_000.0] {
+            for fc in [100.0, 1000.0, 8000.0, 12_000.0, 16_000.0] {
+                let lp = FirstOrder::cut(false, fc, sr);
+                let hp = FirstOrder::cut(true, fc, sr);
+                let tilt = FirstOrder::matched(10f64.powf(-6.0 / 40.0), 10f64.powf(6.0 / 40.0), fc, sr);
+                let mut worst = [0.0f64; 3];
+                let mut f = 20.0;
+                while f <= 20_000.0 {
+                    let x = f / fc;
+                    let db = |h: (f64, f64)| 10.0 * (h.0 * h.0 + h.1 * h.1).max(1e-30).log10();
+                    let lp_a = -10.0 * (1.0 + x * x).log10();
+                    let hp_a = 10.0 * (x * x / (1.0 + x * x)).log10();
+                    let (gl, gh) = (10f64.powf(-6.0 / 40.0), 10f64.powf(6.0 / 40.0));
+                    let tilt_a = 10.0 * ((gl * gl + gh * gh * x * x) / (1.0 + x * x)).log10();
+                    if lp_a > -30.0 {
+                        worst[0] = worst[0].max((db(lp.response(f, sr)) - lp_a).abs());
+                    }
+                    if hp_a > -30.0 {
+                        worst[1] = worst[1].max((db(hp.response(f, sr)) - hp_a).abs());
+                    }
+                    worst[2] = worst[2].max((db(tilt.response(f, sr)) - tilt_a).abs());
+                    f *= 1.05;
+                }
+                assert!(worst[0] < 1.2 && worst[1] < 1.2, "{sr} {fc}: lp {} hp {}", worst[0], worst[1]);
+                assert!(worst[2] < 0.5, "{sr} {fc}: tilt {}", worst[2]);
+            }
+        }
+        // The running section agrees with its response.
+        let c = FirstOrder::cut(false, 3000.0, 48_000.0);
+        let mut st = FirstOrderState::default();
+        let m = measure_gain_db(|x| st.process(&c, x), 3000.0, 48_000.0);
+        assert!((m + 3.01).abs() < 0.2, "{m}");
+    }
+
+    #[test]
+    fn matched_notch_sits_at_its_centre() {
+        let sr = 48_000.0;
+        for f0 in [200.0, 3000.0, 15_000.0] {
+            let c = BiquadCoeffs::matched(BiquadShape::Notch, f0, 2.0, 0.0, sr);
+            assert!(c.magnitude_db(f0, sr) < -80.0);
+            assert!(c.magnitude_db(20.0, sr).abs() < 0.1, "{f0}");
         }
     }
 

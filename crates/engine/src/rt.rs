@@ -554,8 +554,9 @@ impl AudioProcessor {
     }
 
     /// Wire the recording queues (control thread, before the callback runs).
-    pub(crate) fn attach_recorder(&mut self, midi_tx: rtrb::Producer<RecEvent>, audio_tx: rtrb::Producer<RecChunk>) {
+    pub(crate) fn attach_recorder(&mut self, midi_tx: rtrb::Producer<RecEvent>, cap_tx: rtrb::Producer<RecEvent>, audio_tx: rtrb::Producer<RecChunk>) {
         self.rec.midi_tx = Some(midi_tx);
+        self.rec.cap_tx = Some(cap_tx);
         self.rec.audio_tx = Some(audio_tx);
     }
 
@@ -937,6 +938,7 @@ impl AudioProcessor {
         });
         let lend = self.loop_range.map_or(f64::NAN, |(_, b)| b as f64);
         let rf = self.last_end_pos;
+        let playing = self.playing;
         let mut seen = 0u64;
         self.midi_base = 0;
         for rx in &mut self.q.midi_rx {
@@ -952,7 +954,9 @@ impl AudioProcessor {
                 } else {
                     self.status.rec_dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                if !recording {
+                // Not recording: while the transport rolls, the notes of armed
+                // tracks still go to the capture queue (Capture MIDI).
+                if !recording && !playing {
                     continue;
                 }
                 let capture = |rec: &mut RecState, status: &SharedStatus, track: usize| {
@@ -973,11 +977,12 @@ impl AudioProcessor {
                         pos += le - ls;
                         pass -= 1;
                     }
-                    if (pass == 0 && pos < rec.start_pos) || (rec.midi_tail && pos > rec.end_pos) {
+                    if recording && ((pass == 0 && pos < rec.start_pos) || (rec.midi_tail && pos > rec.end_pos)) {
                         return;
                     }
                     let tick = g.tempo.samples_to_tick(pos as f64, sr);
-                    rec.push_event(status, RecEvent { track: t.id.0, tick, pass, loop_end: lend, kind });
+                    let e = RecEvent { track: t.id.0, tick, pass, loop_end: lend, kind };
+                    if recording { rec.push_event(status, e) } else { rec.push_capture(e) }
                 };
                 match target {
                     Some(t) => capture(&mut self.rec, &self.status, t),

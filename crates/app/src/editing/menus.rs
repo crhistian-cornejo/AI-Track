@@ -390,6 +390,48 @@ pub fn take_lane_menu(ws: &mut Workspace, track: TrackId, lane: usize, cx: &mut 
         .into_any_element()
 }
 
+/// Right-click in an automation lane: Insert Shape over the selected time
+/// range (one cycle per grid step for the waves), Simplify Envelope, and the
+/// captures.
+pub fn automation_menu(ws: &mut Workspace, track: TrackId, target: aitrack_model::AutomationTarget, cx: &mut Context<Workspace>) -> AnyElement {
+    use aitrack_model::automation::Shape;
+    let range = ws.s.auto_sel.filter(|r| r.track == track && r.target == target && !r.is_empty());
+    let has_points = ws.s.project.track(track).is_some_and(|t| t.automation.iter().any(|l| l.target == target && !l.points.is_empty()));
+    let mut card = widgets::menu_card("automation-menu", 232.);
+    card = card.child(widgets::section_title(if range.is_some() { "Insert Shape" } else { "Insert Shape: drag to select time first" }));
+    if range.is_some() {
+        for shape in Shape::ALL {
+            let icon = match shape {
+                Shape::Sine => Icon::ShapeSine,
+                Shape::Triangle => Icon::ShapeTriangle,
+                Shape::SawUp => Icon::ShapeSawUp,
+                Shape::SawDown => Icon::ShapeSawDown,
+                Shape::Square => Icon::ShapeSquare,
+                Shape::RampUp => Icon::ShapeRampUp,
+                Shape::RampDown => Icon::ShapeRampDown,
+                Shape::SCurveUp => Icon::ShapeSUp,
+                Shape::SCurveDown => Icon::ShapeSDown,
+                Shape::Adsr => Icon::ShapeAdsr,
+            };
+            let row = menu_item(ElementId::Name(format!("auto-shape-{shape:?}").into()), Some(icon), shape.name(), None, false);
+            card = card.child(row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.menu = None;
+                this.s.insert_auto_shape(shape);
+                cx.notify();
+            })));
+        }
+    }
+    card = card.child(widgets::divider_h());
+    if has_points {
+        card = card.child(action("auto-simplify", Icon::Wand, "Simplify Envelope", None, false, cx, move |this, _, cx| {
+            if let Some(n) = this.s.simplify_auto(track, target) {
+                this.toast(format!("Simplified: {n} breakpoint{} fewer", if n == 1 { "" } else { "s" }), cx);
+            }
+        }));
+    }
+    card.child(command("auto-capture", Icon::Record, "Capture Automation", Cmd::CaptureAutomation, cx)).child(command("auto-capture-midi", Icon::Piano, "Capture MIDI", Cmd::CaptureMidi, cx)).into_any_element()
+}
+
 /// Right-click on a device's title bar: it acts on the picked devices,
 /// which the device under the mouse joined when the menu opened.
 pub fn device_menu(

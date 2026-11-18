@@ -187,6 +187,9 @@ pub enum Drag {
     /// Dragging the line inside the selected automation range raises or
     /// lowers just that part (`original` is the lane when the drag began).
     AutoShift { range: crate::state::AutoRange, original: Vec<AutomationPoint>, start_y: f32 },
+    /// A transform handle of the selected automation range: scale, skew or
+    /// time stretch. `lo`/`hi` are the range's lowest and highest value when it began.
+    AutoXform { range: crate::state::AutoRange, original: Vec<AutomationPoint>, kind: views::arrangement::XformKind, start_y: f32, lo: f32, hi: f32 },
     /// Dragging on a take lane picks a range of it; releasing promotes it into
     /// the main lane (with `hold`, from Shift, it waits for Enter).
     TakeRange { track: TrackId, lane: usize, anchor: Tick, hold: bool },
@@ -216,6 +219,8 @@ pub enum MenuKind {
     TrackContext(TrackId),
     /// Right-click on a take lane's header (track, index among its take lanes).
     TakeLaneContext(TrackId, usize),
+    /// Right-click in an automation lane: insert a shape, simplify, capture.
+    AutomationContext(TrackId, AutomationTarget),
     /// Right-click on a device's title bar (acts on the picked devices).
     DeviceContext(DeviceId),
     /// Right-click on a device row in the Cmd+K palette (favorite / reassign group).
@@ -860,6 +865,29 @@ impl Workspace {
                         self.s.arrange.px_per_beat = 24.;
                     }
                 }
+                // A sine over that range, one cycle per grid step (after `autorange`).
+                "autoshape" => {
+                    let lane = self.s.project.tracks.iter().find(|t| self.s.automation_shown.contains(&t.id)).and_then(|t| Some((t.id, t.automation.first()?.target)));
+                    if let Some((track, target)) = lane {
+                        self.s.set_auto_range(track, target, 8 * PPQ, 24 * PPQ);
+                        self.s.arrange.px_per_beat = 24.;
+                        self.s.insert_auto_shape(aitrack_model::automation::Shape::Sine);
+                        self.s.seal();
+                    }
+                }
+                // The first lane's range selected with its transform handles, after scaling it down a little.
+                "autoscale" => {
+                    let lane = self.s.project.tracks.iter().find(|t| self.s.automation_shown.contains(&t.id)).and_then(|t| Some((t.id, t.automation.first()?.target)));
+                    if let Some((track, target)) = lane {
+                        self.s.set_auto_range(track, target, 8 * PPQ, 24 * PPQ);
+                        self.s.arrange.px_per_beat = 24.;
+                        if let Some(r) = self.s.auto_sel {
+                            let original = self.s.project.track(r.track).and_then(|t| t.automation.iter().find(|l| l.target == r.target)).map(|l| l.points.clone()).unwrap_or_default();
+                            self.s.xform_auto_range(r, &original, crate::state::AutoXform::Scale { anchor: 0., factor: 0.7 });
+                            self.s.seal();
+                        }
+                    }
+                }
                 // Raise that range by a quarter (after `autorange`).
                 "autoraise" => {
                     if let Some(r) = self.s.auto_sel {
@@ -1283,6 +1311,14 @@ impl Workspace {
         let edits = self.b.engine.take_plugin_edits();
         // While recording with Automation Arm on, they are written into their lanes too.
         let t = self.b.engine.transport();
+        // Capture Automation / MIDI: the last minutes of moves and played notes, while rolling without recording.
+        self.s.capture.set_clock((t.playing && !t.recording).then_some(t.position));
+        let now = Instant::now();
+        let played = self.b.engine.take_captured_notes();
+        if !played.is_empty() {
+            self.s.capture.push_notes(now, played);
+        }
+        self.s.capture.prune(now);
         changed |= self.s.apply_plugin_edits(&edits, (t.recording && t.playing).then_some(t.position));
         // The usage read-out moves about once a second (3s in low-power mode) even when nothing else does.
         let (cpu, mem) = (self.usage.cpu, self.usage.memory);
@@ -2136,6 +2172,27 @@ impl Workspace {
                     Some((a, b)) => self.s.select_take_range(*track, *lane, a, b),
                     None => self.s.select_take_range(*track, *lane, *anchor, at),
                 }
+            }
+            Drag::AutoXform { range, original, kind, start_y, lo, hi } => {
+                use crate::state::AutoXform;
+                use views::arrangement::XformKind as K;
+                let dy = (*start_y - f32::from(e.position.y)) / views::arrangement::auto_value_px() * fine;
+                let h = (*hi - *lo).max(0.05);
+                let mid = (*lo + *hi) * 0.5;
+                let (tick, _) = self.arrange_pos(e.position);
+                let at = self.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+                let xf = match kind {
+                    // Alt scales about the middle (both edges move), else about the opposite edge.
+                    K::ScaleTop if e.modifiers.alt => AutoXform::Scale { anchor: mid, factor: ((h + 2. * dy) / h).clamp(-4., 4.) },
+                    K::ScaleTop => AutoXform::Scale { anchor: *lo, factor: ((h + dy) / h).clamp(-4., 4.) },
+                    K::ScaleBottom if e.modifiers.alt => AutoXform::Scale { anchor: mid, factor: ((h - 2. * dy) / h).clamp(-4., 4.) },
+                    K::ScaleBottom => AutoXform::Scale { anchor: *hi, factor: ((h - dy) / h).clamp(-4., 4.) },
+                    K::SkewLeft => AutoXform::Skew { left: dy, right: 0. },
+                    K::SkewRight => AutoXform::Skew { left: 0., right: dy },
+                    K::StretchLeft => AutoXform::Stretch { start: at.min(range.end - 1), end: range.end },
+                    K::StretchRight => AutoXform::Stretch { start: range.start, end: at.max(range.start + 1) },
+                };
+                self.s.xform_auto_range(*range, original, xf);
             }
             Drag::AutoShift { range, original, start_y } => {
                 let delta = (*start_y - f32::from(e.position.y)) / views::arrangement::auto_value_px() * fine;

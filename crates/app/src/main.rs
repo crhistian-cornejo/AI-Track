@@ -18,6 +18,7 @@ mod autosave;
 mod appearance;
 mod assets;
 mod bridge;
+mod capture;
 mod demo;
 mod dev_hidden;
 mod grid;

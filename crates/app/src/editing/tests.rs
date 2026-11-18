@@ -1,6 +1,8 @@
 use super::*;
 use crate::state::{AppState, KeyEdit, Snap};
 
+mod auto_tests;
+
 const BEAT: Tick = PPQ;
 
 /// An empty song with two MIDI tracks and an audio track, snapping off.

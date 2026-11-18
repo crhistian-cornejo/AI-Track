@@ -532,6 +532,8 @@ pub(crate) struct RecState {
     pub tracks: Vec<CapTrack>,
     closing: Vec<Closing>,
     pub midi_tx: Option<Producer<RecEvent>>,
+    /// Notes played while not recording (Capture MIDI); a full queue just drops them.
+    pub cap_tx: Option<Producer<RecEvent>>,
     pub audio_tx: Option<Producer<RecChunk>>,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
@@ -556,6 +558,7 @@ impl RecState {
             tracks: Vec::with_capacity(MAX_REC_TRACKS),
             closing: Vec::with_capacity(2 * MAX_REC_TRACKS),
             midi_tx: None,
+            cap_tx: None,
             audio_tx: None,
             scratch_l: vec![0.0; max_frames.max(REC_CHUNK)],
             scratch_r: vec![0.0; max_frames.max(REC_CHUNK)],
@@ -635,6 +638,14 @@ impl RecState {
             return;
         }
         status.rec_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queue a note event played while not recording; wait-free, and a full
+    /// queue drops it (the capture buffer only keeps the recent past).
+    pub fn push_capture(&mut self, e: RecEvent) {
+        if let Some(tx) = self.cap_tx.as_mut() {
+            let _ = tx.push(e);
+        }
     }
 
     /// Send the block's input of every recorded track (`frames` frames of

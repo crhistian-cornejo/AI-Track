@@ -124,6 +124,40 @@ fn automation_line(lane: &aitrack_model::AutomationLane, px_per_tick: f32, scrol
     out
 }
 
+/// The handles of a selected automation range, as in Live 12: the top and
+/// bottom ones scale the envelope vertically (about the opposite edge of
+/// its box), the corners skew it, the side ones stretch it in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XformKind {
+    ScaleTop,
+    ScaleBottom,
+    SkewLeft,
+    SkewRight,
+    StretchLeft,
+    StretchRight,
+}
+
+/// Where the handles of a range box sit in a lane: `l`/`r` are its edges in
+/// x, `lo`/`hi` the lowest and highest value inside, and the result's y is
+/// px below the lane's top. A box too flat to grab is padded to 12 px.
+pub fn xform_handles(l: f32, r: f32, lo: f32, hi: f32) -> [(XformKind, f32, f32); 6] {
+    let mut top = (1. - hi) * auto_value_px() + 6.;
+    let mut bottom = (1. - lo) * auto_value_px() + 6.;
+    if bottom - top < 12. {
+        let mid = (top + bottom) * 0.5;
+        (top, bottom) = (mid - 6., mid + 6.);
+    }
+    let (cx, my) = ((l + r) * 0.5, (top + bottom) * 0.5);
+    [
+        (XformKind::ScaleTop, cx, top),
+        (XformKind::ScaleBottom, cx, bottom),
+        (XformKind::SkewLeft, l, top),
+        (XformKind::SkewRight, r, top),
+        (XformKind::StretchLeft, l, my),
+        (XformKind::StretchRight, r, my),
+    ]
+}
+
 /// Normalised automation value under a window position in `track`'s lane for `target`.
 pub fn automation_value_at(ws: &Workspace, track: TrackId, target: AutomationTarget, pos: Point<Pixels>) -> Option<f32> {
     let row = rows(&ws.s).into_iter().find(|r| r.track == track)?;
@@ -296,6 +330,8 @@ struct AutoPaint {
     /// A lane with no breakpoints: the value it holds (the fader, the knob),
     /// drawn as a faint flat line, as in Live.
     idle: Option<f32>,
+    /// The lowest and highest value inside the selected range: the box the transform handles surround.
+    xform: Option<(f32, f32)>,
 }
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
@@ -425,6 +461,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
                 sel: ws.s.auto_sel.filter(|r| r.track == t.id && r.target == target).map(|r| (r.start as f32 * px_per_tick - view.scroll_x, r.end as f32 * px_per_tick - view.scroll_x)),
                 idle: if lane.is_none() { current_value(&ws.s.project, t, target) } else { None },
+                xform: ws.s.auto_sel.filter(|r| r.track == t.id && r.target == target && !r.is_empty()).and_then(|r| aitrack_model::automation::extent(&lane?.points, r.start, r.end)),
             });
         }
     }
@@ -555,6 +592,13 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         window.paint_quad(paint::fill_rect(at(o, r - 1., a.y, 1., auto_h() - 1.), accent_alpha(0.8)));
                     }
                 }
+                if let (Some((l, r)), Some((lo, hi))) = (a.sel, a.xform) {
+                    // Painted over the line below; the box is drawn first, the handles after the points.
+                    let handles = xform_handles(l, r, lo, hi);
+                    let (top, bottom) = (handles[0].2, handles[1].2);
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y + top, (r - l).max(0.), 1.), accent_alpha(0.45)));
+                    window.paint_quad(paint::fill_rect(at(o, l, a.y + bottom, (r - l).max(0.), 1.), accent_alpha(0.45)));
+                }
                 if let Some(v) = a.idle {
                     let y = lane_top + lane_h * (1. - v);
                     window.paint_quad(paint::fill_rect(at(o, 0., y, w, 1.), with_alpha(a.color, 0.35)));
@@ -580,6 +624,24 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         a.color,
                         1.5,
                     ));
+                }
+                // The transform handles: squares scale, diamonds skew, bars stretch.
+                if let (Some((l, r)), Some((lo, hi))) = (a.sel, a.xform) {
+                    for (kind, hx, hy) in xform_handles(l, r, lo, hi) {
+                        let c = point(o.x + px(hx), o.y + px(a.y + hy));
+                        let (w_, h_, round) = match kind {
+                            XformKind::ScaleTop | XformKind::ScaleBottom => (8., 8., 1.),
+                            XformKind::SkewLeft | XformKind::SkewRight => (8., 8., 4.),
+                            XformKind::StretchLeft | XformKind::StretchRight => (4., 12., 2.),
+                        };
+                        window.paint_quad(paint::rrect_border(
+                            gpui::Bounds::new(point(c.x - px(w_ * 0.5), c.y - px(h_ * 0.5)), gpui::size(px(w_), px(h_))),
+                            round,
+                            p().well,
+                            accent(),
+                            1.5,
+                        ));
+                    }
                 }
             }
             // Time selection and insert marker.
@@ -1680,6 +1742,17 @@ fn auto_lane_down(ws: &mut Workspace, track: TrackId, target: AutomationTarget, 
         cx.notify();
         return;
     }
+    // The transform handles of the selected range come before everything else.
+    if let Some(r) = selected.filter(|r| !r.is_empty())
+        && let Some((lo, hi)) = aitrack_model::automation::extent(&points, r.start, r.end)
+    {
+        let (l, rx) = (r.start as f32 * ppt, r.end as f32 * ppt);
+        if let Some((kind, ..)) = xform_handles(l, rx, lo, hi).into_iter().find(|(_, hx, hy)| (hx - x).abs() <= 6. && (hy - y).abs() <= 6.) {
+            ws.s.seal();
+            ws.begin_drag(Drag::AutoXform { range: r, original: points, kind, start_y: f32::from(e.position.y), lo, hi }, cx);
+            return;
+        }
+    }
     // Alt + drag between two breakpoints bends that segment.
     if hit.is_none() && e.modifiers.alt {
         if let Some(i) = points.windows(2).position(|w| tick >= w[0].tick && tick < w[1].tick) {
@@ -1746,6 +1819,11 @@ fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: 
             if let Some(i) = hit {
                 ws.s.delete_automation_point(row.track, target, i);
                 cx.notify();
+            } else {
+                // Elsewhere in the lane: shapes over the selected range, simplify, capture.
+                ws.s.selected_track = Some(row.track);
+                ws.menu = None;
+                ws.open_menu(MenuKind::AutomationContext(row.track, target), e.position, cx);
             }
         }
         return;

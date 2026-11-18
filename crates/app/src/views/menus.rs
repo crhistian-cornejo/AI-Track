@@ -27,6 +27,7 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::ClipContext => crate::editing::menus::clip_menu(ws, cx),
         MenuKind::LaneContext => crate::editing::menus::lane_menu(cx),
         MenuKind::TrackContext(track) => crate::editing::menus::track_menu(ws, *track, cx),
+        MenuKind::AutomationContext(track, target) => crate::editing::menus::automation_menu(ws, *track, *target, cx),
         MenuKind::TakeLaneContext(track, lane) => crate::editing::menus::take_lane_menu(ws, *track, *lane, cx),
         MenuKind::DeviceContext(device) => crate::editing::menus::device_menu(ws, *device, cx),
         MenuKind::PaletteDevice { key, name, instrument } => palette_device_menu(ws, key, name, *instrument, cx),

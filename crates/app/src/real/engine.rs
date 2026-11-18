@@ -770,6 +770,10 @@ impl EngineBridge for RealEngine {
         self.handle.take_recorded_notes().into_iter().map(rec_note).collect()
     }
 
+    fn take_captured_notes(&mut self) -> Vec<RecNote> {
+        self.handle.take_captured_notes().into_iter().map(rec_note).collect()
+    }
+
     fn finish_midi_recording(&mut self) -> Option<MidiTake> {
         let t = self.handle.finish_midi_recording()?;
         Some(MidiTake { notes: t.notes.into_iter().map(rec_note).collect(), start_tick: t.start_tick, end_tick: t.end_tick, passes: t.passes })

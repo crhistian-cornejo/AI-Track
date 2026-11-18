@@ -692,3 +692,30 @@ fn lost_and_late_input_frames_are_counted() {
     let lost = h.recording_info().input_dropped_frames;
     assert_eq!(lost, ((20 - 1 - 4) * BLOCK) as u64, "{lost}");
 }
+
+#[test]
+fn notes_played_while_rolling_without_recording_are_captured_at_their_tick() {
+    let (p, _track) = synth_project();
+    let (h, mut proc_) = start(&p);
+    // Stopped: nothing is kept.
+    run_block(&h, &mut proc_, 1, 0, &[]);
+    h.play();
+    let mut events: Vec<(usize, MidiMessage)> = Vec::new();
+    events.extend(note(60, 1_000, 480));
+    events.extend(note(64, 3_000, 240));
+    let blocks = 2 * BAR / BLOCK;
+    for m in 2..blocks {
+        run_block(&h, &mut proc_, m, 1, &events);
+    }
+    let got = h.take_captured_notes();
+    assert_eq!(got.len(), 2, "{got:?}");
+    // Positions are within a few ticks of where they were played, shifted by the block alignment of this harness.
+    let (a, b) = (got[0], got[1]);
+    assert_eq!((a.key, b.key), (60, 64));
+    assert!((a.start_tick - 1_000).abs() <= 40, "{a:?}");
+    assert!((b.start_tick - 3_000).abs() <= 40, "{b:?}");
+    assert!((a.length_ticks - 480).abs() <= 40, "{a:?}");
+    assert!(h.take_captured_notes().is_empty(), "each note is handed out once");
+    assert!(h.take_recorded_notes().is_empty(), "and none was recorded");
+    assert!(h.finish_midi_recording().is_none());
+}

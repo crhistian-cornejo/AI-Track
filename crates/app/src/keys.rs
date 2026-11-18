@@ -120,6 +120,9 @@ commands! {
     InsertSilence,
     Quantize,
     InsertMidiClip,
+    CaptureMidi,
+    CaptureAutomation,
+    SimplifyEnvelope,
     NarrowGrid,
     WidenGrid,
     TripletGrid,
@@ -185,18 +188,21 @@ pub static TABLE: &[Entry] = &[
     cmd(Cmd::DuplicateTime, "Duplicate Time", "Repeat the selected time on every track, pushing what follows later.", C::Editing, &["mod-shift-d"]),
     cmd(Cmd::InsertSilence, "Insert Silence", "Insert empty time the length of the time selection on every track.", C::Editing, &["mod-shift-i"]),
     cmd(Cmd::InsertMidiClip, "Insert MIDI Clip", "An empty MIDI clip in the time selection, or one bar at the insert marker.", C::Editing, &["mod-shift-m"]),
-    main("NudgeLeft", "Nudge Left", "Move the selected clips or notes one grid step earlier (or the insert marker).", C::Editing, K, &["left"]),
+    cmd(Cmd::CaptureMidi, "Capture MIDI", "Turn what you played on armed tracks while the song rolled, the last minutes, into a MIDI clip at the positions you played it.", C::Editing, &[]),
+    cmd(Cmd::CaptureAutomation, "Capture Automation", "Write the knob and fader moves of the last minutes into automation lanes, at the positions where you made them.", C::Editing, &[]),
+    cmd(Cmd::SimplifyEnvelope, "Simplify Envelope", "Fewer breakpoints for the same automation curve: in the selected range, or in the whole lane.", C::Editing, &[]),
+    main("NudgeLeft", "Nudge Left", "Move the selected clips or notes one grid step earlier (or the insert marker); with an automation range selected, its envelope.", C::Editing, K, &["left"]),
     main("NudgeRight", "Nudge Right", "Move the selected clips or notes one grid step later (or the insert marker).", C::Editing, K, &["right"]),
     main("Escape", "Close / Deselect", "Close the open menu or dialog and clear the selection.", C::Editing, K, &["escape"]),
     // Notes
-    main("NudgeUp", "Up", "Move the selected notes up one step of the scale; in the arrangement, select the track above.", C::Notes, K, &["up"]),
-    main("NudgeDown", "Down", "Move the selected notes down one step of the scale; in the arrangement, select the track below.", C::Notes, K, &["down"]),
+    main("NudgeUp", "Up", "Move the selected notes up one step of the scale; in the arrangement, select the track above; with an automation range selected, raise its envelope 5 %.", C::Notes, K, &["up"]),
+    main("NudgeDown", "Down", "Move the selected notes down one step of the scale; in the arrangement, select the track below; with an automation range selected, lower its envelope 5 %.", C::Notes, K, &["down"]),
     main("SemitoneUp", "Semitone Up", "Move the selected notes up a semitone.", C::Notes, K, &["alt-up"]),
     main("SemitoneDown", "Semitone Down", "Move the selected notes down a semitone.", C::Notes, K, &["alt-down"]),
-    main("OctaveUp", "Octave Up", "Move the selected notes up an octave.", C::Notes, K, &["shift-up"]),
-    main("OctaveDown", "Octave Down", "Move the selected notes down an octave.", C::Notes, K, &["shift-down"]),
-    main("Longer", "Longer", "Lengthen the selected notes by a grid step.", C::Notes, K, &["shift-right"]),
-    main("Shorter", "Shorter", "Shorten the selected notes by a grid step.", C::Notes, K, &["shift-left"]),
+    main("OctaveUp", "Octave Up", "Move the selected notes up an octave; with an automation range selected, raise its envelope 1 %.", C::Notes, K, &["shift-up"]),
+    main("OctaveDown", "Octave Down", "Move the selected notes down an octave; with an automation range selected, lower its envelope 1 %.", C::Notes, K, &["shift-down"]),
+    main("Longer", "Longer", "Lengthen the selected notes by a grid step; with an automation range selected, move its envelope a fine step later.", C::Notes, K, &["shift-right"]),
+    main("Shorter", "Shorter", "Shorten the selected notes by a grid step; with an automation range selected, move its envelope a fine step earlier.", C::Notes, K, &["shift-left"]),
     main("VelocityUp", "Velocity Up", "Raise the velocity of the selected notes.", C::Notes, K, &["mod-up"]),
     main("VelocityDown", "Velocity Down", "Lower the velocity of the selected notes.", C::Notes, K, &["mod-down"]),
     cmd(Cmd::Quantize, "Quantize", "Move note starts to the grid (the selection, or the whole clip).", C::Notes, &["mod-u"]),
@@ -449,7 +455,7 @@ mod tests {
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
         const KEYLESS: &[Bound] =
-            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack)];
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack), Bound::Cmd(Cmd::CaptureMidi), Bound::Cmd(Cmd::CaptureAutomation), Bound::Cmd(Cmd::SimplifyEnvelope)];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

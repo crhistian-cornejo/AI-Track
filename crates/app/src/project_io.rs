@@ -711,7 +711,7 @@ impl Workspace {
 }
 
 /// Where the first Save As opens: the user's music or documents folder.
-fn default_folder() -> PathBuf {
+pub(crate) fn default_folder() -> PathBuf {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
     [home.join("Music"), home.join("Documents"), home.clone()].into_iter().find(|p| p.is_dir()).unwrap_or(home)
 }

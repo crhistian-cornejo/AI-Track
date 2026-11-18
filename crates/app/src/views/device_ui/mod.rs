@@ -21,6 +21,7 @@ pub mod acid_gen;
 pub mod analyzer;
 pub mod arp;
 pub mod autopan;
+pub mod bloom;
 pub mod buscomp;
 pub mod chorus;
 pub mod chord;
@@ -315,6 +316,8 @@ pub struct UiState {
     pub drum_extract: HashMap<DeviceId, drum_extract::ExtractViewState>,
     /// The device windows' frame: A/B slots, preset list, meter peaks, latency probe.
     pub chrome: HashMap<DeviceId, crate::views::device_window::chrome::ChromeState>,
+    /// The Bloom editors: scenes, cell motion, background jobs.
+    pub bloom: bloom::window::view::BloomState,
     last_change: Instant,
     pub sample_rate: f64,
 }
@@ -342,6 +345,7 @@ impl Default for UiState {
             vault: Default::default(),
             drum_extract: HashMap::new(),
             chrome: HashMap::new(),
+            bloom: Default::default(),
             last_change: Instant::now() - Duration::from_secs(10),
             sample_rate: 48_000.,
         }
@@ -464,6 +468,7 @@ impl UiState {
         self.vault.prune(&alive);
         self.drum_extract.retain(|id, _| alive(*id));
         self.chrome.retain(|id, _| alive(*id));
+        self.bloom.prune(&alive);
     }
 }
 
@@ -754,6 +759,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "instrument.sampler"
             | "instrument.drum"
             | "instrument.vault"
+            | "instrument.bloom"
     )
 }
 
@@ -804,6 +810,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "instrument.sampler" => sampler::render(ws, dev, d, cx),
         "instrument.drum" => drum::render(ws, dev, d, cx),
         "instrument.vault" => vault::render(ws, dev, cx),
+        "instrument.bloom" => bloom::render(ws, dev, d, cx),
         _ => generic::render(ws, dev, cx),
     }
 }

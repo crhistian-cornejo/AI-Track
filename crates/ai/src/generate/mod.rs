@@ -20,6 +20,7 @@
 //! [`Generated`] into commands.
 
 pub mod acid;
+pub mod bloom;
 pub mod context;
 pub mod draft;
 pub mod feel;

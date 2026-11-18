@@ -1,6 +1,7 @@
 //! Stock instruments.
 
 pub mod acid303;
+pub mod bloom;
 pub mod drum;
 pub mod granular;
 pub mod kick808;

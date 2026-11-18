@@ -119,6 +119,7 @@ pub fn editor_extent(plugin: &str) -> (f32, f32) {
         p if p.starts_with("midi.") => (680., 500.),
         "instrument.kick808" => (720., 560.),
         "instrument.acid303" => (960., 640.),
+        "instrument.bloom" => (1080., 760.),
         _ => (700., 380.),
     }
 }

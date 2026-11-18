@@ -1222,6 +1222,12 @@ impl Workspace {
                 // first and `vaultfilter=keys` / `vaultfilter=warm` filters
                 // its browser by a type or a character tag.
                 "vaultwin" => self.window_pending = self.dev_vault(),
+                // A Bloom on a new track with a seeded scene; `bloomwin` opens its
+                // window, `bloomplay` lights cells with synthetic activity.
+                "bloom" | "bloomplay" => {
+                    let _ = views::device_ui::bloom::dev_word(self, word);
+                }
+                "bloomwin" => self.window_pending = views::device_ui::bloom::dev_word(self, word),
                 _ if word.starts_with("vaultpreset=") || word.starts_with("vaultfilter=") => {
                     let Some(id) = self.dev_vault() else { continue };
                     let value = word.split_once('=').map_or("", |(_, v)| v);

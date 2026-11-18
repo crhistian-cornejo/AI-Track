@@ -46,6 +46,11 @@ fn bridges() -> bridge::Bridges {
 }
 
 fn main() {
+    // `aitrack --version` (used by the packaging checks) answers before any window or audio exists.
+    if std::env::args().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("aitrack {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let platform = gpui_platform::current_platform(false);
     gpui::Application::with_platform(platform).with_assets(assets::Assets).run(|cx: &mut App| {
         fps::install(cx);

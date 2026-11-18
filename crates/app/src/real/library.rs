@@ -29,7 +29,8 @@ const FACTORY: usize = 0;
 const USER: usize = 1;
 
 /// The factory sound bank: the setting, then `AITRACK_CONTENT_DIR`, then
-/// `<exe dir>/content`, then the repository's `content/` folder. Each may
+/// `<exe dir>/content`, `<exe dir>/../Resources/content` (inside a macOS `.app`), then, in
+/// debug builds only, the repository's `content/` folder. Each may
 /// point at the content folder or straight at the sound bank folder.
 pub fn find_factory_db(setting: Option<&Path>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -37,7 +38,9 @@ pub fn find_factory_db(setting: Option<&Path>) -> Option<PathBuf> {
     candidates.extend(std::env::var_os("AITRACK_CONTENT_DIR").map(PathBuf::from));
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         candidates.push(dir.join("content"));
+        candidates.push(dir.join("../Resources/content"));
     }
+    #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content"));
     candidates.into_iter().flat_map(|c| [c.join("factory.db"), c.join("soundbank").join("factory.db")]).find(|p| p.is_file())
 }

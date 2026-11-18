@@ -466,6 +466,15 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     let playhead = transport.position as f32 * px_per_tick - view.scroll_x;
     let loop_px = loop_region.map(|(a, b)| (a as f32 * px_per_tick - view.scroll_x, b as f32 * px_per_tick - view.scroll_x));
     let end_px = song_end as f32 * px_per_tick - view.scroll_x;
+    // Locators: (x in the ruler, name, selected, tag width).
+    let selected_locator = ws.s.ed.locator;
+    let locator_marks: Vec<(f32, String, bool, f32)> = ws
+        .s
+        .project
+        .locators
+        .iter()
+        .map(|l| (l.tick as f32 * px_per_tick - view.scroll_x, crate::editing::locators::shown_name(&l.name), selected_locator == Some(l.id), crate::editing::locators::tag_width(&l.name)))
+        .collect();
 
     // What is under the pointer is worked out while painting, from these.
     let boxes: Rc<[ClipBox]> = clips.iter().map(|c| c.bx).collect();
@@ -659,6 +668,17 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             ruler_overlay.paint_ruler(window, cx, o, w, h, m().ruler_loop_h);
             ruler_overlay.paint_ruler_selection(window, o, h);
             ruler_overlay.paint_marker_flag(window, o, w, h);
+            // Locators: a mark down the ruler under the loop strip and a tag with the name.
+            let lh = m().ruler_loop_h;
+            for (x, name, selected, tag_w) in &locator_marks {
+                if *x + *tag_w < 0. || *x > w {
+                    continue;
+                }
+                let (tint, ink) = if *selected { (p().accent2, p().on_accent) } else { (with_alpha(p().accent2, 0.28), p().text) };
+                window.paint_quad(paint::fill_rect(at(o, *x, lh, 1., h - lh), p().accent2));
+                window.paint_quad(paint::rrect(at(o, *x + 1., lh, *tag_w - 1., h - lh - 2.), 2., tint));
+                paint::text(window, cx, name, o.x + px(*x + 5.), o.y + px(lh), TEXT_XS, ink, FontWeight::MEDIUM, TextAlign::Left);
+            }
             if playhead >= 0. && playhead <= w {
                 paint::polygon(
                     window,
@@ -678,18 +698,43 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .cursor_pointer()
         .child(ruler)
         .on_pinch(cx.listener(on_pinch))
-        .tooltip(widgets::tip("Click to place the insert marker · drag the top strip to set the loop", None))
+        .tooltip(widgets::tip("Click to place the insert marker · drag the top strip to set the loop · right-click a locator for its menu", None))
         .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
             this.focus.focus(window, cx);
             let b = this.regions.ruler.get();
             let y = f32::from(e.position.y - b.origin.y);
             let x = f32::from(e.position.x - b.origin.x) + this.s.arrange.scroll_x;
             let tick = (x / this.s.arrange.px_per_beat * PPQ as f32) as Tick;
+            let hit = (y >= m().ruler_loop_h)
+                .then(|| crate::editing::locators::locator_at(&this.s.project, this.s.arrange.px_per_beat / PPQ as f32, this.s.arrange.scroll_x, f32::from(e.position.x - b.origin.x)))
+                .flatten();
             if y < m().ruler_loop_h {
                 let anchor = this.s.snap_tick(crate::editing::GridView::Arrange, tick, e.modifiers.alt).max(0);
                 this.begin_drag(Drag::LoopBrace { anchor }, cx);
+            } else if let Some(id) = hit {
+                // A locator: click jumps there, drag moves it, double-click renames it.
+                this.s.ed.area = crate::editing::Area::Arrange;
+                this.s.ed.locator = Some(id);
+                if e.click_count >= 2 {
+                    crate::commands::open_rename_for(this, Some(crate::commands::RenameTarget::Locator(id)), window, cx);
+                } else {
+                    let grab = this.s.project.locator(id).map_or(0, |l| tick - l.tick);
+                    this.begin_drag(Drag::Locator { id, grab, moved: false }, cx);
+                }
             } else {
                 crate::editing::gestures::ruler_down(this, tick, e, cx);
+            }
+        }))
+        .on_mouse_down(MouseButton::Right, cx.listener(|this, e: &MouseDownEvent, window, cx| {
+            this.focus.focus(window, cx);
+            let b = this.regions.ruler.get();
+            let y = f32::from(e.position.y - b.origin.y);
+            let hit = (y >= m().ruler_loop_h)
+                .then(|| crate::editing::locators::locator_at(&this.s.project, this.s.arrange.px_per_beat / PPQ as f32, this.s.arrange.scroll_x, f32::from(e.position.x - b.origin.x)))
+                .flatten();
+            if let Some(id) = hit {
+                this.s.ed.locator = Some(id);
+                this.open_menu(MenuKind::LocatorContext(id), e.position, cx);
             }
         }))
         .on_scroll_wheel(cx.listener(on_wheel));
@@ -726,6 +771,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .child(label(ws.s.snap_label(crate::editing::GridView::Arrange), TEXT_SM, pal.text)),
         )
         .child(div().flex_1())
+        // Add Locator (Live's Set Locator): at the playhead, or the insert marker when stopped.
+        .child(
+            widgets::sized_icon_button("add-locator", Icon::Flag, false, m().ruler_h - SP1, 14.)
+                .tooltip(widgets::tip("Add a locator at the playhead, or the insert marker when stopped · click a mark to jump, drag to move, double-click to rename", None))
+                .on_click(cx.listener(|this, _, _, cx| this.set_locator_here(cx))),
+        )
         // Live's Automation Arm: while recording, a control moved in a
         // plugin's window writes its automation.
         .child(
@@ -1018,9 +1069,10 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
     // Frozen (Live): an ice-blue header with a snowflake; rendering: a progress bar and a way out.
     let frozen = t.is_frozen();
     let rendering = ws.freeze.progress(id);
+    let verb = ws.freeze.verb(id);
     let tint = |c: Hsla| if frozen { mix(c, pal.frozen, 0.14) } else { c };
     let shown_name = match rendering {
-        Some(f) => format!("{} · freezing {}%", t.name, (f * 100.).round() as u32),
+        Some(f) => format!("{} · {} {}%", t.name, ws.freeze.verb(id), (f * 100.).round() as u32),
         None => t.name.clone(),
     };
     // One step per group the track is in, capped so deep trees keep their names.
@@ -1201,7 +1253,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                     .bottom_0()
                     .h(px(SP1))
                     .bg(with_alpha(pal.frozen, 0.2))
-                    .tooltip(widgets::tip("Freezing… click to cancel", None))
+                    .tooltip(widgets::tip(if verb == "bouncing" { "Bouncing… click to cancel" } else { "Freezing… click to cancel" }, None))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.cancel_freeze(id, cx);

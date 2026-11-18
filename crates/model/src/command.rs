@@ -229,6 +229,13 @@ pub enum Command {
     /// The global groove amount, 0..=1.3 (Live's Global Groove Amount).
     SetGrooveAmount { amount: f32 },
 
+    /// Put a locator on the ruler (ids come from `Project::alloc_locator_id`).
+    AddLocator { locator: Locator },
+    RemoveLocator { id: LocatorId },
+    /// Move a locator to `tick`; coalesces like a drag.
+    MoveLocator { id: LocatorId, tick: Tick },
+    RenameLocator { id: LocatorId, name: String },
+
     /// Freeze an Instrument or Audio track: from now on the engine plays
     /// `file` (the track's clips and device chain rendered offline from tick
     /// 0) and runs none of its devices. Mixer and mixer automation stay live.
@@ -247,6 +254,12 @@ pub enum Command {
 }
 
 type R = Result<Command, CommandError>;
+
+/// Locators stay in order of position (ties by id), so lookups of the
+/// previous / next one are a scan.
+fn sort_locators(p: &mut Project) {
+    p.locators.sort_by_key(|l| (l.tick, l.id));
+}
 
 impl Command {
     /// Short human label for undo menus and agent proposals.
@@ -282,6 +295,10 @@ impl Command {
             RemoveSource { .. } | RemoveClip { .. } => "Delete clip",
             SetSourceFile { .. } => "Relink file",
             UpdateClip { .. } => "Edit clip",
+            AddLocator { .. } => "Add locator",
+            RemoveLocator { .. } => "Delete locator",
+            MoveLocator { .. } => "Move locator",
+            RenameLocator { .. } => "Rename locator",
             AddGroove { .. } => "Add groove",
             RemoveGroove { .. } => "Delete groove",
             UpdateGroove { .. } => "Edit groove",
@@ -584,6 +601,30 @@ impl Command {
                     None => p.clip_grooves.remove(&clip),
                 };
                 Ok(SetClipGroove { clip, groove: old })
+            }
+            AddLocator { locator } => {
+                if p.locator(locator.id).is_some() {
+                    return Err(CommandError::DuplicateId(locator.id.to_string()));
+                }
+                p.ids.observe(locator.id.0);
+                let id = locator.id;
+                p.locators.push(Locator { tick: locator.tick.max(0), ..locator });
+                sort_locators(p);
+                Ok(RemoveLocator { id })
+            }
+            RemoveLocator { id } => {
+                let i = p.locators.iter().position(|l| l.id == id).ok_or_else(|| CommandError::Invalid(format!("locator {id} not found")))?;
+                Ok(AddLocator { locator: p.locators.remove(i) })
+            }
+            MoveLocator { id, tick } => {
+                let l = p.locators.iter_mut().find(|l| l.id == id).ok_or_else(|| CommandError::Invalid(format!("locator {id} not found")))?;
+                let old = std::mem::replace(&mut l.tick, tick.max(0));
+                sort_locators(p);
+                Ok(MoveLocator { id, tick: old })
+            }
+            RenameLocator { id, name } => {
+                let l = p.locators.iter_mut().find(|l| l.id == id).ok_or_else(|| CommandError::Invalid(format!("locator {id} not found")))?;
+                Ok(RenameLocator { id, name: std::mem::replace(&mut l.name, name) })
             }
             SetGrooveAmount { amount } => {
                 let amount = if amount.is_finite() { amount.clamp(0.0, MAX_GROOVE_AMOUNT) } else { 1.0 };
@@ -1537,6 +1578,58 @@ mod tests {
         // Ids allocated during the script are kept, everything else is restored.
         p.ids = before.ids.clone();
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn locators_add_move_rename_remove_round_trip() {
+        let mut p = Project::new("t");
+        let before = p.clone();
+        let a = p.alloc_locator_id();
+        let b = p.alloc_locator_id();
+        let script = vec![
+            Command::AddLocator { locator: Locator { id: a, tick: 16 * PPQ, name: "Drop".into() } },
+            Command::AddLocator { locator: Locator { id: b, tick: 4 * PPQ, name: "Intro".into() } },
+            Command::MoveLocator { id: b, tick: 32 * PPQ },
+            Command::RenameLocator { id: a, name: "Break".into() },
+            Command::RemoveLocator { id: b },
+        ];
+        let mut inverses = Vec::new();
+        let mut states = Vec::new();
+        for c in script {
+            let c: Command = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            inverses.push(c.apply(&mut p).unwrap());
+            states.push(p.locators.clone());
+        }
+        // Kept in order of position.
+        assert_eq!(states[1].iter().map(|l| l.id).collect::<Vec<_>>(), vec![b, a]);
+        assert_eq!(states[2].iter().map(|l| l.id).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(p.locators.len(), 1);
+        for (inv, state) in inverses.into_iter().zip(states.iter()).rev() {
+            assert_eq!(&p.locators.clone(), state);
+            inv.apply(&mut p).unwrap();
+        }
+        p.ids = before.ids.clone();
+        assert_eq!(p, before);
+        assert!(Command::MoveLocator { id: a, tick: 0 }.apply(&mut p).is_err());
+    }
+
+    #[test]
+    fn locator_neighbours_and_old_projects() {
+        let mut p = Project::new("t");
+        for (t, n) in [(0, "A"), (8 * PPQ, "B"), (16 * PPQ, "C")] {
+            let id = p.alloc_locator_id();
+            Command::AddLocator { locator: Locator { id, tick: t, name: n.into() } }.apply(&mut p).unwrap();
+        }
+        assert_eq!(p.next_locator(0).unwrap().name, "B");
+        assert_eq!(p.next_locator(8 * PPQ).unwrap().name, "C");
+        assert!(p.next_locator(16 * PPQ).is_none());
+        assert_eq!(p.prev_locator(9 * PPQ).unwrap().name, "B");
+        assert!(p.prev_locator(0).is_none());
+        // A project saved before locators existed still loads.
+        let mut v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        v.as_object_mut().unwrap().remove("locators");
+        let old: Project = serde_json::from_value(v).unwrap();
+        assert!(old.locators.is_empty());
     }
 
     #[test]

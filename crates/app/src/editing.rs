@@ -17,6 +17,7 @@
 mod clipboard;
 pub mod gestures;
 mod groups;
+pub mod locators;
 mod modulators;
 mod racks;
 pub mod menus;
@@ -65,6 +66,15 @@ pub struct TimeSel {
     pub anchor: (Tick, TrackId),
 }
 
+/// What the last Copy took from the arrangement, for Paste Bounced Audio:
+/// its range and the tracks it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopiedRange {
+    pub start: Tick,
+    pub end: Tick,
+    pub tracks: Vec<TrackId>,
+}
+
 /// Editing state that is not part of the project.
 #[derive(Clone, Debug)]
 pub struct EditState {
@@ -74,11 +84,17 @@ pub struct EditState {
     /// `AppState::selected_placement`.
     pub clips: BTreeSet<PlacementId>,
     pub time: Option<TimeSel>,
+    /// The selected locator (see [`locators`]).
+    pub locator: Option<LocatorId>,
+    /// A jump of the playhead waiting for the launch quantisation.
+    pub jump: Option<locators::PendingJump>,
     /// The insert marker: where playback starts and Paste lands.
     pub marker: Tick,
     /// The insert marker of the piano roll, in clip time.
     pub piano_marker: Tick,
     pub clipboard: Option<Clipboard>,
+    /// Where the clips on the clipboard came from.
+    pub copied: Option<CopiedRange>,
     /// Adaptive grid density, -2 (narrowest) ..= 2 (widest).
     pub density: i8,
     pub triplet: bool,
@@ -112,9 +128,12 @@ impl Default for EditState {
             area: Area::Arrange,
             clips: BTreeSet::new(),
             time: None,
+            locator: None,
+            jump: None,
             marker: 0,
             piano_marker: 0,
             clipboard: None,
+            copied: None,
             density: 0,
             triplet: false,
             snap_before: Snap::Adaptive,

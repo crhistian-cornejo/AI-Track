@@ -17,6 +17,7 @@ mod audition;
 mod autosave;
 mod appearance;
 mod assets;
+mod bounce;
 mod bridge;
 mod demo;
 mod dev_hidden;

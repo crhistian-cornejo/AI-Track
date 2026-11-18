@@ -22,6 +22,17 @@ pub struct FreezeJob {
     /// 0..1 as `f32` bits, written by the render thread.
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
+    /// What the header says it is doing ("freezing", "bouncing").
+    verb: &'static str,
+}
+
+impl FreezeJob {
+    /// A job for `track` writing `path`, with the handles its render thread
+    /// reports progress through and is cancelled by.
+    pub fn new(track: TrackId, path: PathBuf, verb: &'static str) -> (Self, Arc<AtomicU32>, Arc<AtomicBool>) {
+        let (progress, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)));
+        (Self { track, path, progress: progress.clone(), cancel: cancel.clone(), verb }, progress, cancel)
+    }
 }
 
 /// The renders running now (view state of the Workspace).
@@ -39,6 +50,11 @@ impl FreezeUi {
     /// The files the running renders write to.
     pub fn running_paths(&self) -> Vec<PathBuf> {
         self.jobs.iter().map(|j| j.path.clone()).collect()
+    }
+
+    /// What `track`'s running render is called ("freezing", "bouncing").
+    pub fn verb(&self, track: TrackId) -> &'static str {
+        self.jobs.iter().find(|j| j.track == track).map_or("freezing", |j| j.verb)
     }
 
     pub fn is_running(&self, track: TrackId) -> bool {
@@ -89,12 +105,12 @@ fn render_tracks(p: &Project, track: TrackId) -> Vec<TrackId> {
 /// What a freeze reads: the same track, clips, sources, devices (with their
 /// modulators), grooves and tempo as when it started, and the same tracks it
 /// sidechains from?
-fn same_inputs(a: &Project, b: &Project, track: TrackId) -> bool {
+pub(crate) fn same_inputs(a: &Project, b: &Project, track: TrackId) -> bool {
     let (ka, kb) = (render_tracks(a, track), render_tracks(b, track));
     ka == kb && a.tempo == b.tempo && a.groove_amount == b.groove_amount && ka.iter().all(|&id| same_track_inputs(a, b, id, id != track))
 }
 
-fn same_track_inputs(a: &Project, b: &Project, track: TrackId, feeds_sidechain: bool) -> bool {
+pub(crate) fn same_track_inputs(a: &Project, b: &Project, track: TrackId, feeds_sidechain: bool) -> bool {
     let (Some(ta), Some(tb)) = (a.track(track), b.track(track)) else { return false };
     let device_lane = |l: &&AutomationLane| matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. });
     let clips_same = ta.arrangement.iter().all(|pl| {
@@ -200,34 +216,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn start_freeze(&mut self, track: TrackId, cx: &mut Context<Self>) {
-        if self.freeze.is_running(track) {
-            return;
-        }
-        // What was tweaked in the plugin windows and not saved yet is in the
-        // render: the offline instances are built from the project's states.
-        let project = self.s.export_snapshot(&mut *self.b.engine);
-        let Some(name) = project.track(track).map(|t| t.name.clone()) else { return };
-        let mut taken: Vec<PathBuf> = project.tracks.iter().filter_map(|t| t.freeze.as_ref().map(|f| f.file.path.clone())).collect();
-        // Renders still running have no file on disk yet, but their path is spoken for.
-        taken.extend(self.freeze.running_paths());
-        let taken: Vec<&Path> = taken.iter().map(PathBuf::as_path).collect();
-        let path = fresh_frozen(&freeze_folder(self.project_path.as_deref()), &name, &taken);
-        let job_path = path.clone();
-        let rate = project.sample_rate_hint.max(8_000);
-        let factory = self.b.engine.export_factory();
-        let (progress, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)));
-        self.freeze.jobs.push(FreezeJob { track, path: job_path, progress: progress.clone(), cancel: cancel.clone() });
-        let started = project.clone();
-        let job_cancel = cancel.clone();
-        let task = cx.background_executor().spawn(async move {
-            let mut report = |f: f32| {
-                progress.store(f.to_bits(), Ordering::Relaxed);
-                !job_cancel.load(Ordering::Relaxed)
-            };
-            aitrack_engine::freeze_track_to_wav(&project, track, rate, &path, None, &*factory, Some(&mut report)).map_err(|e| e.to_string())
-        });
-        // Repaint while it renders, for the progress bar.
+    /// Repaint while `track` renders, for the progress bar.
+    pub(crate) fn repaint_while_rendering(&mut self, track: TrackId, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(120)).await;
@@ -246,6 +236,36 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    fn start_freeze(&mut self, track: TrackId, cx: &mut Context<Self>) {
+        if self.freeze.is_running(track) {
+            return;
+        }
+        // What was tweaked in the plugin windows and not saved yet is in the
+        // render: the offline instances are built from the project's states.
+        let project = self.s.export_snapshot(&mut *self.b.engine);
+        let Some(name) = project.track(track).map(|t| t.name.clone()) else { return };
+        let mut taken: Vec<PathBuf> = project.tracks.iter().filter_map(|t| t.freeze.as_ref().map(|f| f.file.path.clone())).collect();
+        // Renders still running have no file on disk yet, but their path is spoken for.
+        taken.extend(self.freeze.running_paths());
+        let taken: Vec<&Path> = taken.iter().map(PathBuf::as_path).collect();
+        let path = fresh_frozen(&freeze_folder(self.project_path.as_deref()), &name, &taken);
+        let job_path = path.clone();
+        let rate = project.sample_rate_hint.max(8_000);
+        let factory = self.b.engine.export_factory();
+        let (job, progress, cancel) = FreezeJob::new(track, job_path, "freezing");
+        self.freeze.jobs.push(job);
+        let started = project.clone();
+        let job_cancel = cancel.clone();
+        let task = cx.background_executor().spawn(async move {
+            let mut report = |f: f32| {
+                progress.store(f.to_bits(), Ordering::Relaxed);
+                !job_cancel.load(Ordering::Relaxed)
+            };
+            aitrack_engine::freeze_track_to_wav(&project, track, rate, &path, None, &*factory, Some(&mut report)).map_err(|e| e.to_string())
+        });
+        self.repaint_while_rendering(track, cx);
         let toast_name = name.clone();
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -376,7 +396,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aitrack-frozen-two-{}", std::process::id()));
         let mut ui = FreezeUi::default();
         let first = fresh_frozen(&dir, "Audio 2", &[]);
-        ui.jobs.push(FreezeJob { track: TrackId(1), path: first.clone(), progress: Arc::default(), cancel: Arc::default() });
+        ui.jobs.push(FreezeJob::new(TrackId(1), first.clone(), "freezing").0);
         let running = ui.running_paths();
         let taken: Vec<&Path> = running.iter().map(PathBuf::as_path).collect();
         assert_ne!(first, fresh_frozen(&dir, "Audio 2", &taken));

@@ -103,6 +103,7 @@ pub fn render_rename(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElem
         Some(crate::commands::RenameTarget::Clip(_)) => "Clip name",
         Some(crate::commands::RenameTarget::Scene(_)) => "Scene name",
         Some(crate::commands::RenameTarget::TakeLane(..)) => "Take lane name",
+        Some(crate::commands::RenameTarget::Locator(_)) => "Locator name",
         _ => "Track name",
     };
     div()

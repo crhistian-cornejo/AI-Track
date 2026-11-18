@@ -149,3 +149,52 @@ fn a_silent_take_does_not_lengthen_the_freeze() {
     edit(&mut b.p, Command::PlaceClip { track: t, placement: Placement { id, clip: long, start: 0, lane: 1 } });
     assert_eq!(crate::freeze_end(&b.p, t), end, "a take lane is silent");
 }
+
+#[test]
+fn a_bounce_keeps_the_range_and_starts_where_it_starts() {
+    let (b, t, _) = song();
+    // The lead plays beats 1-3 and 3-4. Bounce beats 1..2: the file starts at beat 1.
+    let path = temp_wav("range");
+    let file = bounce_track_to_wav(&b.p, t, Some((PPQ, 2 * PPQ)), 48_000, &path, None, &FallbackFactory, None).expect("bounce renders");
+    let (decoded, _) = crate::sample_cache::decode_file(&path).unwrap();
+    assert!(file.frames as usize >= BEAT, "at least the range");
+    assert!(peak(&decoded[0][..BEAT / 4]) > 0.05, "the note sounding at beat 1 starts the file");
+    // Beats 0..1 are not in it: the whole bounce starts with a beat of silence.
+    let whole = temp_wav("whole");
+    bounce_track_to_wav(&b.p, t, None, 48_000, &whole, None, &FallbackFactory, None).unwrap();
+    let (all, _) = crate::sample_cache::decode_file(&whole).unwrap();
+    assert!(peak(&all[0][..BEAT - 8]) < 1e-6);
+    let from_beat_1 = &all[0][BEAT..];
+    let worst = decoded[0].iter().zip(from_beat_1).take(BEAT).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 1e-5, "the range is the same audio as the whole render from there: {worst}");
+    assert!(bounce_track_to_wav(&b.p, t, Some((PPQ, PPQ)), 48_000, &path, None, &FallbackFactory, None).is_err(), "an empty range");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&whole);
+}
+
+#[test]
+fn a_group_bounces_as_the_sum_of_its_members() {
+    let mut b = P::new(120.0);
+    let grp = b.track(TrackKind::Group, "bus");
+    let (a, _) = b.synth_track("a");
+    let (c2, _) = b.synth_track("b");
+    for x in [a, c2] {
+        b.t(x).parent = Some(grp);
+    }
+    b.t(c2).volume_db = -60.0;
+    let c = b.notes(&[(60, 0, PPQ)], PPQ, None);
+    b.place(a, c, 0);
+    let c = b.notes(&[(64, 0, PPQ)], PPQ, None);
+    b.place(c2, c, 0);
+    let path = temp_wav("group");
+    let file = bounce_track_to_wav(&b.p, grp, None, 48_000, &path, None, &FallbackFactory, None).expect("the group renders");
+    assert!(file.frames > 0);
+    let (decoded, _) = crate::sample_cache::decode_file(&path).unwrap();
+    // The same as the mix of the two tracks (the group's fader aside).
+    let mix = render(&b.p, (0, 4 * PPQ));
+    let k = BEAT / 4;
+    assert!((decoded[0][k] - mix.channel(0)[k]).abs() < 1e-3, "{} vs {}", decoded[0][k], mix.channel(0)[k]);
+    // Freeze still refuses a group.
+    assert!(freeze_track_to_wav(&b.p, grp, 48_000, &path, None, &FallbackFactory, None).is_err());
+    let _ = std::fs::remove_file(&path);
+}

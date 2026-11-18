@@ -20,6 +20,7 @@ pub enum RenameTarget {
     Scene(SceneId),
     /// A take lane: the track and its index among the take lanes.
     TakeLane(TrackId, usize),
+    Locator(LocatorId),
 }
 
 /// View state of the shortcuts sheet and the Rename field.
@@ -77,6 +78,13 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
         },
         Cmd::SliceToDrumRack => crate::editing::slice::open_for_selection(ws, cx),
         Cmd::Rename => open_rename(ws, window, cx),
+        Cmd::SetLocator => ws.set_locator_here(cx),
+        Cmd::PrevLocator => ws.step_to_locator(false, cx),
+        Cmd::NextLocator => ws.step_to_locator(true, cx),
+        Cmd::LoopToNextLocator => ws.loop_to_next_locator(None, cx),
+        Cmd::BounceToNewTrack => ws.bounce_to_new_track(cx),
+        Cmd::BounceInPlace => ws.bounce_in_place(cx),
+        Cmd::PasteBounced => ws.paste_bounced(cx),
         Cmd::HoldStutter => crate::views::device_ui::stutter::toggle_hold(ws, cx),
         Cmd::LaunchSlot => {
             // Enter launches in the Session View and does nothing elsewhere.
@@ -236,8 +244,11 @@ fn reveal_marker(ws: &mut Workspace) {
 /// else the selected track.
 pub fn open_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let clip = ws.s.clip_selection().first().map(|(_, pl, _)| pl.clip);
-    let target = clip
-        .map(RenameTarget::Clip)
+    // A selected locator is the thing last clicked (clicking anything else in the lanes drops it).
+    let locator = ws.s.ed.locator.filter(|id| ws.s.project.locator(*id).is_some());
+    let target = locator
+        .map(RenameTarget::Locator)
+        .or(clip.map(RenameTarget::Clip))
         .or(ws.s.selected_track.map(RenameTarget::Track));
     open_rename_for(ws, target, window, cx);
 }
@@ -254,6 +265,7 @@ pub fn open_rename_for(
         Some(RenameTarget::Track(t)) => ws.s.project.track(t).map(|t| t.name.clone()),
         Some(RenameTarget::Scene(s)) => ws.s.project.scenes.iter().find(|x| x.id == s).map(|x| x.name.clone()),
         Some(RenameTarget::TakeLane(t, i)) => ws.s.project.track(t).and_then(|t| t.take_lanes.get(i)).map(|l| l.name.clone()),
+        Some(RenameTarget::Locator(l)) => ws.s.project.locator(l).map(|l| l.name.clone()),
         None => None,
     };
     let (Some(target), Some(name)) = (target, name) else {
@@ -275,6 +287,7 @@ pub fn apply_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
         Some(RenameTarget::Track(t)) => ws.s.rename_track(t, &name),
         Some(RenameTarget::Scene(s)) => ws.s.rename_scene(s, &name),
         Some(RenameTarget::TakeLane(t, i)) => ws.s.rename_take_lane(t, i, name.trim().to_owned()),
+        Some(RenameTarget::Locator(l)) => ws.s.rename_locator(l, &name),
         None => false,
     };
     ws.modal = None;

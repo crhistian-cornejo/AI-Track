@@ -57,6 +57,7 @@ icons! {
     Folder => "folder-01",
     FolderOpen => "folder-open",
     FolderTree => "folder-tree",
+    Flag => "flag",
     Gauge => "gauge",
     Globe => "globe",
     Grid => "grid",

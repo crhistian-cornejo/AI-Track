@@ -6,7 +6,9 @@
 //! last one), off the audio thread: when the engine starts, when the device
 //! is reopened or when the "Audio threads" setting changes. Each worker
 //! promotes itself to real-time priority once
-//! ([`crate::thread_priority::promote_worker_thread`]), marks itself as an
+//! ([`crate::thread_priority::promote_worker_thread`]), joins the device's
+//! audio workgroup when the pool was given one (macOS,
+//! [`crate::workgroup`]; it leaves it when it exits), marks itself as an
 //! audio thread (for the panic hook and for plugins' thread checks) and
 //! then waits for work. Dropping the pool (never on the audio thread: it
 //! is retired like a graph) stops and joins the workers.
@@ -54,6 +56,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
+
+use crate::workgroup::AudioWorkgroup;
 
 /// Most indices one [`WorkerPool::run`] takes (16 bits of `claim`).
 pub(crate) const MAX_JOBS: usize = 0xFFFF;
@@ -112,6 +116,10 @@ struct Shared {
     parked: Box<[Padded<AtomicBool>]>,
     /// How long a worker spins for the next job before it parks.
     spin: Duration,
+    /// The device's IO workgroup the workers join (live pools on macOS).
+    workgroup: Option<Arc<AudioWorkgroup>>,
+    /// Workers that are in `workgroup`.
+    joined: AtomicUsize,
 }
 
 /// How the workers of a pool are scheduled.
@@ -156,6 +164,13 @@ impl WorkerPool {
     /// `threads − 1` workers. Call off the audio thread. A worker the system
     /// refuses to start is left out (the pool is smaller, never wrong).
     pub fn new(threads: usize, kind: PoolKind) -> Self {
+        Self::with_workgroup(threads, kind, None)
+    }
+
+    /// [`new`](Self::new), and a live pool's workers join `workgroup` (the
+    /// output device's IO workgroup) after taking the real-time policy.
+    pub fn with_workgroup(threads: usize, kind: PoolKind, workgroup: Option<Arc<AudioWorkgroup>>) -> Self {
+        let workgroup = workgroup.filter(|_| matches!(kind, PoolKind::Live(_)));
         let workers = threads.clamp(1, MAX_THREADS) - 1;
         let spin = match kind {
             PoolKind::Live(_) => Duration::from_micros(50),
@@ -170,6 +185,8 @@ impl WorkerPool {
             shutdown: AtomicBool::new(false),
             parked: (0..workers).map(|_| Padded(AtomicBool::new(false))).collect(),
             spin,
+            workgroup,
+            joined: AtomicUsize::new(0),
         });
         let mut threads = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
@@ -202,6 +219,11 @@ impl WorkerPool {
     #[cfg(test)]
     pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
+    }
+
+    /// Workers that joined the device's audio workgroup so far.
+    pub fn workgroup_members(&self) -> usize {
+        self.shared.joined.load(Ordering::Acquire)
     }
 
     /// Whether [`run`](Self::run) can use more than the calling thread.
@@ -332,6 +354,18 @@ fn worker_main(sh: &Shared, me: usize, kind: PoolKind) {
     {
         log::warn!("DSP worker {me} runs at normal priority (the real-time promotion failed, period {period:?})");
     }
+    // Join the IO thread's workgroup for the worker's whole life (the guard
+    // leaves it when this function returns, before the thread exits).
+    let _member = sh.workgroup.as_ref().and_then(|wg| {
+        let j = wg.join();
+        match &j {
+            Some(_) => {
+                sh.joined.fetch_add(1, Ordering::AcqRel);
+            }
+            None => log::warn!("DSP worker {me} could not join the audio workgroup; it keeps its real-time policy"),
+        }
+        j
+    });
     crate::rt::mark_in_audio();
     aitrack_dsp::mark_audio_thread();
     #[cfg(test)]
@@ -372,6 +406,7 @@ fn worker_main(sh: &Shared, me: usize, kind: PoolKind) {
         }
         // Plugins may have changed the FP mode; the audio thread sets it per block.
         aitrack_dsp::disable_denormals();
+        let _section = crate::rt_check::enter();
         work(sh, seen);
     }
 }

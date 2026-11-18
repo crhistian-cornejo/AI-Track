@@ -65,6 +65,11 @@ pub struct CompileContext<'a> {
     /// The live engine's analysis ring (`None` offline): lets the UI tap one
     /// track instead of the Main output.
     pub analysis: Option<Arc<crate::tap::AnalysisTap>>,
+    /// The live engine's disk streaming: clips of streamed files get its
+    /// readers (filled ahead by its loader, reused across compiles). `None`
+    /// offline: each clip gets a reader of its own that loads pages on the
+    /// spot (blocking), so a render never misses a page.
+    pub streams: Option<&'a crate::stream::StreamHub>,
 }
 
 struct Handle {
@@ -713,7 +718,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                         }
                     // Each clip reads the warp of its own source: a clip transposed
                     // or stretched alone has a copy of the file's source.
-                    CompiledClip::audio(id, clip, AudioClipData::of_bpm_in(&a.warp, audio, project.tempo.initial_bpm(), cx.samples))
+                    let mut c = CompiledClip::audio(id, clip, AudioClipData::of_bpm_in(&a.warp, audio, project.tempo.initial_bpm(), cx.samples));
+                    c.attach_stream(cx.streams, (t.id.0, id.0), project.tempo.initial_bpm(), sr);
+                    c
                 }
                 _ => return None,
             };
@@ -724,7 +731,10 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         let mut arrangement = Vec::new();
         let mut slots = vec![None; scenes.len()];
         if let Some(f) = frozen_here {
-            clips.push(CompiledClip::audio(ClipId(0), &f.clip, f.data));
+            let mut c = CompiledClip::audio(ClipId(0), &f.clip, f.data);
+            // (Keyed apart from the clips: the track's frozen file.)
+            c.attach_stream(cx.streams, (t.id.0, u64::MAX), project.tempo.initial_bpm(), sr);
+            clips.push(c);
             arrangement.push(ArrPlacement { clip: 0, start: 0 });
         } else if t.kind.has_clips() {
             for p in t.arrangement.iter().filter(|p| p.lane == 0) {

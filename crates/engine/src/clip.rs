@@ -27,6 +27,7 @@
 //! click.
 
 use crate::sample_cache::{DecodedAudio, SampleCache};
+use crate::stream::{ReaderKey, StreamHub, StreamReader, PAGE};
 use aitrack_dsp::event::Expression;
 use aitrack_dsp::warp::{pitch_taps, sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
@@ -277,6 +278,9 @@ pub(crate) struct AudioClipData {
     /// plays whole frames like an unwarped clip, as long as the tempo does
     /// not move under it (see [`tempo_is_steady`]).
     pub unity: bool,
+    /// The clip's reader when `audio` streams from disk (see
+    /// [`CompiledClip::attach_stream`]): every read goes through it.
+    pub stream: Option<Arc<StreamReader>>,
 }
 
 impl AudioClipData {
@@ -326,6 +330,7 @@ impl AudioClipData {
                     transients,
                     reverse: warp.reverse,
                     unity: at_tempo,
+                    stream: None,
                 };
             }
             // Still rendering, or the render failed: Re-Pitch, which follows
@@ -341,6 +346,7 @@ impl AudioClipData {
                 transients: Arc::from([]),
                 reverse: warp.reverse,
                 unity: false,
+                stream: None,
             };
         }
         Self {
@@ -353,6 +359,7 @@ impl AudioClipData {
             transients: Arc::from([]),
             reverse: warp.reverse,
             unity: at_tempo && warp.pitch_ratio() == 1.0,
+            stream: None,
         }
     }
 
@@ -362,16 +369,25 @@ impl AudioClipData {
         !self.warped && !self.pitch_preserving && self.ratio == 1.0
     }
 
-    /// Frame `index` of the source as this clip reads it (mirrored when reversed).
+    /// Frame `index` of the source as this clip reads it (mirrored when
+    /// reversed), from memory or from the clip's stream.
     #[inline]
     fn frame(&self, audio: &DecodedAudio, ch: usize, index: i64) -> f32 {
-        audio.frame(ch, if self.reverse { audio.frames as i64 - 1 - index } else { index })
+        let at = if self.reverse { audio.frames as i64 - 1 - index } else { index };
+        match &self.stream {
+            Some(s) => s.frame(ch, at),
+            None => audio.frame(ch, at),
+        }
     }
 
     /// Interpolated read at a fractional frame (mirrored when reversed).
     #[inline]
     fn sample(&self, audio: &DecodedAudio, ch: usize, pos: f64) -> f32 {
-        audio.sample(ch, if self.reverse { (audio.frames as f64 - 1.0) - pos } else { pos })
+        let at = if self.reverse { (audio.frames as f64 - 1.0) - pos } else { pos };
+        match &self.stream {
+            Some(s) => s.sample(ch, at),
+            None => audio.sample(ch, at),
+        }
     }
 
     /// Warp hook: fractional source frame for a source tick. Unwarped clips
@@ -728,6 +744,65 @@ impl CompiledClip {
             shape: ClipShape::default(),
             groove: None,
         }
+    }
+
+    /// Give an audio clip whose file streams from disk its reader: the live
+    /// engine's (`hub`, reused across compiles by `key`, its first pages
+    /// pinned where plays start) or, offline, one of its own that loads
+    /// pages on the spot. `bpm` and `sr` place the pinned pages (a hint:
+    /// a wrong guess costs a late page, never a wrong sample).
+    pub(crate) fn attach_stream(&mut self, hub: Option<&StreamHub>, key: ReaderKey, bpm: f64, sr: f64) {
+        let pins = self.stream_pins(bpm, sr);
+        let ClipContent::Audio(data) = &mut self.content else { return };
+        let Some(file) = data.audio.as_ref().and_then(|a| a.stream.clone()) else { return };
+        data.stream = Some(match hub {
+            Some(h) => h.reader(key, &file, &pins, !data.reverse),
+            None => Arc::new(StreamReader::blocking(file)),
+        });
+    }
+
+    /// Source frames a play of this clip begins at: its start and the page
+    /// after, its loop start, the page after it and the material that leads
+    /// into it (mirrored when reversed).
+    fn stream_pins(&self, bpm: f64, sr: f64) -> Vec<i64> {
+        let ClipContent::Audio(data) = &self.content else { return Vec::new() };
+        let Some(audio) = &data.audio else { return Vec::new() };
+        let spt = sr * 60.0 / (bpm.max(1.0) * PPQ as f64);
+        let n = audio.frames as i64;
+        let at = |tick: f64| {
+            let f = data.source_frame(tick, spt).floor() as i64;
+            if data.reverse { n - 1 - f } else { f }
+        };
+        let next = if data.reverse { -(PAGE as i64) } else { PAGE as i64 };
+        let start = at(self.offset as f64);
+        let mut out = vec![start, start + next];
+        if let Some((ls, le)) = self.looping.filter(|(ls, le)| le > ls) {
+            let lead = (SEAM_SECONDS * sr).ceil() as i64 + 1;
+            let ls_f = at(ls as f64);
+            out.extend([ls_f, ls_f + next, ls_f - next.signum() * lead]);
+            if self.offset >= le {
+                let wrapped = ls + self.offset.saturating_sub(ls).rem_euclid(le - ls);
+                out.push(at(wrapped as f64));
+            }
+        }
+        out
+    }
+
+    /// A play will start (or a transport loop wrap) at sample `at`, inside
+    /// this clip placed at `start`: have its stream load the `pages` pages a
+    /// play from there reads first.
+    pub fn cue_audio(&self, start: Tick, at: i64, ctx: &TimeCtx<'_>, pages: usize) {
+        let ClipContent::Audio(data) = &self.content else { return };
+        let (Some(reader), Some(audio)) = (&data.stream, &data.audio) else { return };
+        let spt = ctx.sr * 60.0 / (ctx.tempo.bpm_at(start) * PPQ as f64);
+        let mut src = self.offset as f64 + (ctx.tick_of(at) - start as f64).max(0.0) * data.ratio;
+        if let Some((ls, le)) = self.looping.filter(|(ls, le)| le > ls)
+            && src >= le as f64
+        {
+            src = ls as f64 + (src - le as f64).rem_euclid((le - ls) as f64);
+        }
+        let f = data.source_frame(src, spt).floor() as i64;
+        reader.cue(if data.reverse { audio.frames as i64 - 1 - f } else { f }, pages);
     }
 
     /// Length of one pass in the Session View: the loop region when looping,
@@ -1235,6 +1310,7 @@ mod tests {
             transients: Arc::from([]),
             reverse: false,
             unity: false,
+            stream: None,
         };
         CompiledClip::audio(ClipId(1), clip, data)
     }
@@ -1270,6 +1346,7 @@ mod tests {
                 transients: Arc::from([]),
                 reverse,
                 unity: false,
+                stream: None,
             },
         )
     }
@@ -1818,6 +1895,7 @@ mod tests {
             prev_meters: None,
             taps: Vec::new(),
             analysis: None,
+            streams: None,
         };
         let t = std::time::Instant::now();
         let graph = crate::compile::compile(p, &mut cx).expect("compiles");

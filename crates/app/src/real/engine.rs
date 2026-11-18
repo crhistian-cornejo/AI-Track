@@ -373,7 +373,13 @@ impl RealEngine {
         let app_config = from_engine(&settings.audio);
         // The device opens on the engine's control thread: a slow driver
         // must not hold up the first frame. `tick` picks the result up.
-        let config = EngineConfig { audio: Some(settings.audio.clone()), open_in_background: true, audio_threads: settings.audio_threads, ..EngineConfig::default() };
+        let config = EngineConfig {
+            audio: Some(settings.audio.clone()),
+            open_in_background: true,
+            audio_threads: settings.audio_threads,
+            streaming: settings.streaming,
+            ..EngineConfig::default()
+        };
         aitrack_engine::set_render_threads(settings.audio_threads);
         let (handle, banner) = match Engine::new(config, live.clone()) {
             Ok((h, _)) => {
@@ -383,7 +389,7 @@ impl RealEngine {
             Err(e) => {
                 // Could not even start the engine threads with a device:
                 // run headless so editing and export keep working.
-                let headless = EngineConfig { audio_threads: settings.audio_threads, ..EngineConfig::headless(48_000.) };
+                let headless = EngineConfig { audio_threads: settings.audio_threads, streaming: settings.streaming, ..EngineConfig::headless(48_000.) };
                 let (h, _) = Engine::new(headless, live.clone()).expect("start the headless engine");
                 (h, Some(no_device_banner(&e.to_string())))
             }
@@ -468,6 +474,7 @@ impl RealEngine {
         }
         let fresh = self.notices.fresh(&self.health);
         self.messages.extend(fresh);
+        warn_rt_heap(aitrack_engine::rt_heap_operations());
     }
 
     /// Start a pass over the MIDI input ports (no-op while one runs).
@@ -1159,6 +1166,20 @@ impl EngineBridge for RealEngine {
         self.handle.sample_cache_stats()
     }
 
+    fn streaming(&self) -> aitrack_engine::StreamSettings {
+        self.settings.streaming
+    }
+
+    fn set_streaming(&mut self, settings: aitrack_engine::StreamSettings) {
+        self.settings.streaming = settings;
+        self.settings.save();
+        self.handle.set_streaming(settings);
+    }
+
+    fn stream_stats(&self) -> aitrack_engine::StreamStats {
+        self.handle.stream_stats()
+    }
+
     fn status_label(&self) -> String {
         match &self.active {
             Some(a) => {
@@ -1245,9 +1266,35 @@ fn render_options(options: &ExportOptions, project: &Project) -> RenderOptions {
     }
 }
 
+/// Debug builds: say when the audio threads touched the heap (the count
+/// from `aitrack_engine::RtAllocChecker`), each time it doubles, so a busy
+/// offender does not flood the log.
+fn warn_rt_heap(ops: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TOLD: AtomicU64 = AtomicU64::new(0);
+    let told = TOLD.load(Ordering::Relaxed);
+    if rt_heap_due(told, ops) {
+        TOLD.store(ops, Ordering::Relaxed);
+        log::warn!("audio threads made {ops} heap operations so far (the engine's or a plugin's): real-time code should not allocate");
+    }
+}
+
+/// Whether `ops` heap operations are worth a new warning after one at `told`.
+fn rt_heap_due(told: u64, ops: u64) -> bool {
+    ops > 0 && (told == 0 || ops >= told.saturating_mul(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_thread_heap_use_is_reported_as_it_doubles() {
+        assert!(!rt_heap_due(0, 0), "nothing to say");
+        assert!(rt_heap_due(0, 1), "the first one");
+        assert!(!rt_heap_due(1, 1) && rt_heap_due(1, 2));
+        assert!(!rt_heap_due(100, 199) && rt_heap_due(100, 200));
+    }
 
     #[test]
     fn midi_ports_open_as_they_appear_and_close_when_unplugged() {

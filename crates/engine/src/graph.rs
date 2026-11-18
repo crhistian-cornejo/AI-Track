@@ -2101,6 +2101,12 @@ pub(crate) fn compute_track(t: &mut TrackNode, env: &TrackEnv<'_>, input: Option
         }
         if io.playing {
             play_clips(t, ctx, lo, hi, scene_count, use_clip_buf);
+            // A loop wrap is a jump: keep what it lands on loaded.
+            if let Some((a, _)) = transport.loop_range_beats {
+                cue_clips(t, ctx, ctx.sample_of((a * PPQ as f64).round() as Tick), 2);
+            }
+        } else {
+            cue_clips(t, ctx, lo, crate::stream::LOOKAHEAD);
         }
         t.active.release_due(ctx, hi, &mut t.events);
         if use_clip_buf {
@@ -2374,6 +2380,21 @@ fn play_clips(t: &mut TrackNode, ctx: &TimeCtx<'_>, lo: i64, hi: i64, scene_coun
         let buf = if use_clip_buf { &mut t.clip_buf } else { &mut t.buf };
         clip.schedule_midi(p.start, Some(clip.length), a, b, ctx, &mut t.events, &mut t.active, &mut t.rng);
         clip.render_audio(p.start, Some(clip.length), a, b, ctx, buf);
+    }
+}
+
+/// A play will start at sample `at` (the transport is stopped there, or
+/// loops back there): the streamed arrangement clips under it load the
+/// `pages` pages a play from there reads first (see [`crate::stream`]).
+fn cue_clips(t: &TrackNode, ctx: &TimeCtx<'_>, at: i64, pages: usize) {
+    if t.session.override_arrangement {
+        return;
+    }
+    for p in &t.arrangement {
+        let clip = &t.clips[p.clip];
+        if ctx.sample_of(p.start) <= at && at < ctx.sample_of(p.start + clip.length) {
+            clip.cue_audio(p.start, at, ctx, pages);
+        }
     }
 }
 

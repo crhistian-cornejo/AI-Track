@@ -268,7 +268,7 @@ fn graph_of(p: &Project, factory: &dyn ProcessorFactory, samples: &SampleCache) 
     let mut pool = ProcessorPool::new();
     compile(
         p,
-        &mut CompileContext { factory, pool: &mut pool, samples, sample_rate: SR, max_frames: BLOCK, prev_meters: None, taps: Vec::new(), analysis: None },
+        &mut CompileContext { factory, pool: &mut pool, samples, sample_rate: SR, max_frames: BLOCK, prev_meters: None, taps: Vec::new(), analysis: None, streams: None },
     )
     .unwrap()
 }

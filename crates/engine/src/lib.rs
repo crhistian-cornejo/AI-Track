@@ -23,12 +23,15 @@ pub mod midi_io;
 pub mod mp3;
 pub mod record;
 pub mod rt;
+pub mod rt_check;
 pub mod sample_cache;
 pub mod shared;
 pub mod status;
+pub mod stream;
 pub mod tap;
 pub mod thread_priority;
 pub mod workers;
+pub mod workgroup;
 
 #[cfg(test)]
 mod alloc_counter;
@@ -47,9 +50,11 @@ pub use graph::CompiledGraph;
 pub use midi_io::MidiPortInfo;
 pub use mp3::{Lame, Mp3Tags};
 pub use rt::{AudioProcessor, MidiMessage};
+pub use rt_check::{rt_heap_operations, RtAllocChecker};
 pub use sample_cache::{DecodedAudio, SampleCache};
 pub use shared::{ProcessorPool, SharedProcessor};
 pub use status::{ClipSlotStatus, MeterReading, SlotState};
+pub use stream::{StreamSettings, StreamStats};
 pub use tap::{AnalysisTap, DeviceMeter, TapReader, DEVICE_METER_LEN, TAP_FRAMES};
 pub use workers::{auto_threads, resolve_threads};
 

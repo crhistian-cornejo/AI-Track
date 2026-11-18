@@ -42,6 +42,12 @@ mod waveform;
 mod widgets;
 mod workspace;
 
+/// Debug builds count heap operations on the audio threads (the engine's
+/// and plugins'); the engine bridge logs them as they grow.
+#[cfg(debug_assertions)]
+#[global_allocator]
+static RT_CHECK: aitrack_engine::RtAllocChecker = aitrack_engine::RtAllocChecker;
+
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
 
 /// The real engine, plugins and AI; `AITRACK_STUBS=1` runs the UI on the

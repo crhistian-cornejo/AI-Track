@@ -925,6 +925,42 @@ fn para_wrapped(text: String, color: gpui::Hsla) -> Div {
 
 const CACHE_BUDGET_MB: &[usize] = &[128, 256, 512, 1024, 2048];
 
+/// The "Stream from disk" choices: off, then files at least this many
+/// seconds long.
+const STREAM_SECONDS: &[Option<u32>] = &[None, Some(30), Some(60), Some(120), Some(300)];
+
+fn stream_choice_text(choice: Option<u32>) -> String {
+    match choice {
+        None => "Off".into(),
+        Some(s) if s < 60 => format!("Over {s} s"),
+        Some(s) => format!("Over {} min", s / 60),
+    }
+}
+
+/// The setting a "Stream from disk" chip stands for (the size threshold is
+/// kept as it is).
+fn stream_settings_for(choice: Option<u32>, now: aitrack_engine::StreamSettings) -> aitrack_engine::StreamSettings {
+    match choice {
+        None => aitrack_engine::StreamSettings { enabled: false, ..now },
+        Some(s) => aitrack_engine::StreamSettings { enabled: true, min_seconds: s, ..now },
+    }
+}
+
+/// The detail line under "Stream from disk".
+fn stream_detail(settings: aitrack_engine::StreamSettings, stats: aitrack_engine::StreamStats) -> String {
+    let base = format!("Long files play from disk through a small buffer instead of RAM (also files over {} MB)", settings.min_megabytes);
+    if !settings.enabled {
+        return "Every file is loaded into RAM".into();
+    }
+    if stats.files == 0 {
+        return base;
+    }
+    let mb = stats.buffer_bytes as f64 / (1024. * 1024.);
+    let files = if stats.files == 1 { "1 file".to_owned() } else { format!("{} files", stats.files) };
+    let late = if stats.underruns == 0 { String::new() } else { format!(" · {} late reads", stats.underruns) };
+    format!("{base} · now {files}, {mb:.1} MB of buffers{late}")
+}
+
 /// The "Audio threads" choices: Auto (`0`), then fixed counts up to the
 /// machine's logical cores.
 fn audio_thread_choices() -> Vec<usize> {
@@ -1067,6 +1103,18 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
     let cache_text = cache_detail(used_bytes, budget_mb, Some(ws.b.engine.sample_cache_warp_bytes()));
     let low_power = ws.look.app.low_power;
     let sandbox = ws.b.engine.sandbox_plugins();
+    let streaming = ws.b.engine.streaming();
+    let stream_text = stream_detail(streaming, ws.b.engine.stream_stats());
+    let stream_items: Vec<(String, bool, bool)> = STREAM_SECONDS
+        .iter()
+        .map(|c| {
+            let on = match c {
+                None => !streaming.enabled,
+                Some(s) => streaming.enabled && streaming.min_seconds == *s,
+            };
+            (stream_choice_text(*c), on, true)
+        })
+        .collect();
     let threads_setting = ws.b.engine.audio_threads();
     let threads_active = ws.b.engine.active_audio_threads();
     let thread_choices = audio_thread_choices();
@@ -1196,6 +1244,17 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
             Some("LRU cap for decoded audio files kept in RAM (evicts unused clips first)".into()),
             chip_row("sample-cache-mb", cache_items, cx, |this, i, cx| {
                 this.b.engine.set_sample_cache_mb(CACHE_BUDGET_MB[i]);
+                cx.notify();
+            }),
+        ))
+        .child(setting_row(
+            "Stream from disk",
+            Some(stream_text.into()),
+            chip_row("stream-from-disk", stream_items, cx, move |this, i, cx| {
+                if let Some(&choice) = STREAM_SECONDS.get(i) {
+                    let now = this.b.engine.streaming();
+                    this.b.engine.set_streaming(stream_settings_for(choice, now));
+                }
                 cx.notify();
             }),
         ))
@@ -1915,6 +1974,29 @@ mod tests {
         assert_eq!(cache_detail(30 * MB, 512, Some(10 * MB)), "Sample cache: 30.0 / 512 MB\n20.0 decoded + 10.0 warp renders");
         // The renders are part of the total, never more than it.
         assert_eq!(cache_detail(MB, 64, Some(5 * MB)), "Sample cache: 1.0 / 64 MB\n0.0 decoded + 1.0 warp renders");
+    }
+
+    #[test]
+    fn the_stream_choices_set_the_length_and_keep_the_size() {
+        let now = aitrack_engine::StreamSettings { enabled: true, min_seconds: 60, min_megabytes: 80 };
+        assert_eq!(stream_settings_for(None, now), aitrack_engine::StreamSettings { enabled: false, ..now });
+        assert_eq!(stream_settings_for(Some(300), aitrack_engine::StreamSettings { enabled: false, ..now }), aitrack_engine::StreamSettings { min_seconds: 300, ..now });
+        let texts: Vec<String> = STREAM_SECONDS.iter().map(|c| stream_choice_text(*c)).collect();
+        assert_eq!(texts, ["Off", "Over 30 s", "Over 1 min", "Over 2 min", "Over 5 min"]);
+        // The default is one of the chips.
+        let d = aitrack_engine::StreamSettings::default();
+        assert!(STREAM_SECONDS.contains(&Some(d.min_seconds)));
+    }
+
+    #[test]
+    fn the_stream_line_says_what_streams_and_what_came_late() {
+        let on = aitrack_engine::StreamSettings::default();
+        assert_eq!(stream_detail(aitrack_engine::StreamSettings::OFF, Default::default()), "Every file is loaded into RAM");
+        assert!(!stream_detail(on, Default::default()).contains("now"));
+        let busy = aitrack_engine::StreamStats { files: 3, buffer_bytes: 6 * 1024 * 1024, underruns: 0 };
+        assert!(stream_detail(on, busy).ends_with("now 3 files, 6.0 MB of buffers"));
+        let late = aitrack_engine::StreamStats { underruns: 2, ..busy };
+        assert!(stream_detail(on, late).ends_with("· 2 late reads"));
     }
 
     #[test]

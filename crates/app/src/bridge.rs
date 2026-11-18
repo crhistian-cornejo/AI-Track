@@ -231,6 +231,15 @@ pub trait EngineBridge {
     }
     /// Memory budget for decoded audio files in MB.
     fn set_sample_cache_mb(&mut self, _mb: usize) {}
+    /// Which audio files stream from disk instead of being decoded into RAM.
+    fn streaming(&self) -> aitrack_engine::StreamSettings {
+        aitrack_engine::StreamSettings::default()
+    }
+    fn set_streaming(&mut self, _settings: aitrack_engine::StreamSettings) {}
+    /// Files streaming, memory their pages take, pages that came too late.
+    fn stream_stats(&self) -> aitrack_engine::StreamStats {
+        aitrack_engine::StreamStats::default()
+    }
     /// `(used_bytes, budget_bytes)` of decoded audio in memory.
     fn sample_cache_stats(&self) -> (usize, usize) {
         (0, 512 * 1024 * 1024)

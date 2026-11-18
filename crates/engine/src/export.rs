@@ -176,6 +176,7 @@ pub fn render(
         prev_meters: None,
         taps: stems.to_vec(),
         analysis: None,
+        streams: None,
     };
     let graph = compile(project, &mut cx)?;
     let latency = graph.total_latency as usize;

@@ -8,14 +8,12 @@
 //!   policy, so the device callback needs nothing. A worker asks for the same
 //!   kind of policy itself ([`promote_worker_thread`]): period = the device
 //!   buffer's duration, computation = half of it, constraint = all of it,
-//!   preemptible. It does not join the device's audio workgroup
-//!   (`os_workgroup_join` with `kAudioDevicePropertyIOThreadOSWorkgroup`):
-//!   cpal does not hand out the `AudioObjectID` of the device it opened, so
-//!   the workgroup is not reachable from here. Without it the scheduler sees
-//!   the workers as separate real-time threads instead of one group with
-//!   the IO thread's deadline; on Apple silicon that can keep them on
-//!   efficiency cores longer under light load. Joining needs the device id
-//!   from the stream (a cpal change or our own CoreAudio lookup by UID).
+//!   preemptible. Then it joins the output device's audio workgroup
+//!   ([`crate::workgroup`]), so the scheduler treats the workers and the IO
+//!   thread as one group with the IO thread's deadline (on Apple silicon a
+//!   lone real-time thread may otherwise sit on an efficiency core under
+//!   light load). Apple asks for both: the policy alone is the fallback when
+//!   there is no workgroup (an older system, a device without one).
 //! * Elsewhere: no-op.
 //!
 //! The callback calls [`promote_audio_thread`] once, on the first callback

@@ -220,6 +220,14 @@ pub(crate) struct Prepared {
     pub in_count: usize,
 }
 
+impl Prepared {
+    /// The output device's IO workgroup, for the DSP workers to join (macOS;
+    /// `None` elsewhere or when the device publishes none).
+    pub(crate) fn workgroup(&self) -> Option<Arc<crate::workgroup::AudioWorkgroup>> {
+        crate::workgroup::AudioWorkgroup::for_cpal_device(&self.output)
+    }
+}
+
 fn find_device(host: &cpal::Host, id: Option<&str>, name: Option<&str>, output: bool) -> Option<cpal::Device> {
     if let Some(id) = id
         && let Some(d) = id.parse::<cpal::DeviceId>().ok().and_then(|p| host.device_by_id(&p)) {

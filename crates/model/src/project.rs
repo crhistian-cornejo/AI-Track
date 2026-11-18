@@ -70,6 +70,19 @@ pub struct Project {
     /// ignored (so undoing a clip's deletion brings its groove back).
     #[serde(default)]
     pub clip_grooves: BTreeMap<ClipId, GrooveId>,
+    /// Named marks on the Arrangement ruler (Live's locators), kept in order
+    /// of position. Projects saved before locators existed have none.
+    #[serde(default)]
+    pub locators: Vec<Locator>,
+}
+
+/// A named mark on the Arrangement timeline: a song section (intro, drop,
+/// break) to jump to, loop or rehearse.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Locator {
+    pub id: LocatorId,
+    pub tick: Tick,
+    pub name: String,
 }
 
 impl Default for Project {
@@ -96,6 +109,7 @@ impl Project {
             grooves: Vec::new(),
             groove_amount: 1.0,
             clip_grooves: BTreeMap::new(),
+            locators: Vec::new(),
         };
         let main = Track::new(TrackId(p.ids.next_raw()), TrackKind::Main, "Main", Color(0xE0E0E0));
         p.tracks.push(main);
@@ -122,6 +136,22 @@ impl Project {
     /// still in the pool.
     pub fn clip_groove(&self, clip: ClipId) -> Option<&PoolGroove> {
         self.clip_grooves.get(&clip).and_then(|g| self.groove(*g))
+    }
+
+    pub fn alloc_locator_id(&mut self) -> LocatorId { LocatorId(self.ids.next_raw()) }
+
+    pub fn locator(&self, id: LocatorId) -> Option<&Locator> {
+        self.locators.iter().find(|l| l.id == id)
+    }
+
+    /// The first locator strictly after `tick`.
+    pub fn next_locator(&self, tick: Tick) -> Option<&Locator> {
+        self.locators.iter().find(|l| l.tick > tick)
+    }
+
+    /// The last locator strictly before `tick`.
+    pub fn prev_locator(&self, tick: Tick) -> Option<&Locator> {
+        self.locators.iter().rev().find(|l| l.tick < tick)
     }
 
     pub fn alloc_groove_id(&mut self) -> GrooveId {

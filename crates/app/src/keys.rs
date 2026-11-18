@@ -147,6 +147,13 @@ commands! {
     Track8,
     LaunchSlot,
     HoldStutter,
+    SetLocator,
+    PrevLocator,
+    NextLocator,
+    LoopToNextLocator,
+    BounceToNewTrack,
+    BounceInPlace,
+    PasteBounced,
 }
 
 const fn main(action: &'static str, label: &'static str, help: &'static str, category: Category, scope: Scope, keys: &'static [&'static str]) -> Entry {
@@ -164,6 +171,10 @@ pub static TABLE: &[Entry] = &[
     // Transport
     main("PlayStop", "Play / Stop", "Play from the insert marker, or stop.", C::Transport, K, &["space"]),
     cmd(Cmd::Continue, "Continue", "Play on from where playback stopped.", C::Transport, &["shift-space"]),
+    cmd(Cmd::SetLocator, "Add Locator", "Put a locator on the ruler at the playhead (on the launch quantisation) while playing, else at the insert marker; on an existing locator it removes it. Ctrl+R renames the new one.", C::Transport, &["mod-shift-l"]),
+    cmd(Cmd::PrevLocator, "Previous Locator", "Jump the playhead (and the insert marker) to the locator before this point.", C::Transport, &["mod-alt-left"]),
+    cmd(Cmd::NextLocator, "Next Locator", "Jump the playhead (and the insert marker) to the locator after this point; while playing the jump waits for the launch quantisation.", C::Transport, &["mod-alt-right"]),
+    cmd(Cmd::LoopToNextLocator, "Loop to Next Locator", "Put the loop brace from the selected locator (else the one before the playhead) to the next one, and switch the loop on.", C::Transport, &[]),
     cmd(Cmd::GoToStart, "Go to Start", "Move the insert marker and the playhead to the start of the song.", C::Transport, &["home"]),
     main("ToggleLoop", "Loop Selection", "Put the loop brace on the selection and switch the loop on; pressed again, or with nothing selected, switch the loop on or off.", C::Transport, W, &["mod-l"]),
     cmd(Cmd::Metronome, "Metronome", "Switch the metronome click on or off.", C::Transport, &["o"]),
@@ -179,8 +190,11 @@ pub static TABLE: &[Entry] = &[
     main("SelectAll", "Select All", "Select every clip, or every note when the piano roll has the keys.", C::Editing, K, &["mod-a"]),
     main("SplitClip", "Split", "Cut clips at the insert marker (at the playhead while playing), or at both edges of the time selection.", C::Editing, K, &["mod-e"]),
     cmd(Cmd::Consolidate, "Consolidate", "Join the selected clips into one clip per track, gaps included; audio is rendered to a new file.", C::Editing, &["mod-j"]),
+    cmd(Cmd::BounceToNewTrack, "Bounce to New Track", "Render the selected tracks (or the time selection) through their devices to a new audio track below, and mute the source.", C::Editing, &["mod-b"]),
+    cmd(Cmd::BounceInPlace, "Bounce Track in Place", "Render the whole selected track to audio and replace its clips and devices with the result; undo brings the original back.", C::Editing, &[]),
+    cmd(Cmd::PasteBounced, "Paste Bounced Audio", "Render what was copied (or the time selection) through its track's devices and paste the audio at the insert marker.", C::Editing, &["mod-shift-v"]),
     cmd(Cmd::SliceToDrumRack, "Slice to Drum Rack…", "Cut the selected audio clip at its transients, a beat division or its warp markers into a new MIDI track with a Drum Rack, one pad per slice.", C::Editing, &[]),
-    cmd(Cmd::Rename, "Rename", "Rename the selected clip, or the selected track.", C::Editing, &["mod-r"]),
+    cmd(Cmd::Rename, "Rename", "Rename the selected locator, clip or track.", C::Editing, &["mod-r"]),
     main("ToggleActive", "Deactivate", "Switch the selected notes, clip or track off or back on.", C::Editing, K, &["0"]),
     cmd(Cmd::DuplicateTime, "Duplicate Time", "Repeat the selected time on every track, pushing what follows later.", C::Editing, &["mod-shift-d"]),
     cmd(Cmd::InsertSilence, "Insert Silence", "Insert empty time the length of the time selection on every track.", C::Editing, &["mod-shift-i"]),
@@ -449,7 +463,7 @@ mod tests {
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
         const KEYLESS: &[Bound] =
-            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack)];
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack), Bound::Cmd(Cmd::LoopToNextLocator), Bound::Cmd(Cmd::BounceInPlace)];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

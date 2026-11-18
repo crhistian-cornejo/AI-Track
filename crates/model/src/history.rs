@@ -69,6 +69,7 @@ enum Slot {
     Groove(crate::GrooveId),
     GrooveSettings(crate::GrooveId),
     GrooveAmount,
+    Locator(crate::LocatorId),
     Automation(crate::TrackId, crate::AutomationTarget),
 }
 
@@ -92,6 +93,7 @@ fn slot(c: &Command) -> Option<Slot> {
         Command::UpdateGroove { id, .. } => Slot::Groove(*id),
         Command::SetGrooveSettings { id, .. } => Slot::GrooveSettings(*id),
         Command::SetGrooveAmount { .. } => Slot::GrooveAmount,
+        Command::MoveLocator { id, .. } => Slot::Locator(*id),
         Command::SetAutomation { track, target, .. } => Slot::Automation(*track, *target),
         _ => return None,
     })

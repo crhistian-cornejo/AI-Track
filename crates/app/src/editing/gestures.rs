@@ -58,6 +58,8 @@ pub fn scrub_to(s: &mut AppState, engine: &mut dyn EngineBridge, at: Tick) {
     s.ed.area = Area::Arrange;
     s.ed.marker = at.max(0);
     s.ed.time = None;
+    s.ed.locator = None;
+    s.ed.jump = None;
     engine.locate(s.ed.marker);
 }
 
@@ -74,6 +76,7 @@ pub fn clip_at(ws: &Workspace, track: TrackId, tick: Tick) -> Option<PlacementId
 pub fn lane_down(ws: &mut Workspace, track: TrackId, kind: TrackKind, tick: Tick, e: &MouseDownEvent, cx: &mut Context<Workspace>) -> bool {
     ws.s.ed.area = Area::Arrange;
     ws.s.ed.pressed = None;
+    ws.s.ed.locator = None;
     ws.s.auto_sel = None;
     let toggle = e.modifiers.shift || e.modifiers.control || e.modifiers.secondary();
     if let Some(id) = clip_at(ws, track, tick) {

@@ -310,6 +310,7 @@ impl AppState {
             self.ed.piano_marker = first + span;
             let notes = sel.into_iter().map(|n| Note { start: n.start - first, ..n }).collect();
             self.ed.clipboard = Some(Clipboard::Notes { span, notes });
+            self.ed.copied = None;
             return true;
         }
         if self.ed.area != Area::Arrange {
@@ -319,6 +320,7 @@ impl AppState {
         if rows.iter().all(|r| r.seeds.is_empty()) {
             return false;
         }
+        self.ed.copied = Some(super::CopiedRange { start, end, tracks: rows.iter().filter(|r| !r.seeds.is_empty()).map(|r| r.track).collect() });
         self.ed.clipboard = Some(Clipboard::Clips { span: end - start, rows });
         self.ed.marker = end;
         true

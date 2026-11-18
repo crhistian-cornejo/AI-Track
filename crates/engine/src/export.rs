@@ -531,11 +531,20 @@ fn sidechain_sources(devices: &[aitrack_model::Device], out: &mut Vec<TrackId>) 
 /// bare Main. The tracks its devices listen to (sidechains) stay, with
 /// their groups' members, but go nowhere audible.
 fn freeze_scratch(project: &Project, track: TrackId) -> Result<Project, EngineError> {
+    scratch_for(project, track, false)
+}
+
+/// [`freeze_scratch`], and with `groups` a Group track too: its members stay,
+/// each through its own fader, and the group is rendered as their sum.
+fn scratch_for(project: &Project, track: TrackId, groups: bool) -> Result<Project, EngineError> {
     let target = project.track(track).ok_or_else(|| EngineError::Export("the track is gone".into()))?;
-    if !target.can_freeze() {
-        return Err(EngineError::Export("only Instrument and Audio tracks can be frozen".into()));
+    let is_group = groups && target.kind == TrackKind::Group;
+    if !target.can_freeze() && !is_group {
+        return Err(EngineError::Export("only Instrument, Audio and Group tracks can be rendered".into()));
     }
+    let members: Vec<TrackId> = if is_group { aitrack_model::groups::descendants(project, track) } else { Vec::new() };
     let mut keep = vec![track];
+    keep.extend(members.iter().copied());
     let mut at = 0;
     while at < keep.len() {
         let mut found = Vec::new();
@@ -577,6 +586,10 @@ fn freeze_scratch(project: &Project, track: TrackId) -> Result<Project, EngineEr
             t.pan = 0.0;
             t.mute = false;
             t.automation.retain(|l| matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }));
+        } else if members.contains(&t.id) {
+            // Part of the group's sum: its fader, pan and mute count.
+            t.sends.clear();
+            t.vca = None;
         } else {
             t.sends.clear();
             t.vca = None;
@@ -646,6 +659,81 @@ pub fn freeze_track_to_wav(
         sample_rate,
         channels: rendered.channels() as u16,
         frames: rendered.frames() as u64,
+        warp: follow_song_warp(project),
+        key: None,
+    })
+}
+
+/// Where the last clip of `track` ends, a Group's members included (at least
+/// one bar): the end of the range a whole-track bounce renders.
+pub fn bounce_end(project: &Project, track: TrackId) -> Tick {
+    let mut end = freeze_end(project, track);
+    for id in aitrack_model::groups::descendants(project, track) {
+        end = end.max(freeze_end(project, id));
+    }
+    end
+}
+
+/// Bounce `track` (an Instrument, Audio or Group track) over `range`
+/// (`None`: from the start to the end of its last clip): its clips through
+/// its whole device chain, before the fader, with the reverb and delay tails
+/// ringing on past the end. A Group is rendered as the sum of its members.
+/// The result is `path` as a 32-bit float stereo WAV that starts at the
+/// range's start, so a clip placed there lines up with the song.
+///
+/// The song is rendered from its start so that held notes, filters and
+/// reverbs are in the state they would be in at `range.0`, and only the
+/// range is kept. Run it off the audio and UI threads; `progress` receives
+/// 0..1 and returns `false` to cancel ([`EngineError::Cancelled`]).
+#[allow(clippy::too_many_arguments)]
+pub fn bounce_track_to_wav(
+    project: &Project,
+    track: TrackId,
+    range: Option<(Tick, Tick)>,
+    sample_rate: u32,
+    path: &Path,
+    samples: Option<SampleCache>,
+    factory: &dyn ProcessorFactory,
+    progress: Option<Progress<'_>>,
+) -> Result<AudioSource, EngineError> {
+    let scratch = scratch_for(project, track, true)?;
+    let (from, to) = range.map_or((0, bounce_end(project, track)), |(a, b)| (a.max(0), b));
+    if to <= from {
+        return Err(EngineError::Export("empty bounce range".into()));
+    }
+    let opts = RenderOptions {
+        range: RenderRange::Ticks(0, to),
+        session_rate: sample_rate as f64,
+        export_rate: sample_rate,
+        block: 512,
+        tail_seconds: FREEZE_TAIL_SECONDS,
+        normalize_db: None,
+        samples,
+        threads: None,
+    };
+    let rendered = render(&scratch, factory, &opts, &[], progress)?.mix;
+    let rate = sample_rate as f64;
+    let first = (project.tempo.tick_to_samples(from, rate).round().max(0.0) as usize).min(rendered.frames());
+    let play_end = (project.tempo.tick_to_samples(to, rate).round().max(0.0) as usize).clamp(first, rendered.frames());
+    let last_loud = (first..rendered.frames()).rev().find(|&i| (0..rendered.channels()).any(|c| rendered.channel(c)[i].abs() > FREEZE_SILENCE));
+    let keep_to = last_loud.map_or(play_end, |i| (i + 1 + sample_rate as usize / 20).max(play_end)).min(rendered.frames());
+    let mut out = AudioBuffer::new(rendered.channels(), keep_to - first);
+    for c in 0..rendered.channels() {
+        out.channel_mut(c).copy_from_slice(&rendered.channel(c)[first..keep_to]);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(EngineError::Io)?;
+    }
+    if let Err(e) = write_wav(path, &out, sample_rate, WavFormat::Float32) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(AudioSource {
+        path: path.to_path_buf(),
+        hash: None,
+        sample_rate,
+        channels: out.channels() as u16,
+        frames: out.frames() as u64,
         warp: follow_song_warp(project),
         key: None,
     })

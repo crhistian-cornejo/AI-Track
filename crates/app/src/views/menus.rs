@@ -26,6 +26,7 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::LibraryContext => library_menu(ws, cx),
         MenuKind::ClipContext => crate::editing::menus::clip_menu(ws, cx),
         MenuKind::LaneContext => crate::editing::menus::lane_menu(cx),
+        MenuKind::LocatorContext(id) => crate::editing::menus::locator_menu(ws, *id, cx),
         MenuKind::TrackContext(track) => crate::editing::menus::track_menu(ws, *track, cx),
         MenuKind::TakeLaneContext(track, lane) => crate::editing::menus::take_lane_menu(ws, *track, *lane, cx),
         MenuKind::DeviceContext(device) => crate::editing::menus::device_menu(ws, *device, cx),

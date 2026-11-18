@@ -191,6 +191,10 @@ pub enum Drag {
     /// the main lane (with `hold`, from Shift, it waits for Enter).
     TakeRange { track: TrackId, lane: usize, anchor: Tick, hold: bool },
     LoopBrace { anchor: Tick },
+    /// A locator on the ruler: dragged to a new place, or (if it never
+    /// moved) a click that jumps there. `grab` is how far past the mark the
+    /// pointer took hold of it.
+    Locator { id: LocatorId, grab: Tick, moved: bool },
     Scrub,
     /// Colour picker: the hue strip or the saturation/value square.
     Pick { hue: bool },
@@ -214,6 +218,8 @@ pub enum MenuKind {
     LaneContext,
     /// Right-click on a track header (acts on the selected tracks).
     TrackContext(TrackId),
+    /// Right-click on a locator of the ruler.
+    LocatorContext(LocatorId),
     /// Right-click on a take lane's header (track, index among its take lanes).
     TakeLaneContext(TrackId, usize),
     /// Right-click on a device's title bar (acts on the picked devices).
@@ -740,6 +746,12 @@ impl Workspace {
                 }
                 // The first track with clips shown as frozen (header, clips, locked devices).
                 "frozen" => self.fake_freeze(),
+                // Four locators on the ruler (Intro, Build, Drop, Break), the Drop selected and
+                // its menu open, with the loop brace on Build..Drop.
+                "locators" => self.fake_locators(),
+                // A track bounced to a new track (seeded without rendering: a synthetic file),
+                // the new track selected, the source muted.
+                "bounced" => self.fake_bounce(),
                 "play" => self.b.engine.play(),
                 // A MIDI track with three take lanes and a comp made of parts of them.
                 "takes" => {
@@ -1279,6 +1291,8 @@ impl Workspace {
         }
         self.audition.retry(|t, k, v| self.b.engine.audition_note(t, k, v));
         let mut changed = self.b.engine.idle();
+        // A jump to a locator waiting for the launch quantisation.
+        changed |= self.poll_jump();
         // Knobs turned in a plugin's own window become undoable SetParam edits.
         let edits = self.b.engine.take_plugin_edits();
         // While recording with Automation Arm on, they are written into their lanes too.
@@ -1562,6 +1576,13 @@ impl Workspace {
             {
                 cx.notify();
             }
+            return;
+        }
+        // A locator picked on the ruler goes first (clicking in the lanes drops it).
+        if let Some(id) = self.s.ed.locator
+            && self.s.remove_locator(id)
+        {
+            cx.notify();
             return;
         }
         if self.s.delete_selection() {
@@ -2149,6 +2170,16 @@ impl Workspace {
                     self.s.set_loop(Some((a, b)));
                 }
             }
+            Drag::Locator { id, grab, moved } => {
+                let (tick, _) = self.arrange_pos(e.position);
+                let at = self.s.snap_tick(crate::editing::GridView::Arrange, (tick - *grab).max(0), e.modifiers.alt);
+                // A click that wobbles is still a click: it takes a few pixels to move.
+                let far = self.s.project.locator(*id).is_some_and(|l| (at - l.tick).abs() as f32 * self.s.arrange.px_per_beat / PPQ as f32 >= 3.);
+                if *moved || far {
+                    *moved = true;
+                    self.s.move_locator(*id, at, true);
+                }
+            }
             Drag::Scrub => {
                 let (tick, _) = self.arrange_pos(e.position);
                 // The insert marker follows the scrub.
@@ -2179,6 +2210,12 @@ impl Workspace {
                 }
                 Drag::TakeRange { hold: false, .. } => {
                     self.s.promote_take_selection();
+                }
+                // A locator that never moved was clicked: the playhead goes there.
+                Drag::Locator { id, moved: false, .. } => {
+                    if let Some(tick) = self.s.project.locator(id).map(|l| l.tick) {
+                        self.jump_to(tick, cx);
+                    }
                 }
                 Drag::ClipCopy(d) => views::arrange_clips::copy_end(self, d),
                 Drag::ClipShape(d) => views::arrange_clips::shape_end(self, &d, cx),

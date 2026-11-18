@@ -1054,8 +1054,8 @@ pub(crate) enum Patch {
 /// stops this from compiling until it is decided here whether the compiler
 /// reads it.
 pub(crate) fn param_patches(old: &Project, new: &Project) -> Option<Vec<Patch>> {
-    let Project { format_version: _, name: _, tempo, scale: _, sample_rate_hint: _, tracks, scenes, clips, sources, loop_region: _, ids: _, grooves, groove_amount, clip_grooves } = old;
-    let Project { format_version: _, name: _, tempo: tempo_b, scale: _, sample_rate_hint: _, tracks: tracks_b, scenes: scenes_b, clips: clips_b, sources: sources_b, loop_region: _, ids: _, grooves: grooves_b, groove_amount: groove_amount_b, clip_grooves: clip_grooves_b } = new;
+    let Project { format_version: _, name: _, tempo, scale: _, sample_rate_hint: _, tracks, scenes, clips, sources, loop_region: _, ids: _, grooves, groove_amount, clip_grooves, locators: _ } = old;
+    let Project { format_version: _, name: _, tempo: tempo_b, scale: _, sample_rate_hint: _, tracks: tracks_b, scenes: scenes_b, clips: clips_b, sources: sources_b, loop_region: _, ids: _, grooves: grooves_b, groove_amount: groove_amount_b, clip_grooves: clip_grooves_b, locators: _ } = new;
     if tempo != tempo_b || scenes != scenes_b || clips != clips_b || sources != sources_b || tracks.len() != tracks_b.len() {
         return None;
     }

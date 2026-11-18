@@ -8,7 +8,7 @@ use crate::keys::{self, Cmd};
 use crate::theme::*;
 use crate::widgets::{self, menu_item, mono};
 use crate::workspace::{MenuKind, Workspace};
-use aitrack_model::{Color, DeviceId, TrackId, TrackKind};
+use aitrack_model::{Color, DeviceId, LocatorId, TrackId, TrackKind};
 use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window};
 
 /// A menu row with its shortcut on the right.
@@ -122,6 +122,8 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
             None => {}
         }))
         .child(command("clip-consolidate", Icon::Group, "Consolidate", Cmd::Consolidate, cx))
+        .child(command("clip-bounce", Icon::Waveform, "Bounce to New Track", Cmd::BounceToNewTrack, cx))
+        .child(command("clip-paste-bounced", Icon::Paste, "Paste Bounced Audio", Cmd::PasteBounced, cx))
         .child(command("clip-rename", Icon::Pencil, "Rename", Cmd::Rename, cx))
         .child(action("clip-active", Icon::Power, if muted { "Activate" } else { "Deactivate" }, keys::action_hint("ToggleActive"), false, cx, |this, _, _| {
             this.s.toggle_clips_active();
@@ -155,6 +157,8 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
 pub fn lane_menu(cx: &mut Context<Workspace>) -> AnyElement {
     widgets::menu_card("lane-menu", 232.)
         .child(command("lane-paste", Icon::Paste, "Paste", Cmd::Paste, cx))
+        .child(command("lane-paste-bounced", Icon::Paste, "Paste Bounced Audio", Cmd::PasteBounced, cx))
+        .child(command("lane-bounce", Icon::Waveform, "Bounce to New Track", Cmd::BounceToNewTrack, cx))
         .child(command("lane-midi-clip", Icon::MusicNote, "Insert MIDI Clip", Cmd::InsertMidiClip, cx))
         .child(widgets::divider_h())
         .child(action("lane-audio-track", Icon::Waveform, "Insert Audio Track", keys::action_hint("AddAudioTrack"), false, cx, |this, _, _| {
@@ -261,6 +265,16 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
             card = card.child(action("track-insert-take", Icon::Add, "Insert Take Lane", None, false, cx, move |this, _, _| {
                 this.s.insert_take_lane(track);
             }));
+        }
+    }
+    // Bounce (Live 12.2): render to audio, in place or to a new track below.
+    let bounceable = !ws.s.bounce_new_track_jobs().is_empty();
+    if bounceable {
+        card = card
+            .child(widgets::divider_h())
+            .child(command("track-bounce-new", Icon::Waveform, if many { "Bounce to New Tracks" } else { "Bounce to New Track" }, Cmd::BounceToNewTrack, cx));
+        if !ws.s.bounce_in_place_jobs().is_empty() {
+            card = card.child(command("track-bounce-place", Icon::Waveform, if many { "Bounce Tracks in Place" } else { "Bounce Track in Place" }, Cmd::BounceInPlace, cx));
         }
     }
     // Freeze (Live): render the track so its devices stop running; Flatten makes the render audio.
@@ -463,5 +477,35 @@ pub fn device_menu(
                     .remove_devices(if ids.is_empty() { vec![device] } else { ids });
             },
         ))
+        .into_any_element()
+}
+
+/// Right-click on a locator of the ruler.
+pub fn locator_menu(ws: &mut Workspace, id: LocatorId, cx: &mut Context<Workspace>) -> AnyElement {
+    let Some(tick) = ws.s.project.locator(id).map(|l| l.tick) else {
+        return widgets::menu_card("locator-menu", 232.).into_any_element();
+    };
+    widgets::menu_card("locator-menu", 232.)
+        .child(item("locator-rename", Icon::Pencil, "Rename", keys::hint(Cmd::Rename), false).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.menu = None;
+            this.s.ed.locator = Some(id);
+            crate::commands::open_rename_for(this, Some(crate::commands::RenameTarget::Locator(id)), window, cx);
+        })))
+        .child(action("locator-jump", Icon::Play, "Jump Here", None, false, cx, move |this, _, cx| this.jump_to(tick, cx)))
+        .child(widgets::divider_h())
+        .child(action("locator-loop-next", Icon::Loop, "Loop to Next Locator", None, false, cx, move |this, _, cx| this.loop_to_next_locator(Some(id), cx)))
+        .child(
+            action("locator-loop-selection", Icon::Loop, "Set Loop to Selection", keys::action_hint("ToggleLoop"), false, cx, |this, _, cx| {
+                if this.s.loop_selection() {
+                    this.b.engine.set_looping(true);
+                } else {
+                    this.toast("Select clips or a stretch of time first", cx);
+                }
+            }),
+        )
+        .child(widgets::divider_h())
+        .child(action("locator-delete", Icon::Trash, "Delete", None, false, cx, move |this, _, _| {
+            this.s.remove_locator(id);
+        }))
         .into_any_element()
 }

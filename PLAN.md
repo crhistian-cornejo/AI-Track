@@ -424,3 +424,6 @@ Errores a **no** repetir: `Mutex` sobre plugins o parámetros, reconstruir el mo
 4. **IA desde el inicio:** audio→MIDI (basic-pitch, Apache-2.0) y separación de stems (Demucs ONNX). Los pesos de stems se descargan bajo demanda desde su origen, con aviso de licencia, en vez de redistribuirlos.
 5. **Banco de sonidos incluido:** samples y presets gratuitos de EDM, pop, reggaetón, etc. Solo se empaquetan los packs con licencia que permita redistribuir (CC0, CC-BY o permiso explícito), descargados y verificados con `cargo xtask soundbank`. Los packs gratis que prohíben redistribución se ofrecen como enlaces en un "Content Hub" para que el usuario los descargue él mismo.
 6. **Nombre:** AI-Track (provisional).
+7. **Licencia confirmada el 2026-11-17: se queda en MIT**, no se pasa a GPL. Si algún día se pasara, tendría que ser GPLv3 (o "v2 o posterior"), porque las dependencias Apache-2.0, GPUI incluido, son incompatibles con GPLv2-only. Lo que la GPL desbloquearía se consigue de otra forma:
+   - **Ableton Link:** licencia propietaria de Ableton, sin pasar a GPL.
+   - **Rubber Band:** licencia comercial. Mientras tanto, time-stretch y pitch-shift propios en `crates/dsp`.

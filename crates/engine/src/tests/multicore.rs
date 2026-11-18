@@ -646,17 +646,24 @@ fn the_allocation_counter_sees_the_workers() {
     let mut pool = crate::workers::WorkerPool::new(4, crate::workers::PoolKind::Offline);
     let id = pool.id();
     let on_workers = std::sync::atomic::AtomicUsize::new(0);
+    // On a small, busy machine (a 2-core CI runner) the caller can finish a
+    // whole run before a worker wakes: run again until one has taken part.
     let ((), n) = count_allocs_in_pools(&[id], || {
-        pool.run(64, &|_| {
-            let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_micros(100) {
-                std::hint::spin_loop();
+        for _ in 0..200 {
+            pool.run(64, &|_| {
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_micros(100) {
+                    std::hint::spin_loop();
+                }
+                if std::thread::current().name().is_some_and(|n| n.starts_with("aitrack-dsp-")) {
+                    on_workers.fetch_add(1, Ordering::Relaxed);
+                    drop(std::hint::black_box(vec![0u8; 32]));
+                }
+            });
+            if on_workers.load(Ordering::Relaxed) > 0 {
+                break;
             }
-            if std::thread::current().name().is_some_and(|n| n.starts_with("aitrack-dsp-")) {
-                on_workers.fetch_add(1, Ordering::Relaxed);
-                drop(std::hint::black_box(vec![0u8; 32]));
-            }
-        });
+        }
     });
     let w = on_workers.load(Ordering::Relaxed) as u64;
     assert!(w > 0, "the workers took part");

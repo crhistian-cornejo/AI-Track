@@ -112,6 +112,12 @@ pub fn scan_out_of_process(
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
+            // Finished, but later than allowed (between two polls): a
+            // timeout all the same, so the limit means the same on any machine.
+            Ok(Some(_)) if start.elapsed() > timeout => {
+                let _ = reader.join();
+                return Err(ScanFailure::Timeout);
+            }
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();

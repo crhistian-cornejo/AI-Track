@@ -8,7 +8,7 @@
 
 mod agent;
 mod markdown;
-mod midi_gen;
+pub(crate) mod midi_gen;
 mod mix;
 pub mod part;
 pub mod slash;

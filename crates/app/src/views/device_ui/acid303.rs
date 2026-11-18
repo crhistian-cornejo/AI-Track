@@ -4,7 +4,7 @@
 use super::filter::{db_frac, paint_response};
 use super::instr;
 use super::kit::{self, Handle, PlotCfg, ax, freq_frac};
-use super::{Dev, caption, set_now};
+use super::{Dev, acid_gen, caption, set_now};
 use crate::paint;
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
@@ -149,6 +149,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 )),
         )
         .child(seq)
+        .child(acid_gen::strip(ws, dev, cx))
         .child(kit::strip(ws, dev, &primary, &more, cx))
         .into_any_element()
 }
@@ -330,6 +331,7 @@ fn pattern(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
                 .child(div().flex_1())
                 .child(instr::chips(dev, p::SEQ_MODE, cx)),
         )
+        .child(acid_gen::strip(ws, dev, cx))
         .child(
             div()
                 .flex_none()

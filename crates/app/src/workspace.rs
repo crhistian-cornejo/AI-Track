@@ -400,6 +400,8 @@ pub struct Workspace {
     pub organize: OrganizeUi,
     /// Devices open in windows of their own (`views::device_window`).
     pub device_windows: std::collections::HashMap<DeviceId, gpui::WindowHandle<views::device_window::DeviceWindow>>,
+    /// The Acid 303 phrase generator's settings per device (UI state, not project data).
+    pub acid_gen: std::collections::HashMap<DeviceId, views::device_ui::acid_gen::AcidGen>,
     /// A device window the dev view asked for (opened on the first frame).
     window_pending: Option<DeviceId>,
     /// Device windows to open on the next frame (dev view `devwins=`).
@@ -558,6 +560,7 @@ impl Workspace {
             drum_jobs: Default::default(),
             organize: OrganizeUi::default(),
             device_windows: Default::default(),
+            acid_gen: Default::default(),
             window_pending: None,
             windows_pending: Vec::new(),
             _housekeeping: housekeeping,
@@ -611,6 +614,22 @@ impl Workspace {
             match word {
                 "devices" => self.s.bottom_tab = BottomTab::Devices,
                 "piano" => self.s.bottom_tab = BottomTab::PianoRoll,
+                // An Acid 303 on a demo track with a generated phrase (fixed seed), the Devices tab open.
+                "acidgen" => {
+                    let track = self.s.project.alloc_track_id();
+                    let device = self.s.project.alloc_device_id();
+                    let mut t = Track::new(track, TrackKind::Instrument, "Acid", Color::palette(3));
+                    t.devices.push(Device::stock(device, aitrack_stock::instrument::acid303::ID, "Acid 303"));
+                    let index = self.s.project.tracks.iter().position(|t| matches!(t.kind, TrackKind::Return | TrackKind::Vca | TrackKind::Main)).unwrap_or(self.s.project.tracks.len());
+                    if self.s.edit("Add track", vec![Command::AddTrack { track: Box::new(t), index }]) {
+                        self.s.selected_track = Some(track);
+                        let mut g = views::device_ui::acid_gen::AcidGen::new(device);
+                        g.seed = 0x303;
+                        self.acid_gen.insert(device, g);
+                        views::device_ui::acid_gen::generate(self, device, cx);
+                        self.s.bottom_tab = BottomTab::Devices;
+                    }
+                }
                 "steps" => self.s.bottom_tab = BottomTab::Steps,
                 "mixer" => self.mixer_open = true,
                 "meters" => self.meters.open = true,

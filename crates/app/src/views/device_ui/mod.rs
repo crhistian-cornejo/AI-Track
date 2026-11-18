@@ -17,6 +17,7 @@
 //! that), a handle is dragged, or meter data is still changing.
 
 pub mod acid303;
+pub mod acid_gen;
 pub mod analyzer;
 pub mod arp;
 pub mod autopan;

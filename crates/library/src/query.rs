@@ -518,6 +518,15 @@ impl Library {
             .query_row(&sql, rusqlite::params_from_iter(w.args.iter()), |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Ids of the samples the filters let through (no text).
+    pub fn filtered_ids(&self, f: &Filters) -> Result<std::collections::HashSet<i64>> {
+        let w = build_where(f);
+        let sql = format!("SELECT s.id FROM samples s JOIN roots r ON r.id = s.root_id WHERE {}", w.sql.join(" AND "));
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(w.args.iter()), |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Samples that fit the project: key compatibility, tempo, favourites.
     /// `score = 0.5·key + 0.35·tempo + 0.1·favourite + 0.05·rating`.
     pub fn recommend(&self, q: &RecommendQuery) -> Result<Vec<Recommendation>> {

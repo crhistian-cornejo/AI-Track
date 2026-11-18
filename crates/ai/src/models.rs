@@ -30,6 +30,8 @@ pub mod ids {
     pub const BASIC_PITCH: &str = "basic-pitch";
     pub const HTDEMUCS: &str = "htdemucs";
     pub const HTDEMUCS_6S: &str = "htdemucs-6s";
+    /// LAION CLAP (`larger_clap_general`): audio and text embeddings for searching sounds by meaning.
+    pub const CLAP_GENERAL: &str = "clap-general";
     /// ONNX Runtime, CPU build (Windows) / CPU + CoreML build (macOS).
     pub const ONNXRUNTIME: &str = "onnxruntime";
     /// ONNX Runtime with the DirectML execution provider (Windows x64).
@@ -132,6 +134,20 @@ pre-trained weights as provided for research purposes (they were trained on MUSD
 license of the weights has not been clarified. AI-Track does not distribute these weights: they are downloaded from \
 the original source on your request. You are responsible for checking that your use complies with their terms.";
 
+const CLAP_NOTICE: &str = "CLAP (Contrastive Language-Audio Pretraining) by LAION: weights of laion/larger_clap_general, \
+published under the Apache-2.0 license. The ONNX export (int8-quantised) is Xenova's, from the same weights. It lets you \
+search your samples by describing them (\"dark punchy kick\", \"warm analog pad\"). Training data was a mix of \
+Creative Commons and other public audio, each clip under its own license; the weights themselves are Apache-2.0. \
+About 205 MB are downloaded once from Hugging Face on your request, and the model runs on this computer: no audio \
+or text leaves it.";
+
+/// Hugging Face commit of the ONNX export the CLAP files are pinned to.
+const CLAP_REV: &str = "d78c3994912c441f0151a5cc44d86f6b7bf4c861";
+
+fn clap_url(file: &str) -> String {
+    format!("https://huggingface.co/Xenova/larger_clap_general/resolve/{CLAP_REV}/{file}")
+}
+
 fn gh_release(file: &str) -> String {
     format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{file}")
 }
@@ -201,6 +217,52 @@ pub fn manifest() -> Vec<ModelEntry> {
             requires_acceptance: true,
             stems: ["drums", "bass", "other", "vocals", "guitar", "piano"].map(String::from).to_vec(),
             sample_rate: 44_100,
+        },
+        ModelEntry {
+            id: ids::CLAP_GENERAL.into(),
+            name: "CLAP (search by meaning)".into(),
+            description: "LAION larger_clap_general, int8 ONNX: a sound and a phrase become vectors in one space, so \"dark punchy kick\" finds kicks without tags. Audio at 48 kHz in 10 s windows; text through a RoBERTa tokenizer.".into(),
+            kind: ModelKind::Onnx,
+            version: format!("larger_clap_general-int8@{}", &CLAP_REV[..7]),
+            // Order matters: audio tower, text tower, vocabulary, merges (see `clap::Clap::open_dir`).
+            files: vec![
+                ModelFile {
+                    url: clap_url("onnx/audio_model_quantized.onnx"),
+                    sha256: "320b831d0043d36aa8cfad0f36b64b7c597fa9ff01a5a9b505e37632923cf9ac".into(),
+                    size: Some(78_155_433),
+                    file_name: "audio_model_quantized.onnx".into(),
+                    extract: vec![],
+                },
+                ModelFile {
+                    url: clap_url("onnx/text_model_quantized.onnx"),
+                    sha256: "045614ce697750cf8876cb965ebfad3ef2d0ae7900dda897d7569f7be86521cd".into(),
+                    size: Some(126_603_263),
+                    file_name: "text_model_quantized.onnx".into(),
+                    extract: vec![],
+                },
+                ModelFile {
+                    url: clap_url("vocab.json"),
+                    sha256: "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e".into(),
+                    size: Some(798_293),
+                    file_name: "vocab.json".into(),
+                    extract: vec![],
+                },
+                ModelFile {
+                    url: clap_url("merges.txt"),
+                    sha256: "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5".into(),
+                    size: Some(456_318),
+                    file_name: "merges.txt".into(),
+                    extract: vec![],
+                },
+            ],
+            license: "Apache-2.0".into(),
+            license_url: "https://huggingface.co/laion/larger_clap_general".into(),
+            source: "https://huggingface.co/Xenova/larger_clap_general (ONNX export of laion/larger_clap_general)".into(),
+            notice: Some(CLAP_NOTICE.into()),
+            // Apache-2.0 weights: the notice is shown next to the download button, no extra gate.
+            requires_acceptance: false,
+            stems: vec![],
+            sample_rate: 48_000,
         },
     ];
     v.extend(runtime_entries());
@@ -772,6 +834,12 @@ mod tests {
             }
             assert!(!e.requires_acceptance || e.notice.is_some());
         }
+        let clap = m.iter().find(|e| e.id == ids::CLAP_GENERAL).unwrap();
+        assert_eq!(clap.license, "Apache-2.0");
+        assert!(clap.notice.as_deref().is_some_and(|n| n.contains("Apache-2.0")));
+        assert_eq!(clap.installed_names().len(), 4);
+        assert_eq!(clap.download_size(), Some(78_155_433 + 126_603_263 + 798_293 + 456_318));
+        assert!(clap.files.iter().all(|f| f.url.contains(CLAP_REV)), "pinned to one commit");
         let demucs = m.iter().find(|e| e.id == ids::HTDEMUCS).unwrap();
         assert!(demucs.requires_acceptance);
         assert_eq!(demucs.stems, vec!["drums", "bass", "other", "vocals"]);

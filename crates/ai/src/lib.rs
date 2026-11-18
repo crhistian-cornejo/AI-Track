@@ -7,6 +7,7 @@
 //!   Runtime (loaded dynamically, see [`runtime`]): polyphonic audio-to-MIDI
 //!   with Spotify's basic-pitch ([`extract_midi`]) and Demucs stem separation
 //!   ([`split_stems`]).
+//! * CLAP ([`clap`]): audio and text embeddings, to search samples by describing them.
 //!
 //! Nothing here may run on the audio thread. Long jobs take a progress
 //! callback and a [`CancelToken`]; [`worker`] runs them on background threads
@@ -15,6 +16,7 @@
 pub mod analysis;
 pub mod audio;
 pub mod chords;
+pub mod clap;
 pub mod classify;
 pub mod drum_extract;
 pub mod embedding;
@@ -35,6 +37,7 @@ pub mod worker;
 
 pub use analysis::{RootNote, SampleAnalysis, analyze, analyze_audio};
 pub use chords::{ChordSegment, detect_chords};
+pub use clap::{CLAP_EMBEDDING_DIM, CLAP_EMBEDDING_ID, CLAP_EMBEDDING_VERSION, Clap};
 pub use classify::SampleCategory;
 pub use drum_extract::{
     DrumClass, DrumExtractOptions, DrumExtractionResult, ExtractedLoop, ExtractedOneShot,

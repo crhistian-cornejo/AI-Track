@@ -19,6 +19,7 @@
 //! I/O, no clock, no globals. It never edits a `Project`; the app turns a
 //! [`Generated`] into commands.
 
+pub mod acid;
 pub mod context;
 pub mod draft;
 pub mod feel;

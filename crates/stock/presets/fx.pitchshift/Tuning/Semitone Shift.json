@@ -1,0 +1,21 @@
+{
+  "name": "Semitone Shift",
+  "plugin": "fx.pitchshift",
+  "author": "AI-Track",
+  "tags": [
+    "pitch",
+    "transpose",
+    "key change",
+    "sample",
+    "loop"
+  ],
+  "params": {
+    "0": 0.5208333,
+    "1": 0.5,
+    "2": 0.64768547,
+    "3": 1.0,
+    "4": 0.0,
+    "5": 1.0,
+    "6": 0.6666667
+  }
+}

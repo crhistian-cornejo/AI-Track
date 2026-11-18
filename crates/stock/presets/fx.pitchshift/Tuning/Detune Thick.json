@@ -1,0 +1,21 @@
+{
+  "name": "Detune Thick",
+  "plugin": "fx.pitchshift",
+  "author": "AI-Track",
+  "tags": [
+    "pitch",
+    "detune",
+    "thicken",
+    "chorus",
+    "wide"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.57,
+    "2": 0.4421141,
+    "3": 1.0,
+    "4": 0.0,
+    "5": 0.5,
+    "6": 0.6666667
+  }
+}

@@ -331,6 +331,7 @@ pub fn stock_group(plugin_id: &str) -> Option<DeviceGroup> {
         "fx.delay" => DeviceGroup::FxDelay,
         "fx.chorus" | "fx.autopan" => DeviceGroup::FxModulation,
         "fx.shaper" | "fx.stutter" => DeviceGroup::FxCreative,
+        "fx.pitchshift" | "fx.freqshift" | "fx.vocoder" => DeviceGroup::FxPitchTime,
         "fx.filter" => DeviceGroup::FxFilter,
         "fx.multiband" | "fx.mbdyn" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,

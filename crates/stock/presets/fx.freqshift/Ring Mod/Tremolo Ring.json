@@ -1,0 +1,24 @@
+{
+  "name": "Tremolo Ring",
+  "plugin": "fx.freqshift",
+  "author": "AI-Track",
+  "tags": [
+    "frequency shifter",
+    "tremolo",
+    "ring",
+    "wobble",
+    "pad"
+  ],
+  "params": {
+    "0": 1.0,
+    "1": 0.5,
+    "2": 0.675,
+    "3": 0.0,
+    "4": 0.56632334,
+    "5": 0.0,
+    "6": 0.0,
+    "7": 0.0,
+    "8": 1.0,
+    "9": 0.6666667
+  }
+}

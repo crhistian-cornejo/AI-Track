@@ -1,0 +1,22 @@
+{
+  "name": "Shimmer Fifth",
+  "plugin": "fx.pitchshift",
+  "author": "AI-Track",
+  "tags": [
+    "pitch",
+    "shimmer",
+    "ambient",
+    "feedback",
+    "fifth",
+    "cinematic"
+  ],
+  "params": {
+    "0": 0.6458333,
+    "1": 0.5,
+    "2": 0.8842282,
+    "3": 1.0,
+    "4": 0.6666667,
+    "5": 0.35,
+    "6": 0.6666667
+  }
+}

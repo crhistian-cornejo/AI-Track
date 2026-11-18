@@ -1,0 +1,21 @@
+{
+  "name": "Octave Down",
+  "plugin": "fx.pitchshift",
+  "author": "AI-Track",
+  "tags": [
+    "pitch",
+    "octave",
+    "transpose",
+    "bass",
+    "sub"
+  ],
+  "params": {
+    "0": 0.25,
+    "1": 0.5,
+    "2": 0.72105706,
+    "3": 1.0,
+    "4": 0.0,
+    "5": 1.0,
+    "6": 0.6666667
+  }
+}

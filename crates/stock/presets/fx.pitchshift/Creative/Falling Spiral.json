@@ -1,0 +1,22 @@
+{
+  "name": "Falling Spiral",
+  "plugin": "fx.pitchshift",
+  "author": "AI-Track",
+  "tags": [
+    "pitch",
+    "feedback",
+    "dark",
+    "descending",
+    "dub",
+    "fx"
+  ],
+  "params": {
+    "0": 0.39583334,
+    "1": 0.5,
+    "2": 0.78309184,
+    "3": 1.0,
+    "4": 0.7777778,
+    "5": 0.45,
+    "6": 0.6666667
+  }
+}

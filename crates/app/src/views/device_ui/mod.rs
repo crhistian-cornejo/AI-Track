@@ -33,6 +33,7 @@ pub mod dynamics;
 pub mod echo;
 pub mod eq;
 pub mod filter;
+pub mod freqshift;
 pub mod generic;
 pub mod granular;
 pub mod instr;
@@ -45,6 +46,7 @@ pub mod midi_kit;
 pub mod midside;
 pub mod multiband;
 pub mod pitch;
+pub mod pitchshift;
 pub mod random;
 pub mod reverb;
 pub mod sampler;
@@ -55,6 +57,7 @@ pub mod stutter;
 pub mod utility;
 pub mod velocity;
 pub mod vault;
+pub mod vocoder;
 pub mod wavetable;
 
 use crate::bridge::{EngineBridge, PluginCatalog};
@@ -723,6 +726,9 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.crusher"
             | "fx.drumbus"
             | "fx.stutter"
+            | "fx.pitchshift"
+            | "fx.freqshift"
+            | "fx.vocoder"
             | "midi.arp"
             | "midi.echo"
             | "midi.random"
@@ -768,6 +774,9 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.crusher" => crusher::render(ws, dev, cx),
         "fx.drumbus" => drumbus::render(ws, dev, cx),
         "fx.stutter" => stutter::render(ws, dev, cx),
+        "fx.pitchshift" => pitchshift::render(ws, dev, cx),
+        "fx.freqshift" => freqshift::render(ws, dev, cx),
+        "fx.vocoder" => vocoder::render(ws, dev, cx),
         "midi.arp" => arp::render(ws, dev, cx),
         "midi.echo" => echo::render(ws, dev, cx),
         "midi.random" => random::render(ws, dev, cx),

@@ -533,9 +533,9 @@ mod tests {
             .map(|i| grooved(&note(i as u64 + 1, 42, i * S16, S16 / 2, 0.8), &g, &p, 1, 0, 64 * S16, 0))
             .collect();
         let got = extract(&notes, 0, 64 * S16, S16, 16, "got").expect("a groove");
-        for i in 0..16 {
+        for (i, slot) in got.slots.iter().enumerate().take(16) {
             let want = if i % 2 == 1 { 0.3333 } else { 0.0 };
-            assert!((got.slots[i].timing - want).abs() < 0.01, "cell {i}: {} vs {want}", got.slots[i].timing);
+            assert!((slot.timing - want).abs() < 0.01, "cell {i}: {} vs {want}", slot.timing);
         }
         // Velocity is relative to the mean: even cells above it, odd below.
         assert!(got.slots[0].velocity > 0.1 && got.slots[1].velocity < -0.1);

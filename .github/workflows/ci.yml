@@ -11,6 +11,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Same Rust as the developers' machines (1.99): a newer stable can add clippy
+# lints and fail `-D warnings` on code nobody touched. Bump on purpose.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -27,8 +29,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check

@@ -102,12 +102,14 @@ impl BoxFilter {
 }
 
 /// Taps per polyphase branch of the true-peak interpolator.
-const TP_TAPS: usize = 16;
-const TP_PHASES: usize = 4;
+const TP_TAPS: usize = 24;
+const TP_PHASES: usize = 8;
 
-/// 4× oversampled peak detector (ITU-R BS.1770 Annex 2 method: polyphase
-/// interpolation, then absolute peak). Kaiser-windowed sinc, 64 taps.
-/// Its output lags the input by [`TruePeak::LATENCY`] samples.
+/// 8× oversampled peak detector (ITU-R BS.1770 Annex 2 method: polyphase
+/// interpolation, then absolute peak). Kaiser-windowed sinc, 8 × 24 taps with
+/// the cut-off at the base Nyquist (flat to within 0.1 dB up to 0.9 of it; the
+/// old 4 × 16 taps with a 0.92 cut-off read 2.1 dB low at 20 kHz). Its output
+/// lags the input by [`TruePeak::LATENCY`] samples.
 #[derive(Clone, Debug)]
 pub struct TruePeak {
     coefs: [[f32; TP_TAPS]; TP_PHASES],
@@ -137,12 +139,15 @@ fn bessel_i0(x: f64) -> f64 {
 
 impl TruePeak {
     pub const LATENCY: usize = TP_TAPS / 2;
+    /// Span of the interpolator in input samples: a peak it reports depends
+    /// on this many consecutive inputs.
+    pub const SPAN: usize = TP_TAPS;
 
     pub fn new() -> Self {
         let mut coefs = [[0.0f32; TP_TAPS]; TP_PHASES];
-        let beta = 7.0;
+        let beta = 4.0;
         let total = (TP_TAPS * TP_PHASES) as f64;
-        let cutoff = 0.92; // of the base-rate Nyquist
+        let cutoff = 1.0; // of the base-rate Nyquist (half-gain point)
         for (p, row) in coefs.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (k, c) in row.iter_mut().enumerate() {
@@ -168,7 +173,7 @@ impl TruePeak {
         self.pos = 0;
     }
 
-    /// Push a sample; returns the absolute peak of the 4 interpolated
+    /// Push a sample; returns the absolute peak of the 8 interpolated
     /// samples around the sample `LATENCY` steps ago.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
@@ -247,6 +252,36 @@ mod tests {
         }
         assert!((sample_peak - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
         assert!(peak > 0.98 && peak < 1.02, "{peak}");
+    }
+
+    /// Worst reading of a unit sine over 64 start phases (the report's `tp`
+    /// probe): what the detector leaves unseen, in dB.
+    fn missed_db(freq: f32) -> f32 {
+        let mut worst = 0.0f32;
+        for k in 0..64 {
+            let ph = std::f32::consts::TAU * k as f32 / 64.0;
+            let mut tp = TruePeak::new();
+            let mut peak = 0.0f32;
+            for n in 0..400 {
+                let x = (std::f32::consts::TAU * freq * n as f32 / 48_000.0 + ph).sin();
+                let v = tp.process(x);
+                if n > 100 {
+                    peak = peak.max(v);
+                }
+            }
+            worst = worst.max(-20.0 * peak.log10());
+        }
+        worst
+    }
+
+    /// Report 24/01 §3.2: 12 kHz missed 0.17 dB, 18 kHz 0.49 dB, 20 kHz 2.11 dB
+    /// with the 4x/16-tap detector.
+    #[test]
+    fn true_peak_reads_high_tones() {
+        for (f, max) in [(1_000.0, 0.01), (12_000.0, 0.05), (15_000.0, 0.03), (18_000.0, 0.1), (20_000.0, 0.2)] {
+            let m = missed_db(f);
+            assert!(m < max, "{f} Hz: misses {m:.3} dB (max {max})");
+        }
     }
 
     #[test]

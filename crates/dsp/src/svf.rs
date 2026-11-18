@@ -8,6 +8,7 @@
 //! Coefficients ([`SvfCoeffs`]) and state ([`SvfState`]) are separate so a
 //! stereo pair or a bank of voices can share one set of coefficients.
 
+use crate::biquad::BiquadCoeffs;
 use std::f64::consts::PI;
 
 /// Response of an SVF.
@@ -81,6 +82,35 @@ impl SvfCoeffs {
             SvfMode::LowShelf => Self::from_gk(w / a.sqrt(), k, 1.0, k * (a - 1.0), a * a - 1.0),
             SvfMode::HighShelf => Self::from_gk(w * a.sqrt(), k, a * a, k * (1.0 - a) * a, 1.0 - a * a),
         }
+    }
+
+    /// Realise any stable second-order section (here the magnitude-matched
+    /// biquads) on this structure: the SVF's poles are set from the biquad's
+    /// denominator and its three outputs are mixed into the biquad's
+    /// numerator, so the transfer function is the biquad's exactly while the
+    /// state stays as robust under fast modulation as the SVF.
+    ///
+    /// With `n = 1 - a1 + a2` and `d = 1 + a1 + a2`: `g² = d / n`,
+    /// `g k = 4 / n - 1 - g²`, `m0` is the gain at Nyquist, `m2 + m0` the
+    /// gain at DC and `m1 = 2 (b0 - b2) / (n g) - m0 k`.
+    pub fn from_biquad(c: &BiquadCoeffs) -> Self {
+        let n = (1.0 - c.a1 + c.a2).max(1e-12);
+        let dc = (1.0 + c.a1 + c.a2).max(1e-18);
+        let g2 = dc / n;
+        let g = g2.sqrt();
+        let k = ((4.0 / n - 1.0 - g2) / g).max(1e-6);
+        let nyquist = (c.b0 - c.b1 + c.b2) / n;
+        let dc_gain = (c.b0 + c.b1 + c.b2) / dc;
+        let beta = 2.0 * (c.b0 - c.b2) / (n * g);
+        Self::from_gk(g, k, nyquist, beta - nyquist * k, dc_gain - nyquist)
+    }
+
+    /// The same filter with its output multiplied by `gain`.
+    pub fn scaled(mut self, gain: f32) -> Self {
+        self.m0 *= gain;
+        self.m1 *= gain;
+        self.m2 *= gain;
+        self
     }
 
     /// Complex response at `freq` as `(re, im)` — exact for this structure
@@ -351,6 +381,76 @@ pub(crate) mod tests {
         assert!((butterworth_q(2, 0) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert!((butterworth_q(4, 0) - 0.5412).abs() < 1e-3);
         assert!((butterworth_q(4, 1) - 1.3066).abs() < 1e-3);
+    }
+
+    /// The matched biquads on the SVF structure: same transfer function, and
+    /// the running filter agrees with the biquad's own state machine.
+    #[test]
+    fn from_biquad_is_the_same_filter() {
+        use crate::biquad::{Biquad32, BiquadShape, BiquadState};
+        for sr in [44_100.0, 48_000.0] {
+            for &(shape, f0, q, g) in &[
+                (BiquadShape::Bell, 1000.0, 1.0, 12.0),
+                (BiquadShape::Bell, 16_000.0, 0.7, -18.0),
+                (BiquadShape::Bell, 40.0, 8.0, 6.0),
+                (BiquadShape::LowShelf, 120.0, 0.707, 9.0),
+                (BiquadShape::HighShelf, 9000.0, 1.2, -6.0),
+                (BiquadShape::Bandpass, 2000.0, 3.0, 0.0),
+                (BiquadShape::Lowpass, 12_000.0, 0.707, 0.0),
+                (BiquadShape::Highpass, 80.0, 1.3, 0.0),
+                (BiquadShape::Notch, 5000.0, 2.0, 0.0),
+            ] {
+                let bq = BiquadCoeffs::matched(shape, f0, q, g, sr);
+                let svf = SvfCoeffs::from_biquad(&bq);
+                let b32: Biquad32 = bq.into();
+                for f in [30.0, 120.0, 1000.0, 5000.0, 12_000.0, 19_000.0] {
+                    let (a, b) = (bq.response(f, sr), svf.response(f, sr));
+                    assert!((a.0 - b.0).abs() < 2e-4 && (a.1 - b.1).abs() < 2e-4, "{shape:?} {f0} at {f}: {a:?} vs {b:?}");
+                    if bq.magnitude_db(f, sr) > -60.0 {
+                        let mut s1 = SvfState::default();
+                        let mut s2 = BiquadState::default();
+                        let m1 = measure_gain_db(|x| s1.process(&svf, x), f, sr);
+                        let m2 = measure_gain_db(|x| s2.process(&b32, x), f, sr);
+                        assert!((m1 - m2).abs() < 0.05, "{shape:?} {f0} at {f}: svf {m1} biquad {m2}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-block sweeps of frequency and gain (the EQ refreshes its
+    /// coefficients every 16 samples): no blow-up, and no jump bigger than
+    /// the signal itself.
+    #[test]
+    fn matched_sections_survive_fast_sweeps() {
+        use crate::biquad::BiquadShape;
+        let sr = 48_000.0;
+        for shape in [BiquadShape::Bell, BiquadShape::LowShelf, BiquadShape::HighShelf, BiquadShape::Lowpass, BiquadShape::Highpass, BiquadShape::Notch] {
+            let mut st = SvfState::default();
+            let mut peak = 0.0f32;
+            let mut max_step = 0.0f32;
+            let mut last = 0.0f32;
+            let mut c = SvfCoeffs::passthrough();
+            for i in 0..96_000usize {
+                if i % 16 == 0 {
+                    let t = i as f32 / 16.0;
+                    let f = 20.0 * 1000f32.powf(0.5 + 0.5 * (t * 0.9).sin());
+                    let g = 24.0 * (t * 0.37).sin();
+                    c = SvfCoeffs::from_biquad(&BiquadCoeffs::matched(shape, f as f64, 4.0, g as f64, sr));
+                }
+                let x = 0.5 * (i as f32 * 0.07).sin() + 0.3 * (i as f32 * 1.9).sin();
+                let y = st.process(&c, x);
+                assert!(y.is_finite(), "{shape:?}: non-finite at {i}");
+                peak = peak.max(y.abs());
+                if i > 0 {
+                    max_step = max_step.max((y - last).abs());
+                }
+                last = y;
+            }
+            // +24 dB of gain on a 0.8-peak signal, with some resonance.
+            assert!(peak < 80.0, "{shape:?}: peak {peak}");
+            assert!(max_step < 120.0, "{shape:?}: step {max_step}");
+        }
     }
 
     #[test]

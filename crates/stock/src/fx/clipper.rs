@@ -3,8 +3,9 @@
 //!
 //! The curve is memoryless: the input is lifted (a fixed +6 dB low shelf at
 //! 120 Hz blended by *Lift*), driven and normalised by the ceiling, shaped
-//! with `tanh` (Soft) or a hard clamp (Hard), then scaled back and clamped to
-//! the ceiling. With oversampling the shaper runs on the interpolated signal
+//! with `tanh` (Soft) or a hard clamp (Hard), then scaled back and, at 1×,
+//! clamped to the ceiling (above 1× no clamp follows the decimation filter, so
+//! the clipped signal stays band-limited; its Gibbs overshoot is a fraction of a dB). With oversampling the shaper runs on the interpolated signal
 //! through a first-order antiderivative (ADAA1), which is bypassed at 1× so
 //! that mode stays zero-latency. At 2×/4× the reported latency is the
 //! oversampler's delay plus the half high-rate sample of the ADAA.
@@ -233,7 +234,11 @@ impl Segmented for Clipper {
             let out = if delta {
                 [wet[0] - dry[0], wet[1] - dry[1]]
             } else {
-                [wet[0].clamp(-ceil, ceil), wet[1].clamp(-ceil, ceil)]
+                // At 1x the curve is already bounded. Above it a base-rate hard
+                // clamp would undo the oversampling (it clips the decimator's
+                // Gibbs overshoot, which aliases; a smooth knee measured no better,
+                // -27 dB), so the overshoot (<= ~0.9 dB on hard 2x) is left alone.
+                if factor == 1 { [wet[0].clamp(-ceil, ceil), wet[1].clamp(-ceil, ceil)] } else { wet }
             };
             gr = (gr / decay).min(gr_min);
             in_peak = (in_peak * decay).max(driven_peak);
@@ -354,9 +359,36 @@ mod tests {
                     (v, v)
                 }, 24_000);
                 let skip = c.latency() as usize + 1000;
-                assert!(peak(&l[skip..]) <= db_to_gain(-1.0) + 1e-4, "os {os} curve {curve}: {}", peak(&l[skip..]));
+                // 1x is exactly bounded; above it the decimation filter's Gibbs
+                // overshoot (no base-rate clamp any more) stays under 1 dB.
+                let max = if os == 0.0 { db_to_gain(-1.0) + 1e-4 } else { db_to_gain(0.0) };
+                assert!(peak(&l[skip..]) <= max, "os {os} curve {curve}: {}", peak(&l[skip..]));
             }
         }
+    }
+
+    /// Report 24/01 §6.2: seno de 4987 Hz a -6 dBFS, drive +12 dB, techo 0 dB.
+    /// With the base-rate clamp the hard 4x curve measured -26 dB of aliasing
+    /// (-81 dB before the clamp); without it the decimation filter band-limits it.
+    #[test]
+    fn oversampled_hard_clip_stays_band_limited() {
+        let alias = |os: f32, curve: f32| {
+            let mut c = Clipper::new();
+            set_plain(&mut c, p::CEILING, 0.0);
+            set_plain(&mut c, p::DRIVE, 12.0);
+            set_plain(&mut c, p::CURVE, curve);
+            set_plain(&mut c, p::OVERSAMPLING, os);
+            let (l, _) = process_stereo(&mut c, sine(4987.0, 0.5), 3 << 14);
+            crate::fx::saturator::shapes::alias_db(&l[1 << 15..], 4987.0, SR)
+        };
+        let hard1 = alias(0.0, curve::HARD);
+        let hard2 = alias(1.0, curve::HARD);
+        let hard4 = alias(2.0, curve::HARD);
+        let soft2 = alias(1.0, curve::SOFT);
+        eprintln!("alias dB: hard 1x {hard1:.1}, 2x {hard2:.1}, 4x {hard4:.1}, soft 2x {soft2:.1}");
+        assert!(hard4 < -65.0, "hard 4x {hard4}");
+        assert!(hard2 < -45.0, "hard 2x {hard2}");
+        assert!(soft2 < -60.0, "soft 2x {soft2}");
     }
 
     #[test]

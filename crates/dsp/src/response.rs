@@ -1,12 +1,13 @@
 //! Frequency responses of the filter structures the stock plugins run, so a
 //! UI can draw an EQ or filter curve with the same maths as the audio path
-//! (matched biquads, TPT SVFs, Butterworth cascades, first-order tilt).
+//! (matched second-order sections run on the SVF, Butterworth cascades,
+//! first-order tilt).
 //!
 //! [`BandResponse::design`] mirrors how `fx.eq` designs one band;
 //! [`BandResponse::magnitude_at`] is the curve in dB. Nothing here runs on
 //! the audio thread.
 
-use crate::biquad::{BiquadCoeffs, BiquadShape};
+use crate::biquad::{BiquadCoeffs, BiquadShape, FirstOrder};
 use crate::svf::{OnePole, SvfCoeffs, SvfMode, butterworth_q};
 
 /// A complex value `(re, im)`.
@@ -75,13 +76,21 @@ pub fn cascade_q(order: usize, section: usize) -> f32 {
     }
 }
 
+/// The first-order part of a cut or tilt: the bilinear one-pole of Classic
+/// mode or the magnitude-matched section.
+#[derive(Clone, Copy, Debug)]
+enum First {
+    Pole(OnePole),
+    Matched(FirstOrder),
+}
+
 #[allow(clippy::large_enum_variant)] // short-lived, built per curve; boxing would allocate per band
 #[derive(Clone, Copy, Debug)]
 enum Stage {
-    Biquad(BiquadCoeffs),
     Svf(SvfCoeffs),
-    Cut { sections: [SvfCoeffs; 8], pairs: usize, first: Option<OnePole>, high_cut: bool },
+    Cut { sections: [SvfCoeffs; 8], pairs: usize, first: Option<First>, high_cut: bool },
     Tilt { pole: OnePole, low: f64, high: f64 },
+    TiltMatched(FirstOrder),
 }
 
 /// One designed band and the sample rate it was designed for.
@@ -93,9 +102,12 @@ pub struct BandResponse {
 
 impl BandResponse {
     /// Design a band. `order` is the cut slope in poles (1..=16, 6 dB/oct
-    /// each) and is ignored by the other shapes; `matched` picks the
-    /// magnitude-matched biquad for bells, shelves and band-passes (as the
-    /// EQ's Matched mode does for static bands) instead of the SVF.
+    /// each) and is ignored by the other shapes. With `matched` every shape
+    /// is the magnitude-matched design the EQ's Matched mode runs (second
+    /// order sections on the SVF structure, first-order sections matched at
+    /// DC and Nyquist, dynamic bands included); without it the plain bilinear
+    /// SVF of Classic mode. `gain_db` is the band's gain plus any dynamic
+    /// change (ignored by the band-pass, notch and cuts).
     pub fn design(kind: BandKind, freq: f32, gain_db: f32, q: f32, order: usize, matched: bool, sample_rate: f64) -> Self {
         let shape = match kind {
             BandKind::Bell => Some((BiquadShape::Bell, SvfMode::Bell)),
@@ -104,26 +116,42 @@ impl BandResponse {
             BandKind::BandPass => Some((BiquadShape::Bandpass, SvfMode::Bandpass)),
             _ => None,
         };
+        let (f, qd) = (freq as f64, q as f64);
         let stage = match (kind, shape) {
             (_, Some((bs, sm))) => {
                 if matched {
-                    Stage::Biquad(BiquadCoeffs::matched(bs, freq as f64, q as f64, gain_db as f64, sample_rate))
+                    Stage::Svf(SvfCoeffs::from_biquad(&BiquadCoeffs::matched(bs, f, qd, gain_db as f64, sample_rate)))
                 } else {
                     Stage::Svf(SvfCoeffs::new(sm, freq, q, gain_db, sample_rate))
                 }
             }
-            (BandKind::Notch, _) => Stage::Svf(SvfCoeffs::new(SvfMode::Notch, freq, q, 0.0, sample_rate)),
+            (BandKind::Notch, _) => {
+                if matched {
+                    Stage::Svf(SvfCoeffs::from_biquad(&BiquadCoeffs::matched(BiquadShape::Notch, f, qd, 0.0, sample_rate)))
+                } else {
+                    Stage::Svf(SvfCoeffs::new(SvfMode::Notch, freq, q, 0.0, sample_rate))
+                }
+            }
             (BandKind::LowCut | BandKind::HighCut, _) => {
                 let high_cut = kind == BandKind::HighCut;
                 let order = order.clamp(1, 16);
                 let pairs = order / 2;
-                let mode = if high_cut { SvfMode::Lowpass } else { SvfMode::Highpass };
                 let mut sections = [SvfCoeffs::passthrough(); 8];
                 for (k, s) in sections.iter_mut().enumerate().take(pairs) {
-                    *s = SvfCoeffs::new(mode, freq, cascade_q(order, k), 0.0, sample_rate);
+                    let cq = cascade_q(order, k);
+                    *s = if matched {
+                        let shape = if high_cut { BiquadShape::Lowpass } else { BiquadShape::Highpass };
+                        SvfCoeffs::from_biquad(&BiquadCoeffs::matched(shape, f, cq as f64, 0.0, sample_rate))
+                    } else {
+                        SvfCoeffs::new(if high_cut { SvfMode::Lowpass } else { SvfMode::Highpass }, freq, cq, 0.0, sample_rate)
+                    };
                 }
-                let first = (order % 2 == 1).then(|| OnePole::new(freq, sample_rate));
+                let first = (order % 2 == 1).then(|| if matched { First::Matched(FirstOrder::cut(!high_cut, f, sample_rate)) } else { First::Pole(OnePole::new(freq, sample_rate)) });
                 Stage::Cut { sections, pairs, first, high_cut }
+            }
+            _ if matched => {
+                let (gl, gh) = (crate::db_to_gain(-0.5 * gain_db) as f64, crate::db_to_gain(0.5 * gain_db) as f64);
+                Stage::TiltMatched(FirstOrder::matched(gl, gh, f, sample_rate))
             }
             _ => Stage::Tilt {
                 pole: OnePole::new(freq, sample_rate),
@@ -138,16 +166,19 @@ impl BandResponse {
     pub fn response(&self, freq: f64) -> Complex {
         let sr = self.sample_rate;
         match &self.stage {
-            Stage::Biquad(c) => c.response(freq, sr),
             Stage::Svf(c) => c.response(freq, sr),
             Stage::Cut { sections, pairs, first, high_cut } => {
                 let mut acc = (1.0, 0.0);
                 for s in &sections[..*pairs] {
                     acc = cmul(acc, s.response(freq, sr));
                 }
-                if let Some(pole) = first {
-                    let lp = pole.lowpass_response(freq, sr);
-                    acc = cmul(acc, if *high_cut { lp } else { (1.0 - lp.0, -lp.1) });
+                match first {
+                    Some(First::Pole(pole)) => {
+                        let lp = pole.lowpass_response(freq, sr);
+                        acc = cmul(acc, if *high_cut { lp } else { (1.0 - lp.0, -lp.1) });
+                    }
+                    Some(First::Matched(fo)) => acc = cmul(acc, fo.response(freq, sr)),
+                    None => {}
                 }
                 acc
             }
@@ -155,6 +186,7 @@ impl BandResponse {
                 let lp = pole.lowpass_response(freq, sr);
                 (low * lp.0 + high * (1.0 - lp.0), low * lp.1 - high * lp.1)
             }
+            Stage::TiltMatched(fo) => fo.response(freq, sr),
         }
     }
 
@@ -264,6 +296,81 @@ mod tests {
         assert!(BandKind::Bell.uses_gain() && BandKind::Bell.uses_q());
         assert!(BandKind::LowCut.uses_slope() && !BandKind::LowCut.uses_q());
         assert!(!BandKind::Notch.uses_gain());
+    }
+
+    /// Worst |digital - analogue| (dB) of a band over 20 Hz - `fmax` against
+    /// the analogue prototype `analog(f)`.
+    fn worst_error(band: &BandResponse, fmax: f64, analog: impl Fn(f64) -> f64) -> f64 {
+        let mut worst = 0.0f64;
+        let mut f = 20.0;
+        while f <= fmax {
+            // Deep in the stop band (below -40 dB) nothing is audible.
+            let a = analog(f);
+            if a > -40.0 {
+                worst = worst.max((band.magnitude_at(f) - a).abs());
+            }
+            f *= 1.04;
+        }
+        worst
+    }
+
+    fn butterworth_db(order: usize, f: f64, fc: f64, high_cut: bool) -> f64 {
+        let x = if high_cut { f / fc } else { fc / f };
+        -10.0 * (1.0 + x.powi(2 * order as i32)).log10()
+    }
+
+    /// Report 24/01 §2.2 (cramping at 48 kHz). With the bilinear SVF the bell
+    /// of +12 dB, Q 1 was off by 0.17 / 2.22 / 4.51 / 6.18 dB at f0 = 2 / 8 /
+    /// 12 / 16 kHz, the 12 dB/oct low-pass at 12 kHz by 13.5 dB at 20 kHz.
+    #[test]
+    fn matched_design_removes_the_cramping() {
+        for (sr, fmax) in [(48_000.0, 20_000.0), (44_100.0, 20_000.0)] {
+            // 44.1 kHz puts the same centres closer to Nyquist: a little more error.
+            for (f0, max_matched, min_svf) in [(2_000.0, 0.1, 0.1), (8_000.0, 0.6, 1.5), (12_000.0, 0.8, 3.0), (16_000.0, 1.35, 4.0)] {
+                let analog = |f: f64| analog_magnitude_db(BiquadShape::Bell, f, f0, 1.0, 12.0);
+                let m = worst_error(&BandResponse::design(BandKind::Bell, f0 as f32, 12.0, 1.0, 4, true, sr), fmax, analog);
+                let c = worst_error(&BandResponse::design(BandKind::Bell, f0 as f32, 12.0, 1.0, 4, false, sr), fmax, analog);
+                println!("{sr} Hz bell +12 dB Q1 at {f0}: matched {m:.2} dB, bilinear {c:.2} dB");
+                assert!(m < max_matched, "{sr}: bell at {f0}: {m} dB");
+                if sr == 48_000.0 {
+                    assert!(c > min_svf, "{sr}: the bilinear bell at {f0} was only {c} dB off");
+                }
+            }
+            // High shelf +6 dB at 12 kHz: 0.69 dB off at 20 kHz with the SVF.
+            let analog = |f: f64| analog_magnitude_db(BiquadShape::HighShelf, f, 12_000.0, 0.707, 6.0);
+            let m = worst_error(&BandResponse::design(BandKind::HighShelf, 12_000.0, 6.0, 0.707, 4, true, sr), fmax, analog);
+            assert!(m < 0.3, "{sr}: high shelf {m} dB");
+            // Notch.
+            let analog = |f: f64| analog_magnitude_db(BiquadShape::Notch, f, 10_000.0, 2.0, 0.0);
+            let m = worst_error(&BandResponse::design(BandKind::Notch, 10_000.0, 0.0, 2.0, 4, true, sr), fmax, analog);
+            let c = worst_error(&BandResponse::design(BandKind::Notch, 10_000.0, 0.0, 2.0, 4, false, sr), fmax, analog);
+            println!("{sr} Hz notch 10 kHz Q2: matched {m:.2} dB, bilinear {c:.2} dB");
+            assert!(m < 0.5, "{sr}: notch {m} dB");
+            // Cuts, every order, evaluated up to 20 kHz.
+            for fc in [8_000.0, 12_000.0, 16_000.0] {
+                for order in [1usize, 2, 3, 4, 6, 8, 12, 16] {
+                    for high_cut in [true, false] {
+                        let kind = if high_cut { BandKind::HighCut } else { BandKind::LowCut };
+                        let analog = |f: f64| butterworth_db(order, f, fc, high_cut);
+                        let m = worst_error(&BandResponse::design(kind, fc as f32, 0.0, 0.707, order, true, sr), fmax, analog);
+                        let c = worst_error(&BandResponse::design(kind, fc as f32, 0.0, 0.707, order, false, sr), fmax, analog);
+                        println!("{sr} Hz {kind:?} {fc} order {order}: matched {m:.2} dB, bilinear {c:.2} dB");
+                        // Low cuts have no Nyquist to cramp against; the low-pass
+                        // cascades add up the 0.5 dB of each section in their skirt.
+                        let max = match (high_cut, order) {
+                            (false, _) => 1.0,
+                            (true, 1..=2) => 1.0,
+                            (true, 3..=4) => 2.0,
+                            _ => 4.5,
+                        };
+                        assert!(m < max * if sr < 48_000.0 { 1.8 } else { 1.0 }, "{sr} Hz {kind:?} {fc} order {order}: {m} dB");
+                        if sr == 48_000.0 && high_cut && order == 2 && fc >= 12_000.0 {
+                            assert!(c > 7.0, "the bilinear low-pass was only {c} dB off");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

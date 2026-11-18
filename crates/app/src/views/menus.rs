@@ -1,7 +1,7 @@
 //! Popover menus: key/scale picker, snap grid, piano roll tools, device
 //! picker and time signature.
 
-use crate::bridge::{DeviceCategory, ExternalPlugin};
+use crate::bridge::ExternalPlugin;
 use crate::icons::Icon;
 use crate::state::Snap;
 use crate::theme::*;
@@ -463,23 +463,19 @@ fn tools_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .into_any_element()
 }
 
-fn category_icon(c: DeviceCategory) -> Icon {
-    match c {
-        DeviceCategory::Instrument => Icon::Piano,
-        DeviceCategory::Drums => Icon::Drum,
-        DeviceCategory::Dynamics => Icon::Gauge,
-        DeviceCategory::Eq => Icon::Sliders,
-        DeviceCategory::Filter => Icon::Waveform,
-        DeviceCategory::Space => Icon::Layers,
-        DeviceCategory::Distortion => Icon::Wand,
-        DeviceCategory::Modulation => Icon::Refresh,
-        DeviceCategory::Utility => Icon::Device,
-        DeviceCategory::Rack => Icon::Grid,
+/// The icon of a stock device or rack: its browser group's icon (so a user's
+/// category override moves the icon too), the grid for racks.
+pub fn device_icon(plugin_id: &str, ws: &Workspace) -> Icon {
+    if plugin_id.starts_with("rack.") {
+        return Icon::Grid;
     }
+    ws.b.plugins.device(plugin_id).map_or(Icon::Plug, |_| group_icon(classify_stock(plugin_id, &ws.palette.plugin_prefs)))
 }
 
-pub fn device_icon(plugin_id: &str, ws: &Workspace) -> Icon {
-    ws.b.plugins.device(plugin_id).map_or(Icon::Plug, |d| category_icon(d.category))
+/// The group name a stock device shows in its header ("Dynamics", "MIDI
+/// Effects"…), the same group the browser files it under.
+pub fn device_kind_label(plugin_id: &str, ws: &Workspace) -> &'static str {
+    ws.b.plugins.device(plugin_id).map_or("Device", |_| classify_stock(plugin_id, &ws.palette.plugin_prefs).label())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

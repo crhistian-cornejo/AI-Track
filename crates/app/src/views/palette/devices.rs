@@ -310,7 +310,13 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
     if let Some(group) = prefs.category_overrides.get(&key).and_then(|k| DeviceGroup::from_key(k)) {
         return group;
     }
-    match plugin_id {
+    stock_group(plugin_id).unwrap_or(DeviceGroup::FxStereoUtility)
+}
+
+/// The built-in group of a stock device or rack, or `None` for an id this
+/// table does not know (a test requires every registry id to be listed).
+pub fn stock_group(plugin_id: &str) -> Option<DeviceGroup> {
+    Some(match plugin_id {
         "instrument.synth" | "instrument.acid303" => DeviceGroup::InstAnalog,
         "instrument.wavetable" => DeviceGroup::InstWavetable,
         "instrument.sampler" | "instrument.granular" => DeviceGroup::InstSampler,
@@ -318,22 +324,20 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "instrument.vault" | "rack.instrument" => DeviceGroup::InstMulti,
         "rack.drum" => DeviceGroup::InstDrums,
         "fx.eq" => DeviceGroup::FxEq,
-        "fx.compressor" | "fx.gate" | "fx.transient" => DeviceGroup::FxDynamics,
-        "fx.drumbus" => DeviceGroup::FxDynamics,
+        "fx.compressor" | "fx.buscomp" | "fx.gate" | "fx.transient" | "fx.drumbus" => DeviceGroup::FxDynamics,
         "fx.limiter" => DeviceGroup::FxLimiter,
         "fx.saturator" | "fx.tape" | "fx.amp" | "fx.console" | "fx.clipper" | "fx.crusher" => DeviceGroup::FxSaturation,
-        "fx.shaper" => DeviceGroup::FxCreative,
         "fx.reverb" => DeviceGroup::FxReverb,
         "fx.delay" => DeviceGroup::FxDelay,
         "fx.chorus" | "fx.autopan" => DeviceGroup::FxModulation,
-        "fx.stutter" => DeviceGroup::FxCreative,
+        "fx.shaper" | "fx.stutter" => DeviceGroup::FxCreative,
         "fx.filter" => DeviceGroup::FxFilter,
-        "fx.multiband" => DeviceGroup::FxMastering,
+        "fx.multiband" | "fx.mbdyn" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,
-        id if id.starts_with("midi.") => DeviceGroup::MidiEffects,
         "fx.midside" | "fx.utility" | "rack.audio" => DeviceGroup::FxStereoUtility,
-        _ => DeviceGroup::FxStereoUtility,
-    }
+        id if id.starts_with("midi.") || id == "rack.midi" => DeviceGroup::MidiEffects,
+        _ => return None,
+    })
 }
 
 pub fn classify_external(
@@ -612,6 +616,24 @@ mod tests {
         assert!(!DeviceGroup::MidiEffects.is_instrument());
         assert!(DeviceGroup::EFFECTS.contains(&DeviceGroup::MidiEffects) && DeviceGroup::ALL.contains(&DeviceGroup::MidiEffects));
         assert_eq!(DeviceGroup::from_key(DeviceGroup::MidiEffects.key()), Some(DeviceGroup::MidiEffects));
+    }
+
+    #[test]
+    fn every_stock_device_has_an_explicit_group_of_its_own_kind() {
+        let prefs = PluginPrefs::default();
+        for p in aitrack_stock::registry() {
+            let group = stock_group(p.id).unwrap_or_else(|| panic!("{} is not listed in stock_group", p.id));
+            assert_eq!(classify_stock(p.id, &prefs), group);
+            let kind = p.category;
+            match kind {
+                aitrack_dsp::Category::Instrument => assert!(group.is_instrument(), "{} is an instrument but sits in {group:?}", p.id),
+                aitrack_dsp::Category::MidiEffect => assert_eq!(group, DeviceGroup::MidiEffects, "{}", p.id),
+                _ => assert!(!group.is_instrument() && group != DeviceGroup::MidiEffects, "{} is an audio effect but sits in {group:?}", p.id),
+            }
+        }
+        assert_eq!(classify_stock("fx.buscomp", &prefs), DeviceGroup::FxDynamics);
+        assert_eq!(classify_stock("fx.mbdyn", &prefs), DeviceGroup::FxMastering);
+        assert_eq!(stock_group("fx.unknown"), None);
     }
 
     fn ext(name: &str, vendor: &str, format: PluginFormat) -> ExternalPlugin {

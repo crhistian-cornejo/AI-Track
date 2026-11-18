@@ -41,6 +41,11 @@ sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Background images: decode, downscale and pre-blur once, off the UI thread.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
+# `AITRACK_DEV_HIDDEN`: moves the window out of sight for background visual checks (MIT).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 

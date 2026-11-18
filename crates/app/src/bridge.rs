@@ -1151,43 +1151,11 @@ fn stub_export(options: ExportOptions, mut progress: ProgressFn) {
 
 // ───────────────────────────── Plugins ─────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum DeviceCategory {
-    Instrument,
-    Drums,
-    Dynamics,
-    Eq,
-    Filter,
-    Space,
-    Distortion,
-    Modulation,
-    Utility,
-    Rack,
-}
-
-impl DeviceCategory {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Instrument => "Instruments",
-            Self::Drums => "Drums",
-            Self::Dynamics => "Dynamics",
-            Self::Eq => "EQ",
-            Self::Filter => "Filter",
-            Self::Space => "Reverb & Delay",
-            Self::Distortion => "Distortion",
-            Self::Modulation => "Modulation",
-            Self::Utility => "Utility",
-            Self::Rack => "Racks",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     /// Stock plugin id, as in `DeviceKind::Stock { plugin_id }` (e.g. `"fx.eq"`).
     pub id: &'static str,
     pub name: &'static str,
-    pub category: DeviceCategory,
     pub tags: &'static [&'static str],
     pub params: Vec<ParamInfo>,
     #[allow(dead_code)]

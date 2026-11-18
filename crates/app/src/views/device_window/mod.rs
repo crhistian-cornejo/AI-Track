@@ -104,10 +104,14 @@ pub fn open(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>) {
                 // Not GPUI's 30 Hz cap for unfocused windows (20 fps on a 60 Hz display): the
                 // meters should move as smoothly as in the main window. Low-power mode throttles.
                 inactive_frame_interval: None,
+                focus: !crate::dev_hidden::enabled(),
                 titlebar: Some(TitlebarOptions { title: Some(title.into()), appears_transparent: false, traffic_light_position: None }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| DeviceWindow::new(weak, entity.clone(), device, plugin, window, cx)),
+            |window, cx| {
+                crate::dev_hidden::hide(window);
+                cx.new(|cx| DeviceWindow::new(weak, entity.clone(), device, plugin, window, cx))
+            },
         );
         if let Ok(handle) = opened {
             entity.update(cx, |ws, _| {

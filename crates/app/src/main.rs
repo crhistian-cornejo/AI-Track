@@ -17,6 +17,7 @@ mod appearance;
 mod assets;
 mod bridge;
 mod demo;
+mod dev_hidden;
 mod grid;
 mod icons;
 mod motion;
@@ -68,6 +69,8 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(1024.), px(640.))),
                 app_id: Some("dev.aitrack.daw".into()),
+                // `AITRACK_DEV_HIDDEN=1`: a visual check in the background takes no focus.
+                focus: !dev_hidden::enabled(),
                 // GPUI draws a window that is not the focused one at 30 Hz at most, which the
                 // display's 60 Hz tick turns into 20 fps: the playhead and meters of the main
                 // window would stutter whenever a device window has the focus. Low-power mode
@@ -107,11 +110,17 @@ fn main() {
                     })
                     .detach();
                 });
-                window.activate_window();
+                if dev_hidden::enabled() {
+                    dev_hidden::hide(window);
+                } else {
+                    window.activate_window();
+                }
                 ws
             },
         )
         .expect("open the AI-Track window");
-        cx.activate(true);
+        if !dev_hidden::enabled() {
+            cx.activate(true);
+        }
     });
 }

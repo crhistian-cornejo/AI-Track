@@ -495,7 +495,7 @@ fn device_rows(ws: &Workspace, q: &str) -> Vec<DeviceRow> {
         let cat = group.label();
         let mut extra: Vec<&str> = d.tags.to_vec();
         extra.push(cat);
-        extra.push(d.category.label());
+        extra.push(group.header());
         extra.push("stock");
         let s = text_score(q, d.name, &extra)?;
         Some((

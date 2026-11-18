@@ -15,7 +15,7 @@
 //!   data folder).
 
 use super::main_thread::MainThread;
-use crate::bridge::{DeviceCategory, DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PluginFolder, PluginProblem, PluginReport, PresetInfo, ScanStatus};
+use crate::bridge::{DeviceInfo, ExternalPlugin, PluginCatalog, PluginEdit, PluginEditKind, PluginFolder, PluginProblem, PluginReport, PresetInfo, ScanStatus};
 use aitrack_dsp::{Category, ParamInfo, PluginInfo, ProcessContext, Processor};
 use aitrack_engine::ProcessorFactory;
 use aitrack_host::sandbox::{SandboxEditor, SandboxedPlugin};
@@ -48,22 +48,6 @@ impl ProcessorFactory for StockFactory {
     }
 }
 
-fn category_for(id: &str, category: Category) -> DeviceCategory {
-    match id {
-        "fx.eq" => DeviceCategory::Eq,
-        "fx.compressor" | "fx.limiter" | "fx.gate" | "fx.transient" => DeviceCategory::Dynamics,
-        "fx.saturator" | "fx.tape" | "fx.amp" | "fx.console" => DeviceCategory::Distortion,
-        "fx.clipper" => DeviceCategory::Distortion,
-        "fx.multiband" | "fx.midside" => DeviceCategory::Utility,
-        "fx.reverb" | "fx.delay" => DeviceCategory::Space,
-        "fx.filter" => DeviceCategory::Filter,
-        "fx.chorus" => DeviceCategory::Modulation,
-        "instrument.drum" => DeviceCategory::Drums,
-        _ if category == Category::Instrument => DeviceCategory::Instrument,
-        _ => DeviceCategory::Utility,
-    }
-}
-
 /// Every stock device with its real parameter list, plus the three racks.
 pub fn stock_devices() -> Vec<DeviceInfo> {
     let mut out: Vec<DeviceInfo> = aitrack_stock::registry()
@@ -73,14 +57,13 @@ pub fn stock_devices() -> Vec<DeviceInfo> {
             DeviceInfo {
                 id: p.id,
                 name: p.name,
-                category: category_for(p.id, p.category),
                 tags: p.tags,
                 params: proc.info().params.clone(),
                 is_instrument: p.category == Category::Instrument,
             }
         })
         .collect();
-    let rack = |id, name, tags, is_instrument| DeviceInfo { id, name, category: DeviceCategory::Rack, tags, params: Vec::new(), is_instrument };
+    let rack = |id, name, tags, is_instrument| DeviceInfo { id, name, tags, params: Vec::new(), is_instrument };
     out.push(rack("rack.instrument", "Instrument Rack", &["rack", "macros"], true));
     out.push(rack("rack.drum", "Drum Rack", &["rack", "drums", "pads"], true));
     out.push(rack("rack.audio", "Audio Effect Rack", &["rack", "macros"], false));

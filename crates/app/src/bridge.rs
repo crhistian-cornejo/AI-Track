@@ -529,6 +529,25 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
         "fx.reverb" => put(&[0.3 * env + 0.1 * hat, 0.28 * env + 0.12 * hat, 2.4]),
         "fx.delay" => put(&[0.3 * hat, 0.26 * (1.0 - hat) * env, 1.0 - 0.3 * env]),
         "fx.chorus" => put(&[(secs * 0.8).fract()]),
+        "fx.pitchshift" => {
+            let ph = (secs * 1.6).fract();
+            let win = |x: f32| (std::f32::consts::PI * x.rem_euclid(1.0)).sin().powi(2);
+            put(&[7.0, ph, (ph + 0.5).fract(), win(ph), win(ph + 0.5), 40.0, 0.5 * env, 0.45 * env])
+        }
+        "fx.freqshift" => put(&[120.0 + 80.0 * (secs * 0.7).sin(), -(120.0 + 80.0 * (secs * 0.7).sin()), 0.5 * env, 0.45 * env, (secs * 0.7).sin()]),
+        "fx.vocoder" => {
+            let mut v = [0.0f32; 20];
+            v[0] = 16.0;
+            v[1] = 140.0;
+            v[2] = 1.0;
+            v[3] = 0.6 * hat;
+            for k in 0..16 {
+                let t = k as f32 / 15.0;
+                let formants = (-(t - 0.25 - 0.1 * (secs * 0.9).sin()).powi(2) * 40.0).exp() + 0.7 * (-(t - 0.6).powi(2) * 60.0).exp();
+                v[4 + k] = if playing { (0.15 + 0.7 * formants * env).clamp(0.0, 1.0) } else { 0.0 };
+            }
+            put(&v)
+        }
         "fx.utility" => put(&[0.7 * env, 0.64 * env, 0.55 + 0.3 * (secs * 0.7).sin()]),
         "fx.filter" => put(&[0.0, 0.0, env]),
         "instrument.wavetable" => put(&[if playing { 3.0 } else { 0.0 }, 0.5 * env, 0.46 * env]),

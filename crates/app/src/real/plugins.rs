@@ -57,7 +57,7 @@ fn category_for(id: &str, category: Category) -> DeviceCategory {
         "fx.multiband" | "fx.midside" => DeviceCategory::Utility,
         "fx.reverb" | "fx.delay" => DeviceCategory::Space,
         "fx.filter" => DeviceCategory::Filter,
-        "fx.chorus" => DeviceCategory::Modulation,
+        "fx.chorus" | "fx.pitchshift" | "fx.freqshift" | "fx.vocoder" => DeviceCategory::Modulation,
         "instrument.drum" => DeviceCategory::Drums,
         _ if category == Category::Instrument => DeviceCategory::Instrument,
         _ => DeviceCategory::Utility,

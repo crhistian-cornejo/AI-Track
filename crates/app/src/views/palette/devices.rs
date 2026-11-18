@@ -327,6 +327,7 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "fx.delay" => DeviceGroup::FxDelay,
         "fx.chorus" | "fx.autopan" => DeviceGroup::FxModulation,
         "fx.stutter" => DeviceGroup::FxCreative,
+        "fx.pitchshift" | "fx.freqshift" | "fx.vocoder" => DeviceGroup::FxPitchTime,
         "fx.filter" => DeviceGroup::FxFilter,
         "fx.multiband" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,

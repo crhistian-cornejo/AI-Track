@@ -1,6 +1,7 @@
 //! The panels of a rack (Live's Instrument / Audio / Drum Rack): a chain's
 //! strip (volume, pan, mute, solo, and a Drum Rack pad's choke, notes and
-//! sends), the Drum Rack's 4×4 pad grid (a click auditions the pad), its
+//! sends), the Drum Rack's 4×4 pad grid (a click auditions the pad through
+//! the track, the headphones play the pad's sample file as it is), its
 //! return buses, the zones panel (key, velocity and chain-select ranges with
 //! their fades) and the macros with their Map mode, range handles, Rand and
 //! variations.
@@ -16,12 +17,14 @@ use crate::widgets::{self, knob_cell, label, mono};
 use crate::workspace::{ChainKnob, Drag, KnobTarget, Workspace};
 use aitrack_model::command::ChainProp;
 use aitrack_model::racks::Container;
-use aitrack_model::{Chain, DeviceId, DeviceKind, MAX_RETURNS, Rack, RackKind, SEND_MAX_DB, SEND_OFF_DB};
+use aitrack_model::{Chain, Device, DeviceId, DeviceKind, MAX_RETURNS, Rack, RackKind, SEND_MAX_DB, SEND_OFF_DB};
 use gpui::{
     AnyElement, Context, Div, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
     Stateful, StatefulInteractiveElement, Styled, canvas, div, point, prelude::FluentBuilder, px,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Widths of the rack's side panels, to bound the devices of the picked chain.
 const LEFT_DRUM_W: f32 = 248.;
@@ -64,6 +67,10 @@ pub struct RackUi {
     pub ret_sel: HashMap<DeviceId, usize>,
     /// Where the next device the Add menu adds goes (a chain of a rack, a return); `None` = the track.
     pub add_into: Option<Container>,
+    /// The Drum Rack pad whose sample file is playing in the preview, and
+    /// which preview it is (a newer one outlives an older one's timer).
+    pub previewing: Option<(DeviceId, u8, u64)>,
+    previews: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -628,6 +635,7 @@ fn pads_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: O
             let chain = ci.and_then(|i| rack.chains.get(i));
             let key = (id.0 as usize) << 8 | usize::from(note);
             let lit = track.is_some_and(|t| ws.audition.pressed(t, note));
+            let sample = chain.and_then(pad_sample);
             let mut pad = div().id(("pad", key)).size(px(PAD)).rounded(px(r_md())).p(px(SP1)).flex().flex_col().justify_between().cursor_pointer();
             pad = match chain {
                 Some(c) => {
@@ -670,8 +678,21 @@ fn pads_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: O
                                             }
                                             cx.notify();
                                         }))),
-                                ),
+                                )
+                                .when_some(sample.clone(), |row, path| {
+                                    let on = ws.rack_ui.previewing.is_some_and(|(d, n, _)| d == id && n == note);
+                                    row.child(div().flex_1()).child(
+                                        widgets::sized_icon_button(("ppreview", key), Icon::Headphones, on, 16., 10.)
+                                            .tooltip(widgets::tip(if on { "Stop the sample" } else { "Play the sample file" }, None))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| preview_pad(this, id, note, &path, cx))),
+                                    )
+                                }),
                         )
+                        .tooltip(widgets::tip_owned(match &sample {
+                            Some(path) => format!("{}\n{}\nClick plays the pad · the headphones play the sample", c.name, path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned())),
+                            None => format!("{}\nClick plays the pad", c.name),
+                        }))
                 }
                 None => pad.bg(content(0.04)).border_1().border_color(border()).child(div()).child(mono(note_name(note), TEXT_XS, pal.faint)),
             };
@@ -710,6 +731,55 @@ fn pads_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: O
         .child(pager)
         .child(returns_section(ws, id, rack, ret, cx))
         .into_any_element()
+}
+
+/// The audio file a Drum Rack pad plays: the sample of the first sampler in
+/// its chain, nested racks included.
+pub fn pad_sample(chain: &Chain) -> Option<PathBuf> {
+    fn find(devices: &[Device]) -> Option<String> {
+        devices.iter().find_map(|d| match &d.kind {
+            DeviceKind::Rack(r) => r.chains.iter().find_map(|c| find(&c.devices)),
+            _ => {
+                let (path, pads) = crate::views::device_ui::kit::state_paths(d.state.as_deref());
+                path.or_else(|| pads.into_iter().flatten().next())
+            }
+        })
+    }
+    find(&chain.devices).filter(|p| !p.is_empty()).map(PathBuf::from)
+}
+
+/// Play a pad's sample file in the preview (as the browser does), or stop it
+/// when that pad is already playing. The button lights until the file ends.
+fn preview_pad(ws: &mut Workspace, id: DeviceId, note: u8, path: &Path, cx: &mut Context<Workspace>) {
+    if ws.rack_ui.previewing.take().is_some_and(|(d, n, _)| d == id && n == note) {
+        ws.b.engine.preview(None);
+        cx.notify();
+        return;
+    }
+    ws.b.engine.preview(Some(path));
+    ws.rack_ui.previews += 1;
+    let run = ws.rack_ui.previews;
+    ws.rack_ui.previewing = Some((id, note, run));
+    let path = path.to_owned();
+    cx.spawn(async move |this, cx| {
+        let seconds = cx.background_executor().spawn(async move { wav_seconds(&path) }).await.unwrap_or(2.);
+        cx.background_executor().timer(Duration::from_secs_f64(seconds.clamp(0.1, 60.) + 0.05)).await;
+        let _ = this.update(cx, |this, cx| {
+            if this.rack_ui.previewing.is_some_and(|(_, _, r)| r == run) {
+                this.rack_ui.previewing = None;
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+    cx.notify();
+}
+
+/// How long a WAV file plays, from its header.
+fn wav_seconds(path: &Path) -> Option<f64> {
+    let r = hound::WavReader::open(path).ok()?;
+    let rate = r.spec().sample_rate;
+    (rate > 0).then(|| f64::from(r.duration()) / f64::from(rate))
 }
 
 /// The Drum Rack's return buses: effect chains the pads send to.
@@ -1160,6 +1230,31 @@ pub fn map_pick(ws: &mut Workspace, target: KnobTarget, cx: &mut Context<Workspa
 mod tests {
     use super::*;
     use aitrack_model::{Device, Project, TrackKind};
+
+    #[test]
+    fn a_pad_plays_the_sample_of_its_first_sampler_even_inside_a_nested_rack() {
+        let sampler = |id: u64, path: &str| {
+            let mut d = Device::stock(DeviceId(id), "instrument.sampler", "Sampler");
+            d.state = Some(format!(r#"{{"version":1,"params":{{}},"extra":{{"path":"{path}"}}}}"#).into_bytes());
+            d
+        };
+        let mut pad = Chain::new("Kick", aitrack_model::Color(0x808080));
+        pad.devices.push(Device::stock(DeviceId(1), "fx.eq", "EQ"));
+        pad.devices.push(sampler(2, "/kits/kick.wav"));
+        assert_eq!(pad_sample(&pad), Some(PathBuf::from("/kits/kick.wav")));
+
+        let mut inner = Rack::new(RackKind::Instrument);
+        let mut layer = Chain::new("Layer", aitrack_model::Color(0x808080));
+        layer.devices.push(sampler(3, "/kits/snare.wav"));
+        inner.chains.push(layer);
+        let mut nested = Chain::new("Snare", aitrack_model::Color(0x808080));
+        nested.devices.push(Device { kind: DeviceKind::Rack(inner), ..Device::stock(DeviceId(4), "rack.instrument", "Rack") });
+        assert_eq!(pad_sample(&nested), Some(PathBuf::from("/kits/snare.wav")));
+
+        let mut synth = Chain::new("Synth", aitrack_model::Color(0x808080));
+        synth.devices.push(Device::stock(DeviceId(5), "instrument.wavetable", "Wavetable"));
+        assert_eq!(pad_sample(&synth), None, "no sampler, no file to play");
+    }
 
     #[test]
     fn notes_are_named_as_live_names_them() {

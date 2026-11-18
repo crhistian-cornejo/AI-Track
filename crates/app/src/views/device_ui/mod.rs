@@ -44,6 +44,7 @@ pub mod limiter;
 pub mod mbdyn;
 pub mod midi_kit;
 pub mod midside;
+pub mod modulator;
 pub mod multiband;
 pub mod pitch;
 pub mod pitchshift;
@@ -258,6 +259,8 @@ pub enum PopKind {
     SavePreset(DeviceId),
     /// The synth window's menus (wavetables, matrix sources and destinations…).
     Synth(crate::views::device_window::synth::SynthPop),
+    /// Every parameter a modulator can be mapped to.
+    ModTarget(DeviceId),
 }
 
 #[derive(Clone, Debug)]
@@ -586,6 +589,7 @@ pub fn overlay(ws: &mut Workspace, window: Option<WindowId>, cx: &mut Context<Wo
         PopKind::Presets(device) => crate::views::device_window::chrome::preset_menu(ws, *device, cx)?,
         PopKind::SavePreset(device) => crate::views::device_window::chrome::save_card(ws, *device, cx)?,
         PopKind::Synth(pop) => crate::views::device_window::synth::pop_menu(ws, pop, cx)?,
+        PopKind::ModTarget(device) => modulator::target_menu(ws, *device, cx)?,
     };
     let id = gpui::ElementId::Name(format!("fx-pop-{}", pop.seq).into());
     Some(
@@ -723,6 +727,8 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.delay"
             | "fx.chorus"
             | "fx.autopan"
+            | "mod.lfo"
+            | "mod.envfollow"
             | "fx.crusher"
             | "fx.drumbus"
             | "fx.stutter"
@@ -771,6 +777,8 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.delay" => delay::render(ws, dev, cx),
         "fx.chorus" => chorus::render(ws, dev, cx),
         "fx.autopan" => autopan::render(ws, dev, cx),
+        "mod.lfo" => modulator::render_lfo(ws, dev, d, cx),
+        "mod.envfollow" => modulator::render_env(ws, dev, d, cx),
         "fx.crusher" => crusher::render(ws, dev, cx),
         "fx.drumbus" => drumbus::render(ws, dev, cx),
         "fx.stutter" => stutter::render(ws, dev, cx),

@@ -1,0 +1,19 @@
+{
+  "name": "Slow Swell",
+  "plugin": "mod.envfollow",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "envelope",
+    "pads",
+    "filter"
+  ],
+  "params": {
+    "0": 0.41666666,
+    "1": 0.83244294,
+    "2": 0.8257071,
+    "3": 0.0,
+    "4": 1.0,
+    "5": 0.0
+  }
+}

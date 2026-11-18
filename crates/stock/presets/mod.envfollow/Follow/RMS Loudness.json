@@ -1,0 +1,19 @@
+{
+  "name": "RMS Loudness",
+  "plugin": "mod.envfollow",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "envelope",
+    "mix",
+    "bus"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.7034553,
+    "2": 0.73470664,
+    "3": 1.0,
+    "4": 1.0,
+    "5": 0.0
+  }
+}

@@ -239,8 +239,8 @@ pub fn segmented(id: &'static str, items: &[(Option<Icon>, &'static str)], selec
 
 // ───────────────────────────── Knob ─────────────────────────────
 
-const KNOB_A0: f32 = std::f32::consts::PI * 0.75;
-const KNOB_SPAN: f32 = std::f32::consts::PI * 1.5;
+pub(crate) const KNOB_A0: f32 = std::f32::consts::PI * 0.75;
+pub(crate) const KNOB_SPAN: f32 = std::f32::consts::PI * 1.5;
 
 /// A rotary knob painted as an arc (style from the theme). The caller attaches the drag.
 pub fn knob(id: impl Into<ElementId>, value: f32, bipolar: bool, side: f32, color: Hsla) -> Stateful<Div> {

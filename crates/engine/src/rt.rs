@@ -115,6 +115,8 @@ pub(crate) enum RtCommand {
     /// Fast path for a knob: a device parameter (normalised), applied to the
     /// installed graph without compiling.
     SetParam(DeviceId, u32, f32),
+    /// The range of a modulator's mapping: `(modulator, mapping index, min, max)`.
+    SetModRange(DeviceId, u16, f32, f32),
     /// Fast path for a fader: volume in dB.
     SetTrackVolume(TrackId, f32),
     SetTrackPan(TrackId, f32),
@@ -706,6 +708,11 @@ impl AudioProcessor {
                 RtCommand::SetParam(device, param, v) => {
                     if let Some(g) = &mut self.graph {
                         g.set_device_param(device, param, v);
+                    }
+                }
+                RtCommand::SetModRange(device, index, min, max) => {
+                    if let Some(g) = &mut self.graph {
+                        g.set_mod_range(device, index, min, max);
                     }
                 }
                 RtCommand::SetTrackVolume(track, db) => {

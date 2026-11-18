@@ -1,0 +1,19 @@
+{
+  "name": "Fast Punch",
+  "plugin": "mod.envfollow",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "envelope",
+    "drums",
+    "filter"
+  ],
+  "params": {
+    "0": 0.5833333,
+    "1": 0.27034554,
+    "2": 0.40137333,
+    "3": 0.0,
+    "4": 1.0,
+    "5": 0.0
+  }
+}

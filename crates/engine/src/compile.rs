@@ -35,7 +35,7 @@ use crate::shared::{ProcessorPool, SharedProcessor};
 use crate::status::{MeterBank, SessionStatus};
 use aitrack_dsp::{db_to_gain, AudioBuffer};
 use aitrack_model::{
-    AutomationLane, AutomationTarget, Chain, ClipId, Device, DeviceId, DeviceKind, Macro, MacroMapping, Output, Project, Rack, Source, Track, TrackId, TrackKind,
+    AutomationLane, AutomationTarget, Chain, ClipId, Device, DeviceId, DeviceKind, Macro, MacroMapping, ModTarget, Output, Project, Rack, Source, Track, TrackId, TrackKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
@@ -763,6 +763,54 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             }
         }
 
+        // Modulators: the targets each drives, their base values and the room
+        // for their events (a target device is driven like an automated one).
+        let mut mods: Vec<ModNode> = Vec::new();
+        let mut has_fader_mod = false;
+        let mut sources: Vec<(DeviceId, String, Vec<aitrack_model::ModMapping>)> = Vec::new();
+        visit_all(&t.devices, &mut |d| {
+            if d.is_modulator() && !d.mods.is_empty() {
+                sources.push((d.id, d.name.clone(), d.mods.clone()));
+            }
+        });
+        for (src_id, src_name, src_mods) in sources {
+            if handles.get(&src_id).and_then(|h| h.proc.as_ref()).is_none() {
+                continue;
+            }
+            let mut targets: Vec<ModTargetNode> = Vec::new();
+            for (k, mm) in src_mods.iter().enumerate() {
+                let dest = match mm.target {
+                    ModTarget::Param { device, param } => {
+                        if device == src_id || handles.get(&device).and_then(|h| h.proc.as_ref()).is_none() {
+                            warnings.push(format!("track '{}': modulator '{}' targets an unknown device", t.name, src_name));
+                            continue;
+                        }
+                        ModDest::Param(device, param)
+                    }
+                    ModTarget::Volume => ModDest::Volume,
+                    ModTarget::Pan => ModDest::Pan,
+                };
+                // A parameter has one modulator: the first mapped wins.
+                if targets.iter().any(|x| x.dest == dest) || mods.iter().any(|m| m.targets.iter().any(|x| x.dest == dest)) {
+                    continue;
+                }
+                let base = match dest {
+                    ModDest::Param(device, param) => {
+                        automated.insert((device, param));
+                        project.device(device).and_then(|dv| dv.params.get(&param).copied()).or_else(|| cx.pool.default_param(device, param)).unwrap_or(0.0)
+                    }
+                    ModDest::Volume | ModDest::Pan => {
+                        has_fader_mod = true;
+                        0.0
+                    }
+                };
+                targets.push(ModTargetNode { dest, index: k as u16, min: mm.min, max: mm.max, base, last: f32::NAN });
+            }
+            if !targets.is_empty() {
+                mods.push(ModNode { source: src_id, targets, steps: Vec::with_capacity(max / CONTROL_BLOCK + 2) });
+            }
+        }
+
         // Room for the timed automation events of each device a lane reaches:
         // one per control block and per breakpoint in a block. A hosted plugin
         // also gets the buffer its events are merged with the block's; a stock
@@ -786,6 +834,20 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                     ParamTarget::Timed(device, _) => reach(*device),
                     ParamTarget::TimedMacro(maps) => maps.iter().for_each(|m| reach(m.0)),
                     ParamTarget::Enabled(_) => {}
+                }
+            }
+            for tg in mods.iter().flat_map(|m| &m.targets) {
+                if let ModDest::Param(device, _) = tg.dest
+                    && let Some(node) = crate::graph::find_proc_mut(devices, device)
+                {
+                    // Up to one event per control block and target, on top of any automation.
+                    let cap = node.auto_events.events.capacity() + per_lane;
+                    node.auto_events = EventList::with_capacity(cap);
+                    if hosted_devices.contains(&device) {
+                        node.merged = EventList::with_capacity(cap + EVENT_CAPACITY);
+                    } else if node.chunk.is_none() {
+                        node.chunk = Some(Box::new(ChunkScratch { buf: AudioBuffer::new(2, max), events: EventList::with_capacity(EVENT_CAPACITY) }));
+                    }
                 }
             }
         }
@@ -829,6 +891,11 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             has_input: has_input[i],
             devices: chains[i].take().unwrap_or_default(),
             param_autos,
+            mods,
+            beat_steps: Vec::with_capacity(max / CONTROL_BLOCK + 2),
+            has_fader_mod,
+            mod_vol: Vec::with_capacity(if has_fader_mod { max / CONTROL_BLOCK + 2 } else { 0 }),
+            mod_pan: Vec::with_capacity(if has_fader_mod { max / CONTROL_BLOCK + 2 } else { 0 }),
             buf: AudioBuffer::new(2, max),
             chunk_buf: AudioBuffer::new(2, CONTROL_BLOCK),
             chunk_events: EventList::with_capacity(EVENT_CAPACITY),
@@ -936,6 +1003,8 @@ pub(crate) enum Patch {
     GrooveSettings { id: aitrack_model::GrooveId, settings: aitrack_model::GrooveSettings },
     /// The global groove amount.
     GrooveAmount(f32),
+    /// The range of mapping `index` of a modulator.
+    ModRange { device: DeviceId, index: u16, min: f32, max: f32 },
 }
 
 /// If `new` differs from `old` only in device parameters, track volume and
@@ -1051,10 +1120,19 @@ fn diff_devices(a: &[Device], b: &[Device], overrides: &HashMap<DeviceId, BTreeM
         return false;
     }
     a.iter().zip(b).all(|(da, db)| {
-        let Device { id, name: _, kind, enabled, params, state, preset: _, collapsed: _, sidechain } = da;
-        let Device { id: id_b, name: _, kind: kind_b, enabled: enabled_b, params: params_b, state: state_b, preset: _, collapsed: _, sidechain: sidechain_b } = db;
-        if id != id_b || enabled != enabled_b || state != state_b || sidechain != sidechain_b {
+        let Device { id, name: _, kind, enabled, params, state, preset: _, collapsed: _, sidechain, mods } = da;
+        let Device { id: id_b, name: _, kind: kind_b, enabled: enabled_b, params: params_b, state: state_b, preset: _, collapsed: _, sidechain: sidechain_b, mods: mods_b } = db;
+        if id != id_b || enabled != enabled_b || state != state_b || sidechain != sidechain_b || mods.len() != mods_b.len() {
             return false;
+        }
+        // A mapping whose range moved is a patch; a different target or order is a compile.
+        for (k, (ma, mb)) in mods.iter().zip(mods_b).enumerate() {
+            if ma.target != mb.target {
+                return false;
+            }
+            if (ma.min, ma.max) != (mb.min, mb.max) {
+                out.push(Patch::ModRange { device: *id, index: k as u16, min: mb.min, max: mb.max });
+            }
         }
         match (kind, kind_b) {
             (DeviceKind::Rack(ra), DeviceKind::Rack(rb)) => {
@@ -1154,6 +1232,12 @@ pub(crate) fn apply_patch(project: &mut Project, patch: &Patch) {
             }
         }
         Patch::GrooveAmount(a) => project.groove_amount = a.clamp(0.0, aitrack_model::MAX_GROOVE_AMOUNT),
+        Patch::ModRange { device, index, min, max } => {
+            if let Some(m) = project.device_mut(device).and_then(|d| d.mods.get_mut(index as usize)) {
+                m.min = min;
+                m.max = max;
+            }
+        }
         Patch::Selector { rack, value } => {
             fn set(devices: &mut [Device], rack: DeviceId, value: u8) -> bool {
                 for d in devices {

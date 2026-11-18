@@ -381,6 +381,13 @@ impl ProcessorPool {
         restore
     }
 
+    /// The value a parameter the project never set starts from: what was
+    /// last applied, else the processor's default.
+    pub(crate) fn default_param(&self, device: DeviceId, param: u32) -> Option<f32> {
+        let e = self.entries.get(&device)?;
+        e.applied.get(&param).or_else(|| e.defaults.get(&param)).copied()
+    }
+
     /// Re-prepare every pooled processor for a new sample rate / block size.
     ///
     /// # Safety

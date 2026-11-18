@@ -559,6 +559,7 @@ fn group_icon(g: DeviceGroup) -> Icon {
         DeviceGroup::FxCreative => Icon::Sparkles,
         DeviceGroup::FxStereoUtility => Icon::Device,
         DeviceGroup::FxAnalysis => Icon::Dashboard,
+        DeviceGroup::FxModulators => Icon::Automation,
         DeviceGroup::MidiEffects => Icon::Keyboard,
     }
 }

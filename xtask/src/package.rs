@@ -151,23 +151,6 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
-    for entry in walkdir::WalkDir::new(from) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(from)?;
-        let dest = to.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dest)?;
-        } else {
-            if let Some(p) = dest.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            std::fs::copy(entry.path(), &dest).with_context(|| format!("copying {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
 /// The data the installers carry next to the executables: both manifests, the factory
 /// index and the sound bank's licence notes. Never the packs themselves.
 fn copy_content(root: &Path, dest: &Path) -> Result<()> {
@@ -499,8 +482,8 @@ fn authenticode(files: &[&Path]) -> Result<bool> {
         for f in files {
             let mut cmd = Command::new(env_set("SIGNTOOL").unwrap_or_else(|| "signtool".into()));
             cmd.args(["sign", "/fd", "sha256", "/tr", &tr, "/td", "sha256", "/f", &pfx]);
-            if let Some(p) = pass {
-                cmd.args(["/p", &p]);
+            if let Some(p) = &pass {
+                cmd.args(["/p", p]);
             }
             run_cmd(cmd.arg(f))?;
         }

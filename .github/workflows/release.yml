@@ -1,0 +1,173 @@
+# Builds the installers for a tag (v*) and publishes the GitHub Release.
+# Everything signing-related is optional: without the secrets the release is still
+# produced, just unsigned (see docs/release-0.0.1.md). Manual runs: Actions > Release >
+# Run workflow; they only publish when "publish" is ticked, otherwise they leave a draft.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (default: v<workspace version>)"
+        required: false
+        type: string
+      publish:
+        description: "Publish the release (otherwise it stays a draft)"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        shell: bash
+        run: |
+          ws_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -1)
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ] && [ "${{ github.ref_type }}" = "tag" ]; then tag="${{ github.ref_name }}"; fi
+          if [ -z "$tag" ]; then tag="v${ws_version}"; fi
+          version="${tag#v}"
+          if [ "$version" != "$ws_version" ]; then
+            echo "::error::tag $tag does not match the workspace version $ws_version"; exit 1
+          fi
+          publish=false
+          if [ "${{ github.ref_type }}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ]; then publish=true; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: meta
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
+      UPDATER_KEY_PASSWORD: ${{ secrets.UPDATER_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Import the Developer ID certificate
+        if: env.APPLE_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass=$(uuidgen)
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Package (universal)
+        run: cargo xtask package --target mac --universal --sign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            target/dist/AI-Track-*
+            target/dist/platform-*.json
+          if-no-files-found: error
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+      WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+      WINDOWS_SIGN_COMMAND: ${{ secrets.WINDOWS_SIGN_COMMAND }}
+      UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
+      UPDATER_KEY_PASSWORD: ${{ secrets.UPDATER_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Decode the code-signing certificate
+        if: env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          "WINDOWS_PFX_FILE=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Package
+        run: cargo xtask package --target win --sign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            target/dist/AI-Track-*
+            target/dist/platform-*.json
+          if-no-files-found: error
+
+  publish:
+    needs: [meta, macos, windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      PUBLISH: ${{ needs.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: target/dist
+          merge-multiple: true
+      - name: Release notes
+        run: |
+          git fetch --tags --force
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then ref="$GITHUB_SHA"; else ref="$TAG"; fi
+          {
+            if [ -n "$prev" ]; then git log --no-merges --pretty='- %s (%h)' "${prev}..${ref}"; else git log --no-merges --pretty='- %s (%h)' -n 50 "$ref"; fi
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: latest.json and SHA256SUMS.txt
+        run: |
+          cargo xtask package manifest --version "$VERSION" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${TAG}" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+          ls -l target/dist
+      - name: Create the release
+        run: |
+          flags=()
+          if [ "$PUBLISH" != "true" ]; then flags+=(--draft); fi
+          # A tag with a suffix (v0.0.2-rc1) is a prerelease; those never become "latest".
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          files=(target/dist/AI-Track-* target/dist/SHA256SUMS.txt)
+          if [ -f target/dist/latest.json ]; then files+=(target/dist/latest.json); fi
+          gh release create "$TAG" "${files[@]}" "${flags[@]}" \
+            --title "AI-Track ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md" \
+            --target "$GITHUB_SHA" --repo "${{ github.repository }}"

@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Signs files with the updater's minisign secret key (`UPDATER_PRIVATE_KEY`, the contents
-/// of the key file; `UPDATER_KEY_PASSWORD` unlocks it). Absent key = no signatures.
+/// of the key file; `UPDATER_KEY_PASSWORD` unlocks it and is optional: an empty or missing
+/// password means an unencrypted key). Absent key = no signatures.
 pub struct Signer {
     key: Option<SecretKey>,
 }
@@ -30,11 +31,11 @@ impl Signer {
         let text = secret_key_text.replace("\r\n", "\n");
         let text = format!("{}\n", text.trim());
         let sk_box = SecretKeyBox::from_string(&text).map_err(|e| anyhow::anyhow!("UPDATER_PRIVATE_KEY is not a minisign secret key: {e}"))?;
+        // No password = an unencrypted key (`minisign -G -W`); never prompt on a terminal.
+        if password.is_empty() {
+            return sk_box.into_unencrypted_secret_key().map_err(|e| anyhow::anyhow!("UPDATER_PRIVATE_KEY is password-protected: set UPDATER_KEY_PASSWORD ({e})"));
+        }
         sk_box.into_secret_key(Some(password.to_string())).map_err(|e| anyhow::anyhow!("could not unlock the updater key (wrong UPDATER_KEY_PASSWORD?): {e}"))
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.key.is_some()
     }
 
     /// Writes `<file>.minisig` and returns its full text; `None` when there is no key.
@@ -329,6 +330,20 @@ mod tests {
         let sig = minisign::SignatureBox::from_string(&sig_text).unwrap();
         assert!(minisign::verify(&pk, &sig, std::io::Cursor::new(b"payload"), true, false, false).is_ok());
         assert!(minisign::verify(&pk, &sig, std::io::Cursor::new(b"tampered"), true, false, false).is_err());
+    }
+
+    #[test]
+    fn an_unencrypted_key_needs_no_password() {
+        let kp = KeyPair::generate_unencrypted_keypair().unwrap();
+        let text = kp.sk.to_box(None).unwrap().into_string();
+        let sk = Signer::unlock(&text, "").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"a").unwrap();
+        assert!(Signer { key: Some(sk) }.sign_file(&file).unwrap().is_some());
+        // A protected key without a password is an error, not a prompt.
+        let (_, protected) = generate_keypair("pw").unwrap();
+        assert!(Signer::unlock(&protected, "").is_err());
     }
 
     #[test]

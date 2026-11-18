@@ -507,6 +507,7 @@ fn target_name(t: &AutomationTarget) -> String {
         AutomationTarget::DeviceEnabled { .. } => "Device On".into(),
         AutomationTarget::Macro { index, .. } => format!("Macro {}", index + 1),
         AutomationTarget::Tempo => "Tempo".into(),
+        AutomationTarget::Transpose => "Transpose".into(),
     }
 }
 

@@ -729,6 +729,29 @@ pub fn sample_warped_beats(slice: &[f32], transients: &[usize], pos: f64, sr: f6
     read_cubic(slice, final_pos)
 }
 
+/// The two read taps of a stateless, zero-allocation pitch shifter that keeps
+/// the timing of a clip (the transpose envelope of a pitch-preserving clip).
+///
+/// `drift` is how many frames the pitch shift has advanced the read position
+/// beyond the time-aligned one (`∫ (ratio - 1)` along the clip, negative
+/// when shifting down) and `window` the span the taps wander in. Each tap
+/// reads at `aligned + offset`, the offsets cover `-window/2..window/2` and
+/// wrap to the other end as the drift grows, where their weight is zero; the
+/// two weights always sum to 1. Between wraps a tap reads the clip at exactly
+/// the shifted speed, so the pitch is the ratio and the delay never exceeds
+/// half a window.
+#[inline]
+pub fn pitch_taps(drift: f64, window: f64) -> [(f64, f32); 2] {
+    let window = window.max(1.0);
+    let u = if drift.is_finite() { drift / window } else { 0.0 };
+    let tap = |u: f64| {
+        let phase = u - u.floor();
+        let s = (std::f64::consts::PI * phase).sin();
+        (window * (phase - 0.5), (s * s) as f32)
+    };
+    [tap(u), tap(u + 0.5)]
+}
+
 /// Stateless, zero-allocation 4-overlap Hann granular reader for live tempo ramps
 /// and runtime speed adjustments when no steady pre-warped buffer applies.
 #[inline]
@@ -794,6 +817,26 @@ mod tests {
             }
         }
         crossings as f32 * sr as f32 / n as f32
+    }
+
+    #[test]
+    fn pitch_taps_sum_to_one_and_wrap_where_their_weight_is_zero() {
+        let w = 1920.0;
+        let mut prev = pitch_taps(-5.0 * w, w);
+        for i in -4999..5000 {
+            let drift = i as f64 * w / 1000.0;
+            let taps = pitch_taps(drift, w);
+            assert!((taps[0].1 + taps[1].1 - 1.0).abs() < 1e-5, "weights at {drift}");
+            for (t, p) in taps.iter().zip(&prev) {
+                // An offset only jumps (by a whole window) while its weight is next to nothing.
+                if (t.0 - p.0).abs() > w / 2.0 {
+                    assert!(t.1 < 0.01 && p.1 < 0.01, "jump at {drift}: {t:?} {p:?}");
+                }
+                assert!(t.0.abs() <= w / 2.0 + 1e-6);
+            }
+            prev = taps;
+        }
+        assert!(pitch_taps(f64::NAN, w).iter().all(|t| t.1.is_finite()));
     }
 
     #[test]

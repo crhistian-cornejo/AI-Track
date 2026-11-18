@@ -768,6 +768,31 @@ impl Workspace {
                         self.s.bottom_tab = BottomTab::PianoRoll;
                     }
                 }
+                // The Clip view with envelope `clipenv=pan` / `clipenv=pitch` / `clipenv=volume` selected and
+                // a few points drawn on the selected audio clip (`wav=…,audio` first).
+                _ if word.starts_with("clipenv=") => {
+                    let kind = match &word["clipenv=".len()..] {
+                        "pan" => ClipEnv::Pan,
+                        "pitch" | "transpose" => ClipEnv::Pitch,
+                        _ => ClipEnv::Volume,
+                    };
+                    self.sample.env = kind;
+                    if let Some(clip) = self.s.selected_clip
+                        && let Some(length) = self.s.project.clips.get(&clip).map(|c| c.length)
+                    {
+                        // Fractions of the clip and where they sit in the kind's range.
+                        let shape: &[(f64, f32)] = match kind {
+                            ClipEnv::Volume => &[(0., 1.), (0.25, 0.4), (0.6, 0.9), (1., 0.2)],
+                            ClipEnv::Pan => &[(0., 0.5), (0.3, 0.1), (0.6, 0.9), (1., 0.5)],
+                            ClipEnv::Pitch => &[(0., 0.5), (0.25, 0.5), (0.5, 0.75), (0.75, 0.375), (1., 0.5)],
+                        };
+                        let points = shape.iter().map(|&(at, unit)| AutomationPoint { tick: (length as f64 * at).round() as Tick, value: kind.from_unit(unit), curve: 0. }).collect();
+                        if let Some(cmd) = aitrack_model::ops::set_clip_envelope(&self.s.project, clip, kind, points) {
+                            self.s.edit("Draw clip envelope", vec![cmd]);
+                            self.s.seal();
+                        }
+                    }
+                }
                 // Reverse the selected clip's sample; `transpose=-7` / `detune=25` tune it.
                 _ if word == "reverse"
                     || word.starts_with("transpose=")

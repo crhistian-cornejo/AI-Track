@@ -71,7 +71,10 @@ pub struct Look {
     /// Apply on the next frame (`true` = cross-fade); needs the window.
     pub pending: Option<bool>,
     pub tokens_open: bool,
+    /// The token editor's search field.
+    pub token_search: gpui::Entity<widgets::TextInput>,
     _watcher: Option<notify::RecommendedWatcher>,
+    _token_sub: gpui::Subscription,
 }
 
 impl Look {
@@ -102,6 +105,8 @@ impl Look {
         })
         .detach();
         let effective = theme::builtin_themes().remove(0);
+        let token_search = gpui::AppContext::new(cx, |cx| widgets::TextInput::new(cx, "Search tokens…", Some(Icon::Search)));
+        let token_sub = cx.observe(&token_search, |_, _, cx| cx.notify());
         Self {
             app,
             lib,
@@ -112,7 +117,9 @@ impl Look {
             bg_image: None,
             pending: Some(false),
             tokens_open: false,
+            token_search,
             _watcher: watcher,
+            _token_sub: token_sub,
         }
     }
 }
@@ -137,6 +144,7 @@ impl Workspace {
     pub fn apply_look(&mut self, window: &mut Window, animate: bool, cx: &mut Context<Self>) {
         let system_dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         self.look.effective = appearance::apply(&self.look.app, &self.look.lib, system_dark, animate);
+        self.s.color_prefs = crate::state::ColorPrefs { auto_track: self.look.app.auto_track_colors, clips_take_track: self.look.app.clips_take_track_color };
         window.set_content_zoom(self.look.app.ui_scale.clamp(0.8, 1.5), cx);
         cx.set_reduce_motion(self.look.app.reduced_motion || self.look.app.low_power);
         match self.look.app.background.clone().filter(|b| !b.path.as_os_str().is_empty()) {
@@ -1381,6 +1389,8 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
                         a.follow_system = false;
                         a.overrides.clear();
                         a.accent = None;
+                        a.adjust = theme::ThemeAdjust::default();
+                        a.clip_intensity = 1.;
                     });
                     this.toast(format!("Created “{}”", t.name), cx);
                 }
@@ -1445,37 +1455,130 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
 
     let mut tokens = div().flex().flex_col();
     if ws.look.tokens_open {
-        for name in theme::Colors::NAMES.iter().copied() {
-            let value = ws.look.effective.colors.get(name).unwrap_or(Rgba8::rgb(0));
-            let overridden = a.overrides.contains_key(name);
-            let picking = ws.look.picker.as_ref().is_some_and(|(t, ..)| *t == PickTarget::Token(name));
+        let query = ws.look.token_search.read(cx).text().trim().to_lowercase();
+        tokens = tokens.child(div().py(px(SP2)).child(ws.look.token_search.clone()));
+        for group in theme::TOKEN_GROUPS.iter().copied() {
+            let names: Vec<&'static str> = theme::Colors::NAMES
+                .iter()
+                .copied()
+                .filter(|n| theme::token_group(n) == group)
+                .filter(|n| query.is_empty() || n.contains(query.as_str()) || theme::token_doc(n).to_lowercase().contains(query.as_str()) || group.to_lowercase().contains(query.as_str()))
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let in_group: Vec<&'static str> = names.iter().copied().filter(|n| a.overrides.contains_key(*n)).collect();
             tokens = tokens.child(
                 div()
-                    .h(px(ROW_H + 4.))
+                    .h(px(ROW_H))
+                    .mt(px(SP2))
                     .px(px(SP2))
-                    .gap(px(SP3))
                     .flex()
                     .items_center()
-                    .rounded(px(r_md()))
-                    .when(picking, |d| d.bg(pal.selection))
-                    .child(widgets::swatch(gpui::ElementId::Name(format!("tok-{name}").into()), value.to_hsla(), 20., picking).on_click(cx.listener(move |this, _, _, cx| this.pick(PickTarget::Token(name), cx))))
-                    .child(mono(name, TEXT_SM, pal.text).w(px(128.)))
-                    .child(label(theme::token_doc(name), TEXT_SM, pal.faint).flex_1())
-                    .child(mono(value.hex(), TEXT_XS, if overridden { pal.accent } else { pal.faint }))
-                    .when(overridden, |d| {
-                        d.child(widgets::sized_icon_button(gpui::ElementId::Name(format!("tok-reset-{name}").into()), Icon::Undo, false, 20., 12.).on_click(cx.listener(move |this, _, _, cx| {
+                    .gap(px(SP2))
+                    .child(label(group.to_uppercase(), TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD).flex_1())
+                    .when(!in_group.is_empty(), |d| {
+                        d.child(text_button(gpui::ElementId::Name(format!("group-reset-{group}").into()), "Reset group", None, false).on_click(cx.listener(move |this, _, _, cx| {
+                            let names = in_group.clone();
                             this.set_look(true, cx, |a| {
-                                a.overrides.remove(name);
+                                for n in &names {
+                                    a.overrides.remove(*n);
+                                }
                             })
                         })))
                     }),
             );
-            if picking
-                && let Some(p) = picker_panel(ws, cx) {
-                    tokens = tokens.child(p);
-                }
+            for name in names {
+                let value = ws.look.effective.colors.get(name).unwrap_or(Rgba8::rgb(0));
+                let overridden = a.overrides.contains_key(name);
+                let picking = ws.look.picker.as_ref().is_some_and(|(t, ..)| *t == PickTarget::Token(name));
+                tokens = tokens.child(
+                    div()
+                        .h(px(ROW_H + 4.))
+                        .px(px(SP2))
+                        .gap(px(SP3))
+                        .flex()
+                        .items_center()
+                        .rounded(px(r_md()))
+                        .when(picking, |d| d.bg(pal.selection))
+                        .child(widgets::swatch(gpui::ElementId::Name(format!("tok-{name}").into()), value.to_hsla(), 20., picking).on_click(cx.listener(move |this, _, _, cx| this.pick(PickTarget::Token(name), cx))))
+                        .child(mono(name, TEXT_SM, pal.text).w(px(128.)))
+                        .child(label(theme::token_doc(name), TEXT_SM, pal.faint).flex_1())
+                        .child(mono(value.hex(), TEXT_XS, if overridden { pal.accent } else { pal.faint }))
+                        .when(overridden, |d| {
+                            d.child(widgets::sized_icon_button(gpui::ElementId::Name(format!("tok-reset-{name}").into()), Icon::Undo, false, 20., 12.).on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_look(true, cx, |a| {
+                                    a.overrides.remove(name);
+                                })
+                            })))
+                        }),
+                );
+                if picking
+                    && let Some(p) = picker_panel(ws, cx) {
+                        tokens = tokens.child(p);
+                    }
+            }
         }
     }
+
+    // ── Theme adjustments (Live's Themes & Colors) ──
+    let adj = a.adjust;
+    let adj_row = |title: &'static str, hint: &'static str, id: &'static str, text: String, step: fn(&mut Appearance, f32), cx: &mut Context<Workspace>| setting_row(title, Some(hint.into()), look_stepper(id, text, cx, step));
+    let adjustments = div()
+        .flex()
+        .flex_col()
+        .child(adj_row("Hue", "Turns every colour round the wheel", "adj-hue", format!("{:+.0}°", adj.hue), |a, d| a.adjust.hue = wrap_hue(a.adjust.hue + d * 15.), cx))
+        .child(adj_row("Saturation", "Greyer to more vivid", "adj-sat", format!("{:+.0}%", adj.saturation * 100.), |a, d| a.adjust.saturation = step_unit(a.adjust.saturation, d * 0.1), cx))
+        .child(adj_row("Brightness", "Darker to lighter", "adj-bright", format!("{:+.0}%", adj.brightness * 100.), |a, d| a.adjust.brightness = step_unit(a.adjust.brightness, d * 0.05), cx))
+        .child(adj_row("Contrast", "Flatter to harder", "adj-contrast", format!("{:+.0}%", adj.contrast * 100.), |a, d| a.adjust.contrast = step_unit(a.adjust.contrast, d * 0.1), cx))
+        .child(adj_row(
+            "Grid line intensity",
+            "Arrangement, piano roll and session grids",
+            "adj-grid",
+            format!("{:.0}%", adj.grid * 100.),
+            |a, d| a.adjust.grid = ((a.adjust.grid + d * 0.1) * 10.).round().clamp(0., 30.) / 10.,
+            cx,
+        ))
+        .when(!adj.is_neutral(), |d| {
+            d.child(div().py(px(SP2)).flex().justify_end().child(text_button("adj-reset", "Reset adjustments", Some(Icon::Undo), false).on_click(cx.listener(|this, _, _, cx| this.set_look(true, cx, |a| a.adjust = theme::ThemeAdjust::default())))))
+        });
+
+    // ── Clip & track colours ──
+    let colour_rows = div()
+        .flex()
+        .flex_col()
+        .child(setting_row(
+            "Clip color intensity",
+            Some("How saturated and strong clips are".into()),
+            look_stepper("clip-intensity", format!("{:.0}%", a.clip_intensity * 100.), cx, |a, d| a.clip_intensity = ((a.clip_intensity + d * 0.1) * 10.).round().clamp(2., 20.) / 10.),
+        ))
+        .child(setting_row(
+            "Track color intensity",
+            Some("How much track headers wear their colour".into()),
+            look_stepper("track-intensity", format!("{:.0}%", a.track_tint * 100.), cx, |a, d| a.track_tint = ((a.track_tint + d * 0.1) * 10.).round().clamp(0., 10.) / 10.),
+        ))
+        .child(setting_row(
+            "Auto-assign track colors",
+            Some("New tracks take the next palette colour".into()),
+            switch("auto-track-colors", a.auto_track_colors).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.auto_track_colors = !a.auto_track_colors))),
+        ))
+        .child(setting_row(
+            "New clips take the track color",
+            Some("Off: each new clip picks its own colour".into()),
+            switch("clips-take-track", a.clips_take_track_color).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.clips_take_track_color = !a.clips_take_track_color))),
+        ))
+        .child(setting_row(
+            "Piano roll note color",
+            Some("What colours the notes".into()),
+            seg(
+                "note-color",
+                &NoteColor::ALL.map(|n| (n, n.label())),
+                a.note_color,
+                72.,
+                cx,
+                |a, v| a.note_color = v,
+            ),
+        ));
 
     // ── Background ──
     let bg = a.background.clone().filter(|b| !b.path.as_os_str().is_empty());
@@ -1598,6 +1701,10 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
                 }),
         ))
         .child(tokens)
+        .child(section_title("THEME ADJUSTMENTS"))
+        .child(adjustments)
+        .child(section_title("CLIP & TRACK COLOURS"))
+        .child(colour_rows)
         .child(section_title("BACKGROUND"))
         .child(bg_rows)
         .child(section_title("LAYOUT & TYPE"))
@@ -1690,6 +1797,17 @@ fn appearance_page(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspac
             switch("reduce-motion", a.reduced_motion).on_click(cx.listener(|this, _, _, cx| this.set_look(false, cx, |a| a.reduced_motion = !a.reduced_motion))),
         ))
         .into_any_element()
+}
+
+/// A hue shift in degrees wrapped into -180..=180.
+fn wrap_hue(h: f32) -> f32 {
+    let w = (h + 180.).rem_euclid(360.) - 180.;
+    if w <= -180. { 180. } else { w }.round()
+}
+
+/// A -1..=1 slider stepped by `d`, kept tidy to two decimals.
+fn step_unit(v: f32, d: f32) -> f32 {
+    ((v + d) * 100.).round().clamp(-100., 100.) / 100.
 }
 
 fn bg_mut(a: &mut Appearance) -> &mut Background {

@@ -45,20 +45,21 @@ fn action(
     }))
 }
 
-/// The palette as two rows of swatches; `current` is ringed. Picking one
-/// closes the menu and runs `pick`.
+/// The palette grid (hue columns by lightness rows); `current` is ringed.
+/// Picking one closes the menu and runs `pick`.
 fn swatches(id: &'static str, current: Option<Color>, cx: &mut Context<Workspace>, pick: impl Fn(&mut Workspace, Color, &mut Context<Workspace>) + Clone + 'static) -> gpui::Div {
     use gpui::{div, px, InteractiveElement, Styled};
-    let row = |range: std::ops::Range<usize>, cx: &mut Context<Workspace>| {
+    let mut grid = div().px(px(SP2)).py(px(SP1)).flex().flex_col().gap(px(SP1));
+    for row in 0..aitrack_model::colors::GRID_ROWS {
         let mut r = div().flex().gap(px(SP1));
-        for i in range {
-            let color = Color::palette(i);
+        for col in 0..aitrack_model::colors::GRID_COLS {
+            let color = Color::grid(row, col);
             let pick = pick.clone();
             r = r.child(
                 div()
-                    .id(ElementId::Name(format!("{id}-{i}").into()))
-                    .w(px(16.))
-                    .h(px(16.))
+                    .id(ElementId::Name(format!("{id}-{row}-{col}").into()))
+                    .w(px(12.))
+                    .h(px(12.))
                     .rounded(px(r_sm()))
                     .bg(track_color(color))
                     .border_1()
@@ -72,10 +73,14 @@ fn swatches(id: &'static str, current: Option<Color>, cx: &mut Context<Workspace
                     })),
             );
         }
-        r
-    };
-    let half = Color::PALETTE.len() / 2;
-    div().px(px(SP2)).py(px(SP1)).flex().flex_col().gap(px(SP1)).child(row(0..half, cx)).child(row(half..Color::PALETTE.len(), cx))
+        grid = grid.child(r);
+    }
+    grid
+}
+
+/// A seed for "Randomize Colors" that differs on every use.
+fn color_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x5EED, |d| d.as_nanos() as u64)
 }
 
 /// Right-click on a clip. It acts on the selected clips (the clip under
@@ -88,7 +93,7 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
     // The clip under the mouse, when it is audio and other clips play its file too.
     let clip_color = clips.first().and_then(|(_, pl, _)| ws.s.project.clips.get(&pl.clip)).map(|c| c.color).filter(|c| clips.iter().all(|(_, pl, _)| ws.s.project.clips.get(&pl.clip).is_some_and(|x| x.color == *c)));
     let sample = ws.s.selected_placement.and_then(|(_, id)| ws.s.placement(id)).map(|(_, pl, _)| pl.clip).filter(|c| ws.s.sample_targets(*c).len() > 1);
-    let card = widgets::menu_card("clip-menu", 232.)
+    let card = widgets::menu_card("clip-menu", 240.)
         .child(command("clip-cut", Icon::Scissors, "Cut", Cmd::Cut, cx))
         .child(command("clip-copy", Icon::Copy, "Copy", Cmd::Copy, cx))
         .child(command("clip-paste", Icon::Paste, "Paste", Cmd::Paste, cx))
@@ -101,6 +106,13 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         .child(widgets::divider_h())
         .child(swatches("clip-color", clip_color, cx, |this, color, _| {
             this.s.set_clips_color(color);
+        }))
+        .child(action("clip-track-color", Icon::Wand, "Assign Track Color to Clips", None, false, cx, |this, _, _| {
+            let tracks: Vec<TrackId> = this.s.clip_selection().iter().map(|(t, _, _)| *t).collect();
+            this.s.assign_track_color_to_clips(&tracks);
+        }))
+        .child(action("clip-randomize", Icon::Shuffle, "Randomize Colors", None, false, cx, |this, _, _| {
+            this.s.randomize_clip_colors(color_seed());
         }))
         .child(widgets::divider_h())
         .child(action("clip-split", Icon::Split, "Split at Marker", keys::action_hint("SplitClip"), false, cx, |this, _, cx| this.split_clips(cx)))
@@ -177,7 +189,7 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
     };
     let groupable = t.kind.has_clips() || matches!(t.kind, TrackKind::Group | TrackKind::Folder);
     let many = ws.s.selected_tracks().len() > 1;
-    let mut card = widgets::menu_card("track-menu", 232.);
+    let mut card = widgets::menu_card("track-menu", 240.);
     if groupable {
         if t.kind == TrackKind::Instrument {
             let kbd = t.keyboard_input;
@@ -288,6 +300,14 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
         .child(swatches("track-color", Some(t.color), cx, move |this, color, _| {
             let ids = this.s.selected_tracks();
             this.s.set_tracks_color(&ids, color);
+        }))
+        .child(action("track-assign-color", Icon::Wand, "Assign Track Color to Clips", None, false, cx, |this, _, _| {
+            let ids = this.s.selected_tracks();
+            this.s.assign_track_color_to_clips(&ids);
+        }))
+        .child(action("track-randomize", Icon::Shuffle, "Randomize Colors", None, false, cx, |this, _, _| {
+            let ids = this.s.selected_tracks();
+            this.s.randomize_track_colors(&ids, color_seed());
         }))
         .child(action(
             "track-duplicate",

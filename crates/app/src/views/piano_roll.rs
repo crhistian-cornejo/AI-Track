@@ -174,6 +174,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     // ── Grid + notes ──
     let regions = ws.regions.clone();
     let grid_notes = notes.clone();
+    let note_mode = ws.look.app.note_color;
     let grid_sel = selected.clone();
     let grid_rows = rows;
     let grid = canvas(
@@ -235,6 +236,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let sel = grid_sel.contains(&n.id);
                 let out_of_scale = folded.is_some_and(|s| !s.contains(n.key));
                 // Deactivated notes (0) stay visible but drained of colour.
+                let fill = note_fill(note_mode, fill, n.key, n.velocity, n.probability);
                 let base = if n.muted { theme_mix(fill, pal.well, 0.75) } else { fill };
                 let body = with_alpha(if sel { theme_mix(base, pal.clip_text_light, 0.35) } else { base }, if n.muted { 0.45 } else { 0.55 + 0.45 * n.velocity });
                 let outline = if sel { pal.accent } else if out_of_scale { pal.record } else { shadow(0.35) };

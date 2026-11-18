@@ -329,6 +329,8 @@ pub struct AppState {
     /// Live's Automation Arm: while recording, moving a control in a
     /// plugin's window writes its automation.
     pub automation_arm: bool,
+    /// The colour options of Preferences > Appearance that decide how new tracks and clips are coloured.
+    pub color_prefs: ColorPrefs,
     /// Gestures being written as automation: per (device, param), the last tick written.
     pub auto_writes: BTreeMap<(DeviceId, u32), Tick>,
     pub arrange: ArrangeView,
@@ -346,6 +348,26 @@ pub struct AppState {
     /// Ableton-style Scale Mode in the piano roll: fold vertically to show only keys in the active scale.
     pub piano_scale_fold: bool,
     pub last_error: Option<String>,
+}
+
+/// How new tracks and clips are coloured (from the Appearance settings).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorPrefs {
+    /// New tracks take the next palette colour (off: a neutral grey).
+    pub auto_track: bool,
+    /// New clips take the colour of the track they land on.
+    pub clips_take_track: bool,
+}
+
+impl ColorPrefs {
+    /// The neutral grey tracks get when colours are not auto-assigned.
+    pub const DEFAULT_TRACK: Color = Color(0x9AA0A6);
+}
+
+impl Default for ColorPrefs {
+    fn default() -> Self {
+        Self { auto_track: true, clips_take_track: true }
+    }
 }
 
 impl AppState {
@@ -373,6 +395,7 @@ impl AppState {
             pending_audio: None,
             session_takes: BTreeSet::new(),
             automation_arm: false,
+            color_prefs: ColorPrefs::default(),
             auto_writes: BTreeMap::new(),
             arrange: ArrangeView { px_per_beat: 7., scroll_x: 0., scroll_y: 0. },
             piano: PianoView { px_per_beat: 64., row_h: 12., scroll_x: 0., scroll_y: 0. },
@@ -1508,7 +1531,7 @@ impl AppState {
             TrackKind::Audio => (format!("Audio {}", count + 1), self.new_track_index()),
             _ => (format!("MIDI {}", count + 1), self.new_track_index()),
         };
-        let mut track = Track::new(id, kind, name, Color::palette(self.project.tracks.len()));
+        let mut track = Track::new(id, kind, name, if self.color_prefs.auto_track { Color::palette(self.project.tracks.len()) } else { ColorPrefs::DEFAULT_TRACK });
         // A track created inside a group joins it.
         if kind != TrackKind::Return
             && let Some(parent) = self.selected_track.and_then(|s| self.project.track(s)).and_then(|s| if s.kind == TrackKind::Group { Some(s.id) } else { s.parent })
@@ -2280,11 +2303,17 @@ impl AppState {
         ok
     }
 
-    /// Give `ids` the palette colour `color`. The clips that wore the old
-    /// colour of their track follow it; a clip coloured by hand keeps its own.
+    /// Give `ids` the palette colour `color`.
     pub fn set_tracks_color(&mut self, ids: &[TrackId], color: Color) -> bool {
+        let pairs: Vec<(TrackId, Color)> = ids.iter().map(|id| (*id, color)).collect();
+        self.recolor_tracks(&pairs, "Change track colour")
+    }
+
+    /// Give each track its colour, as one undo step. The clips that wore the
+    /// old colour of their track follow it; a clip coloured by hand keeps its own.
+    pub fn recolor_tracks(&mut self, pairs: &[(TrackId, Color)], label: &str) -> bool {
         let mut cmds = Vec::new();
-        for &id in ids {
+        for &(id, color) in pairs {
             let Some(t) = self.project.track(id) else { continue };
             let Some(set) = tracks::set_track_color(&self.project, id, color) else { continue };
             cmds.push(set);
@@ -2300,7 +2329,39 @@ impl AppState {
             return false;
         }
         self.seal();
-        let ok = self.edit("Change track colour", cmds);
+        let ok = self.edit(label, cmds);
+        self.seal();
+        ok
+    }
+
+    /// The colour a new clip on a track coloured `track` gets: the track's, or its own palette pick.
+    pub fn clip_color_for(&self, track: Color) -> Color {
+        if self.color_prefs.clips_take_track { track } else { Color::palette(self.project.clips.len()) }
+    }
+
+    /// Context action "Assign Track Color to Clips" for `tracks`.
+    pub fn assign_track_color_to_clips(&mut self, tracks: &[TrackId]) -> bool {
+        self.run_color_commands(colors::assign_track_color_to_clips(&self.project, tracks), "Assign track colour to clips")
+    }
+
+    /// Context action "Randomize Colors" for the selected tracks.
+    pub fn randomize_track_colors(&mut self, tracks: &[TrackId], seed: u64) -> bool {
+        let pairs = colors::randomize_tracks(&self.project, tracks, seed);
+        self.recolor_tracks(&pairs, "Randomize track colours")
+    }
+
+    /// Context action "Randomize Colors" for the selected clips.
+    pub fn randomize_clip_colors(&mut self, seed: u64) -> bool {
+        let clips: Vec<ClipId> = self.clip_selection().iter().map(|(_, pl, _)| pl.clip).collect();
+        self.run_color_commands(colors::randomize_clips(&self.project, &clips, seed), "Randomize clip colours")
+    }
+
+    fn run_color_commands(&mut self, cmds: Vec<Command>, label: &str) -> bool {
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit(label, cmds);
         self.seal();
         ok
     }
@@ -3340,6 +3401,42 @@ mod tests {
         s.select_clips(vec![p2], Some(p2));
         assert!(s.set_clips_color(Color::palette(1)));
         assert_eq!(s.project.clips[&c2].color, Color::palette(1));
+    }
+
+    #[test]
+    fn colour_actions_are_one_undo_step_and_the_colour_options_apply() {
+        let mut s = AppState::new(Project::new("t"));
+        let t = add_named(&mut s, TrackKind::Instrument, "K");
+        let color = s.project.track(t).unwrap().color;
+        let (src, c1, p1) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+        let hand = Color::grid(2, 4);
+        s.edit("clips", vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddClip { id: c1, clip: Box::new(Clip::new("one", hand, src, PPQ)) },
+            Command::PlaceClip { track: t, placement: Placement { id: p1, clip: c1, start: 0, lane: 0 } },
+        ]);
+        s.seal();
+        // Assign Track Color to Clips.
+        assert!(s.assign_track_color_to_clips(&[t]));
+        assert_eq!(s.project.clips[&c1].color, color);
+        assert!(!s.assign_track_color_to_clips(&[t]), "already the track's colour: no step");
+        assert!(s.undo());
+        assert_eq!(s.project.clips[&c1].color, hand, "one undo step");
+        // Randomize Colors: tracks and the clips that followed them, in one step.
+        assert!(s.randomize_track_colors(&[t], 99));
+        let randomised = s.project.track(t).unwrap().color;
+        assert_ne!(randomised, color);
+        s.select_clips(vec![p1], Some(p1));
+        assert!(s.randomize_clip_colors(5));
+        assert!(s.undo() && s.undo());
+        assert_eq!(s.project.track(t).unwrap().color, color);
+        // Colour options: a neutral default instead of the next palette colour; clips keep their own colour.
+        s.color_prefs = ColorPrefs { auto_track: false, clips_take_track: false };
+        let u = s.add_track(TrackKind::Audio).unwrap();
+        assert_eq!(s.project.track(u).unwrap().color, ColorPrefs::DEFAULT_TRACK);
+        assert_ne!(s.clip_color_for(Color(0x123456)), Color(0x123456));
+        s.color_prefs = ColorPrefs::default();
+        assert_eq!(s.clip_color_for(Color(0x123456)), Color(0x123456));
     }
 
     #[test]

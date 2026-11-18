@@ -4,7 +4,7 @@
 //! app config dir; custom themes live there as `.aitheme` files and are
 //! hot-reloaded when the folder changes.
 
-use crate::theme::{self, Colors, Density, KnobStyle, MeterStyle, Resolved, Rgba8, Theme, WaveformStyle};
+use crate::theme::{self, Colors, Density, KnobStyle, MeterStyle, NoteColor, Resolved, Rgba8, Theme, ThemeAdjust, WaveformStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,18 @@ pub struct Appearance {
     /// The assistant's brain: a Claude model id, or `agent:<cli>`; empty
     /// for the default.
     pub assistant_model: String,
+    /// Hue / saturation / brightness / contrast / grid-line sliders over the theme.
+    pub adjust: ThemeAdjust,
+    /// How saturated and strong clip bodies are (1 = as the theme designs them, 0.2–2).
+    pub clip_intensity: f32,
+    /// How strongly track headers wear the track colour (0 = not at all, 1 = strongly).
+    pub track_tint: f32,
+    /// New tracks take the next palette colour (off: a neutral default).
+    pub auto_track_colors: bool,
+    /// New clips take the colour of the track they land on (off: their own).
+    pub clips_take_track_color: bool,
+    /// What colours notes in the piano roll.
+    pub note_color: NoteColor,
 }
 
 impl Default for Appearance {
@@ -108,6 +120,12 @@ impl Default for Appearance {
             reduced_motion: false,
             low_power: false,
             assistant_model: String::new(),
+            adjust: ThemeAdjust::default(),
+            clip_intensity: 1.,
+            track_tint: 0.,
+            auto_track_colors: true,
+            clips_take_track_color: true,
+            note_color: NoteColor::Clip,
         }
     }
 }
@@ -200,6 +218,9 @@ pub fn load_dir(dir: &Path) -> Vec<(Theme, PathBuf)> {
 /// The theme with the user's accent and token overrides applied.
 pub fn effective_theme(app: &Appearance, base: &Theme) -> Theme {
     let mut t = base.clone();
+    // Adjustments tune the theme; the accent and token overrides are exact and come after.
+    t.colors = t.colors.adjusted(&app.adjust);
+    t.clips = t.clips.with_intensity(app.clip_intensity, t.dark);
     apply_overrides(&mut t.colors, app);
     t.style.ui_scale = app.ui_scale;
     t.style.density = app.density;
@@ -235,7 +256,7 @@ pub fn apply(app: &Appearance, lib: &ThemeLibrary, system_dark: bool, animate: b
         Some(bg) if !bg.path.as_os_str().is_empty() => (bg.glass.clone(), bg.glass_opacity.clamp(0.3, 1.)),
         _ => (Vec::new(), 1.),
     };
-    theme::install(&t.colors, t.dark, Resolved { style: t.style.clone(), clips: t.clips, glass, glass_alpha }, animate && !(app.reduced_motion || app.low_power));
+    theme::install(&t.colors, t.dark, Resolved { style: t.style.clone(), clips: t.clips, glass, glass_alpha, track_tint: app.track_tint.clamp(0., 1.) }, animate && !(app.reduced_motion || app.low_power));
     t
 }
 
@@ -329,6 +350,31 @@ mod tests {
         assert_eq!(t.colors.panel, Rgba8::rgb(0x223344));
         assert_eq!(t.colors.text, base.colors.text);
         assert_eq!(t.style.radius, 0.);
+    }
+
+    #[test]
+    fn adjustments_apply_under_overrides_and_old_files_still_load() {
+        let base = theme::builtin_themes().remove(0);
+        let mut app = Appearance::default();
+        app.adjust.hue = 90.;
+        app.adjust.grid = 2.;
+        app.clip_intensity = 1.5;
+        app.overrides.insert("panel".into(), Rgba8::rgb(0x223344));
+        let t = effective_theme(&app, &base);
+        // An override is exact; the adjustment moved everything else.
+        assert_eq!(t.colors.panel, Rgba8::rgb(0x223344));
+        assert_ne!(t.colors.accent, base.colors.accent);
+        assert_ne!(t.colors.grid_bar, base.colors.grid_bar);
+        assert!(t.clips.saturation > base.clips.saturation);
+        // The defaults are today's look exactly.
+        assert_eq!(effective_theme(&Appearance::default(), &base).colors, base.colors);
+        // A settings file from before these fields reads with today's behaviour.
+        let old: Appearance = serde_json::from_str(r#"{"theme":"Graphite","radius":1.5}"#).unwrap();
+        assert_eq!((old.theme.as_str(), old.radius), ("Graphite", 1.5));
+        assert!(old.adjust.is_neutral() && old.clip_intensity == 1. && old.track_tint == 0. && old.auto_track_colors && old.clips_take_track_color);
+        assert_eq!(old.note_color, NoteColor::Clip);
+        let back: Appearance = serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
+        assert_eq!(back, app);
     }
 
     #[test]

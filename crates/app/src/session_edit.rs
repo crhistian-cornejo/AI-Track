@@ -175,7 +175,7 @@ impl AppState {
         if t.session_slots.contains_key(&scene) || !self.project.scenes.iter().any(|s| s.id == scene) {
             return None;
         }
-        let color = t.color;
+        let color = self.clip_color_for(t.color);
         let source = self.project.alloc_source_id();
         let clip = self.project.alloc_clip_id();
         self.seal();
@@ -269,7 +269,7 @@ impl AppState {
         if !self.project.scenes.iter().any(|s| s.id == scene) {
             return None;
         }
-        let color = t.color;
+        let color = self.clip_color_for(t.color);
         let name = if sample.name.is_empty() { path.file_stem().map_or_else(|| "Audio".into(), |n| n.to_string_lossy().into_owned()) } else { sample.name.clone() };
         let source = self.project.alloc_source_id();
         let clip = self.project.alloc_clip_id();

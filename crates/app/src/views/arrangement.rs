@@ -1152,6 +1152,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                 .pl(px(SP2 + indent))
                 .pr(px(SP2))
                 .when(is_group, |d| d.bg(with_alpha(track_color(t.color), 0.10)))
+                .when_some(track_tint_overlay(t.color).filter(|_| !is_group), |d, c| d.bg(c))
                 .flex()
                 .flex_col()
                 .justify_center()

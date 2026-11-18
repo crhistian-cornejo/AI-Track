@@ -634,6 +634,46 @@ impl Workspace {
                         views::prefs::PrefsPage::Sounds,
                     ))
                 }
+                // The Appearance page open, with the token editor expanded (`prefs=tokens`).
+                "prefs=appearance" | "prefs=tokens" => {
+                    self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Appearance));
+                    self.look.tokens_open = word == "prefs=tokens";
+                }
+                // The colour palette popover (the track menu) open on the selected track.
+                "colors" => {
+                    let track = self.s.selected_track.or_else(|| self.s.project.content_tracks().next().map(|t| t.id));
+                    if let Some(t) = track {
+                        self.s.selected_track = Some(t);
+                        self.menu = Some(Menu { kind: MenuKind::TrackContext(t), at: gpui::point(gpui::px(120.), gpui::px(220.)), opened: 0 });
+                    }
+                }
+                // Look settings for a screenshot, shown without saving them: `tint=40` (hue shift in degrees),
+                // `saturation=-50`, `bright=20`, `contrast=30`, `gridlines=250` (percent), `clipcolor=150`,
+                // `trackcolor=60`, `notes=pitch|velocity|chance|clip`.
+                _ if ["tint=", "saturation=", "bright=", "contrast=", "gridlines=", "clipcolor=", "trackcolor=", "notes="].iter().any(|k| word.starts_with(k)) => {
+                    if let Some((key, v)) = word.split_once('=') {
+                        let n = v.parse::<f32>().unwrap_or(0.);
+                        let a = &mut self.look.app;
+                        match key {
+                            "tint" => a.adjust.hue = n.clamp(-180., 180.),
+                            "saturation" => a.adjust.saturation = (n / 100.).clamp(-1., 1.),
+                            "bright" => a.adjust.brightness = (n / 100.).clamp(-1., 1.),
+                            "contrast" => a.adjust.contrast = (n / 100.).clamp(-1., 1.),
+                            "gridlines" => a.adjust.grid = (n / 100.).clamp(0., 3.),
+                            "clipcolor" => a.clip_intensity = (n / 100.).clamp(0.2, 2.),
+                            "trackcolor" => a.track_tint = (n / 100.).clamp(0., 1.),
+                            _ => {
+                                a.note_color = match v {
+                                    "velocity" => theme::NoteColor::Velocity,
+                                    "pitch" => theme::NoteColor::Pitch,
+                                    "chance" => theme::NoteColor::Chance,
+                                    _ => theme::NoteColor::Clip,
+                                }
+                            }
+                        }
+                        self.look.pending = Some(false);
+                    }
+                }
                 "prefs=look" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Appearance,
@@ -3078,7 +3118,7 @@ fn is_audio_file(path: &std::path::Path) -> bool {
 /// `target` when it is an audio track, else on one new audio track at `index`.
 /// Each clip starts where the one before it ends.
 fn drop_audio_commands(s: &mut AppState, files: &[(Option<AudioFacts>, std::path::PathBuf)], target: Option<TrackId>, start: Tick, index: usize) -> Vec<Command> {
-    let color = target.and_then(|t| s.project.track(t)).map(|t| t.color);
+    let color = target.and_then(|t| s.project.track(t)).map(|t| t.color).map(|c| s.clip_color_for(c));
     let mut out = Vec::new();
     let mut track = target;
     let mut at = start;
@@ -3253,7 +3293,7 @@ fn sample_clip_commands(s: &mut AppState, item: &LibraryItem, target: Option<Tra
             a.warp = warp.clone();
         }
         if let Command::AddClip { clip, .. } = c {
-            if let Some(color) = target.and_then(|t| s.project.track(t)).map(|t| t.color) {
+            if let Some(color) = target.and_then(|t| s.project.track(t)).map(|t| t.color).map(|c| s.clip_color_for(c)) {
                 clip.color = color;
             }
             if let Some(span) = span.filter(|_| facts.2 > 0) {

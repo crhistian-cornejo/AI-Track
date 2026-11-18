@@ -10,6 +10,7 @@
 //! headlessly.
 
 pub mod automation;
+pub mod colors;
 pub mod command;
 pub mod format;
 pub mod groove;

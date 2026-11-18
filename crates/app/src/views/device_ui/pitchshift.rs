@@ -43,6 +43,13 @@ pub fn shift_text(semitones: f32, cents: f32) -> String {
     }
 }
 
+/// Where the "dry" label and the top of its stem go: the label stays inside
+/// the plot (below the title row) however short the plot is.
+pub fn dry_label_rows(plot_top: f32, base: f32) -> (f32, f32) {
+    let label = (base - 36.).max(plot_top + 20.);
+    (label, (label + 14.).min(base - 6.).max(base - 22.))
+}
+
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let (semi, cents) = (dev.plain(p::SEMITONES).round(), dev.plain(p::CENTS));
     let total = semi + cents / 100.;
@@ -83,8 +90,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         // From the dry pitch to the shifted one.
         let (x0, x1) = (r.px(0.5), r.px(semi_frac(total)));
         kit::bar(window, x0.min(x1), base - 6., (x1 - x0).abs().max(1.), 6., 3., with_alpha(colour, 0.45));
-        kit::bar(window, x0 - 1., base - 22., 2., 22., 1., content(0.4));
-        kit::txt(window, cx, "dry", x0, base - 36., TEXT_XS, pal.faint, TextAlign::Center);
+        let (label_y, stem_top) = dry_label_rows(r.y, base);
+        kit::bar(window, x0 - 1., stem_top, 2., base - stem_top, 1., content(0.4));
+        kit::txt(window, cx, "dry", x0, label_y, TEXT_XS, pal.faint, TextAlign::Center);
         kit::vline(window, r, x1, with_alpha(colour, 0.35));
         kit::dot(window, r.pt(semi_frac(total), 0.5 - 0.3 * (cents / 100.)), 7., colour, Some(pal.text));
         kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
@@ -151,6 +159,16 @@ mod tests {
         for i in 0..=20 {
             let x = i as f32 / 20.;
             assert!((hann(x) + hann(x + 0.5) - 1.).abs() < 1e-5, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_dry_label_never_leaves_the_plot() {
+        for h in [60., 90., 140., 300.] {
+            let (top, base) = (100., 100. + BASE * h);
+            let (label, stem) = dry_label_rows(top, base);
+            assert!(label >= top + 20., "{h}");
+            assert!(stem >= base - 22. && stem <= base - 6., "{h}");
         }
     }
 

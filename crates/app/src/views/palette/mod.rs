@@ -59,7 +59,7 @@ const TIME_W: f32 = 48.;
 const KEY_W: f32 = 44.;
 const BPM_W: f32 = 44.;
 /// The "92%" of a similar sound.
-const SIM_W: f32 = 40.;
+const SIM_W: f32 = 44.;
 /// How the "Similar" action is reached from the keyboard, as the tooltip and the footer say it.
 const SIMILAR_KEYS: &str = if cfg!(target_os = "macos") { "⇧⌘F" } else { "Ctrl+Shift+F" };
 /// Rows per section on the All tab.
@@ -1807,6 +1807,8 @@ fn sort_header(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         d
     };
     let splice = ws.palette.tab == Tab::Splice;
+    // The similarity column of a "similar sounds" list has a header of its own, aligned with the percentages.
+    let match_header = (ws.palette.similar.is_some() && ws.palette.tab == Tab::Samples).then(|| column(SIM_W, label("MATCH", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD)));
     div()
         .h(px(HEADER_H))
         .flex_none()
@@ -1819,6 +1821,7 @@ fn sort_header(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .child(div().w(px(32. + 14. + SP3)).flex_none())
         .child(head("sort-name", "NAME", SortCol::Name, None, cx))
         .child(div().w(px(WAVE_W)).flex_none().child(label("WAVEFORM", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD)))
+        .children(match_header)
         .child(head("sort-time", "TIME", SortCol::Time, Some(TIME_W), cx))
         .child(head("sort-key", "KEY", SortCol::Key, Some(KEY_W), cx))
         .child(head("sort-bpm", "BPM", SortCol::Bpm, Some(BPM_W), cx))

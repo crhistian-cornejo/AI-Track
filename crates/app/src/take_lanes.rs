@@ -67,7 +67,8 @@ impl AppState {
 
     pub(crate) fn prune_take_view(&mut self) {
         let p = &self.project;
-        self.takes.shown.retain(|t| p.track(*t).is_some());
+        // A track shown with no lanes (undo took the only one away) has nothing to show.
+        self.takes.shown.retain(|t| p.track(*t).is_some_and(|t| !t.take_lanes.is_empty()));
         if self.takes.sel.is_some_and(|s| p.track(s.track).is_none_or(|t| s.lane >= t.take_lanes.len())) {
             self.takes.sel = None;
         }
@@ -89,6 +90,29 @@ impl AppState {
             self.insert_take_lane(track);
         }
         true
+    }
+
+    /// Show the take lanes of all `tracks` (when any is hidden) or hide them
+    /// all. The first empty lanes the tracks need are one undo step.
+    pub fn toggle_take_lanes_of(&mut self, tracks: &[TrackId]) {
+        let tracks: Vec<TrackId> = tracks.iter().copied().filter(|t| self.project.track(*t).is_some_and(|t| t.kind.has_clips())).collect();
+        let show = tracks.iter().any(|t| !self.take_lanes_shown(*t));
+        let mut cmds = Vec::new();
+        for t in tracks {
+            if !show {
+                self.takes.shown.remove(&t);
+                self.takes.sel = None;
+            } else if !self.take_lanes_shown(t) {
+                self.takes.shown.insert(t);
+                if let Some(tr) = self.project.track(t).filter(|tr| tr.take_lanes.is_empty()) {
+                    cmds.push(Command::AddTakeLane { track: t, index: 0, name: takes::next_lane_name(tr) });
+                }
+            }
+        }
+        if !cmds.is_empty() {
+            self.edit("Show take lanes", cmds);
+            self.seal();
+        }
     }
 
     /// "Insert Take Lane": a new empty lane after the last one. Shows the lanes.
@@ -290,6 +314,21 @@ mod tests {
         assert_eq!(audio_passes(0, 20 * PPQ, Some((ls, le))), None);
         assert_eq!(audio_passes(ls, 6 * PPQ, Some((ls, le))), None);
         assert_eq!(audio_passes(ls, 4 * PPQ, Some((ls, le))), None);
+    }
+
+    #[test]
+    fn showing_take_lanes_on_several_tracks_is_one_undo_step() {
+        let (mut s, a) = audio_state();
+        let b = s.project.alloc_track_id();
+        Command::AddTrack { track: Box::new(Track::new(b, TrackKind::Audio, "B", Color::palette(2))), index: 1 }.apply(&mut s.project).unwrap();
+        let before = s.history.steps().count();
+        s.toggle_take_lanes_of(&[a, b]);
+        assert_eq!(s.history.steps().count(), before + 1);
+        assert!(s.take_lanes_shown(a) && s.take_lanes_shown(b));
+        assert_eq!((s.project.track(a).unwrap().take_lanes.len(), s.project.track(b).unwrap().take_lanes.len()), (1, 1));
+        assert!(s.undo());
+        assert_eq!((s.project.track(a).unwrap().take_lanes.len(), s.project.track(b).unwrap().take_lanes.len()), (0, 0));
+        assert!(!s.take_lanes_shown(a) && !s.take_lanes_shown(b), "nothing is shown with no lanes");
     }
 
     #[test]

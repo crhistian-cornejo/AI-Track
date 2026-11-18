@@ -16,13 +16,13 @@ use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, TextAlign, d
 const AX_LO: f32 = 40.;
 const AX_HI: f32 = 20_000.;
 /// Fractions of the plot: the bars' baseline, the band-range track, the formant track.
-const BASE: f32 = 0.84;
-const RANGE_Y: f32 = 0.93;
-const FORMANT_Y: f32 = 0.1;
+const BASE: f32 = 0.72;
+const RANGE_Y: f32 = 0.92;
+const FORMANT_Y: f32 = 0.08;
 /// Share of the plot width the formant bar uses, centred.
 const GAUGE_SPAN: f32 = 0.9;
 /// Longest a bar gets, as a fraction of the plot.
-const REACH: f32 = 0.64;
+const REACH: f32 = 0.52;
 
 /// Horizontal fraction of a frequency on the plot.
 pub fn axis_frac(hz: f32) -> f32 {
@@ -77,6 +77,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         Handle { fx: (1. - GAUGE_SPAN) / 2. + GAUGE_SPAN * formant_norm, fy: FORMANT_Y, x: ax(p::FORMANT, 1. / GAUGE_SPAN), index: 2, reset: vec![default(p::FORMANT)], ..Default::default() },
     ];
     let title = carrier_text(dev, tracked);
+    let status = format!("{n} bands · formant {formant:+.1} st");
     let freqs = centres(n, lo, hi);
 
     let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
@@ -104,8 +105,6 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 kit::bar(window, gx - width / 2., base - h - 1., width, 2., 1., with_alpha(pal.accent2, 0.9));
             }
         }
-        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, &format!("{n} bands · formant {formant:+.1} st"), r.x + 6., r.py(FORMANT_Y) + 10., TEXT_XS, pal.muted, TextAlign::Left);
         // Sibilance: the level of the unvoiced path.
         if live {
             kit::bar(window, r.right() - 12., base - 40., 5., 40., 2., content(0.08));
@@ -142,6 +141,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     }
     primary.push(p::MIX);
     kit::panel(if dev.big { 640. } else { 480. })
+        .child(kit::plot_header(title, Some(status)))
         .child(div().flex_1().min_h(px(0.)).child(plot))
         .child(row.child(kit::strip(ws, dev, &primary, &[p::LOW, p::HIGH, p::BANDWIDTH, p::OUTPUT], cx)))
         .into_any_element()
@@ -165,6 +165,17 @@ mod tests {
         assert_eq!(axis_frac(AX_LO), 0.);
         assert_eq!(axis_frac(AX_HI), 1.);
         assert!(axis_frac(1000.) > axis_frac(100.));
+    }
+
+    #[test]
+    fn handles_labels_and_bars_keep_apart_at_any_plot_height() {
+        for h in [100., 120., 150., 200., 300.] {
+            // The band-range handles sit below the axis labels.
+            assert!(RANGE_Y * h - 5.5 >= BASE * h + 2. + 12., "{h}");
+            // The formant handle sits above the tallest bar.
+            assert!(FORMANT_Y * h + 5.5 <= BASE * h - REACH * h, "{h}");
+            assert!(FORMANT_Y * h - 5.5 >= 0., "{h}");
+        }
     }
 
     #[test]

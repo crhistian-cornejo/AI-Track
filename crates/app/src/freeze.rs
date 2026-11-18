@@ -17,6 +17,8 @@ use std::time::Duration;
 /// A render in flight.
 pub struct FreezeJob {
     pub track: TrackId,
+    /// The file this render writes (no other render may pick it).
+    path: PathBuf,
     /// 0..1 as `f32` bits, written by the render thread.
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
@@ -32,6 +34,11 @@ impl FreezeUi {
     /// How far `track`'s render has got, while it runs.
     pub fn progress(&self, track: TrackId) -> Option<f32> {
         self.jobs.iter().find(|j| j.track == track).map(|j| f32::from_bits(j.progress.load(Ordering::Relaxed)).clamp(0., 1.))
+    }
+
+    /// The files the running renders write to.
+    pub fn running_paths(&self) -> Vec<PathBuf> {
+        self.jobs.iter().map(|j| j.path.clone()).collect()
     }
 
     pub fn is_running(&self, track: TrackId) -> bool {
@@ -58,20 +65,50 @@ pub fn fresh_frozen(dir: &Path, name: &str, taken: &[&Path]) -> PathBuf {
         .expect("a free name")
 }
 
-/// What a freeze reads: the same track, clips, sources and devices as when it started?
+/// `track` and the tracks it sidechains from (and their groups' members), as the offline render keeps them.
+fn render_tracks(p: &Project, track: TrackId) -> Vec<TrackId> {
+    let mut keep = vec![track];
+    let mut at = 0;
+    while at < keep.len() {
+        let mut found = Vec::new();
+        if let Some(t) = p.track(keep[at]) {
+            visit_devices(&t.devices, &mut |d| found.extend(d.sidechain));
+        }
+        for id in found {
+            for t in std::iter::once(id).chain(aitrack_model::groups::descendants(p, id)) {
+                if !keep.contains(&t) {
+                    keep.push(t);
+                }
+            }
+        }
+        at += 1;
+    }
+    keep
+}
+
+/// What a freeze reads: the same track, clips, sources, devices (with their
+/// modulators), grooves and tempo as when it started, and the same tracks it
+/// sidechains from?
 fn same_inputs(a: &Project, b: &Project, track: TrackId) -> bool {
+    let (ka, kb) = (render_tracks(a, track), render_tracks(b, track));
+    ka == kb && a.tempo == b.tempo && a.groove_amount == b.groove_amount && ka.iter().all(|&id| same_track_inputs(a, b, id, id != track))
+}
+
+fn same_track_inputs(a: &Project, b: &Project, track: TrackId, feeds_sidechain: bool) -> bool {
     let (Some(ta), Some(tb)) = (a.track(track), b.track(track)) else { return false };
     let device_lane = |l: &&AutomationLane| matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. });
     let clips_same = ta.arrangement.iter().all(|pl| {
         let (ca, cb) = (a.clips.get(&pl.clip), b.clips.get(&pl.clip));
-        ca == cb && ca.is_some_and(|c| a.sources.get(&c.source) == b.sources.get(&c.source))
+        ca == cb && ca.is_some_and(|c| a.sources.get(&c.source) == b.sources.get(&c.source)) && a.clip_groove(pl.clip) == b.clip_groove(pl.clip)
     });
+    // A track that only feeds a sidechain is heard through its fader.
+    let mix_same = !feeds_sidechain || (ta.volume_db == tb.volume_db && ta.pan == tb.pan && ta.mute == tb.mute);
     ta.kind == tb.kind
         && ta.devices == tb.devices
         && ta.arrangement == tb.arrangement
         && ta.automation.iter().filter(device_lane).eq(tb.automation.iter().filter(device_lane))
-        && a.tempo == b.tempo
         && clips_same
+        && mix_same
 }
 
 impl AppState {
@@ -171,13 +208,16 @@ impl Workspace {
         // render: the offline instances are built from the project's states.
         let project = self.s.export_snapshot(&mut *self.b.engine);
         let Some(name) = project.track(track).map(|t| t.name.clone()) else { return };
-        let taken: Vec<PathBuf> = project.tracks.iter().filter_map(|t| t.freeze.as_ref().map(|f| f.file.path.clone())).collect();
+        let mut taken: Vec<PathBuf> = project.tracks.iter().filter_map(|t| t.freeze.as_ref().map(|f| f.file.path.clone())).collect();
+        // Renders still running have no file on disk yet, but their path is spoken for.
+        taken.extend(self.freeze.running_paths());
         let taken: Vec<&Path> = taken.iter().map(PathBuf::as_path).collect();
         let path = fresh_frozen(&freeze_folder(self.project_path.as_deref()), &name, &taken);
+        let job_path = path.clone();
         let rate = project.sample_rate_hint.max(8_000);
         let factory = self.b.engine.export_factory();
         let (progress, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)));
-        self.freeze.jobs.push(FreezeJob { track, progress: progress.clone(), cancel: cancel.clone() });
+        self.freeze.jobs.push(FreezeJob { track, path: job_path, progress: progress.clone(), cancel: cancel.clone() });
         let started = project.clone();
         let job_cancel = cancel.clone();
         let task = cx.background_executor().spawn(async move {
@@ -304,6 +344,42 @@ mod tests {
         let started = s.project.clone();
         assert!(s.edit("mix", vec![Command::SetTrack { id: track, change: TrackProp::VolumeDb(-9.0) }]));
         assert!(s.finish_freeze(track, file(), &started).is_ok());
+    }
+
+    #[test]
+    fn a_groove_or_sidechain_change_while_rendering_makes_the_freeze_stale() {
+        let (mut s, track, other) = project();
+        let clip = s.project.track(track).unwrap().arrangement[0].clip;
+        // The groove amount scales every groove's timing.
+        let started = s.project.clone();
+        s.project.groove_amount = 0.5;
+        assert!(s.finish_freeze(track, file(), &started).is_err());
+        s.project.groove_amount = started.groove_amount;
+        // A groove assigned to a clip of the track.
+        let gid = s.project.alloc_groove_id();
+        s.project.grooves.push(aitrack_model::PoolGroove { id: gid, groove: aitrack_model::Groove::new("g", 480, 4), settings: Default::default() });
+        let started = s.project.clone();
+        s.project.clip_grooves.insert(clip, gid);
+        assert!(s.finish_freeze(track, file(), &started).is_err());
+        s.project.clip_grooves.remove(&clip);
+        // A track it sidechains from.
+        if !s.project.track(track).unwrap().devices.is_empty() {
+            s.project.tracks.iter_mut().find(|t| t.id == track).unwrap().devices[0].sidechain = Some(other);
+            let started = s.project.clone();
+            s.project.tracks.iter_mut().find(|t| t.id == other).unwrap().volume_db -= 6.0;
+            assert!(s.finish_freeze(track, file(), &started).is_err());
+        }
+    }
+
+    #[test]
+    fn two_renders_never_share_a_file() {
+        let dir = std::env::temp_dir().join(format!("aitrack-frozen-two-{}", std::process::id()));
+        let mut ui = FreezeUi::default();
+        let first = fresh_frozen(&dir, "Audio 2", &[]);
+        ui.jobs.push(FreezeJob { track: TrackId(1), path: first.clone(), progress: Arc::default(), cancel: Arc::default() });
+        let running = ui.running_paths();
+        let taken: Vec<&Path> = running.iter().map(PathBuf::as_path).collect();
+        assert_ne!(first, fresh_frozen(&dir, "Audio 2", &taken));
     }
 
     #[test]

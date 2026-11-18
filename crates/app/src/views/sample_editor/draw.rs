@@ -361,9 +361,25 @@ pub(super) fn env_color(kind: ClipEnv, clip: Hsla) -> Hsla {
     let pal = p();
     match kind {
         ClipEnv::Volume => mix(clip, pal.automation, 0.35),
-        ClipEnv::Pan => pal.series2,
+        ClipEnv::Pan => pan_color(mix(clip, pal.waveform, 0.5)),
         ClipEnv::Pitch => pal.series5,
     }
+}
+
+/// How far apart two hues are, 0..=0.5 of the wheel.
+fn hue_gap(a: Hsla, b: Hsla) -> f32 {
+    let d = (a.h - b.h).abs();
+    d.min(1. - d)
+}
+
+/// The pan envelope's colour: the series colour (other than Transpose's)
+/// whose hue is farthest from the waveform it is drawn over.
+pub(super) fn pan_color(wave: Hsla) -> Hsla {
+    let pal = p();
+    [pal.series1, pal.series2, pal.series3, pal.series4, pal.series6, pal.series7, pal.series8]
+        .into_iter()
+        .max_by(|a, b| hue_gap(*a, wave).total_cmp(&hue_gap(*b, wave)))
+        .unwrap_or(pal.series2)
 }
 
 /// The selected envelope: its line over the played region and its breakpoints.
@@ -478,4 +494,23 @@ fn readout(pen: &Pen, text: &str, hit: Hit, window: &mut Window, cx: &mut App) {
     let top = (y - h - 6.).clamp(RULER + 2., (l.h - h - 2.).max(RULER + 2.));
     window.paint_quad(paint::rrect_border(at(pen.o, left, top, w, h), r_sm(), pal.raised, border_strong(), 1.));
     paint::text(window, cx, text, pen.o.x + px(left + w / 2.), pen.o.y + px(top + 3.), TEXT_SM, pal.text, FontWeight::MEDIUM, TextAlign::Center);
+}
+
+#[cfg(test)]
+mod env_color_tests {
+    use super::*;
+
+    #[test]
+    fn the_pan_line_contrasts_with_the_waveform_in_every_theme() {
+        for t in builtin_themes() {
+            let pal = &t.colors;
+            let series = [pal.series1, pal.series2, pal.series3, pal.series4, pal.series6, pal.series7, pal.series8].map(|c| c.to_hsla());
+            // A waveform of any hue (the clip's colour mixed into the waveform colour).
+            for i in 0..24 {
+                let wave = Hsla { h: i as f32 / 24., s: 0.6, l: 0.5, a: 1. };
+                let best = series.iter().map(|c| hue_gap(*c, wave)).fold(0f32, f32::max);
+                assert!(best >= 0.15, "{}: nothing contrasts with hue {}", t.name, wave.h);
+            }
+        }
+    }
 }

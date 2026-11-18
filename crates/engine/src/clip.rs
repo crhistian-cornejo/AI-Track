@@ -406,11 +406,22 @@ impl AudioClipData {
         // interpolator does (a loop that ends at the end of the file would
         // dip before its seam): those few frames keep the file's own reader.
         let reach = kernel.reach(fc) as f64;
-        if fc >= 1.0 || audio.channels.is_empty() || p < reach || p > audio.frames as f64 - reach {
+        if fc >= 1.0 || (audio.channels.is_empty() && self.stream.is_none()) || p < reach || p > audio.frames as f64 - reach {
             return self.sample(audio, ch, pos);
         }
-        let data = &audio.channels[ch.min(audio.channels.len() - 1)];
-        kernel.read(&data[..audio.frames.min(data.len())], p, fc)
+        match &self.stream {
+            // A file streamed from disk keeps no samples in memory: the same
+            // kernel reads its frames through the stream, so disk and memory
+            // play the same samples.
+            Some(s) => {
+                let n = audio.frames as i64;
+                kernel.read_with(p, fc, |i| if (0..n).contains(&i) { s.frame(ch, i) } else { 0.0 })
+            }
+            None => {
+                let data = &audio.channels[ch.min(audio.channels.len() - 1)];
+                kernel.read(&data[..audio.frames.min(data.len())], p, fc)
+            }
+        }
     }
 
     /// Warp hook: fractional source frame for a source tick. Unwarped clips

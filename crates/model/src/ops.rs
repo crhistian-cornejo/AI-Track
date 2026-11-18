@@ -8,6 +8,7 @@
 
 use crate::command::Command;
 use crate::ids::*;
+use crate::pitch::PitchCurve;
 use crate::project::*;
 use crate::time::{Tick, PPQ};
 
@@ -276,7 +277,7 @@ pub fn trim_start(p: &Project, track: TrackId, placement: PlacementId, new_start
         return None;
     }
     let mut new = old.clone();
-    new.offset = advance(old, delta, rate).max(if in_loop(old) || notes { Tick::MIN } else { 0 });
+    new.offset = advance(old, read_ticks(p, old, delta, rate)).max(if in_loop(old) || notes { Tick::MIN } else { 0 });
     new.length -= delta;
     shift_envelope(&mut new, -delta);
     clamp_fades(&mut new, Edge::Start);
@@ -386,7 +387,7 @@ pub fn crop(p: &Project, clip: ClipId, from: Tick, to: Tick) -> Option<Command> 
         return None;
     }
     let mut new = old.clone();
-    new.offset = advance(old, from, clip_rate(p, clip));
+    new.offset = advance(old, read_ticks(p, old, from, clip_rate(p, clip)));
     new.length = to - from;
     shift_envelope(&mut new, -from);
     clamp_fades(&mut new, Edge::End);
@@ -433,7 +434,7 @@ pub fn split_placement(p: &mut Project, track: TrackId, placement: PlacementId, 
         return None;
     }
     let mut left = Clip { length: cut, fade_out: Fade::default(), ..old.clone() };
-    let mut right = Clip { offset: advance(&old, cut, clip_rate(p, place.clip)), length: old.length - cut, fade_in: Fade::default(), ..old.clone() };
+    let mut right = Clip { offset: advance(&old, read_ticks(p, &old, cut, clip_rate(p, place.clip))), length: old.length - cut, fade_in: Fade::default(), ..old.clone() };
     for (i, lane) in old.envelopes.iter().enumerate() {
         if ClipEnv::of(lane.target).is_some() {
             let (before, after) = split_points(lane, cut);
@@ -697,13 +698,26 @@ fn in_loop(c: &Clip) -> bool {
     c.looping.is_some_and(|l| l.end > l.start && c.offset >= l.start)
 }
 
-/// The source position `delta` ticks of clip time after the clip's offset
-/// (before it when negative) at `rate` source ticks per clip tick, wrapped
-/// inside the loop as playback does.
-fn advance(c: &Clip, delta: Tick, rate: f64) -> Tick {
-    let pos = c.offset + (delta as f64 * rate).round() as Tick;
+/// Source ticks an audio clip reads over `delta` ticks of clip time (negative
+/// before its start). A clip that plays by Re-Pitch (or unwarped) with a
+/// transpose envelope reads `rate × ∫ speed` as the engine does (the speed
+/// follows the envelope); every other clip reads at the constant `rate`.
+fn read_ticks(p: &Project, c: &Clip, delta: Tick, rate: f64) -> Tick {
+    if let Some(Source::Audio(a)) = p.sources.get(&c.source)
+        && c.envelope(ClipEnv::Pitch).is_some_and(|l| !l.points.is_empty())
+        && !(a.warp.enabled && a.warp.original_bpm.is_some_and(|b| b > 0.0) && a.warp.mode.preserves_pitch())
+    {
+        return PitchCurve::of_clip(c).read_ticks(delta, rate);
+    }
+    (delta as f64 * rate).round() as Tick
+}
+
+/// The source position `read` source ticks after the clip's offset (before it
+/// when negative), wrapped inside the loop as playback does.
+fn advance(c: &Clip, read: Tick) -> Tick {
+    let pos = c.offset + read;
     match c.looping.filter(|l| l.end > l.start) {
-        Some(l) if pos >= l.end || (delta < 0 && c.offset >= l.start) => l.start + (pos - l.start).rem_euclid(l.end - l.start),
+        Some(l) if pos >= l.end || (read < 0 && c.offset >= l.start) => l.start + (pos - l.start).rem_euclid(l.end - l.start),
         _ => pos,
     }
 }
@@ -1245,6 +1259,32 @@ mod tests {
         });
         assert_eq!(crop(&f.p, clip, 0, 4 * BEAT), None);
         assert_eq!(crop(&f.p, clip, BEAT, BEAT + 1), None);
+    }
+
+    #[test]
+    fn splitting_a_repitch_clip_with_a_transpose_envelope_keeps_the_source_position() {
+        let mut f = fixture(Some(16), 4 * BEAT);
+        let (track, clip, placement) = (f.track, f.clip, f.placement);
+        edit(&mut f, |c| {
+            let mut lane = envelope(&[(0, 0.0), (4 * BEAT, 12.0)]);
+            lane.target = AutomationTarget::Transpose;
+            c.envelopes.push(lane);
+            c.offset = BEAT;
+        });
+        let whole = PitchCurve::of_clip(&f.p.clips[&clip]);
+        let cut = 2 * BEAT;
+        let cmds = split_at(&mut f.p, track, placement, 4 * BEAT + cut).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let right_id = p.track(track).unwrap().arrangement.iter().find(|pl| pl.id != placement).unwrap().clip;
+            let right = &p.clips[&right_id];
+            let half = PitchCurve::of_clip(right);
+            assert!(whole.integral(cut as f64) > cut as f64 * 1.1, "the envelope speeds the clip up");
+            for t in (0..2 * BEAT).step_by(48) {
+                let unsplit = BEAT as f64 + whole.integral((cut + t) as f64);
+                let split = right.offset as f64 + half.integral(t as f64);
+                assert!((unsplit - split).abs() <= 2.0, "at {t}: {unsplit} vs {split}");
+            }
+        });
     }
 
     #[test]

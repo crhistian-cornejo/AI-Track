@@ -461,10 +461,24 @@ pub fn freeze_end(project: &Project, track: TrackId) -> Tick {
         .track(track)
         .into_iter()
         .flat_map(|t| t.arrangement.iter())
+        // Take lanes are silent: only the main lane (the comp) plays.
+        .filter(|pl| pl.lane == 0)
         .filter_map(|pl| project.clips.get(&pl.clip).map(|c| pl.start + c.length.max(0)))
         .max()
         .unwrap_or(0);
     end.max(4 * aitrack_model::PPQ)
+}
+
+/// Drop the modulator mappings that drive the track's fader or pan, at any depth.
+fn strip_fader_mods(devices: &mut [aitrack_model::Device]) {
+    for d in devices {
+        d.mods.retain(|m| matches!(m.target, aitrack_model::ModTarget::Param { .. }));
+        if let aitrack_model::DeviceKind::Rack(r) = &mut d.kind {
+            for c in r.chains.iter_mut().chain(r.returns.iter_mut()) {
+                strip_fader_mods(&mut c.devices);
+            }
+        }
+    }
 }
 
 fn sidechain_sources(devices: &[aitrack_model::Device], out: &mut Vec<TrackId>) {
@@ -518,6 +532,9 @@ fn freeze_scratch(project: &Project, track: TrackId) -> Result<Project, EngineEr
             t.automation.retain(|l| l.target == AutomationTarget::Tempo);
         } else if t.id == track {
             t.freeze = None;
+            // The fader is applied on top of the frozen file, live: baking it into the render
+            // would apply it twice.
+            strip_fader_mods(&mut t.devices);
             t.output = aitrack_model::Output::Main;
             t.parent = None;
             t.vca = None;

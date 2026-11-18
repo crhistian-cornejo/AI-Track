@@ -488,8 +488,10 @@ impl AppState {
         let mut changed = false;
         for ((id, _, start), to) in origin.iter().zip(&dest) {
             let Some((track, pl, _)) = self.placement(*id) else { continue };
-            changed |= track != *to || pl.start != start + dt;
-            cmds.push(Command::MovePlacement { track, id: *id, to_track: *to, start: start + dt, lane: pl.lane });
+            // The take lane it was on may not exist on the track it lands on.
+            let lane = if self.project.track(*to).is_some_and(|t| usize::from(pl.lane) <= t.take_lanes.len()) { pl.lane } else { 0 };
+            changed |= track != *to || pl.start != start + dt || lane != pl.lane;
+            cmds.push(Command::MovePlacement { track, id: *id, to_track: *to, start: start + dt, lane });
         }
         if !changed {
             return false;

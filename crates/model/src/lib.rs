@@ -18,6 +18,7 @@ pub mod history;
 pub mod ids;
 pub mod ops;
 pub mod paths;
+pub mod pitch;
 pub mod project;
 pub mod racks;
 pub mod routing;

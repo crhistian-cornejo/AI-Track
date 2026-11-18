@@ -261,6 +261,25 @@ struct DevCx<'a, 'b> {
     track: TrackId,
 }
 
+/// The modulators of a frozen track that drive its fader or pan, with only
+/// those mappings: the rest of the chain is what the frozen file replaced.
+fn frozen_fader_mods(devs: &[Device]) -> Vec<Device> {
+    let mut out = Vec::new();
+    for d in devs {
+        if d.is_modulator() {
+            let mods: Vec<_> = d.mods.iter().filter(|m| !matches!(m.target, ModTarget::Param { .. })).cloned().collect();
+            if !mods.is_empty() {
+                out.push(Device { mods, ..d.clone() });
+            }
+        } else if let DeviceKind::Rack(r) = &d.kind {
+            for c in r.chains.iter().chain(r.returns.iter()) {
+                out.extend(frozen_fader_mods(&c.devices));
+            }
+        }
+    }
+    out
+}
+
 fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>, u32) {
     let mut nodes = Vec::with_capacity(devs.len());
     let mut latency = 0u32;
@@ -599,7 +618,15 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             let mut overrides = HashMap::new();
             collect_macro_overrides(&t.devices, &mut overrides);
             let mut dc = DevCx { cx: &mut *cx, overrides, handles: HashMap::new(), warnings: Vec::new(), side_slots: &side_slots, track: t.id };
-            let (nodes, lat) = if t.kind.carries_audio() && frozen[i].is_none() { compile_devices(&t.devices, &mut dc) } else { (Vec::new(), 0) };
+            let (nodes, lat) = if !t.kind.carries_audio() {
+                (Vec::new(), 0)
+            } else if frozen[i].is_none() {
+                compile_devices(&t.devices, &mut dc)
+            } else {
+                // A frozen track runs none of its devices, except the modulators that drive its
+                // fader or pan: they keep modulating the mixer, reading the frozen audio.
+                compile_devices(&frozen_fader_mods(&t.devices), &mut dc)
+            };
             warnings.append(&mut dc.warnings);
             chain_lat[i] = lat;
             chains.push(nodes);
@@ -770,7 +797,13 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         let mut sources: Vec<(DeviceId, String, Vec<aitrack_model::ModMapping>)> = Vec::new();
         visit_all(&t.devices, &mut |d| {
             if d.is_modulator() && !d.mods.is_empty() {
-                sources.push((d.id, d.name.clone(), d.mods.clone()));
+                let mut mappings = d.mods.clone();
+                if is_frozen {
+                    mappings.retain(|m| !matches!(m.target, ModTarget::Param { .. }));
+                }
+                if !mappings.is_empty() {
+                    sources.push((d.id, d.name.clone(), mappings));
+                }
             }
         });
         for (src_id, src_name, src_mods) in sources {

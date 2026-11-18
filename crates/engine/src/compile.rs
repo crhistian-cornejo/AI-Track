@@ -331,7 +331,8 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                     returns,
                     selector: rack.chain_selector,
                     dry_delay: DelayLine::new(2, max_ret as usize),
-                    input: AudioBuffer::new(2, max),
+                    input: AudioBuffer::new(2, if rack.kind == aitrack_model::RackKind::Midi { 0 } else { max }),
+                    out: EventList::with_capacity(if rack.kind == aitrack_model::RackKind::Midi { EVENT_CAPACITY } else { 0 }),
                 }));
             }
             _ => {
@@ -369,7 +370,7 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
     }
     // MIDI effects run before everything else, in the order they were put in:
     // each hands its events to the next, and the instrument gets the result.
-    nodes.sort_by_key(|n| !matches!(n, DeviceNode::Proc(p) if p.is_midi));
+    nodes.sort_by_key(|n| !matches!(n, DeviceNode::Proc(p) if p.is_midi) && !matches!(n, DeviceNode::Rack(r) if r.kind == aitrack_model::RackKind::Midi));
     (nodes, latency)
 }
 

@@ -221,6 +221,8 @@ pub enum MenuKind {
     StutterStep { device: DeviceId, step: usize },
     /// File: new from a template, open, save.
     File,
+    /// Slice an audio clip into a Drum Rack: how to cut.
+    SliceToDrumRack(TrackId, PlacementId),
 }
 
 #[derive(Clone, Debug)]
@@ -809,6 +811,43 @@ impl Workspace {
                     {
                         self.s.edit("Duplicate", cmds);
                         self.s.seal();
+                    }
+                }
+                // The Slice to Drum Rack dialog on the selected audio clip (`audio` first);
+                // `slice=beats` has it on the beat division, `sliced` slices by 1/8 notes.
+                "slice" | "slice=beats" | "sliced" => {
+                    use crate::editing::slice as sl;
+                    if word == "slice=beats" {
+                        sl::set_choice(sl::SliceChoice { cut: sl::Cut::Beats, ..sl::choice() });
+                    }
+                    if let Some((track, placement)) = sl::target(&self.s) {
+                        if word == "sliced" {
+                            sl::set_choice(sl::SliceChoice { cut: sl::Cut::Beats, division: aitrack_model::slice::BeatDivision::Eighth, ..sl::choice() });
+                            if let Ok(done) = self.s.slice_to_drum_rack(track, placement, sl::choice().mode()) {
+                                self.s.bottom_tab = BottomTab::Devices;
+                                self.s.selected_track = Some(done.track);
+                            }
+                        } else {
+                            self.menu = Some(Menu { kind: MenuKind::SliceToDrumRack(track, placement), at: gpui::point(gpui::px(420.), gpui::px(200.)), opened: 0 });
+                        }
+                    }
+                }
+                // A MIDI Effect Rack with two chains (an arpeggiator, a chord) on the selected track.
+                "midirack" => {
+                    if let Some(t) = self.s.selected_track
+                        && let Some(rack) = self.s.add_stock_device(t, "rack.midi", "MIDI Effect Rack")
+                    {
+                        let into = |chain| Some(aitrack_model::racks::Container::Rack { rack, chain });
+                        self.s.edit("chain", vec![Command::AddChain { rack, index: 0, chain: Box::new(Chain::new("Arp", Color::palette(2))) }, Command::AddChain { rack, index: 1, chain: Box::new(Chain::new("Chords", Color::palette(5))) }]);
+                        let arp = self.s.add_stock_device_in(t, into(0), "midi.arp", "Arpeggiator");
+                        self.s.add_stock_device_in(t, into(1), "midi.chord", "Chord");
+                        self.s.add_stock_device_in(t, into(1), "midi.velocity", "Velocity");
+                        self.s.seal();
+                        if let Some(arp) = arp {
+                            self.s.map_macro_param(rack, 0, arp, 0, 0.5);
+                            self.s.seal();
+                        }
+                        self.s.bottom_tab = BottomTab::Devices;
                     }
                 }
                 // The right-click menu of the selected clip.

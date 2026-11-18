@@ -73,6 +73,7 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             Ok(Consolidation::Render(job)) => render_consolidate(ws, *job, cx),
             Err(why) => ws.toast(why, cx),
         },
+        Cmd::SliceToDrumRack => crate::editing::slice::open_for_selection(ws, cx),
         Cmd::Rename => open_rename(ws, window, cx),
         Cmd::HoldStutter => crate::views::device_ui::stutter::toggle_hold(ws, cx),
         Cmd::LaunchSlot => {

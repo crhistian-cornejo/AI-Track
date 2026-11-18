@@ -64,7 +64,7 @@ fn category_for(id: &str, category: Category) -> DeviceCategory {
     }
 }
 
-/// Every stock device with its real parameter list, plus the three racks.
+/// Every stock device with its real parameter list, plus the four racks.
 pub fn stock_devices() -> Vec<DeviceInfo> {
     let mut out: Vec<DeviceInfo> = aitrack_stock::registry()
         .iter()
@@ -84,6 +84,7 @@ pub fn stock_devices() -> Vec<DeviceInfo> {
     out.push(rack("rack.instrument", "Instrument Rack", &["rack", "macros"], true));
     out.push(rack("rack.drum", "Drum Rack", &["rack", "drums", "pads"], true));
     out.push(rack("rack.audio", "Audio Effect Rack", &["rack", "macros"], false));
+    out.push(rack("rack.midi", "MIDI Effect Rack", &["rack", "macros", "midi"], false));
     out
 }
 

@@ -114,6 +114,17 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         .child(action("clip-active", Icon::Power, if muted { "Activate" } else { "Deactivate" }, keys::action_hint("ToggleActive"), false, cx, |this, _, _| {
             this.s.toggle_clips_active();
         }));
+    let sliceable = crate::editing::slice::target(&ws.s);
+    let card = match sliceable {
+        Some((track, placement)) if clips.len() == 1 => card.child(widgets::divider_h()).child(
+            item("clip-slice", Icon::Drum, "Slice to Drum Rack…", None, false).on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                let at = e.position();
+                this.menu = None;
+                this.open_menu(MenuKind::SliceToDrumRack(track, placement), gpui::point(at.x, at.y), cx);
+            })),
+        ),
+        _ => card,
+    };
     let Some(clip) = sample else { return card.into_any_element() };
     // Transpose, detune and reverse of this clip on every clip of its sample.
     card.child(widgets::divider_h())

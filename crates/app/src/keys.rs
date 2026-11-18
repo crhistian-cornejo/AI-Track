@@ -114,6 +114,7 @@ commands! {
     Cut,
     Paste,
     Consolidate,
+    SliceToDrumRack,
     Rename,
     DuplicateTime,
     InsertSilence,
@@ -177,6 +178,7 @@ pub static TABLE: &[Entry] = &[
     main("SelectAll", "Select All", "Select every clip, or every note when the piano roll has the keys.", C::Editing, K, &["mod-a"]),
     main("SplitClip", "Split", "Cut clips at the insert marker (at the playhead while playing), or at both edges of the time selection.", C::Editing, K, &["mod-e"]),
     cmd(Cmd::Consolidate, "Consolidate", "Join the selected clips into one clip per track, gaps included; audio is rendered to a new file.", C::Editing, &["mod-j"]),
+    cmd(Cmd::SliceToDrumRack, "Slice to Drum Rack…", "Cut the selected audio clip at its transients, a beat division or its warp markers into a new MIDI track with a Drum Rack, one pad per slice.", C::Editing, &[]),
     cmd(Cmd::Rename, "Rename", "Rename the selected clip, or the selected track.", C::Editing, &["mod-r"]),
     main("ToggleActive", "Deactivate", "Switch the selected notes, clip or track off or back on.", C::Editing, K, &["0"]),
     cmd(Cmd::DuplicateTime, "Duplicate Time", "Repeat the selected time on every track, pushing what follows later.", C::Editing, &["mod-shift-d"]),
@@ -444,7 +446,7 @@ mod tests {
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
         const KEYLESS: &[Bound] =
-            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles")];
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Cmd(Cmd::SliceToDrumRack)];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

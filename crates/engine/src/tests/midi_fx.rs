@@ -561,3 +561,115 @@ fn midi_effects_never_allocate_on_the_audio_thread() {
     });
     assert_eq!(allocs, 0, "effects, delayed events, stop and restart");
 }
+
+// ───────────────────────────── MIDI Effect Rack ─────────────────────────────
+
+/// A MIDI Effect Rack on the track with one chain per `(key zone, [(effect, amount)])`.
+/// A chain of a test rack: its key zone and its effects with their first parameter.
+type TestChain<'a> = ((u8, u8), &'a [(&'a str, f32)]);
+
+fn midi_rack(b: &mut B, chains: &[TestChain<'_>]) -> DeviceId {
+    let id = b.p.alloc_device_id();
+    let mut rack = Rack::new(RackKind::Midi);
+    for (i, (zone, effects)) in chains.iter().enumerate() {
+        let mut c = Chain::new(format!("chain {i}"), Color(0));
+        c.key_range = *zone;
+        for (plugin, amount) in effects.iter() {
+            let d = b.p.alloc_device_id();
+            let mut dev = Device::stock(d, *plugin, *plugin);
+            dev.params.insert(0, *amount);
+            c.devices.push(dev);
+        }
+        rack.chains.push(c);
+    }
+    b.p.track_mut(b.track).unwrap().devices.push(Device { kind: DeviceKind::Rack(rack), ..Device::stock(id, "rack.midi", "MIDI Effect Rack") });
+    id
+}
+
+#[test]
+fn parallel_chains_of_a_midi_rack_are_merged_in_front_of_the_instrument() {
+    let mut b = B::new();
+    // The probe is placed before the rack; the rack still runs first.
+    let probe = b.device(KEYS, &[]);
+    midi_rack(&mut b, &[((0, 127), &[(PITCH, 0.625)]), ((0, 127), &[(PITCH, 0.5 + 7.0 / 96.0)])]);
+    let track = b.track;
+    let f = Arc::new(Fx::default());
+    let (h, mut proc_) = start(&b.p, f.clone());
+    h.send_midi_to(track, MidiMessage::note_on(0, 60, 100));
+    blocks(&mut proc_, 2);
+    h.send_midi_to(track, MidiMessage::note_off(0, 60));
+    blocks(&mut proc_, 2);
+    let mut ons: Vec<u8> = f.notes(probe).iter().filter(|n| n.0).map(|n| n.1).collect();
+    ons.sort();
+    assert_eq!(ons, vec![67, 72], "+7 and +12, both");
+    assert_eq!(f.notes(probe).iter().filter(|n| !n.0).count(), 2, "and both end");
+}
+
+#[test]
+fn a_midi_rack_routes_by_key_zone_and_chain_select() {
+    let mut b = B::new();
+    let rack = midi_rack(&mut b, &[((0, 59), &[(PITCH, 0.625)]), ((60, 127), &[(PITCH, 0.5 + 7.0 / 96.0)])]);
+    let probe = b.device(KEYS, &[]);
+    // The second chain is only open for chain-select values 64..=127.
+    if let Some(DeviceKind::Rack(r)) = b.p.track_mut(b.track).unwrap().devices.iter_mut().find(|d| d.id == rack).map(|d| &mut d.kind) {
+        r.chains[1].selector_range = (64, 127);
+        r.chain_selector = 0;
+    }
+    let track = b.track;
+    let f = Arc::new(Fx::default());
+    let (h, mut proc_) = start(&b.p, f.clone());
+    h.send_midi_to(track, MidiMessage::note_on(0, 40, 100));
+    h.send_midi_to(track, MidiMessage::note_on(0, 62, 100));
+    blocks(&mut proc_, 2);
+    assert_eq!(f.notes(probe).iter().map(|n| n.1).collect::<Vec<_>>(), vec![52], "62 is in the closed chain's zone: only 40 -> 52 sounds");
+
+    // Open the selector: now 62 passes through its chain (+7).
+    let DeviceKind::Rack(r) = &mut b.p.track_mut(b.track).unwrap().devices.iter_mut().find(|d| d.id == rack).unwrap().kind else { panic!() };
+    r.chain_selector = 100;
+    let (h, mut proc_) = start(&b.p, f.clone());
+    f.log.lock().unwrap().clear();
+    h.send_midi_to(track, MidiMessage::note_on(0, 62, 100));
+    blocks(&mut proc_, 2);
+    assert_eq!(f.notes(probe).iter().map(|n| n.1).collect::<Vec<_>>(), vec![69]);
+}
+
+#[test]
+fn a_disabled_midi_rack_is_transparent() {
+    let mut b = B::new();
+    let rack = midi_rack(&mut b, &[((0, 127), &[(PITCH, 0.625)])]);
+    let probe = b.device(KEYS, &[]);
+    b.p.track_mut(b.track).unwrap().devices.iter_mut().find(|d| d.id == rack).unwrap().enabled = false;
+    let track = b.track;
+    let f = Arc::new(Fx::default());
+    let (h, mut proc_) = start(&b.p, f.clone());
+    h.send_midi_to(track, MidiMessage::note_on(0, 60, 100));
+    blocks(&mut proc_, 2);
+    assert_eq!(f.notes(probe).iter().map(|n| n.1).collect::<Vec<_>>(), vec![60]);
+}
+
+#[test]
+fn a_midi_rack_sounds_the_same_in_any_block_size_and_never_allocates_live() {
+    let mut b = B::new();
+    midi_rack(&mut b, &[((0, 127), &[(PITCH, 0.625)]), ((0, 127), &[(ECHO, 0.0)])]);
+    b.device(TEST_SYNTH, &[(0, 1.0)]);
+    b.notes(&[(60, 0, PPQ)]);
+    let f = Fx::default();
+    let a = b.render(&f, 256, 2 * PPQ);
+    assert!(a.channel(0).iter().any(|s| s.abs() > 0.01), "it sounds");
+    assert_eq!(a.channel(0), b.render(&f, 1024, 2 * PPQ).channel(0), "block size does not matter");
+
+    let track = b.track;
+    let (h, mut proc_) = start(&b.p, Arc::new(Fx::default()));
+    h.play();
+    blocks(&mut proc_, 4);
+    let mut buf = AudioBuffer::new(2, BLOCK);
+    let ((), allocs) = crate::alloc_counter::count_allocs(|| {
+        for i in 0..300u32 {
+            let key = 48 + (i % 24) as u8;
+            h.send_midi_to(track, MidiMessage::note_on(0, key, 90));
+            h.send_midi_to(track, MidiMessage::note_off(0, key));
+            proc_.process_planar(&mut buf);
+        }
+    });
+    assert_eq!(allocs, 0);
+}

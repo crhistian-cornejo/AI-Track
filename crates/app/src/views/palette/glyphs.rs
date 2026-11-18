@@ -219,7 +219,7 @@ mod tests {
         "fx.amp", "fx.analyzer", "fx.autopan", "fx.buscomp", "fx.chorus", "fx.clipper", "fx.compressor", "fx.console", "fx.crusher", "fx.delay", "fx.drum_extract", "fx.drumbus", "fx.eq",
         "fx.filter", "fx.gate", "fx.limiter", "fx.mbdyn", "fx.midside", "fx.multiband", "fx.reverb", "fx.saturator", "fx.shaper", "fx.stutter", "fx.tape", "fx.transient", "fx.utility",
         "instrument.acid303", "instrument.drum", "instrument.granular", "instrument.kick808", "instrument.sampler", "instrument.synth", "instrument.vault", "instrument.wavetable", "midi.arp",
-        "midi.chord", "midi.echo", "midi.length", "midi.pitch", "midi.random", "midi.scale", "midi.velocity", "rack.audio", "rack.drum", "rack.instrument",
+        "midi.chord", "midi.echo", "midi.length", "midi.pitch", "midi.random", "midi.scale", "midi.velocity", "rack.audio", "rack.drum", "rack.instrument", "rack.midi",
     ];
 
     #[test]

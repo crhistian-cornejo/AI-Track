@@ -21,6 +21,7 @@ pub mod paths;
 pub mod project;
 pub mod racks;
 pub mod routing;
+pub mod slice;
 pub mod scale;
 pub mod time;
 pub mod tracks;

@@ -330,7 +330,7 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "fx.filter" => DeviceGroup::FxFilter,
         "fx.multiband" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,
-        id if id.starts_with("midi.") => DeviceGroup::MidiEffects,
+        id if id.starts_with("midi.") || id == "rack.midi" => DeviceGroup::MidiEffects,
         "fx.midside" | "fx.utility" | "rack.audio" => DeviceGroup::FxStereoUtility,
         _ => DeviceGroup::FxStereoUtility,
     }

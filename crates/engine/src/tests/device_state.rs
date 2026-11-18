@@ -105,6 +105,7 @@ impl Rig {
                 prev_meters: None,
                 taps: Vec::new(),
                 analysis: None,
+                streams: None,
             },
         )
         .unwrap()

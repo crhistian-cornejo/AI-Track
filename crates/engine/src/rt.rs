@@ -641,7 +641,9 @@ impl AudioProcessor {
             return false;
         }
         IN_AUDIO.with(|f| f.set(true));
+        let section = crate::rt_check::enter();
         let ran = guarded(|| self.process_interleaved_at(data, channels, first));
+        drop(section);
         IN_AUDIO.with(|f| f.set(false));
         self.halted = ran.is_none();
         if ran.is_none() {

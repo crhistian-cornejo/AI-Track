@@ -481,6 +481,7 @@ fn a_returns_latency_is_compensated_like_a_chains() {
         prev_meters: None,
         taps: Vec::new(),
         analysis: None,
+        streams: None,
     })
     .unwrap();
     assert_eq!(g.total_latency(), 300, "the rack reports its slowest return");

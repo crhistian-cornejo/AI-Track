@@ -331,6 +331,7 @@ fn compile_plain(p: &Project) -> Result<crate::CompiledGraph, crate::CompileErro
             prev_meters: None,
             taps: Vec::new(),
             analysis: None,
+            streams: None,
         },
     )
 }

@@ -29,6 +29,7 @@ use crate::record::{AudioTake, MidiCollector, MidiTake, RecordedNote, RecordingI
 use crate::midi_io::{self, MidiConnection, MidiPortInfo, MidiPortStatus};
 use crate::rt::{AudioProcessor, InputQueue, InputSink, InputStamp, MidiMessage, RtCommand, RtQueues, TimedMidi, TransportInit};
 use crate::sample_cache::SampleCache;
+use crate::stream::{StreamHub, StreamSettings, StreamStats};
 use crate::shared::{ProcessorPool, SharedProcessor};
 use crate::status::{AudioHealth, ClipSlotStatus, LatencyReport, MeterReading, PlayheadAnchor, SharedStatus};
 use crate::tap::{DeviceMeter, TapReader};
@@ -71,6 +72,8 @@ pub struct EngineConfig {
     /// Threads the graph runs on, the audio thread included: `0` = Auto
     /// ([`crate::auto_threads`]), `1` = the single-threaded path.
     pub audio_threads: usize,
+    /// Which audio files stream from disk instead of being decoded into RAM.
+    pub streaming: StreamSettings,
 }
 
 impl Default for EngineConfig {
@@ -83,6 +86,7 @@ impl Default for EngineConfig {
             count_in_bars: 0,
             open_in_background: false,
             audio_threads: 0,
+            streaming: StreamSettings::default(),
         }
     }
 }
@@ -212,11 +216,14 @@ impl Engine {
         let samples = SampleCache::with_loader(move || {
             let _ = loader_tx.send(Msg::Recompile);
         });
+        samples.set_streaming(config.streaming);
         let handle_samples = samples.clone();
+        let streams = StreamHub::new();
         let mut control = Control {
             factory,
             pool: ProcessorPool::new(),
             samples,
+            streams: streams.clone(),
             status: status.clone(),
             shared: shared.clone(),
             project: None,
@@ -264,7 +271,7 @@ impl Engine {
             .spawn(move || control.run(rx))
             .map_err(EngineError::Io)?;
         Ok((
-            EngineHandle { tx, shared, status, samples: handle_samples, thread: Some(thread), _graveyard: Some(graveyard) },
+            EngineHandle { tx, shared, status, samples: handle_samples, streams, thread: Some(thread), _graveyard: Some(graveyard) },
             manual,
         ))
     }
@@ -277,6 +284,7 @@ pub struct EngineHandle {
     shared: Arc<HandleShared>,
     status: Arc<SharedStatus>,
     samples: SampleCache,
+    streams: StreamHub,
     thread: Option<JoinHandle<()>>,
     _graveyard: Option<JoinHandle<()>>,
 }
@@ -745,6 +753,35 @@ impl EngineHandle {
         (self.samples.used_bytes(), self.samples.budget_bytes())
     }
 
+    /// Which audio files stream from disk. Files already loaded the other
+    /// way are reloaded and the graph recompiled (playback goes on).
+    pub fn set_streaming(&self, settings: StreamSettings) {
+        if self.samples.streaming() != settings {
+            self.samples.set_streaming(settings);
+            let _ = self.tx.send(Msg::Recompile);
+        }
+    }
+
+    pub fn streaming(&self) -> StreamSettings {
+        self.samples.streaming()
+    }
+
+    /// Disk streaming at a glance: files streamed, memory their pages take
+    /// and pages the disk delivered too late (each played as silence).
+    pub fn stream_stats(&self) -> StreamStats {
+        StreamStats { files: self.samples.streamed_files(), buffer_bytes: self.streams.buffer_bytes(), underruns: self.streams.underruns() }
+    }
+
+    /// Whether files are still being decoded (or stretched) for the project.
+    pub fn samples_loading(&self) -> bool {
+        self.samples.is_loading()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn streams(&self) -> &StreamHub {
+        &self.streams
+    }
+
     /// Last compile or device error. A compile that fails (only a project
     /// without a Main track does) leaves the previous graph running and sets
     /// this; the next successful compile clears it.
@@ -770,7 +807,7 @@ impl EngineHandle {
     /// Panics the audio path contained and non-finite samples it repaired
     /// since the engine started, and the devices a panic silenced.
     pub fn audio_health(&self) -> AudioHealth {
-        self.status.health()
+        AudioHealth { stream_underruns: self.streams.underruns(), ..self.status.health() }
     }
 
     /// Audio hosts available on this machine.
@@ -980,6 +1017,8 @@ struct Control {
     factory: Arc<dyn ProcessorFactory>,
     pool: ProcessorPool,
     samples: SampleCache,
+    /// Disk streaming: the loader and the readers of the live graphs.
+    streams: StreamHub,
     status: Arc<SharedStatus>,
     shared: Arc<HandleShared>,
     project: Option<Arc<Project>>,
@@ -1326,6 +1365,7 @@ impl Control {
             prev_meters,
             taps: Vec::new(),
             analysis: Some(self.status.tap.clone()),
+            streams: Some(&self.streams),
         };
         self.shared.compile_count.fetch_add(1, Ordering::Release);
         match compile(&project, &mut cx) {

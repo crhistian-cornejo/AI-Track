@@ -248,6 +248,9 @@ pub struct AudioHealth {
     /// `file:line` of the last panic contained on the audio thread (its
     /// message is not printed there). Process-wide.
     pub last_panic: Option<String>,
+    /// Pages of streamed files the audio thread needed before the disk
+    /// delivered them; each played as silence ([`crate::stream`]).
+    pub stream_underruns: u64,
 }
 
 impl AudioHealth {
@@ -524,6 +527,7 @@ impl SharedStatus {
             midi_events_dropped: self.midi_dropped.load(Ordering::Relaxed),
             crashed_devices,
             last_panic: crate::rt::last_audio_panic(),
+            stream_underruns: 0,
         }
     }
 

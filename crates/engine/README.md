@@ -161,6 +161,29 @@ are listed in `ActiveAudio::notes`. A lost device is reopened automatically
 (preferred device first, then the default one). The engine mixes in `f32`
 at the device rate; audio files are resampled with rubato's 256-tap sinc.
 
+### Disk streaming
+
+Files at least `StreamSettings::min_seconds` long (default 60 s) or
+`min_megabytes` big once decoded (default 64 MB) stream from disk instead of
+being decoded into RAM (`stream.rs`; Preferences > Performance > "Stream from
+disk", `EngineHandle::set_streaming`). A 16/24/32-bit or float WAV at the
+device rate is read in place (recorded takes are float WAVs at the device
+rate); anything else is decoded and resampled as the RAM path does and
+written to a temporary float WAV first. Each clip has its own reader: pinned
+pages where it starts and where its loop starts, and a ring of 16 384-frame
+pages a loader thread (`aitrack-disk-stream`) fills ahead of the playhead.
+While stopped, and at the transport loop start while looping, the clips
+under the playhead are cued. A page that is late plays as silence and counts
+in `AudioHealth::stream_underruns`; the audio thread never waits. Offline
+renders read the same pages blocking. Streamed and RAM playback are
+bit-identical (tests). Pitch-preserving warp still renders the whole file
+into RAM through the warp worker. Recording already writes to disk as it
+goes (`record.rs`: a wait-free chunk queue and a writer thread).
+
+Debug builds of the app install `RtAllocChecker` as the global allocator:
+it counts heap operations made on the device callback and on DSP workers
+running a job (`rt_heap_operations`), the engine's or a plugin's.
+
 * **ASIO**: feature `asio` (off by default). Build only against the ASIO SDK
   under Steinberg's free **proprietary** licence, never the GPLv3 option.
 * **WASAPI exclusive**: accepted in the config but cpal opens shared streams
@@ -206,8 +229,10 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 
 * Clip envelopes other than volume, fades on MIDI clips, MIDI racks, launch
   modes Gate/Repeat (behave as Trigger),
-  scene tempo, recording to disk, disk streaming (`creek`), pitch-preserving
-  warp (hook: `AudioClipData::source_frame`), WASAPI exclusive, nested VCAs.
+  scene tempo, WASAPI exclusive, nested VCAs.
+* Disk streaming for the sampler and drum pads, and for pitch-preserving
+  warp (its render still holds the whole file in RAM); a conversion that
+  does not hold the whole decoded file in memory while it runs.
 
 ## Tests
 

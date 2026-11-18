@@ -2,9 +2,12 @@
 //!
 //! Files are decoded (hound for WAV, symphonia for everything else),
 //! resampled with rubato to the device rate and kept fully in memory behind
-//! an `Arc`, shared by every clip that uses them. Disk streaming for very
-//! long files is a later step (`creek`); the [`DecodedAudio`] interface is
-//! what the clip player reads, so a streamed source can replace it.
+//! an `Arc`, shared by every clip that uses them. Long files are streamed
+//! from disk instead ([`crate::stream`], decided by [`StreamSettings`]): their
+//! [`DecodedAudio`] holds no samples, only the [`StreamFile`] each clip's
+//! reader pages through. Both are read with the same interpolation kernel
+//! ([`interpolate`] over a [`FrameSource`]), so a streamed file sounds
+//! bit-identical to the same file in RAM.
 
 use aitrack_dsp::warp::{detect_transients, warp_audio, WarpAlgorithm};
 use aitrack_model::WarpMode;
@@ -12,6 +15,8 @@ use crossbeam_channel::{unbounded, Sender};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+
+use crate::stream::{StreamFile, StreamSettings};
 
 /// Planar `f32` audio at `sample_rate`.
 #[derive(Debug)]
@@ -21,13 +26,28 @@ pub struct DecodedAudio {
     /// Rate of the file before resampling.
     pub source_rate: u32,
     pub frames: usize,
+    /// Set for a streamed file: `channels` then holds one empty `Vec` per
+    /// channel and the samples are read through a
+    /// [`crate::stream::StreamReader`].
+    pub stream: Option<Arc<StreamFile>>,
 }
 
 impl DecodedAudio {
     pub fn from_planar(channels: Vec<Vec<f32>>, sample_rate: u32) -> Self {
         let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
         init_interpolator();
-        Self { channels, sample_rate, source_rate: sample_rate, frames }
+        Self { channels, sample_rate, source_rate: sample_rate, frames, stream: None }
+    }
+
+    /// A file streamed from disk (no samples in memory).
+    pub fn streamed(file: Arc<StreamFile>, source_rate: u32) -> Self {
+        init_interpolator();
+        Self { channels: vec![Vec::new(); file.channels().max(1)], sample_rate: file.sample_rate(), source_rate, frames: file.frames(), stream: Some(file) }
+    }
+
+    /// Whether the samples live on disk ([`stream`](Self::stream)).
+    pub fn is_streamed(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// Heap bytes occupied by the decoded sample buffers.
@@ -43,7 +63,8 @@ impl DecodedAudio {
         if index < 0 || index as usize >= self.frames || self.channels.is_empty() {
             return 0.0;
         }
-        self.channels[ch.min(self.channels.len() - 1)][index as usize]
+        // (A streamed file's channels are empty: its clips read the stream.)
+        self.channels[ch.min(self.channels.len() - 1)].get(index as usize).copied().unwrap_or(0.0)
     }
 
     /// Windowed-sinc interpolation at a fractional frame; 0 outside the data.
@@ -54,35 +75,85 @@ impl DecodedAudio {
     /// is built once off the audio thread (see [`init_interpolator`]).
     #[inline]
     pub fn sample(&self, ch: usize, pos: f64) -> f32 {
-        if self.channels.is_empty() || pos <= -(SINC_HALF as f64) || pos >= (self.frames + SINC_HALF) as f64 {
-            return 0.0;
-        }
-        let data = &self.channels[ch.min(self.channels.len() - 1)];
-        let floor = pos.floor();
-        let base = floor as i64;
-        let phase = (pos - floor) * SINC_PHASES as f64;
-        let p0 = (phase as usize).min(SINC_PHASES - 1);
-        let blend = (phase - p0 as f64) as f32;
-        let table = sinc_table();
-        let row0 = &table[p0 * SINC_TAPS..(p0 + 1) * SINC_TAPS];
-        let row1 = &table[(p0 + 1) * SINC_TAPS..(p0 + 2) * SINC_TAPS];
-        let first = base - SINC_HALF as i64 + 1;
-        let mut acc = 0.0f32;
-        if first >= 0 && (first as usize + SINC_TAPS) <= self.frames {
-            let window = &data[first as usize..first as usize + SINC_TAPS];
+        interpolate(self, ch, pos)
+    }
+}
+
+/// Planar audio the interpolator reads: in memory ([`DecodedAudio`]) or
+/// paged from disk ([`crate::stream::StreamReader`]).
+pub(crate) trait FrameSource {
+    fn channel_count(&self) -> usize;
+    fn frame_count(&self) -> usize;
+    /// Frames `first .. first + len` of channel `ch` (all inside the data),
+    /// when they are stored contiguously.
+    fn window(&self, ch: usize, first: usize, len: usize) -> Option<&[f32]>;
+    /// Frame `index` (inside the data) of channel `ch`.
+    fn at(&self, ch: usize, index: usize) -> f32;
+}
+
+impl FrameSource for DecodedAudio {
+    #[inline]
+    fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    #[inline]
+    fn frame_count(&self) -> usize {
+        self.frames
+    }
+
+    #[inline]
+    fn window(&self, ch: usize, first: usize, len: usize) -> Option<&[f32]> {
+        self.channels[ch].get(first..first + len)
+    }
+
+    #[inline]
+    fn at(&self, ch: usize, index: usize) -> f32 {
+        self.channels[ch].get(index).copied().unwrap_or(0.0)
+    }
+}
+
+/// [`DecodedAudio::sample`] for any [`FrameSource`]: a 16-tap Kaiser-windowed
+/// sinc at a fractional frame, 0 outside the data. The taps are summed in
+/// the same order whichever way they are fetched, so the result does not
+/// depend on where the samples are stored.
+#[inline]
+pub(crate) fn interpolate<S: FrameSource + ?Sized>(src: &S, ch: usize, pos: f64) -> f32 {
+    let frames = src.frame_count();
+    let channels = src.channel_count();
+    if channels == 0 || pos <= -(SINC_HALF as f64) || pos >= (frames + SINC_HALF) as f64 {
+        return 0.0;
+    }
+    let ch = ch.min(channels - 1);
+    let floor = pos.floor();
+    let base = floor as i64;
+    let phase = (pos - floor) * SINC_PHASES as f64;
+    let p0 = (phase as usize).min(SINC_PHASES - 1);
+    let blend = (phase - p0 as f64) as f32;
+    let table = sinc_table();
+    let row0 = &table[p0 * SINC_TAPS..(p0 + 1) * SINC_TAPS];
+    let row1 = &table[(p0 + 1) * SINC_TAPS..(p0 + 2) * SINC_TAPS];
+    let first = base - SINC_HALF as i64 + 1;
+    let mut acc = 0.0f32;
+    if first >= 0 && (first as usize + SINC_TAPS) <= frames {
+        if let Some(window) = src.window(ch, first as usize, SINC_TAPS) {
             for j in 0..SINC_TAPS {
                 acc += window[j] * (row0[j] + (row1[j] - row0[j]) * blend);
             }
         } else {
             for j in 0..SINC_TAPS {
-                let idx = first + j as i64;
-                if idx >= 0 && (idx as usize) < self.frames {
-                    acc += data[idx as usize] * (row0[j] + (row1[j] - row0[j]) * blend);
-                }
+                acc += src.at(ch, first as usize + j) * (row0[j] + (row1[j] - row0[j]) * blend);
             }
         }
-        acc
+    } else {
+        for j in 0..SINC_TAPS {
+            let idx = first + j as i64;
+            if idx >= 0 && (idx as usize) < frames {
+                acc += src.at(ch, idx as usize) * (row0[j] + (row1[j] - row0[j]) * blend);
+            }
+        }
     }
+    acc
 }
 
 const SINC_TAPS: usize = 16;
@@ -310,6 +381,37 @@ pub fn load_audio(path: &Path, rate: u32) -> Result<DecodedAudio, String> {
     Ok(d)
 }
 
+fn is_wav(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+}
+
+/// `path` at `rate`, streamed from disk when `streaming` says so (see
+/// [`crate::stream`]), else decoded into memory ([`load_audio`]). A WAV that
+/// can be read in place at the device rate is not decoded at all; anything
+/// else long enough is decoded, resampled and written to a temporary float
+/// WAV, which then streams.
+pub fn load_source(path: &Path, rate: u32, streaming: StreamSettings) -> Result<DecodedAudio, String> {
+    if streaming.enabled
+        && is_wav(path)
+        && let Some(f) = StreamFile::open_wav(path)
+        && f.sample_rate() == rate
+        && streaming.streams(f.frames(), f.channels(), rate)
+        // The RAM path reads it with hound: only stream what hound reads the same way.
+        && hound::WavReader::open(path).is_ok_and(|r| r.duration() as usize == f.frames() && r.spec().channels as usize == f.channels())
+    {
+        return Ok(DecodedAudio::streamed(Arc::new(f), rate));
+    }
+    let d = load_audio(path, rate)?;
+    if streaming.streams(d.frames, d.channels.len(), rate) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("audio");
+        match StreamFile::from_decoded(&d.channels, rate, name) {
+            Ok(f) => return Ok(DecodedAudio::streamed(Arc::new(f), d.source_rate)),
+            Err(e) => log::warn!("could not stream {} from disk ({e}); it stays in memory", path.display()),
+        }
+    }
+    Ok(d)
+}
+
 /// Default decoded sample cache budget (512 MB) before LRU eviction.
 pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
@@ -454,6 +556,20 @@ fn warp_algo(mode: WarpMode) -> WarpAlgorithm {
 /// Stretch and pitch-shift a whole file. Slow (whole seconds for a long
 /// file): never on the control or the audio thread when a loader is running.
 fn render_warp(src: &DecodedAudio, mode: WarpMode, time_scale: f64, pitch_ratio: f64) -> Warped {
+    // A streamed source is read whole for the render (the render is kept in
+    // RAM, as for any other file); the copy goes when it is done.
+    let whole;
+    let src = match &src.stream {
+        Some(f) => {
+            let channels = f.read_all().unwrap_or_else(|e| {
+                log::warn!("time-stretching {}: {e}", f.path().display());
+                vec![vec![0.0; f.frames()]; f.channels()]
+            });
+            whole = DecodedAudio { source_rate: src.source_rate, ..DecodedAudio::from_planar(channels, src.sample_rate) };
+            &whole
+        }
+        None => src,
+    };
     let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
     let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
     let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
@@ -489,6 +605,8 @@ pub struct SampleCache {
     jobs: Option<Sender<Key>>,
     warp_jobs: Option<Sender<WarpJob>>,
     warper: Warper,
+    /// Which files stream from disk instead of being decoded into RAM.
+    streaming: Arc<Mutex<StreamSettings>>,
 }
 
 impl SampleCache {
@@ -506,12 +624,15 @@ impl SampleCache {
         let notify = on_loaded.clone();
         let state: Arc<Mutex<CacheState>> = Arc::default();
         let budget = Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_CACHE_BUDGET_BYTES));
+        let streaming: Arc<Mutex<StreamSettings>> = Arc::default();
         let (tx, rx) = unbounded::<Key>();
         let map = state.clone();
         let budget_bg = budget.clone();
+        let streaming_bg = streaming.clone();
         let spawned = std::thread::Builder::new().name("aitrack-sample-loader".into()).spawn(move || {
             while let Ok(key) = rx.recv() {
-                let entry = match load_audio(&key.0, key.1) {
+                let settings = *streaming_bg.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = match load_source(&key.0, key.1, settings) {
                     Ok(d) => Ok(Arc::new(d)),
                     Err(e) => {
                         log::warn!("could not load {}: {e}", key.0.display());
@@ -580,7 +701,7 @@ impl SampleCache {
                 None
             }
         };
-        Self { state, budget, jobs: Some(tx), warp_jobs, warper }
+        Self { state, budget, jobs: Some(tx), warp_jobs, warper, streaming }
     }
 
     /// A cache without a loader: misses are decoded synchronously (offline
@@ -592,6 +713,7 @@ impl SampleCache {
             jobs: None,
             warp_jobs: None,
             warper: Arc::new(render_warp),
+            streaming: Arc::default(),
         }
     }
 
@@ -613,6 +735,26 @@ impl SampleCache {
 
     pub fn budget_bytes(&self) -> usize {
         self.budget.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Which files stream from disk. Files already loaded the other way are
+    /// forgotten, so the next compile loads them as the setting now says
+    /// (the graph playing keeps its copy until then).
+    pub fn set_streaming(&self, settings: StreamSettings) {
+        *self.streaming.lock().unwrap_or_else(|p| p.into_inner()) = settings;
+        self.lock().entries.retain(|_, e| match e {
+            Entry::Ready { audio, .. } => audio.is_streamed() == settings.streams(audio.frames, audio.channels.len(), audio.sample_rate),
+            _ => true,
+        });
+    }
+
+    pub fn streaming(&self) -> StreamSettings {
+        *self.streaming.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Decoded files that stream from disk (they take no cache memory).
+    pub fn streamed_files(&self) -> usize {
+        self.lock().entries.values().filter(|e| matches!(e, Entry::Ready { audio, .. } if audio.is_streamed())).count()
     }
 
     /// Bytes of decoded files and stretched renders together: what the
@@ -719,7 +861,7 @@ impl SampleCache {
                 }
             }
         }
-        let res = match load_audio(path, rate) {
+        let res = match load_source(path, rate, self.streaming()) {
             Ok(d) => Ok(Arc::new(d)),
             Err(e) => {
                 log::warn!("could not load {}: {e}", path.display());

@@ -31,6 +31,8 @@ pub mod settings {
         /// Threads the audio graph (live and offline renders) runs on, the
         /// audio thread included: `0` = Auto, `1` = one thread.
         pub audio_threads: usize,
+        /// Which audio files play from disk instead of RAM.
+        pub streaming: aitrack_engine::StreamSettings,
         /// Folder holding the factory sound bank (`factory.db` + `packs/`).
         pub content_dir: Option<PathBuf>,
     }
@@ -42,6 +44,7 @@ pub mod settings {
                 sandbox: false,
                 sample_cache_mb: 512,
                 audio_threads: 0,
+                streaming: aitrack_engine::StreamSettings::default(),
                 content_dir: None,
             }
         }

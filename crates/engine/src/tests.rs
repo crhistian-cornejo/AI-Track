@@ -130,6 +130,7 @@ fn compile_plain(p: &Project) -> Result<crate::CompiledGraph, CompileError> {
             prev_meters: None,
             taps: Vec::new(),
             analysis: None,
+            streams: None,
         },
     )
 }
@@ -508,6 +509,7 @@ fn processors_survive_recompiles() {
                 prev_meters: None,
                 taps: Vec::new(),
                 analysis: None,
+                streams: None,
             },
         )
         .unwrap()
@@ -1315,3 +1317,4 @@ mod device_state;
 mod freeze;
 mod modulation;
 mod multicore;
+mod streaming;

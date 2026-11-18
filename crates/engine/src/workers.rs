@@ -406,6 +406,7 @@ fn worker_main(sh: &Shared, me: usize, kind: PoolKind) {
         }
         // Plugins may have changed the FP mode; the audio thread sets it per block.
         aitrack_dsp::disable_denormals();
+        let _section = crate::rt_check::enter();
         work(sh, seen);
     }
 }

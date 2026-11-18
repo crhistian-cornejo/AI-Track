@@ -392,6 +392,7 @@ fn midi_effects_add_no_audio_latency() {
         prev_meters: None,
         taps: Vec::new(),
         analysis: None,
+        streams: None,
     })
     .unwrap();
     assert_eq!(g.total_latency(), 300, "only the audio device counts");

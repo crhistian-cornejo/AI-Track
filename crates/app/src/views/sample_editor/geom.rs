@@ -13,7 +13,7 @@
 //! gestures divide by the rate again to edit the real clip.
 
 use crate::grid::GridSpec;
-use aitrack_model::{AudioSource, AutomationPoint, Clip, LoopRegion, PPQ, Tick, TimeSignature, curve_shape};
+use aitrack_model::{AudioSource, AutomationPoint, Clip, ClipEnv, LoopRegion, PPQ, Tick, TimeSignature, curve_shape};
 
 /// Height of the ruler band at the top of the canvas.
 pub const RULER: f32 = 20.;
@@ -181,6 +181,8 @@ pub struct Layout {
     pub axis: Axis,
     pub w: f32,
     pub h: f32,
+    /// The envelope the canvas edits (the gain scale below serves the fades).
+    pub env: ClipEnv,
 }
 
 impl Layout {
@@ -202,6 +204,19 @@ impl Layout {
     pub fn gain_at_y(&self, y: f32) -> f32 {
         let (top, bottom) = self.gain_span();
         (1. - (y - top) / (bottom - top)).clamp(0., 1.)
+    }
+
+    /// Where value `v` of the selected envelope is drawn: the same span as the
+    /// gain scale, greatest value at the top.
+    pub fn env_y(&self, v: f32) -> f32 {
+        let (top, bottom) = self.gain_span();
+        top + (1. - self.env.unit(v)) * (bottom - top)
+    }
+
+    /// The selected envelope's value at height `y`.
+    pub fn env_at_y(&self, y: f32) -> f32 {
+        let (top, bottom) = self.gain_span();
+        self.env.from_unit(1. - (y - top) / (bottom - top))
     }
 }
 
@@ -228,15 +243,15 @@ pub fn fade_mid(l: &Layout, c: &Clip, fade_in: bool) -> Option<(f32, f32)> {
     Some((l.axis.x(u), l.gain_y(curve_shape(0.5, fade.curve))))
 }
 
-/// The breakpoints of the volume envelope, in clip time.
-pub fn envelope(c: &Clip) -> &[AutomationPoint] {
-    c.volume_envelope().map_or(&[], |lane| &lane.points)
+/// The breakpoints of envelope `kind`, in clip time.
+pub fn envelope(c: &Clip, kind: ClipEnv) -> &[AutomationPoint] {
+    c.envelope(kind).map_or(&[], |lane| &lane.points)
 }
 
 /// Where breakpoint `pt` is drawn; `None` when it lies outside the clip
 /// (trimming keeps such points so that revealing the audio brings them back).
 pub fn point_pos(l: &Layout, c: &Clip, pt: &AutomationPoint) -> Option<(f32, f32)> {
-    (pt.tick >= 0 && pt.tick <= c.length).then(|| (l.x(c.offset + pt.tick), l.gain_y(pt.value)))
+    (pt.tick >= 0 && pt.tick <= c.length).then(|| (l.x(c.offset + pt.tick), l.env_y(pt.value)))
 }
 
 /// The curvature whose shape passes through `mid` halfway along: the
@@ -261,7 +276,7 @@ pub enum Hit {
     /// The start and end markers of the played region.
     Start,
     End,
-    /// A breakpoint of the volume envelope, by index.
+    /// A breakpoint of the selected envelope, by index.
     Point(usize),
     /// The envelope line between breakpoint `i` and the next.
     Segment(usize),
@@ -312,7 +327,7 @@ pub fn hit_test(l: &Layout, c: &Clip, x: f32, y: f32) -> Hit {
     if let Some(m) = marker() {
         return m;
     }
-    let points = envelope(c);
+    let points = envelope(c, l.env);
     let nearest = points
         .iter()
         .enumerate()
@@ -332,8 +347,8 @@ pub fn hit_test(l: &Layout, c: &Clip, x: f32, y: f32) -> Hit {
     if t >= 0
         && t <= c.length
         && let Some(i) = points.windows(2).position(|w| t >= w[0].tick && t < w[1].tick)
-        && let Some(v) = c.volume_envelope().and_then(|lane| lane.value_at(t))
-        && (l.gain_y(v) - y).abs() <= LINE_REACH
+        && let Some(v) = c.envelope(l.env).and_then(|lane| lane.value_at(t))
+        && (l.env_y(v) - y).abs() <= LINE_REACH
     {
         return Hit::Segment(i);
     }
@@ -380,6 +395,15 @@ pub fn format_gain(gain: f32) -> String {
     if gain <= 0.0003 { "-inf dB".into() } else { format!("{:+.1} dB", 20. * gain.log10()) }
 }
 
+/// A value of envelope `kind` as the editor reads it out: dB, pan, semitones.
+pub fn format_env(kind: ClipEnv, v: f32) -> String {
+    match kind {
+        ClipEnv::Volume => format_gain(v),
+        ClipEnv::Pan => crate::views::arrangement::pan_text(v),
+        ClipEnv::Pitch => format!("{v:+.1} st"),
+    }
+}
+
 pub fn db_to_gain(db: f32) -> f32 {
     if db <= -70. { 0. } else { 10f32.powf(db / 20.) }
 }
@@ -412,7 +436,7 @@ mod tests {
 
     /// 100 px per beat, the file starting 20 px in; a 400 × 200 px canvas.
     fn layout() -> Layout {
-        Layout { axis: Axis { px_per_beat: 100., start: -0.2 * BEAT as f64 }, w: 400., h: 200. }
+        Layout { axis: Axis { px_per_beat: 100., start: -0.2 * BEAT as f64 }, w: 400., h: 200., env: ClipEnv::Volume }
     }
 
     /// A clip that plays beats 1..3 of its file.
@@ -494,7 +518,7 @@ mod tests {
         // An octave up: two beats of clip time read four beats of the file.
         let a = on_axis(&c, 2.);
         assert_eq!((a.offset, end_u(&a), a.fade_in.length, a.fade_out.length), (BEAT, 5 * BEAT, BEAT, 2 * BEAT));
-        assert_eq!(envelope(&a).iter().map(|pt| pt.tick).collect::<Vec<_>>(), vec![0, 2 * BEAT]);
+        assert_eq!(envelope(&a, ClipEnv::Volume).iter().map(|pt| pt.tick).collect::<Vec<_>>(), vec![0, 2 * BEAT]);
         // The end marker's position comes back as the clip's length.
         assert_eq!(clip_time(end_u(&a), a.offset, 2.), c.length);
         // The handles follow: the end marker hit sits where the scaled end is drawn.
@@ -549,9 +573,9 @@ mod tests {
         assert!(y > l.gain_y(0.1), "a fade that bends down has its middle low");
         // Breakpoints outside the clip are kept but not drawn.
         let c = with_points(c, &[(-BEAT, 0.5), (0, 1.), (BEAT, 0.5), (5 * BEAT, 0.)]);
-        let drawn: Vec<_> = envelope(&c).iter().map(|pt| point_pos(&l, &c, pt)).collect();
+        let drawn: Vec<_> = envelope(&c, ClipEnv::Volume).iter().map(|pt| point_pos(&l, &c, pt)).collect();
         assert_eq!(drawn, vec![None, Some((120., l.gain_y(1.))), Some((220., l.gain_y(0.5))), None]);
-        assert!(envelope(&clip()).is_empty());
+        assert!(envelope(&clip(), ClipEnv::Volume).is_empty());
     }
 
     #[test]
@@ -570,7 +594,7 @@ mod tests {
         // the start marker, right under the fade-in handle.
         let c = with_points(clip(), &[(0, 1.), (BEAT, 0.5), (2 * BEAT, 1.)]);
         let (hx, hy) = fade_handle(&l, &c, true);
-        let (px, py) = point_pos(&l, &c, &envelope(&c)[0]).unwrap();
+        let (px, py) = point_pos(&l, &c, &envelope(&c, ClipEnv::Volume)[0]).unwrap();
         assert!((hx - px).abs() <= GRAB && (hy - py).abs() <= GRAB + GRAB, "the three overlap");
         // On the handle: the fade.
         assert_eq!(hit_test(&l, &c, hx, hy), Hit::FadeIn);

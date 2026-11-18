@@ -173,6 +173,8 @@ pub fn current_value(p: &Project, track: &Track, target: AutomationTarget) -> Op
         AutomationTarget::Mute => f32::from(u8::from(track.mute)),
         AutomationTarget::Send { index } => db(track.sends.get(index as usize)?.level_db),
         AutomationTarget::Tempo => ((p.tempo.initial_bpm() as f32 - 20.) / 280.).clamp(0., 1.),
+        // Clip envelopes only; a track has no such lane.
+        AutomationTarget::Transpose => return None,
         AutomationTarget::DeviceParam { device, param } => *p.device(device)?.params.get(&param)?,
         AutomationTarget::DeviceEnabled { device } => f32::from(u8::from(p.device(device)?.enabled)),
         AutomationTarget::Macro { device, index } => match &p.device(device)?.kind {
@@ -192,6 +194,7 @@ pub fn value_text(target: AutomationTarget, v: f32) -> String {
         AutomationTarget::Mute => (if v >= 0.5 { "Muted" } else { "On" }).into(),
         AutomationTarget::DeviceEnabled { .. } => (if v >= 0.5 { "On" } else { "Off" }).into(),
         AutomationTarget::Tempo => format!("{:.1} BPM", 20. + v.clamp(0., 1.) * 280.),
+        AutomationTarget::Transpose => format!("{:+.1} st", v),
         AutomationTarget::DeviceParam { .. } | AutomationTarget::Macro { .. } => format!("{:.0} %", v * 100.),
     }
 }
@@ -224,6 +227,7 @@ pub fn target_name(ws: &Workspace, t: AutomationTarget) -> String {
         AutomationTarget::Mute => "Mute".into(),
         AutomationTarget::Send { index } => format!("Send {}", (b'A' + index as u8) as char),
         AutomationTarget::Tempo => "Tempo".into(),
+        AutomationTarget::Transpose => "Transpose".into(),
         AutomationTarget::DeviceParam { device, .. } | AutomationTarget::DeviceEnabled { device } | AutomationTarget::Macro { device, .. } => {
             let name = p.device(device).map_or("Device".into(), |d| d.name.clone());
             format!("{name} · {}", short_name(ws, t))

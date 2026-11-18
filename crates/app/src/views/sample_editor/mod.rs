@@ -31,7 +31,7 @@ use crate::waveform::Status;
 use crate::widgets::{self, label, mono};
 use crate::workspace::Workspace;
 use aitrack_model::ops::{self, MIN_CLIP_LEN};
-use aitrack_model::{AudioSource, Clip, ClipId, PPQ, Source, Tick, TimeSignature, curve_shape};
+use aitrack_model::{AudioSource, Clip, ClipEnv, ClipId, PPQ, Source, Tick, TimeSignature, curve_shape};
 use edit::{Gesture, Placed, Snapshot};
 use geom::{Axis, Hit, Layout, RULER, TimeBase};
 use gpui::{
@@ -64,6 +64,8 @@ pub struct UiState {
     hover: Option<Hit>,
     /// The breakpoint clicked last (Delete removes it).
     picked: Option<usize>,
+    /// Which envelope the canvas shows and edits (kept from clip to clip).
+    pub env: ClipEnv,
     drag: Option<Drag>,
     /// Clicks on the waveform draw volume breakpoints.
     pencil: bool,
@@ -160,7 +162,7 @@ impl Frame {
         let sig = ws.s.project.tempo.signature_at(0);
         // The grid's lines are the song's, scaled onto the file axis by `rate`.
         let grid = grid::adaptive((axis.px_per_beat * rate.max(1e-6)) as f32, sig, 0, false);
-        Some(Self { id, clip, rate, source, base, source_len, end, place, origin, sig, bpm, grid, layout: Layout { axis, w, h } })
+        Some(Self { id, clip, rate, source, base, source_len, end, place, origin, sig, bpm, grid, layout: Layout { axis, w, h, env: ws.sample.env } })
     }
 
     /// Snap an axis position (`free` = Alt or Shift: no grid). The ends of
@@ -358,9 +360,9 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
         Hit::Point(i) => {
             if double {
                 // Double-click a breakpoint to delete it (as in the automation lanes).
-                edit::delete_point(&mut ws.s, f.id, i);
+                edit::delete_point(&mut ws.s, f.id, l.env, i);
                 ws.sample.hover = None;
-            } else if let Some(home) = geom::envelope(c).get(i).and_then(|pt| geom::point_pos(l, c, pt)) {
+            } else if let Some(home) = geom::envelope(c, l.env).get(i).and_then(|pt| geom::point_pos(l, c, pt)) {
                 ws.sample.picked = Some(i);
                 handle(ws, hit, home, cx);
             }
@@ -398,10 +400,10 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
         }
         Hit::Segment(i) if alt => {
             // Alt + drag on the envelope line bends that segment.
-            let points = geom::envelope(c);
+            let points = geom::envelope(c, l.env);
             let middle = (points[i].tick + points[i + 1].tick) / 2;
-            let value = c.volume_envelope().and_then(|lane| lane.value_at(middle)).unwrap_or(1.);
-            handle(ws, hit, (x, l.gain_y(value)), cx);
+            let value = c.envelope(l.env).and_then(|lane| lane.value_at(middle)).unwrap_or(l.env.neutral());
+            handle(ws, hit, (x, l.env_y(value)), cx);
         }
         Hit::Segment(_) | Hit::Body | Hit::Ruler => {
             let u = f.snap(l.axis.tick(x), alt, true);
@@ -409,7 +411,7 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
             if inside && (double || ws.sample.pencil) {
                 // A new breakpoint under the pointer, dragged on in the same press.
                 ws.s.seal();
-                if let Some(index) = edit::add_point(&mut ws.s, f.id, u, l.gain_at_y(y)) {
+                if let Some(index) = edit::add_point(&mut ws.s, f.id, l.env, u, l.env_at_y(y)) {
                     let snapshot = Snapshot::take(&ws.s, f.id);
                     let grab = (x - l.x(u), 0.);
                     ws.sample.picked = Some(index);
@@ -430,7 +432,7 @@ fn canvas_right_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx:
     // Right-click a breakpoint to delete it.
     if let Hit::Point(i) = geom::hit_test(&f.layout, &f.clip, x, y) {
         cx.stop_propagation();
-        edit::delete_point(&mut ws.s, f.id, i);
+        edit::delete_point(&mut ws.s, f.id, f.layout.env, i);
         ws.sample.hover = None;
         ws.sample.picked = None;
         cx.notify();
@@ -476,6 +478,7 @@ fn drag_move(ws: &mut Workspace, e: &MouseMoveEvent, cx: &mut Context<Workspace>
     let on_loop = matches!(drag.kind, DragKind::Handle(Hit::LoopStart | Hit::LoopEnd | Hit::LoopBody));
     let u = f.snap(l.axis.tick(x), e.modifiers.alt || fine < 1., !on_loop);
     let value = l.gain_at_y(y);
+    let env_value = l.env_at_y(y);
     let gesture = match drag.kind {
         DragKind::Handle(hit) => match hit {
             Hit::Start => Some(Gesture::Start(u)),
@@ -484,8 +487,8 @@ fn drag_move(ws: &mut Workspace, e: &MouseMoveEvent, cx: &mut Context<Workspace>
             Hit::FadeOut => Some(Gesture::FadeOut(u)),
             Hit::FadeInCurve => Some(Gesture::FadeInCurve(value)),
             Hit::FadeOutCurve => Some(Gesture::FadeOutCurve(value)),
-            Hit::Point(index) => Some(Gesture::Point { index, u, value }),
-            Hit::Segment(index) => Some(Gesture::Bend { index, mid: value }),
+            Hit::Point(index) => Some(Gesture::Point { kind: l.env, index, u, value: env_value }),
+            Hit::Segment(index) => Some(Gesture::Bend { kind: l.env, index, mid: env_value }),
             Hit::LoopStart => Some(Gesture::LoopStart(u)),
             Hit::LoopEnd => Some(Gesture::LoopEnd(u)),
             Hit::LoopBody => Some(Gesture::LoopMove(u)),
@@ -524,8 +527,8 @@ fn readout(ws: &Workspace, f: &Frame, kind: DragKind) -> Option<String> {
         Hit::FadeOut => format!("Fade out {}", f.seconds(c.fade_out.length)),
         Hit::FadeInCurve => format!("Curve {:+.2}", c.fade_in.curve),
         Hit::FadeOutCurve => format!("Curve {:+.2}", c.fade_out.curve),
-        Hit::Point(i) => geom::format_gain(geom::envelope(c).get(i)?.value),
-        Hit::Segment(i) => format!("Curve {:+.2}", geom::envelope(c).get(i)?.curve),
+        Hit::Point(i) => geom::format_env(f.layout.env, geom::envelope(c, f.layout.env).get(i)?.value),
+        Hit::Segment(i) => format!("Curve {:+.2}", geom::envelope(c, f.layout.env).get(i)?.curve),
         Hit::LoopStart | Hit::LoopEnd | Hit::LoopBody => {
             let lp = c.looping?;
             format!("Loop {}", geom::format_length(lp.end - lp.start, f.sig))
@@ -691,6 +694,50 @@ fn tool_button(id: &'static str, text: &'static str, enabled: bool) -> Stateful<
         .child(label(text, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM))
 }
 
+/// The Volume / Pan / Transpose chooser: the canvas draws and edits the
+/// selected envelope. A dot marks the ones the clip has.
+fn envelope_chooser(selected: ClipEnv, has: [bool; 3], cx: &mut Context<Workspace>) -> impl IntoElement {
+    let pal = p();
+    let mut row = div().flex().items_center().gap(px(2.)).p(px(2.)).rounded(px(r_md())).bg(pal.well);
+    for (kind, has) in ClipEnv::ALL.into_iter().zip(has) {
+        let on = kind == selected;
+        let color = draw::env_color(kind, pal.accent);
+        row = row.child(
+            div()
+                .id(("se-env", kind as usize))
+                .flex_none()
+                .h(px(CONTROL_H - 4.))
+                .px(px(SP2))
+                .flex()
+                .items_center()
+                .gap(px(SP1))
+                .rounded(px(r_sm()))
+                .cursor_pointer()
+                .when(on, |d| d.bg(pal.raised))
+                .hover(|s| s.bg(hover()))
+                .tooltip(widgets::tip(
+                    match kind {
+                        ClipEnv::Volume => "Volume envelope: the level over the clip",
+                        ClipEnv::Pan => "Pan envelope: left to right over the clip",
+                        ClipEnv::Pitch => "Transpose envelope: -24 to +24 semitones over the clip",
+                    },
+                    None,
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.sample.env != kind {
+                        this.sample.env = kind;
+                        this.sample.picked = None;
+                        this.sample.hover = None;
+                        cx.notify();
+                    }
+                }))
+                .child(label(kind.label(), TEXT_SM, if on { pal.text } else { pal.muted }).font_weight(FontWeight::MEDIUM))
+                .when(has, |d| d.child(div().size(px(6.)).rounded_full().bg(color))),
+        );
+    }
+    row
+}
+
 /// The clip editor for an audio clip (bottom panel, "Clip" tab).
 pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
@@ -755,6 +802,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         readout: ws.sample.drag.as_ref().and_then(|d| d.readout.clone()),
         color: track_color(c.color),
         reverse: f.source.warp.reverse,
+        env: ws.sample.env,
     };
     let region = ws.sample.region.clone();
     let surface = canvas(move |b, _, _| region.set(b), move |b, _, window, cx| draw::paint(&scene, b, window, cx)).size_full();
@@ -762,6 +810,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     // ── Toolbar ──
     let auditioning = ws.sample.audition.is_some_and(|until| Instant::now() < until);
     let has_shaping = c.fade_in.length > 0 || c.fade_out.length > 0 || c.volume_envelope().is_some();
+    let env = ws.sample.env;
+    let env_set = c.envelope(env).is_some();
     let can_split = f.place.is_some() && ws.sample.cursor.is_some_and(|u| u > c.offset && u < geom::end_u(c));
     let can_crop = ws.sample.selection.is_some();
     let gain_db = c.gain_db;
@@ -822,6 +872,19 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     cx.notify();
                 })),
         )
+        .child(envelope_chooser(env, ClipEnv::ALL.map(|kind| c.envelope(kind).is_some()), cx))
+        .child(
+            tool_button("se-env-clear", "Clear", env_set)
+                .tooltip(widgets::tip("Remove the selected envelope", None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let kind = this.sample.env;
+                    if edit::clear_envelope(&mut this.s, id, kind) {
+                        this.sample.picked = None;
+                        cx.notify();
+                    }
+                })),
+        )
+        .child(widgets::divider_v(16.))
         .child(
             widgets::icon_button("se-loop", Icon::Loop, looping)
                 .tooltip(widgets::tip("Loop the clip: drag the brace on the ruler, then pull the end marker out to repeat it", None))
@@ -937,7 +1000,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .on_action(cx.listener(move |this, _: &DeleteSelection, _, cx| {
             // Delete removes the breakpoint clicked last; otherwise it is the workspace's.
             match this.sample.picked.take() {
-                Some(index) if edit::delete_point(&mut this.s, id, index) => cx.notify(),
+                Some(index) if edit::delete_point(&mut this.s, id, this.sample.env, index) => cx.notify(),
                 _ => cx.propagate(),
             }
         }))

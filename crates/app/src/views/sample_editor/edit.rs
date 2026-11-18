@@ -61,10 +61,11 @@ pub enum Gesture {
     /// The gain halfway along the fade's slope.
     FadeInCurve(f32),
     FadeOutCurve(f32),
-    /// Envelope breakpoint `index` moved; it stays between its neighbours.
-    Point { index: usize, u: Tick, value: f32 },
+    /// Breakpoint `index` of envelope `kind` moved; it stays between its
+    /// neighbours. `value` is in the kind's own unit (see [`ClipEnv::range`]).
+    Point { kind: ClipEnv, index: usize, u: Tick, value: f32 },
     /// The envelope's value halfway between breakpoint `index` and the next.
-    Bend { index: usize, mid: f32 },
+    Bend { kind: ClipEnv, index: usize, mid: f32 },
     LoopStart(Tick),
     LoopEnd(Tick),
     /// The whole loop brace moved so that it starts here.
@@ -82,7 +83,9 @@ impl Gesture {
             Self::End(_) | Self::Length(_) => "Resize clip",
             Self::FadeIn(_) | Self::FadeInCurve(_) => "Fade in",
             Self::FadeOut(_) | Self::FadeOutCurve(_) => "Fade out",
-            Self::Point { .. } | Self::Bend { .. } => "Edit clip volume",
+            Self::Point { kind: ClipEnv::Volume, .. } | Self::Bend { kind: ClipEnv::Volume, .. } => "Edit clip volume",
+            Self::Point { kind: ClipEnv::Pan, .. } | Self::Bend { kind: ClipEnv::Pan, .. } => "Edit clip pan",
+            Self::Point { kind: ClipEnv::Pitch, .. } | Self::Bend { kind: ClipEnv::Pitch, .. } => "Edit clip transpose",
             Self::LoopStart(_) | Self::LoopEnd(_) | Self::LoopMove(_) => "Set clip loop",
             Self::Gain(_) => "Change clip gain",
         }
@@ -186,24 +189,24 @@ impl Snapshot {
             Gesture::FadeOut(u) => one(ops::set_fades(p, id, c.fade_in, Fade { length: (c.length - t(u)).max(0), ..c.fade_out })),
             Gesture::FadeInCurve(mid) => one(ops::set_fades(p, id, Fade { curve: curve_through(mid), ..c.fade_in }, c.fade_out)),
             Gesture::FadeOutCurve(mid) => one(ops::set_fades(p, id, c.fade_in, Fade { curve: curve_through(mid), ..c.fade_out })),
-            Gesture::Point { index, u, value } => {
-                let mut points = c.volume_envelope()?.points.clone();
+            Gesture::Point { kind, index, u, value } => {
+                let mut points = c.envelope(kind)?.points.clone();
                 let old = *points.get(index)?;
                 let after = index.checked_sub(1).and_then(|i| points.get(i)).map_or(0, |prev| prev.tick + 1).max(0);
                 let before = points.get(index + 1).map_or(c.length, |next| next.tick - 1).min(c.length);
                 let tick = if after <= before { t(u).clamp(after, before) } else { old.tick };
-                points[index] = AutomationPoint { tick, value: value.clamp(0., 1.), curve: old.curve };
-                one(ops::set_volume_envelope(p, id, points))
+                points[index] = AutomationPoint { tick, value: kind.clamp(value), curve: old.curve };
+                one(ops::set_clip_envelope(p, id, kind, points))
             }
-            Gesture::Bend { index, mid } => {
-                let mut points = c.volume_envelope()?.points.clone();
+            Gesture::Bend { kind, index, mid } => {
+                let mut points = c.envelope(kind)?.points.clone();
                 let (a, b) = (*points.get(index)?, *points.get(index + 1)?);
                 let rise = b.value - a.value;
                 if rise.abs() < 1e-3 {
                     return None;
                 }
                 points[index].curve = curve_through((mid - a.value) / rise);
-                one(ops::set_volume_envelope(p, id, points))
+                one(ops::set_clip_envelope(p, id, kind, points))
             }
             Gesture::LoopStart(u) => {
                 let l = c.looping?;
@@ -251,30 +254,39 @@ fn sealed(s: &mut AppState, label: &str, cmds: Vec<Command>) -> bool {
     ok
 }
 
-/// Add a breakpoint to the volume envelope at unrolled position `u` and
-/// return its index. Like a drag move it coalesces, so drawing a point and
-/// dragging it on in the same press is one undo step.
-pub fn add_point(s: &mut AppState, clip: ClipId, u: Tick, value: f32) -> Option<usize> {
+/// Add a breakpoint to envelope `kind` at unrolled position `u` and return
+/// its index. Like a drag move it coalesces, so drawing a point and dragging
+/// it on in the same press is one undo step.
+pub fn add_point(s: &mut AppState, clip: ClipId, kind: ClipEnv, u: Tick, value: f32) -> Option<usize> {
     let c = s.project.clips.get(&clip)?;
     let tick = clip_time(u, c.offset, ops::clip_rate(&s.project, clip)).clamp(0, c.length);
-    let mut points = c.volume_envelope().map(|lane| lane.points.clone()).unwrap_or_default();
-    points.push(AutomationPoint { tick, value: value.clamp(0., 1.), curve: 0. });
-    let cmd = ops::set_volume_envelope(&s.project, clip, points)?;
-    if !s.edit_coalesced(&drag_key(clip), "Add volume breakpoint", vec![cmd]) {
+    let mut points = c.envelope(kind).map(|lane| lane.points.clone()).unwrap_or_default();
+    points.push(AutomationPoint { tick, value: kind.clamp(value), curve: 0. });
+    let cmd = ops::set_clip_envelope(&s.project, clip, kind, points)?;
+    if !s.edit_coalesced(&drag_key(clip), &format!("Add {} breakpoint", kind.label().to_lowercase()), vec![cmd]) {
         return None;
     }
-    s.project.clips.get(&clip)?.volume_envelope()?.points.iter().position(|pt| pt.tick == tick)
+    s.project.clips.get(&clip)?.envelope(kind)?.points.iter().position(|pt| pt.tick == tick)
 }
 
-/// Remove breakpoint `index`; the last one takes the envelope with it.
-pub fn delete_point(s: &mut AppState, clip: ClipId, index: usize) -> bool {
-    let Some(mut points) = s.project.clips.get(&clip).and_then(|c| c.volume_envelope()).map(|lane| lane.points.clone()) else { return false };
+/// Remove breakpoint `index` of envelope `kind`; the last one takes the
+/// envelope with it.
+pub fn delete_point(s: &mut AppState, clip: ClipId, kind: ClipEnv, index: usize) -> bool {
+    let Some(mut points) = s.project.clips.get(&clip).and_then(|c| c.envelope(kind)).map(|lane| lane.points.clone()) else { return false };
     if index >= points.len() {
         return false;
     }
     points.remove(index);
-    match ops::set_volume_envelope(&s.project, clip, points) {
-        Some(cmd) => sealed(s, "Delete volume breakpoint", vec![cmd]),
+    match ops::set_clip_envelope(&s.project, clip, kind, points) {
+        Some(cmd) => sealed(s, &format!("Delete {} breakpoint", kind.label().to_lowercase()), vec![cmd]),
+        None => false,
+    }
+}
+
+/// Remove envelope `kind` altogether.
+pub fn clear_envelope(s: &mut AppState, clip: ClipId, kind: ClipEnv) -> bool {
+    match ops::set_clip_envelope(&s.project, clip, kind, Vec::new()) {
+        Some(cmd) => sealed(s, &format!("Clear clip {} envelope", kind.label().to_lowercase()), vec![cmd]),
         None => false,
     }
 }
@@ -454,14 +466,14 @@ mod tests {
         let clip = f.clip;
         // Two breakpoints: the attack and where it reaches full level.
         f.s.seal();
-        assert_eq!(add_point(&mut f.s, clip, 0, 0.2), Some(0));
+        assert_eq!(add_point(&mut f.s, clip, ClipEnv::Volume, 0, 0.2), Some(0));
         f.s.seal();
-        assert_eq!(add_point(&mut f.s, clip, BEAT, 1.), Some(1));
+        assert_eq!(add_point(&mut f.s, clip, ClipEnv::Volume, BEAT, 1.), Some(1));
         f.s.seal();
         assert_eq!(points(f.clip()), vec![(0, 0.2), (BEAT, 1.)]);
         let before = f.clip().clone();
         // Drag the second one later and lower.
-        let moves: Vec<Gesture> = (1..=6).map(|i| Gesture::Point { index: 1, u: BEAT + i * BEAT / 4, value: 1. - 0.05 * i as f32 }).collect();
+        let moves: Vec<Gesture> = (1..=6).map(|i| Gesture::Point { kind: ClipEnv::Volume, index: 1, u: BEAT + i * BEAT / 4, value: 1. - 0.05 * i as f32 }).collect();
         assert_eq!(f.drag(&moves), 1);
         assert_eq!(points(f.clip()), vec![(0, 0.2), (5 * BEAT / 2, 0.7)]);
         assert_eq!(f.s.history.undo_label(), Some("Edit clip volume"));
@@ -469,12 +481,12 @@ mod tests {
         assert_eq!(*f.clip(), before, "undo restores exactly");
         assert!(f.s.redo());
         // A breakpoint stays between its neighbours and inside the clip.
-        assert_eq!(f.drag(&[Gesture::Point { index: 0, u: 9 * BEAT, value: 2. }]), 1);
+        assert_eq!(f.drag(&[Gesture::Point { kind: ClipEnv::Volume, index: 0, u: 9 * BEAT, value: 2. }]), 1);
         assert_eq!(points(f.clip()), vec![(5 * BEAT / 2 - 1, 1.), (5 * BEAT / 2, 0.7)]);
-        assert_eq!(f.drag(&[Gesture::Point { index: 1, u: 99 * BEAT, value: -1. }]), 1);
+        assert_eq!(f.drag(&[Gesture::Point { kind: ClipEnv::Volume, index: 1, u: 99 * BEAT, value: -1. }]), 1);
         assert_eq!(points(f.clip())[1], (4 * BEAT, 0.));
         // Bending the segment between them: the line passes through `mid` halfway.
-        assert_eq!(f.drag(&[Gesture::Bend { index: 0, mid: 0.9 }, Gesture::Bend { index: 0, mid: 0.25 }]), 1);
+        assert_eq!(f.drag(&[Gesture::Bend { kind: ClipEnv::Volume, index: 0, mid: 0.9 }, Gesture::Bend { kind: ClipEnv::Volume, index: 0, mid: 0.25 }]), 1);
         let lane = f.clip().volume_envelope().unwrap();
         let half = (lane.points[0].tick + lane.points[1].tick) / 2;
         assert!((lane.value_at(half).unwrap() - 0.25).abs() < 0.01);
@@ -482,18 +494,57 @@ mod tests {
         // Drawing a breakpoint and dragging it on in the same press is one step too.
         let steps = f.steps();
         f.s.seal();
-        let index = add_point(&mut f.s, clip, 2 * BEAT, 0.5).expect("added");
+        let index = add_point(&mut f.s, clip, ClipEnv::Volume, 2 * BEAT, 0.5).expect("added");
         let snapshot = Snapshot::take(&f.s, clip).unwrap();
-        assert!(apply(&mut f.s, &snapshot, Gesture::Point { index, u: 2 * BEAT + 240, value: 0.4 }));
+        assert!(apply(&mut f.s, &snapshot, Gesture::Point { kind: ClipEnv::Volume, index, u: 2 * BEAT + 240, value: 0.4 }));
         f.s.seal();
         assert_eq!(f.steps(), steps + 1);
         assert!(points(f.clip()).contains(&(2 * BEAT + 240, 0.4)));
         // Deleting: by index, and the last one removes the envelope.
-        assert!(delete_point(&mut f.s, clip, index));
+        assert!(delete_point(&mut f.s, clip, ClipEnv::Volume, index));
         assert_eq!(points(f.clip()).len(), 2);
-        assert!(delete_point(&mut f.s, clip, 0) && delete_point(&mut f.s, clip, 0));
+        assert!(delete_point(&mut f.s, clip, ClipEnv::Volume, 0) && delete_point(&mut f.s, clip, ClipEnv::Volume, 0));
         assert!(f.clip().envelopes.is_empty());
-        assert!(!delete_point(&mut f.s, clip, 0));
+        assert!(!delete_point(&mut f.s, clip, ClipEnv::Volume, 0));
+    }
+
+    #[test]
+    fn pan_and_transpose_point_drags_are_one_undo_step_each() {
+        let mut f = fixture(true);
+        let clip = f.clip;
+        for (kind, label, far, range) in [(ClipEnv::Pan, "Edit clip pan", 5., (-1., 1.)), (ClipEnv::Pitch, "Edit clip transpose", 99., (-24., 24.))] {
+            let before = f.clip().clone();
+            f.s.seal();
+            assert_eq!(add_point(&mut f.s, clip, kind, 0, kind.from_unit(0.25)), Some(0));
+            f.s.seal();
+            let index = add_point(&mut f.s, clip, kind, 2 * BEAT, 0.).expect("added");
+            f.s.seal();
+            let steps = f.steps();
+            let moves: Vec<Gesture> = (1..=5).map(|i| Gesture::Point { kind, index, u: 2 * BEAT, value: kind.from_unit(0.5 + 0.05 * i as f32) }).collect();
+            assert_eq!(f.drag(&moves), 1);
+            assert_eq!(f.steps(), steps + 1);
+            assert_eq!(f.s.history.undo_label(), Some(label));
+            let lane = f.clip().envelope(kind).expect("lane");
+            assert!((kind.unit(lane.points[index].value) - 0.75).abs() < 1e-4);
+            // Values stop at the ends of the kind's range.
+            assert_eq!(f.drag(&[Gesture::Point { kind, index, u: 2 * BEAT, value: far }]), 1);
+            assert_eq!(f.clip().envelope(kind).unwrap().points[index].value, range.1);
+            assert_eq!(f.drag(&[Gesture::Point { kind, index, u: 2 * BEAT, value: -far }]), 1);
+            assert_eq!(f.clip().envelope(kind).unwrap().points[index].value, range.0);
+            // The other envelopes are untouched.
+            assert!(ClipEnv::ALL.into_iter().filter(|k| *k != kind).all(|k| f.clip().envelope(k).is_none() || f.clip().envelope(k) == before.envelope(k)));
+            // A bend is a drag too, and clearing is a step of its own.
+            assert_eq!(f.drag(&[Gesture::Bend { kind, index: 0, mid: kind.from_unit(0.1) }]), 1);
+            assert!(f.clip().envelope(kind).unwrap().points[0].curve != 0.);
+            assert!(clear_envelope(&mut f.s, clip, kind));
+            assert!(f.clip().envelope(kind).is_none());
+            assert!(!clear_envelope(&mut f.s, clip, kind));
+            assert!(f.s.undo());
+            assert!(f.clip().envelope(kind).is_some());
+            // Back to the clip as it was.
+            while f.clip() != &before && f.s.undo() {}
+            assert_eq!(*f.clip(), before);
+        }
     }
 
     #[test]
@@ -578,10 +629,10 @@ mod tests {
         assert_eq!((f.clip().fade_out.length, end_u(&axis(&f)) - axis(&f).fade_out.length), (BEAT / 2, 7 * BEAT));
         // A volume breakpoint drawn at beat 4 of the file sits two beats into the clip, and is drawn at 4.
         f.s.seal();
-        let index = add_point(&mut f.s, clip, 4 * BEAT, 0.5).unwrap();
+        let index = add_point(&mut f.s, clip, ClipEnv::Volume, 4 * BEAT, 0.5).unwrap();
         f.s.seal();
-        assert_eq!((points(f.clip())[index].0, super::super::geom::envelope(&axis(&f))[index].tick), (2 * BEAT, 4 * BEAT));
-        assert_eq!(f.drag(&[Gesture::Point { index, u: 6 * BEAT, value: 0.5 }]), 1);
+        assert_eq!((points(f.clip())[index].0, super::super::geom::envelope(&axis(&f), ClipEnv::Volume)[index].tick), (2 * BEAT, 4 * BEAT));
+        assert_eq!(f.drag(&[Gesture::Point { kind: ClipEnv::Volume, index, u: 6 * BEAT, value: 0.5 }]), 1);
         assert_eq!(points(f.clip())[index], (3 * BEAT, 0.5));
         // Split at the cursor on beat 4 of the file: the left half is two beats of the timeline.
         assert_eq!(split(&mut f.s, clip, 4 * BEAT), Ok(()));
@@ -601,7 +652,7 @@ mod tests {
         assert_eq!(f.drag(&still), 0);
         assert_eq!(f.drag(&[]), 0);
         // Gestures on things the clip does not have.
-        assert_eq!(f.drag(&[Gesture::Point { index: 3, u: BEAT, value: 0.5 }, Gesture::Bend { index: 0, mid: 0.5 }, Gesture::LoopEnd(BEAT)]), 0);
+        assert_eq!(f.drag(&[Gesture::Point { kind: ClipEnv::Volume, index: 3, u: BEAT, value: 0.5 }, Gesture::Bend { kind: ClipEnv::Volume, index: 0, mid: 0.5 }, Gesture::LoopEnd(BEAT)]), 0);
         assert_eq!((f.clip(), f.steps()), (&before, steps));
     }
 

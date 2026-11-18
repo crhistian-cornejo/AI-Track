@@ -141,8 +141,21 @@ pub fn set_gain(p: &Project, clip: ClipId, gain_db: f32) -> Option<Command> {
 /// Replace the volume envelope (see [`Clip::envelopes`]); no points removes it.
 /// Points are sorted by tick (the last one wins on a shared tick) and values
 /// clamped to 0..=1.
-pub fn set_volume_envelope(p: &Project, clip: ClipId, mut points: Vec<AutomationPoint>) -> Option<Command> {
+pub fn set_volume_envelope(p: &Project, clip: ClipId, points: Vec<AutomationPoint>) -> Option<Command> {
+    set_clip_envelope(p, clip, ClipEnv::Volume, points)
+}
+
+/// Replace the envelope `kind` of a clip; no points removes it. Points are
+/// sorted by tick (the last one wins on a shared tick), values held in the
+/// kind's range and curvatures in -1..=1. Every edit of a clip envelope (add,
+/// move or delete a point, set a curve, clear) is this command with the new
+/// point list, so a gesture is one undo step. Only audio clips have a pan or
+/// a transpose envelope.
+pub fn set_clip_envelope(p: &Project, clip: ClipId, kind: ClipEnv, mut points: Vec<AutomationPoint>) -> Option<Command> {
     let mut new = p.clips.get(&clip)?.clone();
+    if kind != ClipEnv::Volume && !matches!(p.sources.get(&new.source), Some(Source::Audio(_))) {
+        return None;
+    }
     points.sort_by_key(|pt| pt.tick);
     points.dedup_by(|later, kept| {
         let same = later.tick == kept.tick;
@@ -152,10 +165,11 @@ pub fn set_volume_envelope(p: &Project, clip: ClipId, mut points: Vec<Automation
         same
     });
     for pt in &mut points {
-        pt.value = if pt.value.is_finite() { pt.value.clamp(0.0, 1.0) } else { 1.0 };
+        pt.value = kind.clamp(pt.value);
         pt.curve = tidy_curve(pt.curve);
     }
-    let at = new.envelopes.iter().position(|l| l.target == AutomationTarget::Volume);
+    let target = kind.target();
+    let at = new.envelopes.iter().position(|l| l.target == target);
     match (at, points.is_empty()) {
         (Some(i), true) => {
             new.envelopes.remove(i);
@@ -165,7 +179,7 @@ pub fn set_volume_envelope(p: &Project, clip: ClipId, mut points: Vec<Automation
             new.envelopes[i].enabled = true;
         }
         (None, true) => return None,
-        (None, false) => new.envelopes.push(AutomationLane { points, ..AutomationLane::new(AutomationTarget::Volume) }),
+        (None, false) => new.envelopes.push(AutomationLane { points, ..AutomationLane::new(target) }),
     }
     update(p, clip, new)
 }
@@ -421,7 +435,7 @@ pub fn split_placement(p: &mut Project, track: TrackId, placement: PlacementId, 
     let mut left = Clip { length: cut, fade_out: Fade::default(), ..old.clone() };
     let mut right = Clip { offset: advance(&old, cut, clip_rate(p, place.clip)), length: old.length - cut, fade_in: Fade::default(), ..old.clone() };
     for (i, lane) in old.envelopes.iter().enumerate() {
-        if lane.target == AutomationTarget::Volume {
+        if ClipEnv::of(lane.target).is_some() {
             let (before, after) = split_points(lane, cut);
             left.envelopes[i].points = before;
             right.envelopes[i].points = after;
@@ -694,9 +708,9 @@ fn advance(c: &Clip, delta: Tick, rate: f64) -> Tick {
     }
 }
 
-/// Move the volume envelope by `by` ticks of clip time.
+/// Move the clip envelopes by `by` ticks of clip time.
 fn shift_envelope(c: &mut Clip, by: Tick) {
-    for lane in c.envelopes.iter_mut().filter(|l| l.target == AutomationTarget::Volume) {
+    for lane in c.envelopes.iter_mut().filter(|l| ClipEnv::of(l.target).is_some()) {
         for pt in &mut lane.points {
             pt.tick += by;
         }
@@ -906,6 +920,64 @@ mod tests {
         });
         let cmd = set_volume_envelope(&f.p, clip, Vec::new()).unwrap();
         round_trip(&mut f.p, vec![cmd], |p| assert!(p.clips[&clip].envelopes.is_empty()));
+    }
+
+    #[test]
+    fn pan_and_transpose_envelopes_are_set_clamped_and_undone_apart_from_volume() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let clip = f.clip;
+        let pt = |tick, value| AutomationPoint { tick, value, curve: 0.0 };
+        assert_eq!(set_clip_envelope(&f.p, clip, ClipEnv::Pan, Vec::new()), None);
+        let cmd = set_clip_envelope(&f.p, clip, ClipEnv::Pan, vec![pt(BEAT, 3.0), pt(0, -0.5)]).unwrap();
+        round_trip(&mut f.p, vec![cmd.clone()], |p| {
+            let c = &p.clips[&clip];
+            assert_eq!(c.pan_envelope().unwrap().points, vec![pt(0, -0.5), pt(BEAT, 1.0)]);
+            assert_eq!(c.pan_at(BEAT / 2), 0.25);
+            assert!(c.volume_envelope().is_none() && c.transpose_envelope().is_none());
+            assert_eq!(c.gain_at(BEAT), 1.0, "pan is not gain");
+        });
+        cmd.apply(&mut f.p).unwrap();
+        let cmd = set_clip_envelope(&f.p, clip, ClipEnv::Pitch, vec![pt(0, -40.0), pt(2 * BEAT, 12.0)]).unwrap();
+        round_trip(&mut f.p, vec![cmd.clone()], |p| {
+            let c = &p.clips[&clip];
+            assert_eq!(c.transpose_envelope().unwrap().points, vec![pt(0, -24.0), pt(2 * BEAT, 12.0)]);
+            assert_eq!(c.transpose_at(BEAT), -6.0);
+            assert_eq!(c.envelopes.len(), 2);
+        });
+        cmd.apply(&mut f.p).unwrap();
+        // Clearing one leaves the other.
+        let cmd = set_clip_envelope(&f.p, clip, ClipEnv::Pan, Vec::new()).unwrap();
+        round_trip(&mut f.p, vec![cmd], |p| {
+            assert!(p.clips[&clip].pan_envelope().is_none());
+            assert!(p.clips[&clip].transpose_envelope().is_some());
+        });
+        // Notes clips have neither.
+        let notes = fixture(None, 4 * BEAT);
+        assert_eq!(set_clip_envelope(&notes.p, notes.clip, ClipEnv::Pan, vec![pt(0, 0.5)]), None);
+        assert_eq!(set_clip_envelope(&notes.p, notes.clip, ClipEnv::Pitch, vec![pt(0, 5.0)]), None);
+    }
+
+    #[test]
+    fn pan_and_transpose_envelopes_move_with_the_clip_and_split_with_it() {
+        let mut f = fixture(Some(8), 4 * BEAT);
+        let clip = f.clip;
+        let pt = |tick, value| AutomationPoint { tick, value, curve: 0.0 };
+        edit(&mut f, |c| {
+            c.envelopes.push(AutomationLane { points: vec![pt(0, -1.0), pt(4 * BEAT, 1.0)], ..AutomationLane::new(AutomationTarget::Pan) });
+            c.envelopes.push(AutomationLane { points: vec![pt(0, 0.0), pt(4 * BEAT, 12.0)], ..AutomationLane::new(AutomationTarget::Transpose) });
+        });
+        let whole = f.p.clips[&clip].clone();
+        let (track, place) = (f.track, f.placement);
+        let cmds = split_at(&mut f.p, track, place, 6 * BEAT).unwrap();
+        round_trip(&mut f.p, cmds, |p| {
+            let arrangement = &p.track(track).unwrap().arrangement;
+            let right = &p.clips[&arrangement.iter().find(|pl| pl.id != place).unwrap().clip];
+            let left = &p.clips[&clip];
+            // Each half reads the same as the whole did over its part.
+            assert_eq!(left.pan_at(BEAT), whole.pan_at(BEAT));
+            assert_eq!(right.pan_at(BEAT), whole.pan_at(3 * BEAT));
+            assert!((right.transpose_at(BEAT) - whole.transpose_at(3 * BEAT)).abs() < 1e-4);
+        });
     }
 
     #[test]

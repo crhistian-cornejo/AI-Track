@@ -758,7 +758,8 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                         param_autos.push(ParamAuto { lane: lane.clone(), target: ParamTarget::TimedMacro(maps), last: f32::NAN });
                     }
                 }
-                AutomationTarget::Tempo => {}
+                // Tempo is read from the map; transpose only exists in clip envelopes.
+                AutomationTarget::Tempo | AutomationTarget::Transpose => {}
             }
         }
 

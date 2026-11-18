@@ -7,7 +7,7 @@ use crate::grid::{GridSpec, Line};
 use crate::paint::{self, at};
 use crate::theme::*;
 use crate::waveform::{self, Peaks};
-use aitrack_model::{Clip, PPQ, Tick, curve_shape};
+use aitrack_model::{Clip, ClipEnv, PPQ, Tick, curve_shape};
 use gpui::{App, Bounds, ContentMask, FontWeight, Hsla, Pixels, Point, TextAlign, Window, point, px};
 use std::sync::Arc;
 
@@ -46,6 +46,8 @@ pub struct Scene {
     pub color: Hsla,
     /// The sample plays reversed: the file is drawn back to front.
     pub reverse: bool,
+    /// The envelope drawn and edited on the canvas.
+    pub env: ClipEnv,
 }
 
 struct Pen<'a> {
@@ -66,7 +68,7 @@ impl Pen<'_> {
 }
 
 pub fn paint(s: &Scene, b: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-    let l = Layout { axis: s.axis, w: f32::from(b.size.width), h: f32::from(b.size.height) };
+    let l = Layout { axis: s.axis, w: f32::from(b.size.width), h: f32::from(b.size.height), env: s.env };
     if l.w <= 0. || l.h <= RULER {
         return;
     }
@@ -353,19 +355,34 @@ fn fade(pen: &Pen, fade_in: bool, window: &mut Window) {
     window.paint_quad(paint::rrect_border(at(pen.o, x - side / 2., y - side / 2., side, side), 2., fill, pal.well, 1.));
 }
 
-/// The volume envelope: its line over the played region and its breakpoints.
+/// The colour an envelope is drawn in: the volume one is the automation
+/// colour toned by `clip`'s, pan and transpose have a series colour each.
+pub(super) fn env_color(kind: ClipEnv, clip: Hsla) -> Hsla {
+    let pal = p();
+    match kind {
+        ClipEnv::Volume => mix(clip, pal.automation, 0.35),
+        ClipEnv::Pan => pal.series2,
+        ClipEnv::Pitch => pal.series5,
+    }
+}
+
+/// The selected envelope: its line over the played region and its breakpoints.
 fn envelope(pen: &Pen, window: &mut Window) {
     let pal = p();
     let (s, l) = (pen.s, &pen.l);
     let c = &s.clip;
-    let color = mix(s.color, pal.automation, 0.35);
+    let color = env_color(l.env, s.color);
     let (xs, xe) = (l.x(c.offset).max(-4.), l.x(geom::end_u(c)).min(l.w + 4.));
     if xe <= xs {
         return;
     }
-    let Some(lane) = c.volume_envelope().filter(|lane| !lane.points.is_empty()) else {
-        // No envelope yet: unity, where a double-click starts one.
-        window.paint_quad(paint::fill_rect(at(pen.o, xs, l.gain_y(1.), xe - xs, 1.), with_alpha(color, 0.4)));
+    // Pan and transpose have a middle to measure against, drawn under the line.
+    if l.env != ClipEnv::Volume {
+        window.paint_quad(paint::fill_rect(at(pen.o, xs, l.env_y(l.env.neutral()), xe - xs, 1.), with_alpha(color, 0.25)));
+    }
+    let Some(lane) = c.envelope(l.env).filter(|lane| !lane.points.is_empty()) else {
+        // No envelope yet: the neutral value, where a double-click starts one.
+        window.paint_quad(paint::fill_rect(at(pen.o, xs, l.env_y(l.env.neutral()), xe - xs, 1.), with_alpha(color, 0.4)));
         return;
     };
     // The breakpoints on screen plus a sample every few pixels, so curved
@@ -378,7 +395,7 @@ fn envelope(pen: &Pen, window: &mut Window) {
     ticks.sort_unstable();
     ticks.dedup();
     let pts: Vec<Point<Pixels>> =
-        ticks.iter().filter_map(|t| lane.value_at(*t).map(|v| pen.pt(l.x(c.offset + t), l.gain_y(v)))).collect();
+        ticks.iter().filter_map(|t| lane.value_at(*t).map(|v| pen.pt(l.x(c.offset + t), l.env_y(v)))).collect();
     paint::polyline(window, &pts, 1.5, color);
     for (i, pt) in lane.points.iter().enumerate() {
         let Some((x, y)) = geom::point_pos(l, c, pt) else { continue };
@@ -442,12 +459,12 @@ fn readout(pen: &Pen, text: &str, hit: Hit, window: &mut Window, cx: &mut App) {
         Hit::FadeOut => Some(geom::fade_handle(l, c, false)),
         Hit::FadeInCurve => geom::fade_mid(l, c, true).or(Some(geom::fade_handle(l, c, true))),
         Hit::FadeOutCurve => geom::fade_mid(l, c, false).or(Some(geom::fade_handle(l, c, false))),
-        Hit::Point(i) => geom::envelope(c).get(i).and_then(|pt| geom::point_pos(l, c, pt)),
+        Hit::Point(i) => geom::envelope(c, l.env).get(i).and_then(|pt| geom::point_pos(l, c, pt)),
         Hit::Segment(i) => {
-            let pts = geom::envelope(c);
+            let pts = geom::envelope(c, l.env);
             pts.get(i).zip(pts.get(i + 1)).and_then(|(a, b)| {
                 let t = (a.tick + b.tick) / 2;
-                c.volume_envelope()?.value_at(t).map(|v| (l.x(c.offset + t), l.gain_y(v)))
+                c.envelope(l.env)?.value_at(t).map(|v| (l.x(c.offset + t), l.env_y(v)))
             })
         }
         Hit::LoopStart | Hit::LoopEnd | Hit::LoopBody => c.looping.map(|lp| (middle(lp.start, lp.end), RULER + GAIN_TOP)),

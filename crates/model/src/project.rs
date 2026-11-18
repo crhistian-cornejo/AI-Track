@@ -482,7 +482,12 @@ pub struct Clip {
     /// The `AutomationTarget::Volume` lane is the clip's volume envelope: its
     /// point ticks are **clip time** (ticks from the clip's start on the
     /// timeline, so the envelope does not repeat with the loop) and its value
-    /// is a **linear gain multiplier 0..=1 where 1.0 is unity**.
+    /// is a **linear gain multiplier 0..=1 where 1.0 is unity**. Audio clips
+    /// have two more, same time base and curves ([`ClipEnv`]): an
+    /// `AutomationTarget::Pan` lane whose value is a **pan -1..=1** (0 centre)
+    /// and an `AutomationTarget::Transpose` lane whose value is **semitones
+    /// -24..=24** (0 = no change). A missing lane is a flat envelope at the
+    /// neutral value, so files saved before they existed load unchanged.
     pub envelopes: Vec<AutomationLane>,
     pub launch: LaunchSettings,
     pub muted: bool,
@@ -528,7 +533,33 @@ impl Clip {
 
     /// The enabled volume envelope (see [`Clip::envelopes`] for its units).
     pub fn volume_envelope(&self) -> Option<&AutomationLane> {
-        self.envelopes.iter().find(|l| l.enabled && l.target == AutomationTarget::Volume)
+        self.envelope(ClipEnv::Volume)
+    }
+
+    /// The enabled pan envelope (-1..=1).
+    pub fn pan_envelope(&self) -> Option<&AutomationLane> {
+        self.envelope(ClipEnv::Pan)
+    }
+
+    /// The enabled transpose envelope (semitones).
+    pub fn transpose_envelope(&self) -> Option<&AutomationLane> {
+        self.envelope(ClipEnv::Pitch)
+    }
+
+    /// The enabled envelope of `kind`.
+    pub fn envelope(&self, kind: ClipEnv) -> Option<&AutomationLane> {
+        let target = kind.target();
+        self.envelopes.iter().find(|l| l.enabled && l.target == target)
+    }
+
+    /// Pan -1..=1 at clip time `t`; 0 without a pan envelope.
+    pub fn pan_at(&self, t: Tick) -> f32 {
+        self.pan_envelope().and_then(|l| l.value_at(t)).map_or(0.0, |v| ClipEnv::Pan.clamp(v))
+    }
+
+    /// Transpose in semitones at clip time `t`; 0 without a transpose envelope.
+    pub fn transpose_at(&self, t: Tick) -> f32 {
+        self.transpose_envelope().and_then(|l| l.value_at(t)).map_or(0.0, |v| ClipEnv::Pitch.clamp(v))
     }
 
     /// Linear gain at clip time `t` (0..length): fade in × fade out × volume
@@ -547,6 +578,87 @@ impl Clip {
         }
         gain
     }
+}
+
+/// Which of an audio clip's envelopes (see [`Clip::envelopes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClipEnv {
+    #[default]
+    Volume,
+    Pan,
+    Pitch,
+}
+
+impl ClipEnv {
+    pub const ALL: [ClipEnv; 3] = [Self::Volume, Self::Pan, Self::Pitch];
+
+    /// The lane target that stores this envelope in [`Clip::envelopes`].
+    pub fn target(self) -> AutomationTarget {
+        match self {
+            Self::Volume => AutomationTarget::Volume,
+            Self::Pan => AutomationTarget::Pan,
+            Self::Pitch => AutomationTarget::Transpose,
+        }
+    }
+
+    pub fn of(target: AutomationTarget) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.target() == target)
+    }
+
+    /// The least and the greatest value a point can hold.
+    pub fn range(self) -> (f32, f32) {
+        match self {
+            Self::Volume => (0.0, 1.0),
+            Self::Pan => (-1.0, 1.0),
+            Self::Pitch => (-24.0, 24.0),
+        }
+    }
+
+    /// The value that changes nothing: unity gain, centre, no transpose.
+    pub fn neutral(self) -> f32 {
+        match self {
+            Self::Volume => 1.0,
+            Self::Pan | Self::Pitch => 0.0,
+        }
+    }
+
+    /// `v` held inside [`range`](Self::range); a NaN or infinity is neutral.
+    pub fn clamp(self, v: f32) -> f32 {
+        let (lo, hi) = self.range();
+        if v.is_finite() { v.clamp(lo, hi) } else { self.neutral() }
+    }
+
+    /// Position of `v` in the range, 0..=1 (0 = least).
+    pub fn unit(self, v: f32) -> f32 {
+        let (lo, hi) = self.range();
+        ((self.clamp(v) - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    /// Inverse of [`unit`](Self::unit).
+    pub fn from_unit(self, u: f32) -> f32 {
+        let (lo, hi) = self.range();
+        lo + u.clamp(0.0, 1.0) * (hi - lo)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Volume => "Volume",
+            Self::Pan => "Pan",
+            Self::Pitch => "Transpose",
+        }
+    }
+}
+
+/// Channel gains of a clip pan -1..=1: a balance law. The side the sound
+/// moves away from is turned down on an equal-power curve and the other
+/// stays at unity, so the centre changes nothing, for stereo and mono files.
+pub fn clip_pan_gains(pan: f32) -> (f32, f32) {
+    let pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    if pan == 0.0 {
+        return (1.0, 1.0);
+    }
+    let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    ((theta.cos() * std::f32::consts::SQRT_2).clamp(0.0, 1.0), (theta.sin() * std::f32::consts::SQRT_2).clamp(0.0, 1.0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1077,6 +1189,8 @@ pub enum AutomationTarget {
     DeviceEnabled { device: DeviceId },
     Macro { device: DeviceId, index: u8 },
     Tempo,
+    /// Clip envelopes only: transpose in semitones (see [`ClipEnv`]).
+    Transpose,
 }
 
 /// Parameter maps keyed by id. JSON object keys are strings; serde turns them
@@ -1214,6 +1328,39 @@ mod tests {
         lane.insert(AutomationPoint { tick: 100, value: 1.0, curve: 0.0 });
         assert_eq!(lane.value_at(50), Some(0.5));
         assert_eq!(lane.value_at(200), Some(1.0));
+    }
+
+    #[test]
+    fn clip_pan_and_transpose_envelopes_round_trip_and_old_files_have_none() {
+        let mut c = Clip::new("c", Color(0), SourceId(7), 960);
+        c.envelopes.push(AutomationLane { points: vec![AutomationPoint { tick: 0, value: -0.5, curve: 0.3 }], ..AutomationLane::new(AutomationTarget::Pan) });
+        c.envelopes.push(AutomationLane { points: vec![AutomationPoint { tick: 480, value: 7.0, curve: 0.0 }], ..AutomationLane::new(AutomationTarget::Transpose) });
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""type":"transpose""#), "{json}");
+        let back: Clip = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+        assert_eq!((back.pan_at(0), back.transpose_at(960)), (-0.5, 7.0));
+        // A clip saved before they existed: flat, nothing to play.
+        let old = Clip::new("c", Color(0), SourceId(7), 960);
+        assert_eq!((old.pan_at(100), old.transpose_at(100)), (0.0, 0.0));
+        assert!(old.pan_envelope().is_none() && old.transpose_envelope().is_none());
+    }
+
+    #[test]
+    fn clip_env_ranges_and_pan_law() {
+        for kind in ClipEnv::ALL {
+            let (lo, hi) = kind.range();
+            assert_eq!((kind.unit(lo), kind.unit(hi)), (0.0, 1.0));
+            assert_eq!(kind.from_unit(kind.unit(kind.neutral())), kind.neutral());
+            assert_eq!(kind.clamp(f32::NAN), kind.neutral());
+            assert_eq!(ClipEnv::of(kind.target()), Some(kind));
+        }
+        assert_eq!(clip_pan_gains(0.0), (1.0, 1.0));
+        assert_eq!(clip_pan_gains(1.0).0, 0.0);
+        assert!((clip_pan_gains(1.0).1 - 1.0).abs() < 1e-6);
+        assert!((clip_pan_gains(-1.0).0 - 1.0).abs() < 1e-6 && clip_pan_gains(-1.0).1.abs() < 1e-6);
+        let (l, r) = clip_pan_gains(0.5);
+        assert!(l < 1.0 && r == 1.0);
     }
 
     #[test]

@@ -28,10 +28,10 @@
 
 use crate::sample_cache::{DecodedAudio, SampleCache};
 use aitrack_dsp::event::Expression;
-use aitrack_dsp::warp::{sample_warped_beats, sample_warped_grain};
+use aitrack_dsp::warp::{pitch_taps, sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
 use aitrack_model::groove::{grooved_velocity, random_unit, Groove, GrooveParams, GrooveSettings, NoteGroove, PoolGroove, MAX_GROOVE_AMOUNT};
-use aitrack_model::{curve_shape, AutomationPoint, Clip, ClipId, Fade, FollowAction, GrooveId, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
+use aitrack_model::{clip_pan_gains, curve_shape, AutomationPoint, Clip, ClipEnv, ClipId, Fade, FollowAction, GrooveId, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
 use std::sync::Arc;
 
 /// Musical-time context of one processing segment.
@@ -415,8 +415,9 @@ pub(crate) enum ClipContent {
     Audio(AudioClipData),
 }
 
-/// Fades and volume envelope of an audio clip, copied out of the model when
-/// the graph is compiled so the audio thread only reads them.
+/// Fades and envelopes (volume, pan, transpose) of an audio clip, copied out
+/// of the model when the graph is compiled so the audio thread only reads
+/// them.
 ///
 /// [`gain`](Self::gain) is `Clip::gain_at` on a fractional clip time: equal
 /// to it on whole ticks, continuous in between.
@@ -426,6 +427,51 @@ pub(crate) struct ClipShape {
     pub fade_out: Fade,
     /// Points of the enabled volume envelope, sorted by tick (clip time).
     pub envelope: Box<[AutomationPoint]>,
+    /// Points of the enabled pan envelope (-1..=1), sorted by tick.
+    pub pan: Box<[AutomationPoint]>,
+    /// Points of the enabled transpose envelope (semitones), sorted by tick.
+    pub pitch: Box<[AutomationPoint]>,
+    /// `∫ 2^(semitones/12) dt` from clip time 0 to `k × pitch_step`, in ticks
+    /// (the speed of a Re-Pitch clip is the transpose as a ratio; this is how
+    /// far into the file it has read). Empty without a transpose envelope.
+    pitch_area: Box<[f64]>,
+    pitch_step: f64,
+}
+
+/// Finest spacing of the transpose area table, in ticks.
+const PITCH_STEP: f64 = (PPQ / 16) as f64;
+/// Most cells the transpose area table gets (a very long envelope widens the step).
+const PITCH_CELLS: f64 = 131_072.0;
+
+/// Value of sorted `pts` at clip time `t` with a cursor `seg` (start it at 0
+/// and pass it back, so consecutive samples do not search again). `None`
+/// without points.
+#[inline]
+fn points_at(pts: &[AutomationPoint], t: f64, seg: &mut usize) -> Option<f32> {
+    let first = pts.first()?;
+    if t <= first.tick as f64 {
+        return Some(first.value);
+    }
+    let mut i = (*seg).min(pts.len() - 1);
+    while i + 1 < pts.len() && pts[i + 1].tick as f64 <= t {
+        i += 1;
+    }
+    while i > 0 && pts[i].tick as f64 > t {
+        i -= 1;
+    }
+    *seg = i;
+    let a = pts[i];
+    let Some(b) = pts.get(i + 1) else { return Some(a.value) };
+    let x = (t - a.tick as f64) / b.tick.saturating_sub(a.tick).max(1) as f64;
+    Some(a.value + (b.value - a.value) * curve_shape(x as f32, a.curve))
+}
+
+/// [`points_at`] without a cursor: a binary search, for random access.
+#[inline]
+fn points_search(pts: &[AutomationPoint], t: f64) -> Option<f32> {
+    let first = pts.first()?;
+    let mut seg = if t <= first.tick as f64 { 0 } else { pts.partition_point(|p| p.tick as f64 <= t).saturating_sub(1) };
+    points_at(pts, t, &mut seg)
 }
 
 impl ClipShape {
@@ -433,23 +479,47 @@ impl ClipShape {
         // A curvature outside -1..=1 (or NaN) would put NaN in the audio.
         let curve = |c: f32| if c.is_finite() { c.clamp(-1.0, 1.0) } else { 0.0 };
         let fade = |f: Fade| Fade { length: f.length.max(0), curve: curve(f.curve) };
-        let mut envelope: Vec<AutomationPoint> = clip
-            .volume_envelope()
-            .map(|lane| {
-                lane.points
-                    .iter()
-                    .map(|p| AutomationPoint { tick: p.tick, value: if p.value.is_finite() { p.value } else { 1.0 }, curve: curve(p.curve) })
-                    .collect()
-            })
-            .unwrap_or_default();
-        envelope.sort_by_key(|p| p.tick);
-        Self { fade_in: fade(clip.fade_in), fade_out: fade(clip.fade_out), envelope: envelope.into_boxed_slice() }
+        let points = |kind: ClipEnv| -> Box<[AutomationPoint]> {
+            let mut pts: Vec<AutomationPoint> = clip
+                .envelope(kind)
+                .map(|lane| lane.points.iter().map(|p| AutomationPoint { tick: p.tick, value: kind.clamp(p.value), curve: curve(p.curve) }).collect())
+                .unwrap_or_default();
+            pts.sort_by_key(|p| p.tick);
+            pts.into_boxed_slice()
+        };
+        let mut shape = Self { fade_in: fade(clip.fade_in), fade_out: fade(clip.fade_out), envelope: points(ClipEnv::Volume), pan: points(ClipEnv::Pan), pitch: points(ClipEnv::Pitch), ..Self::default() };
+        shape.build_pitch_area();
+        shape
     }
 
-    /// Whether the clip has any fade or envelope at all.
+    /// Fill the transpose area table (control thread, once per compile).
+    fn build_pitch_area(&mut self) {
+        let Some(last) = self.pitch.last().map(|p| p.tick.max(0) as f64) else { return };
+        let step = PITCH_STEP.max((last / PITCH_CELLS).ceil());
+        let cells = (last / step).ceil() as usize + 1;
+        let speed = |t: f64| 2f64.powf(points_search(&self.pitch, t).unwrap_or(0.0) as f64 / 12.0);
+        let mut area = Vec::with_capacity(cells + 1);
+        let mut sum = 0.0;
+        area.push(sum);
+        for k in 0..cells {
+            let (a, b) = (k as f64 * step, (k + 1) as f64 * step);
+            sum += step / 6.0 * (speed(a) + 4.0 * speed((a + b) / 2.0) + speed(b));
+            area.push(sum);
+        }
+        self.pitch_area = area.into_boxed_slice();
+        self.pitch_step = step;
+    }
+
+    /// Whether the clip has any fade or envelope at all, except the transpose
+    /// one ([`has_pitch`](Self::has_pitch)).
     #[inline]
     pub fn active(&self) -> bool {
-        self.fade_in.length > 0 || self.fade_out.length > 0 || !self.envelope.is_empty()
+        self.fade_in.length > 0 || self.fade_out.length > 0 || !self.envelope.is_empty() || !self.pan.is_empty()
+    }
+
+    #[inline]
+    pub fn has_pitch(&self) -> bool {
+        !self.pitch.is_empty()
     }
 
     /// Fades × envelope at clip time `t` (ticks since the clip started).
@@ -473,31 +543,44 @@ impl ClipShape {
                 gain *= curve_shape((left.max(0.0) / fade_out) as f32, self.fade_out.curve);
             }
         }
-        if let Some(v) = self.envelope_at(t, seg) {
+        if let Some(v) = points_at(&self.envelope, t, seg) {
             gain *= v.clamp(0.0, 1.0);
         }
         gain
     }
 
+    /// Left and right gain of the pan envelope at clip time `t` (unity without
+    /// one). `seg` is a cursor as for [`gain`](Self::gain).
     #[inline]
-    fn envelope_at(&self, t: f64, seg: &mut usize) -> Option<f32> {
-        let pts = &self.envelope;
-        let first = pts.first()?;
-        if t <= first.tick as f64 {
-            return Some(first.value);
+    pub fn pan_gains(&self, t: f64, seg: &mut usize) -> (f32, f32) {
+        match points_at(&self.pan, t, seg) {
+            Some(v) => clip_pan_gains(v),
+            None => (1.0, 1.0),
         }
-        let mut i = (*seg).min(pts.len() - 1);
-        while i + 1 < pts.len() && pts[i + 1].tick as f64 <= t {
-            i += 1;
+    }
+
+    /// Transpose in semitones at clip time `t`.
+    #[inline]
+    pub fn semitones(&self, t: f64) -> f64 {
+        points_search(&self.pitch, t).map_or(0.0, f64::from)
+    }
+
+    /// `∫ 2^(transpose/12) dτ` for τ in `0..t`: the clip ticks of the file
+    /// read after `t` ticks of clip time at the envelope's speed (plain `t`
+    /// without a transpose envelope). No allocation: a table lookup and a
+    /// trapezoid inside one cell.
+    #[inline]
+    pub fn pitch_integral(&self, t: f64) -> f64 {
+        let speed = |t: f64| 2f64.powf(self.semitones(t) / 12.0);
+        let Some(&end) = self.pitch_area.last() else { return t };
+        if t <= 0.0 {
+            return t * speed(0.0);
         }
-        while i > 0 && pts[i].tick as f64 > t {
-            i -= 1;
-        }
-        *seg = i;
-        let a = pts[i];
-        let Some(b) = pts.get(i + 1) else { return Some(a.value) };
-        let x = (t - a.tick as f64) / b.tick.saturating_sub(a.tick).max(1) as f64;
-        Some(a.value + (b.value - a.value) * curve_shape(x as f32, a.curve))
+        let last = (self.pitch_area.len() - 1) as f64;
+        let k = (t / self.pitch_step).floor().min(last);
+        let a = k * self.pitch_step;
+        let base = if k >= last { end } else { self.pitch_area[k as usize] };
+        base + (t - a) * 0.5 * (speed(a) + speed(t))
     }
 }
 
@@ -835,12 +918,13 @@ impl CompiledClip {
     /// the cut needs the anti-click ramp. Looping clips are always cut; a clip
     /// that never ends (`limit` `None`) has no end to ramp. Only a clip that
     /// reaches the last sample of the file (within one sample) is not cut.
-    fn cuts_tail(&self, data: &AudioClipData, audio: &DecodedAudio, offset: Tick, looping: bool, limit: Option<Tick>, spt: f64) -> bool {
-        let Some(limit) = limit else { return false };
+    #[allow(clippy::too_many_arguments)]
+    fn cuts_tail(&self, data: &AudioClipData, audio: &DecodedAudio, offset: Tick, looping: bool, limit: Option<Tick>, spt: f64, reach: f64) -> bool {
+        let Some(_) = limit else { return false };
         if looping {
             return true;
         }
-        let end = data.source_frame(offset as f64 + limit as f64 * data.ratio, spt);
+        let end = data.source_frame(offset as f64 + reach, spt);
         end < audio.frames as f64 - 1.0
     }
 
@@ -850,7 +934,11 @@ impl CompiledClip {
     /// (a looping clip in the Session View).
     ///
     /// Gain is the clip gain × fades × volume envelope at the clip time of
-    /// each sample (timeline ticks since `start`). An edge without a fade
+    /// each sample (timeline ticks since `start`), and the pan envelope turns
+    /// one channel down. The transpose envelope changes the speed of a
+    /// Re-Pitch clip (the position in the file is the integral of the speed)
+    /// and shifts the pitch of a pitch-preserving one without moving it in
+    /// time ([`pitch_taps`]). An edge without a fade
     /// keeps its 64-sample anti-click ramp: at the end when the clip cuts the
     /// material off, and at the start when the clip is trimmed (a clip that
     /// starts at the very beginning of its file keeps the transient the file
@@ -878,7 +966,12 @@ impl CompiledClip {
         // The end ramps down only where the clip cuts the material off: a clip
         // that plays its file to the end (or is followed by the rest of it)
         // would otherwise leave a notch at every join of contiguous clips.
-        let ramp_out = shape.fade_out.length == 0 && self.cuts_tail(data, audio, offset, looping.is_some(), limit, spt);
+        // A transpose envelope moves a Re-Pitch clip through its file at a
+        // varying speed; a pitch-preserving clip stays on its time grid.
+        let repitch_env = shape.has_pitch() && !data.pitch_preserving;
+        let shift_env = shape.has_pitch() && data.pitch_preserving;
+        let reach = limit.map_or(0.0, |l| if repitch_env { data.ratio * shape.pitch_integral(l as f64) } else { l as f64 * data.ratio });
+        let ramp_out = shape.fade_out.length == 0 && self.cuts_tail(data, audio, offset, looping.is_some(), limit, spt, reach);
         let ramp_in = self.offset != 0 && shape.fade_in.length == 0;
         // Clip gain with the anti-click ramps, `since` samples into the clip.
         let edge_gain = |k: i64, since: f64| -> f32 {
@@ -897,11 +990,13 @@ impl CompiledClip {
             g
         };
         let mut seg = 0usize;
+        let mut pan_seg = 0usize;
+        let panned = !shape.pan.is_empty();
         let (l, r) = buf.stereo_mut();
 
         // A clip at its native speed reads whole frames: playback is
         // bit-identical to the file instead of an interpolated copy of it.
-        let whole_frames = data.exact() || (data.unity && tempo_is_steady(ctx.tempo, start, limit.map_or(Tick::MAX, |l| start.saturating_add(l)), data.original_bpm));
+        let whole_frames = !shape.has_pitch() && (data.exact() || (data.unity && tempo_is_steady(ctx.tempo, start, limit.map_or(Tick::MAX, |l| start.saturating_add(l)), data.original_bpm)));
         if whole_frames {
             // The first sample at or after the clip start, as the caller's
             // range counts it: rounding down would put frame 0 before it.
@@ -945,12 +1040,17 @@ impl CompiledClip {
                             }
                         }
                         let mut g = edge_gain(j, (j - start_i) as f64);
+                        let (mut gl, mut gr) = (1.0f32, 1.0f32);
                         if shaped {
-                            g *= shape.gain(t0 + dt * (j - n) as f64, limit, &mut seg);
+                            let t = t0 + dt * (j - n) as f64;
+                            g *= shape.gain(t, limit, &mut seg);
+                            if panned {
+                                (gl, gr) = shape.pan_gains(t, &mut pan_seg);
+                            }
                         }
                         let idx = (j - ctx.seg_start) as usize;
-                        l[idx] += sl * g;
-                        r[idx] += sr * g;
+                        l[idx] += sl * (g * gl);
+                        r[idx] += sr * (g * gr);
                     }
                     t0 = t1;
                     n = chunk_end;
@@ -983,21 +1083,26 @@ impl CompiledClip {
         let ch0 = &audio.channels[0];
         let ch1 = if stereo { &audio.channels[1] } else { ch0 };
         let sr = audio.sample_rate as f64;
+        // Source ticks read `t` clip ticks in (beyond `offset`).
+        let reads = |t: f64| if repitch_env { ratio * shape.pitch_integral(t) } else { t * ratio };
+        // Frames the pitch shift of a pitch-preserving clip has run ahead.
+        let frames_per_tick = data.source_frame(1.0, spt);
+        let shift_window = sr * 0.04;
         let mut n = lo;
         while n < hi {
             let chunk_end = (n + crate::automation::CONTROL_BLOCK as i64).min(hi);
             let t0 = ctx.tick_of(n) - start as f64;
             let t1 = ctx.tick_of(chunk_end) - start as f64;
             let len = (chunk_end - n) as f64;
-            let frame_0 = data.source_frame(offset as f64 + t0 * ratio, spt);
-            let frame_1 = data.source_frame(offset as f64 + t1 * ratio, spt);
+            let frame_0 = data.source_frame(offset as f64 + reads(t0), spt);
+            let frame_1 = data.source_frame(offset as f64 + reads(t1), spt);
             let local_step = (frame_1 - frame_0) / len;
             for k in n..chunk_end {
                 let tau = t0 + (t1 - t0) * (k - n) as f64 / len;
                 if tau < 0.0 || limit.is_some_and(|lim| tau >= lim as f64) {
                     continue;
                 }
-                let mut src = offset as f64 + tau * ratio;
+                let mut src = offset as f64 + reads(tau);
                 let mut w = 0.0f32;
                 if let Some((ls, le)) = looping {
                     let mut fade = seam_intro;
@@ -1011,19 +1116,33 @@ impl CompiledClip {
                     }
                 }
                 let frame = data.source_frame(src, spt);
-                let (mut sl, mut sr_s) = if tempo_steady {
-                    (data.sample(audio, 0, frame), if stereo { data.sample(audio, 1, frame) } else { 0.0 })
-                } else if data.mode == WarpMode::Beats {
-                    let s0 = sample_warped_beats(ch0, &data.transients, frame, sr, data.reverse);
-                    let s1 = if stereo { sample_warped_beats(ch1, &data.transients, frame, sr, data.reverse) } else { s0 };
-                    (s0, s1)
+                // The clip read at file frame `at`, both channels.
+                let read = |at: f64| -> (f32, f32) {
+                    if tempo_steady {
+                        (data.sample(audio, 0, at), if stereo { data.sample(audio, 1, at) } else { 0.0 })
+                    } else if data.mode == WarpMode::Beats {
+                        let s0 = sample_warped_beats(ch0, &data.transients, at, sr, data.reverse);
+                        let s1 = if stereo { sample_warped_beats(ch1, &data.transients, at, sr, data.reverse) } else { s0 };
+                        (s0, s1)
+                    } else {
+                        let since = k as f64 - start_exact;
+                        let jitter = data.mode == WarpMode::Texture;
+                        let src_at_hop = |center_out: f64| at + (center_out - since) * local_step;
+                        let s0 = sample_warped_grain(ch0, 0x1234_5678, since, src_at_hop, sr, jitter, data.reverse);
+                        let s1 = if stereo { sample_warped_grain(ch1, 0x8765_4321, since, src_at_hop, sr, jitter, data.reverse) } else { s0 };
+                        (s0, s1)
+                    }
+                };
+                let (mut sl, mut sr_s) = if shift_env {
+                    // Two taps that wander around the aligned position at the
+                    // speed of the shift (see `pitch_taps`).
+                    let drift = (shape.pitch_integral(tau) - tau) * ratio * frames_per_tick;
+                    let [(oa, wa), (ob, wb)] = pitch_taps(drift, shift_window);
+                    let (a0, a1) = read(frame + oa);
+                    let (b0, b1) = read(frame + ob);
+                    (a0 * wa + b0 * wb, a1 * wa + b1 * wb)
                 } else {
-                    let since = k as f64 - start_exact;
-                    let jitter = data.mode == WarpMode::Texture;
-                    let src_at_hop = |center_out: f64| frame + (center_out - since) * local_step;
-                    let s0 = sample_warped_grain(ch0, 0x1234_5678, since, src_at_hop, sr, jitter, data.reverse);
-                    let s1 = if stereo { sample_warped_grain(ch1, 0x8765_4321, since, src_at_hop, sr, jitter, data.reverse) } else { s0 };
-                    (s0, s1)
+                    read(frame)
                 };
                 if !stereo && tempo_steady {
                     sr_s = sl;
@@ -1036,12 +1155,16 @@ impl CompiledClip {
                     sr_s += (pr - sr_s) * w;
                 }
                 let mut g = edge_gain(k, k as f64 - start_exact);
+                let (mut gl, mut gr) = (1.0f32, 1.0f32);
                 if shaped {
                     g *= shape.gain(tau, limit, &mut seg);
+                    if panned {
+                        (gl, gr) = shape.pan_gains(tau, &mut pan_seg);
+                    }
                 }
                 let idx = (k - ctx.seg_start) as usize;
-                l[idx] += sl * g;
-                r[idx] += sr_s * g;
+                l[idx] += sl * (g * gl);
+                r[idx] += sr_s * (g * gr);
             }
             n = chunk_end;
         }
@@ -1255,6 +1378,139 @@ mod tests {
         // +50 ct: 2^(0.5/12) faster.
         let fine = play(&pitched_clip(&c, ramp, 2f64.powf(0.5 / 12.), false), 120., 0, Some(8 * PPQ), 1200);
         assert!((fine[1000] - 1000. * 2f32.powf(0.5 / 12.) / 48_000.).abs() < 1e-3, "{}", fine[1000]);
+    }
+
+    fn lane(target: AutomationTarget, points: &[(Tick, f32)]) -> AutomationLane {
+        let mut lane = AutomationLane::new(target);
+        for &(tick, value) in points {
+            lane.insert(AutomationPoint { tick, value, curve: 0.0 });
+        }
+        lane
+    }
+
+    /// Both channels of the first `total` samples (at 48 kHz, 120 bpm unless said).
+    fn play_stereo(c: &CompiledClip, start: Tick, limit: Option<Tick>, total: usize) -> (Vec<f32>, Vec<f32>) {
+        let tempo = TempoMap::constant(120.0);
+        let (mut l, mut r) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        let mut buf = AudioBuffer::new(2, 100);
+        let mut s = 0i64;
+        while (s as usize) < total {
+            buf.clear();
+            let ctx = TimeCtx { tempo: &tempo, sr: 48_000.0, seg_start: s };
+            c.render_audio(start, limit, s, s + 100, &ctx, &mut buf);
+            l.extend_from_slice(buf.channel(0));
+            r.extend_from_slice(buf.channel(1));
+            s += 100;
+        }
+        (l, r)
+    }
+
+    fn energy(x: &[f32]) -> f32 {
+        x.iter().map(|v| v * v).sum()
+    }
+
+    #[test]
+    fn a_pan_envelope_moves_the_energy_from_left_to_right() {
+        let tone: Vec<f32> = (0..96_000).map(|i| 0.5 * (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin()).collect();
+        // 2 beats = 1 s at 120 bpm: hard left at the start, hard right at the end.
+        let mut c = clip(0, 2 * PPQ, None);
+        c.envelopes.push(lane(AutomationTarget::Pan, &[(0, -1.0), (2 * PPQ, 1.0)]));
+        let compiled = audio_clip(&c, tone.clone(), None);
+        let (l, r) = play_stereo(&compiled, 0, Some(2 * PPQ), 48_000);
+        let q = 1_000..3_000;
+        let end = 45_000..47_000;
+        assert!(energy(&l[q.clone()]) > 10.0 * energy(&r[q.clone()]), "left at the start: {} vs {}", energy(&l[q.clone()]), energy(&r[q.clone()]));
+        assert!(energy(&r[end.clone()]) > 10.0 * energy(&l[end.clone()]), "right at the end");
+        // Halfway the sound is centred and at unity, as with no envelope at all.
+        let plain = audio_clip(&clip(0, 2 * PPQ, None), tone, None);
+        let (pl, _) = play_stereo(&plain, 0, Some(2 * PPQ), 48_000);
+        let mid = 23_900..24_100;
+        assert!((energy(&l[mid.clone()]) / energy(&pl[mid.clone()]) - 1.0).abs() < 0.05);
+        assert!((energy(&r[mid.clone()]) / energy(&pl[mid]) - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_pan_envelope_loops_with_the_clip_time_not_the_loop() {
+        // The envelope is in clip time: a looping clip keeps sweeping while the loop repeats.
+        let tone = vec![0.5f32; 24_000];
+        let mut c = clip(0, 4 * PPQ, Some((0, PPQ)));
+        c.envelopes.push(lane(AutomationTarget::Pan, &[(0, -1.0), (4 * PPQ, 1.0)]));
+        let compiled = audio_clip(&c, tone, None);
+        let (l, r) = play_stereo(&compiled, 0, Some(4 * PPQ), 96_000);
+        assert!(energy(&l[2_000..4_000]) > 10.0 * energy(&r[2_000..4_000]));
+        assert!(energy(&r[92_000..94_000]) > 10.0 * energy(&l[92_000..94_000]));
+    }
+
+    #[test]
+    fn a_transpose_envelope_changes_the_speed_of_a_repitch_clip() {
+        // A ramp: the value read tells where in the file playback is.
+        let ramp: Vec<f32> = (0..96_000).map(|i| i as f32 / 96_000.).collect();
+        // Constant +12 st: twice as fast.
+        let mut c = clip(0, 8 * PPQ, None);
+        c.envelopes.push(lane(AutomationTarget::Transpose, &[(0, 12.0)]));
+        let up = play(&audio_clip(&c, ramp.clone(), None), 120., 0, Some(8 * PPQ), 1200);
+        assert!((up[1000] - 2000. / 96_000.).abs() < 1e-3, "{}", up[1000]);
+        // A sweep from 0 to +12 st over 4 beats: the position is the integral of the speed.
+        let mut c = clip(0, 8 * PPQ, None);
+        c.envelopes.push(lane(AutomationTarget::Transpose, &[(0, 0.0), (4 * PPQ, 12.0)]));
+        let sweep = play(&audio_clip(&c, ramp, None), 120., 0, Some(8 * PPQ), 48_000);
+        let model = c.clone();
+        for n in [6_000usize, 20_000, 40_000] {
+            // 2 beats per second: sample n is at tick n × 1920 / 48000.
+            let tau = n as f64 * 1920.0 / 48_000.0;
+            let steps = 20_000;
+            let area: f64 = (0..steps).map(|i| 2f64.powf(model.transpose_at(((i as f64 + 0.5) * tau / steps as f64) as Tick) as f64 / 12.0) * tau / steps as f64).sum();
+            let want = area * 48_000.0 / 960.0 / 2.0 / 96_000.0;
+            assert!((sweep[n] as f64 - want).abs() < 2e-3, "sample {n}: {} vs {want}", sweep[n]);
+        }
+    }
+
+    #[test]
+    fn a_transpose_envelope_shifts_a_stretch_mode_without_moving_it_in_time() {
+        use aitrack_model::Warp;
+        let sine: Vec<f32> = (0..96_000).map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin()).collect();
+        let audio = Arc::new(DecodedAudio::from_planar(vec![sine], 48_000));
+        let mut c = clip(0, 4 * PPQ, None);
+        c.envelopes.push(lane(AutomationTarget::Transpose, &[(0, 12.0)]));
+        for mode in [WarpMode::Complex, WarpMode::Tones, WarpMode::Beats] {
+            let warp = Warp { enabled: true, mode, original_bpm: Some(120.0), ..Warp::default() };
+            let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&warp, Some(audio.clone()), 120.0));
+            let out = play(&compiled, 120.0, 0, Some(4 * PPQ), 96_000);
+            // Still plays for the whole 2 s (a Re-Pitch clip would be done after 1 s).
+            assert!(energy(&out[70_000..90_000]) > 1.0, "{mode:?} keeps the clip's duration");
+            let seg = &out[8_000..32_000];
+            let crossings = seg.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+            let hz = crossings as f32 * 48_000.0 / seg.len() as f32;
+            assert!((hz - 880.0).abs() < 45.0, "{mode:?} +12 st expected ~880 Hz, got {hz}");
+            assert!(out.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn a_transpose_envelope_that_is_flat_at_zero_changes_nothing() {
+        let tone: Vec<f32> = (0..48_000).map(|i| 0.5 * (std::f32::consts::TAU * 330.0 * i as f32 / 48_000.0).sin()).collect();
+        let plain = clip(0, 2 * PPQ, None);
+        let mut flat = plain.clone();
+        flat.envelopes.push(lane(AutomationTarget::Transpose, &[(0, 0.0), (PPQ, 0.0)]));
+        let a = play(&audio_clip(&plain, tone.clone(), None), 120., 0, Some(2 * PPQ), 30_000);
+        let b = play(&audio_clip(&flat, tone, None), 120., 0, Some(2 * PPQ), 30_000);
+        for (n, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() < 1e-3, "sample {n}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn the_pitch_area_table_is_the_integral_of_the_speed() {
+        let mut c = clip(0, 8 * PPQ, None);
+        c.envelopes.push(lane(AutomationTarget::Transpose, &[(0, -12.0), (2 * PPQ, 12.0)]));
+        let shape = ClipShape::of(&c);
+        for t in [0.0, 100.0, 960.0, 1920.0, 5000.0, 40_000.0] {
+            let steps = 100_000;
+            let want: f64 = (0..steps).map(|i| 2f64.powf(shape.semitones((i as f64 + 0.5) * t / steps as f64) / 12.0) * t / steps as f64).sum();
+            assert!((shape.pitch_integral(t) - want).abs() < 1e-3 * want.max(1.0), "t {t}: {} vs {want}", shape.pitch_integral(t));
+        }
+        // No envelope: the identity.
+        assert_eq!(ClipShape::of(&clip(0, PPQ, None)).pitch_integral(123.5), 123.5);
     }
 
     #[test]

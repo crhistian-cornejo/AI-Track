@@ -285,6 +285,17 @@ pub struct AutoRange {
     pub end: Tick,
 }
 
+/// What the transform handles of a selected automation range do to it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AutoXform {
+    /// Vertical stretch about the value `anchor`.
+    Scale { anchor: f32, factor: f32 },
+    /// A tilt: the offset at the left and right edge (normalised).
+    Skew { left: f32, right: f32 },
+    /// The range becomes `start..end` (an edge dragged).
+    Stretch { start: Tick, end: Tick },
+}
+
 impl AutoRange {
     pub fn is_empty(&self) -> bool {
         self.end <= self.start
@@ -343,6 +354,8 @@ pub struct AppState {
     pub auto_sel: Option<AutoRange>,
     /// What Copy took from an automation range: breakpoints from tick 0 and the span.
     pub auto_clip: Option<(Vec<AutomationPoint>, Tick)>,
+    /// The last minutes of knob moves and played notes, for Capture Automation / Capture MIDI.
+    pub capture: crate::capture::Capture,
     /// Length new notes get (the last drawn or resized length, FL-style).
     pub note_length: Tick,
     /// Ableton-style Scale Mode in the piano roll: fold vertically to show only keys in the active scale.
@@ -402,6 +415,7 @@ impl AppState {
             ed: Default::default(),
             auto_sel: None,
             auto_clip: None,
+            capture: Default::default(),
             note_length: PPQ / 2,
             piano_scale_fold: true,
             last_error: None,
@@ -589,6 +603,11 @@ impl AppState {
     /// loop, and if a clip already sits there (an earlier take) the notes are
     /// added to it: overdub. Returns how many tracks got notes.
     pub fn commit_take(&mut self, take: &crate::bridge::MidiTake) -> usize {
+        self.commit_take_as(take, "Record MIDI")
+    }
+
+    /// [`commit_take`](Self::commit_take) with the undo step's name.
+    pub fn commit_take_as(&mut self, take: &crate::bridge::MidiTake, label: &str) -> usize {
         // The engine reports every note at its place on the timeline, inside
         // the loop for each pass (`RecordedNote.pass` only says which pass it was
         // played in) and `passes` > 1 means the loop wrapped at least once. So
@@ -655,7 +674,7 @@ impl AppState {
             return 0;
         }
         self.seal();
-        let ok = self.edit("Record MIDI", cmds);
+        let ok = self.edit(label, cmds);
         self.seal();
         if ok { tracks } else { 0 }
     }
@@ -701,6 +720,13 @@ impl AppState {
     /// Part of a continuous gesture: merges with the previous step of the same `key`.
     pub fn edit_coalesced(&mut self, key: &str, label: &str, commands: Vec<Command>) -> bool {
         self.note_landed(&commands);
+        // Control moves while the transport rolls are kept for Capture Automation.
+        if !commands.is_empty() {
+            let now = std::time::Instant::now();
+            for (track, target, value) in crate::capture::moves_of(&self.project, &commands) {
+                self.capture.note_move(now, track, target, value);
+            }
+        }
         // A knob, fader, pan or send move can go straight to the engine ([`FastEdit`]).
         let (before, fast) = (self.revision(), FastEdit::of_all(&self.project, &commands));
         match self.history.apply_coalesced(&mut self.project, key, label, commands) {
@@ -1308,6 +1334,10 @@ impl AppState {
         // In the Session View the arrows walk the slots.
         if self.view == MainView::Session {
             return self.session_key(e);
+        }
+        // With an automation range selected the arrows move its envelope.
+        if let Some(done) = self.key_edit_auto_range(e) {
+            return done;
         }
         let grid = self.grid();
         if let Some((clip, source, sel)) = self.key_notes() {
@@ -2489,6 +2519,156 @@ impl AppState {
         let points = aitrack_model::automation::shift(original, range.start, range.end, delta);
         let cmd = self.lane_command(range.track, range.target, points);
         self.edit_coalesced("automation-range", "Move automation", vec![cmd])
+    }
+
+    /// The tick step a wave takes as its period: the grid of the arrangement.
+    pub fn auto_period(&self) -> Tick {
+        self.grid_spec(crate::editing::GridView::Arrange).step.max(1)
+    }
+
+    /// "Insert Shape" over the selected range of an automation lane: `shape`
+    /// replaces what is there, one cycle per grid step for the waves. One undo step.
+    pub fn insert_auto_shape(&mut self, shape: aitrack_model::automation::Shape) -> bool {
+        let Some(r) = self.active_auto_range().filter(|r| !r.is_empty()) else { return false };
+        let points = aitrack_model::automation::shape(&self.lane_points(r.track, r.target), r.start, r.end, shape, self.auto_period());
+        self.set_lane_points(r.track, r.target, &format!("Insert {}", shape.name().to_lowercase()), points)
+    }
+
+    /// Tolerance of "Simplify Envelope", of the normalised range: below what a
+    /// lane a few dozen pixels tall can show.
+    pub const SIMPLIFY_TOLERANCE: f32 = 0.004;
+
+    /// "Simplify Envelope": fewer breakpoints for the same curve, in the
+    /// selected range or, with none, the whole lane `track`/`target`.
+    /// Returns how many breakpoints went (`None` when there is no lane).
+    pub fn simplify_auto(&mut self, track: TrackId, target: AutomationTarget) -> Option<usize> {
+        let points = self.lane_points(track, target);
+        if points.is_empty() {
+            return None;
+        }
+        let range = self.auto_sel.filter(|r| r.track == track && r.target == target && !r.is_empty());
+        let out = match range {
+            Some(r) => aitrack_model::automation::simplify_range(&points, r.start, r.end, Self::SIMPLIFY_TOLERANCE),
+            None => aitrack_model::automation::simplify(&points, Self::SIMPLIFY_TOLERANCE),
+        };
+        let removed = points.len().saturating_sub(out.len());
+        self.set_lane_points(track, target, "Simplify envelope", out);
+        Some(removed)
+    }
+
+    /// A drag of the transform handles of the selected range: the lane is
+    /// `original` with `xform` applied to `range`. One coalesced undo step
+    /// per drag. A time stretch also moves the selection to the new range.
+    pub fn xform_auto_range(&mut self, range: AutoRange, original: &[AutomationPoint], xform: AutoXform) -> bool {
+        use aitrack_model::automation as a;
+        let (points, label) = match xform {
+            AutoXform::Scale { anchor, factor } => (a::scale(original, range.start, range.end, anchor, factor), "Scale automation"),
+            AutoXform::Skew { left, right } => (a::skew(original, range.start, range.end, left, right), "Skew automation"),
+            AutoXform::Stretch { start, end } => (a::stretch(original, range.start, range.end, start, end), "Stretch automation"),
+        };
+        if let AutoXform::Stretch { start, end } = xform
+            && end > start
+        {
+            self.auto_sel = Some(AutoRange { start: start.max(0), end: end.max(0), ..range });
+        }
+        let cmd = self.lane_command(range.track, range.target, points);
+        self.edit_coalesced("automation-xform", label, vec![cmd])
+    }
+
+    /// An arrow key with an automation range selected: ←/→ move its envelope
+    /// by a grid step, ↑/↓ raise or lower it by 5 % of the range. Shift
+    /// (the keys for a fine step) takes an eighth of the time step and 1 %.
+    /// `None` when no range is selected or the key is not one of these.
+    pub(crate) fn key_edit_auto_range(&mut self, e: KeyEdit) -> Option<bool> {
+        let r = self.active_auto_range().filter(|r| !r.is_empty())?;
+        let grid = self.auto_period();
+        let fine_t = (grid / 8).max(1);
+        let (dt, dv) = match e {
+            KeyEdit::Left => (-grid, 0.),
+            KeyEdit::Right => (grid, 0.),
+            KeyEdit::Shorter => (-fine_t, 0.),
+            KeyEdit::Longer => (fine_t, 0.),
+            KeyEdit::Up => (0, 0.05),
+            KeyEdit::Down => (0, -0.05),
+            KeyEdit::OctaveUp => (0, 0.01),
+            KeyEdit::OctaveDown => (0, -0.01),
+            _ => return None,
+        };
+        let points = self.lane_points(r.track, r.target);
+        if dt != 0 {
+            // Not before tick 0.
+            let dt = dt.max(-r.start);
+            if dt == 0 {
+                return Some(false);
+            }
+            let out = aitrack_model::automation::stretch(&points, r.start, r.end, r.start + dt, r.end + dt);
+            let ok = self.set_lane_points(r.track, r.target, "Move automation", out);
+            self.set_auto_range(r.track, r.target, r.start + dt, r.end + dt);
+            return Some(ok);
+        }
+        let out = aitrack_model::automation::shift(&points, r.start, r.end, dv);
+        Some(self.set_lane_points(r.track, r.target, "Move automation", out))
+    }
+
+    /// Capture Automation: the knob moves of the last minutes, written
+    /// where they happened, over what the lanes held there, in one undo
+    /// step. The lanes touched are shown. Returns how many lanes changed.
+    pub fn capture_automation(&mut self) -> usize {
+        let gestures = self.capture.gestures();
+        let mut cmds = Vec::new();
+        let mut shown = Vec::new();
+        for (track, target, runs) in gestures {
+            if self.project.track(track).is_none() {
+                continue;
+            }
+            let mut points = self.lane_points(track, target);
+            let before = points.clone();
+            for run in runs {
+                let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) else { continue };
+                if run.len() == 1 || last.tick <= first.tick {
+                    points = aitrack_model::automation::write(&points, first.tick, first.tick, first.value);
+                } else {
+                    let clip: Vec<AutomationPoint> = run.iter().map(|p| AutomationPoint { tick: p.tick - first.tick, ..*p }).collect();
+                    points = aitrack_model::automation::paste(&points, first.tick, &clip, last.tick - first.tick);
+                }
+            }
+            if points != before {
+                cmds.push(self.lane_command(track, target, points));
+                shown.push((track, target));
+            }
+        }
+        if cmds.is_empty() {
+            return 0;
+        }
+        self.seal();
+        let n = cmds.len();
+        let ok = self.edit("Capture automation", cmds);
+        self.seal();
+        if !ok {
+            return 0;
+        }
+        for (track, target) in shown {
+            self.show_automation(track, target);
+        }
+        self.capture.clear_moves();
+        n
+    }
+
+    /// Capture MIDI: the notes played on armed tracks while the transport
+    /// rolled, as a clip on each track at the position they were played,
+    /// in one undo step. Returns how many tracks got a clip.
+    pub fn capture_midi(&mut self) -> usize {
+        let notes = self.capture.notes();
+        let Some(first) = notes.iter().map(|n| n.start_tick).min() else { return 0 };
+        let last = notes.iter().map(|n| n.start_tick + n.length_ticks).max().unwrap_or(first);
+        // The clip starts on the beat the first note falls in.
+        let start = first.max(0).div_euclid(PPQ) * PPQ;
+        let take = crate::bridge::MidiTake { notes, start_tick: start, end_tick: last, passes: 1 };
+        let n = self.commit_take_as(&take, "Capture MIDI");
+        if n > 0 {
+            self.capture.clear_notes();
+        }
+        n
     }
 
     /// Delete whatever is selected: notes in the piano roll, else the selected arrangement clip.

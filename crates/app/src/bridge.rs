@@ -103,6 +103,11 @@ pub trait EngineBridge {
     fn take_recorded_notes(&mut self) -> Vec<RecNote> {
         Vec::new()
     }
+    /// The notes played on armed tracks while the transport rolled without
+    /// recording, each handed out once (Capture MIDI).
+    fn take_captured_notes(&mut self) -> Vec<RecNote> {
+        Vec::new()
+    }
     /// The finished take (the notes not handed out yet), once, after it ended.
     fn finish_midi_recording(&mut self) -> Option<MidiTake> {
         None

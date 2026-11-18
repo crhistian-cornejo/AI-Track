@@ -109,6 +109,24 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
                 ws.toast("Drag in an empty lane to select how much silence to insert", cx);
             }
         }
+        Cmd::CaptureMidi => {
+            let n = ws.s.capture_midi();
+            ws.toast(if n == 0 { "Nothing to capture: arm a MIDI track and play while the song rolls".to_string() } else { format!("Captured MIDI on {n} track{}", if n == 1 { "" } else { "s" }) }, cx);
+        }
+        Cmd::CaptureAutomation => {
+            let n = ws.s.capture_automation();
+            ws.toast(if n == 0 { "Nothing to capture: move a knob or fader while the song rolls".to_string() } else { format!("Captured automation in {n} lane{}", if n == 1 { "" } else { "s" }) }, cx);
+        }
+        Cmd::SimplifyEnvelope => {
+            let lane = ws.s.auto_sel.map(|r| (r.track, r.target)).or_else(|| {
+                let t = ws.s.selected_track?;
+                Some((t, ws.s.shown_lanes(t).into_iter().find(|l| ws.s.project.track(t).is_some_and(|tr| tr.automation.iter().any(|a| a.target == *l && !a.points.is_empty())))?))
+            });
+            match lane.and_then(|(t, l)| ws.s.simplify_auto(t, l)) {
+                Some(n) => ws.toast(format!("Simplified: {n} breakpoint{} fewer", if n == 1 { "" } else { "s" }), cx),
+                None => ws.toast("Select an automation lane to simplify", cx),
+            }
+        }
         Cmd::Quantize => ws.quantize_clip(cx),
         Cmd::InsertMidiClip => {
             if ws.s.insert_midi_clip().is_none() {

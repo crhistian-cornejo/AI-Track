@@ -141,6 +141,8 @@ struct HandleShared {
     midi_open: Mutex<Vec<String>>,
     /// MIDI notes recorded by the audio thread, paired up for the app.
     rec_midi: Mutex<MidiCollector>,
+    /// Notes played on armed tracks while the transport rolled without recording.
+    cap_midi: Mutex<MidiCollector>,
     /// Takes already handed out by `finish_midi_recording`.
     rec_midi_taken: AtomicU64,
     /// Writes the WAV files of audio takes.
@@ -193,6 +195,7 @@ impl Engine {
             patch_count: AtomicU64::new(0),
             midi_open: Mutex::new(Vec::new()),
             rec_midi: Mutex::new(MidiCollector::default()),
+            cap_midi: Mutex::new(MidiCollector::default()),
             rec_midi_taken: AtomicU64::new(0),
             recorder: Arc::new(Recorder::spawn().map_err(EngineError::Io)?),
             virtual_input: Mutex::new(None),
@@ -465,6 +468,14 @@ impl EngineHandle {
     /// (it holds thousands of events, minutes of playing).
     pub fn take_recorded_notes(&self) -> Vec<RecordedNote> {
         lock(&self.shared.rec_midi).take_closed()
+    }
+
+    /// The notes of armed instrument tracks played while the transport rolled
+    /// without recording and that have been released since the last call
+    /// (Capture MIDI), at the timeline position they were heard. Each is
+    /// handed out once; the audio thread only pushes into a wait-free queue.
+    pub fn take_captured_notes(&self) -> Vec<RecordedNote> {
+        lock(&self.shared.cap_midi).take_closed()
     }
 
     /// The finished MIDI take: the notes not handed out yet (notes still held
@@ -1433,8 +1444,9 @@ impl Control {
         self.pending_pool = None;
         runner.set_pool(self.make_pool());
         let (rec_midi_tx, rec_midi_rx) = RingBuffer::new(REC_MIDI_QUEUE);
+        let (cap_midi_tx, cap_midi_rx) = RingBuffer::new(REC_MIDI_QUEUE);
         let (rec_audio_tx, rec_audio_rx) = RingBuffer::new(AUDIO_QUEUE);
-        runner.attach_recorder(rec_midi_tx, rec_audio_tx);
+        runner.attach_recorder(rec_midi_tx, cap_midi_tx, rec_audio_tx);
         // The old audio thread is gone. A take it was recording ends here, so
         // the app gets what was captured and the next take can start: the
         // notes still in the old queue are collected, the files are closed.
@@ -1444,6 +1456,11 @@ impl Control {
             let mut notes = lock(&self.shared.rec_midi);
             notes.drain();
             notes.rx = Some(rec_midi_rx);
+        }
+        {
+            let mut notes = lock(&self.shared.cap_midi);
+            notes.drain();
+            notes.rx = Some(cap_midi_rx);
         }
         self.shared.recorder.attach(rec_audio_rx);
         if mid_take {

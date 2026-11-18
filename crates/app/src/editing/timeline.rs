@@ -208,7 +208,7 @@ impl AppState {
     /// at the insert marker. What was there is replaced.
     pub fn insert_midi_clip(&mut self) -> Option<ClipId> {
         let track = self.selected_track.and_then(|t| self.project.track(t)).filter(|t| t.kind == TrackKind::Instrument)?;
-        let (track, color) = (track.id, track.color);
+        let (track, color) = (track.id, self.clip_color_for(track.color));
         let bar = self.grid_spec(GridView::Arrange).bar;
         let (start, end) = match self.time_selection().filter(|s| s.tracks.contains(&track)) {
             Some(sel) => (sel.start, sel.end),

@@ -235,7 +235,7 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
         .items_center()
         .gap(px(SP2))
         .rounded(px(r_md()))
-        .bg(if selected { pal.raised } else { pal.surface })
+        .bg(track_header_bg(if selected { pal.raised } else { pal.surface }, t.color))
         .border_1()
         .border_color(if selected { accent_alpha(0.5) } else { border() })
         .cursor_pointer()

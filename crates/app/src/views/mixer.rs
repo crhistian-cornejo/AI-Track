@@ -241,7 +241,7 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
         .flex()
         .flex_col()
         .rounded(px(r_lg()))
-        .bg(if selected { pal.raised } else { pal.surface })
+        .bg(track_header_bg(if selected { pal.raised } else { pal.surface }, t.color))
         .border_1()
         .border_color(if selected { accent_alpha(0.45) } else { border() })
         .when(!selected, |d| d.hover(|s| s.border_color(border_strong())))

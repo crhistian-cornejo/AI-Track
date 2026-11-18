@@ -127,6 +127,10 @@ macro_rules! tokens {
             pub fn set(&mut self, name: &str, v: Rgba8) -> bool {
                 match name { $(stringify!($name) => { self.$name = v; true })* _ => false }
             }
+            /// Every token passed through `f` (name, value).
+            pub fn map(&self, mut f: impl FnMut(&'static str, Rgba8) -> Rgba8) -> Colors {
+                Colors { $($name: f(stringify!($name), self.$name),)* }
+            }
             fn palette(&self, dark: bool) -> Palette {
                 Palette { dark, $($name: self.$name.to_hsla(),)* }
             }
@@ -201,6 +205,155 @@ impl Default for Colors {
     }
 }
 
+/// The areas the Appearance editor groups tokens into, in display order.
+pub const TOKEN_GROUPS: &[&str] = &["Surfaces", "Text", "Accents", "States", "Arrangement", "Mixer & Meters", "Piano Roll", "Waveforms", "Automation", "Device Graphs"];
+
+/// Which editor group a token belongs to (one of [`TOKEN_GROUPS`]).
+pub fn token_group(name: &str) -> &'static str {
+    match name {
+        "base" | "panel" | "surface" | "raised" | "overlay" | "well" | "border" | "divider" | "shadow" => "Surfaces",
+        "text" | "muted" | "faint" | "on_accent" => "Text",
+        "accent" | "accent2" | "selection" | "focus" | "ink" => "Accents",
+        "record" | "play" | "solo" | "mute" | "arm" => "States",
+        "grid_bar" | "grid_beat" | "grid_sub" | "clip_text_light" | "clip_text_dark" => "Arrangement",
+        "meter_low" | "meter_mid" | "meter_high" => "Mixer & Meters",
+        "key_white" | "key_black" | "row_scale" | "row_out" | "scale_highlight" | "root_highlight" => "Piano Roll",
+        "waveform" => "Waveforms",
+        "automation" => "Automation",
+        _ => "Device Graphs",
+    }
+}
+
+// ───────────────────────────── Theme adjustments ─────────────────────────────
+
+/// Global adjustments applied on top of any theme (Live's Themes & Colors
+/// sliders). The default changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeAdjust {
+    /// Hue shift in degrees, wrapping (-180..=180).
+    pub hue: f32,
+    /// -1 = grey, 0 = as designed, 1 = fully saturated.
+    pub saturation: f32,
+    /// -1 = black, 0 = as designed, 1 = white.
+    pub brightness: f32,
+    /// -1 = flat grey, 0 = as designed, 1 = doubled spread around mid grey.
+    pub contrast: f32,
+    /// Multiplies the opacity of the arrangement, piano roll and session grid lines (1 = as designed).
+    pub grid: f32,
+}
+
+impl Default for ThemeAdjust {
+    fn default() -> Self {
+        Self { hue: 0., saturation: 0., brightness: 0., contrast: 0., grid: 1. }
+    }
+}
+
+impl ThemeAdjust {
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether the colour sliders (not the grid one) change anything.
+    fn colours_neutral(&self) -> bool {
+        self.hue == 0. && self.saturation == 0. && self.brightness == 0. && self.contrast == 0.
+    }
+
+    /// Keep every slider inside its range.
+    pub fn clamped(self) -> Self {
+        Self { hue: self.hue.clamp(-180., 180.), saturation: self.saturation.clamp(-1., 1.), brightness: self.brightness.clamp(-1., 1.), contrast: self.contrast.clamp(-1., 1.), grid: self.grid.clamp(0., 3.) }
+    }
+
+    /// `c` with hue, saturation, brightness and contrast applied (alpha untouched).
+    pub fn colour(&self, c: Rgba8) -> Rgba8 {
+        if self.colours_neutral() {
+            return c;
+        }
+        let mut h = c.to_hsla();
+        h.h = (h.h + self.hue / 360.).rem_euclid(1.);
+        h.s = if self.saturation >= 0. { h.s + (1. - h.s) * self.saturation } else { h.s * (1. + self.saturation) }.clamp(0., 1.);
+        h.l = (0.5 + (h.l - 0.5) * (1. + self.contrast)).clamp(0., 1.);
+        h.l = if self.brightness >= 0. { h.l + (1. - h.l) * self.brightness } else { h.l * (1. + self.brightness) }.clamp(0., 1.);
+        let out = Rgba8::from_hsla(h);
+        Rgba8(out.0 & !0xFF | c.0 & 0xFF)
+    }
+
+    /// `c` with its opacity scaled by the grid-line intensity.
+    pub fn grid_line(&self, c: Rgba8) -> Rgba8 {
+        if self.grid == 1. {
+            return c;
+        }
+        let a = ((c.0 & 0xFF) as f32 * self.grid).round().clamp(0., 255.) as u32;
+        Rgba8(c.0 & !0xFF | a)
+    }
+}
+
+impl Colors {
+    /// The tokens with `adj` applied; grid lines also get their intensity.
+    pub fn adjusted(&self, adj: &ThemeAdjust) -> Colors {
+        if adj.is_neutral() {
+            return self.clone();
+        }
+        let adj = adj.clamped();
+        self.map(|name, v| {
+            let v = adj.colour(v);
+            if matches!(name, "grid_bar" | "grid_beat" | "grid_sub") { adj.grid_line(v) } else { v }
+        })
+    }
+}
+
+// ───────────────────────────── Note colouring ─────────────────────────────
+
+/// What colours notes in the piano roll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteColor {
+    /// The clip's colour; velocity sets the opacity.
+    #[default]
+    Clip,
+    /// A ramp across the meter colours from soft to hard.
+    Velocity,
+    /// One hue per pitch class.
+    Pitch,
+    /// The clip's colour, draining away as the chance to play falls.
+    Chance,
+}
+
+impl NoteColor {
+    pub const ALL: [NoteColor; 4] = [Self::Clip, Self::Velocity, Self::Pitch, Self::Chance];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Clip => "Clip",
+            Self::Velocity => "Velocity",
+            Self::Pitch => "Pitch",
+            Self::Chance => "Chance",
+        }
+    }
+}
+
+/// The body colour of a note (opacity is applied by the caller).
+pub fn note_fill(mode: NoteColor, clip: Hsla, key: u8, velocity: f32, chance: f32) -> Hsla {
+    if mode == NoteColor::Clip {
+        return clip;
+    }
+    note_fill_in(&p(), mode, clip, key, velocity, chance)
+}
+
+fn note_fill_in(pal: &Palette, mode: NoteColor, clip: Hsla, key: u8, velocity: f32, chance: f32) -> Hsla {
+    match mode {
+        NoteColor::Clip => clip,
+        NoteColor::Velocity => {
+            let v = velocity.clamp(0., 1.);
+            if v < 0.5 { mix(pal.meter_low, pal.meter_mid, v * 2.) } else { mix(pal.meter_mid, pal.meter_high, (v - 0.5) * 2.) }
+        }
+        NoteColor::Pitch => {
+            let (s, l) = if pal.dark { (0.68, 0.62) } else { (0.72, 0.46) };
+            Hsla { h: (key % 12) as f32 / 12., s, l, a: 1. }
+        }
+        NoteColor::Chance => mix(pal.muted, clip, chance.clamp(0., 1.)),
+    }
+}
+
 // ───────────────────────────── Style ─────────────────────────────
 
 /// How tightly the main window packs its rows: see [`Metrics`].
@@ -258,6 +411,20 @@ pub struct ClipStyle {
     pub saturation: f32,
     /// Multiplies the clip colour's lightness (dark themes) or lifts it (light themes).
     pub brightness: f32,
+}
+
+impl ClipStyle {
+    /// The clip tone at a colour intensity (1 = as the theme designed it,
+    /// 0 = washed out and dim, 2 = vivid and strong).
+    pub fn with_intensity(self, intensity: f32, dark: bool) -> Self {
+        let i = intensity.clamp(0., 2.);
+        if i == 1. {
+            return self;
+        }
+        // Dark themes lift the lightness with intensity; light themes deepen it.
+        let b = if dark { 0.6 + 0.4 * i } else { 1.4 - 0.4 * i };
+        Self { saturation: (self.saturation * i).clamp(0., 1.5), brightness: self.brightness * b }
+    }
 }
 
 impl Default for ClipStyle {
@@ -465,6 +632,8 @@ pub struct Resolved {
     /// Panes painted translucent over a background image.
     pub glass: Vec<crate::appearance::Pane>,
     pub glass_alpha: f32,
+    /// How strongly track headers wear their track's colour (0 = not at all).
+    pub track_tint: f32,
 }
 
 struct Runtime {
@@ -478,7 +647,7 @@ thread_local! {
     static RT: RefCell<Runtime> = RefCell::new({
         let t = &builtin_themes()[0];
         let pal = t.colors.palette(t.dark);
-        Runtime { target: pal, from: pal, start: Instant::now() - TWEEN, resolved: Resolved { style: t.style.clone(), clips: t.clips, glass: Vec::new(), glass_alpha: 1. } }
+        Runtime { target: pal, from: pal, start: Instant::now() - TWEEN, resolved: Resolved { style: t.style.clone(), clips: t.clips, glass: Vec::new(), glass_alpha: 1., track_tint: 0. } }
     });
 }
 
@@ -797,6 +966,20 @@ pub fn track_color(c: Color) -> Hsla {
     Rgba8::rgb(c.0).to_hsla()
 }
 
+/// A track header's background: `base` tinted with the track colour by the
+/// Track Color Intensity setting (unchanged at 0).
+pub fn track_header_bg(base: Hsla, c: Color) -> Hsla {
+    let t = RT.with(|rt| rt.borrow().resolved.track_tint).clamp(0., 1.);
+    if t <= 0. { base } else { mix(base, clip_fill(c), t * 0.5) }
+}
+
+/// A translucent wash of the track colour for headers that paint over their own
+/// background; `None` while Track Color Intensity is 0.
+pub fn track_tint_overlay(c: Color) -> Option<Hsla> {
+    let t = RT.with(|rt| rt.borrow().resolved.track_tint).clamp(0., 1.);
+    (t > 0.).then(|| with_alpha(clip_fill(c), t * 0.35))
+}
+
 /// A project colour toned for a clip body on this theme.
 pub fn clip_fill(c: Color) -> Hsla {
     let mut h = track_color(c);
@@ -1024,5 +1207,85 @@ mod tests {
         assert_eq!(c.get("accent"), Some(Rgba8::rgb(0x123456)));
         assert!(!c.set("nope", Rgba8::rgb(0)));
         assert!(!token_doc("base").is_empty());
+    }
+
+    #[test]
+    fn neutral_adjustments_change_nothing() {
+        let c = Colors::default();
+        assert!(ThemeAdjust::default().is_neutral());
+        assert_eq!(c.adjusted(&ThemeAdjust::default()), c);
+        // Contrast 0 (and every other slider at rest) leaves a colour exactly alone.
+        assert_eq!(ThemeAdjust { contrast: 0., ..Default::default() }.colour(Rgba8::rgb(0x123456)), Rgba8::rgb(0x123456));
+        // The serialised default is what an old settings file reads as.
+        assert_eq!(serde_json::from_str::<ThemeAdjust>("{}").unwrap(), ThemeAdjust::default());
+    }
+
+    #[test]
+    fn hue_shift_wraps_and_keeps_alpha() {
+        let c = Rgba8::rgba(0xFF0000, 0x80);
+        let shifted = |deg: f32| ThemeAdjust { hue: deg, ..Default::default() }.colour(c);
+        assert_eq!(shifted(120.), Rgba8::rgba(0x00FF00, 0x80));
+        assert_eq!(shifted(-120.), Rgba8::rgba(0x0000FF, 0x80));
+        assert_eq!(shifted(360.), c);
+        assert_eq!(shifted(-180.), shifted(180.));
+    }
+
+    #[test]
+    fn saturation_brightness_and_contrast_move_the_right_way() {
+        let c = Rgba8::rgb(0x3060C0);
+        let sat = |v: f32| ThemeAdjust { saturation: v, ..Default::default() }.colour(c).to_hsla();
+        assert!(sat(-0.5).s < c.to_hsla().s && sat(0.5).s > c.to_hsla().s);
+        assert!(sat(-1.).s < 0.01);
+        let lum = |v: f32| ThemeAdjust { brightness: v, ..Default::default() }.colour(c).to_hsla().l;
+        assert!(lum(-0.5) < lum(0.) && lum(0.5) > lum(0.));
+        let con = |v: f32, x: u32| ThemeAdjust { contrast: v, ..Default::default() }.colour(Rgba8::rgb(x)).to_hsla().l;
+        // More contrast pushes dark darker and light lighter; less pulls both to mid grey.
+        assert!(con(0.5, 0x202020) < con(0., 0x202020) && con(0.5, 0xE0E0E0) > con(0., 0xE0E0E0));
+        assert!(con(-1., 0x202020) > 0.45 && con(-1., 0xE0E0E0) < 0.55);
+    }
+
+    #[test]
+    fn grid_intensity_scales_only_grid_lines() {
+        let base = Colors::default();
+        let adj = ThemeAdjust { grid: 2., ..Default::default() };
+        let c = base.adjusted(&adj);
+        assert_eq!(c.grid_bar.0 & 0xFF, ((base.grid_bar.0 & 0xFF) * 2).min(255));
+        assert_eq!(c.grid_bar.0 >> 8, base.grid_bar.0 >> 8);
+        assert_eq!(c.panel, base.panel);
+        assert_eq!(base.adjusted(&ThemeAdjust { grid: 0., ..Default::default() }).grid_sub.0 & 0xFF, 0);
+    }
+
+    #[test]
+    fn clip_intensity_is_neutral_at_one() {
+        for t in builtin_themes() {
+            assert_eq!(t.clips.with_intensity(1., t.dark), t.clips);
+            let (lo, hi) = (t.clips.with_intensity(0.2, t.dark), t.clips.with_intensity(1.8, t.dark));
+            assert!(lo.saturation < t.clips.saturation && hi.saturation > t.clips.saturation, "{}", t.name);
+            if t.dark { assert!(lo.brightness < hi.brightness) } else { assert!(lo.brightness > hi.brightness) }
+        }
+    }
+
+    #[test]
+    fn every_token_has_a_group() {
+        for name in Colors::NAMES {
+            assert!(TOKEN_GROUPS.contains(&token_group(name)), "{name}");
+        }
+        // Every group has at least one token.
+        for g in TOKEN_GROUPS {
+            assert!(Colors::NAMES.iter().any(|n| token_group(n) == *g), "{g} is empty");
+        }
+    }
+
+    #[test]
+    fn note_modes_colour_by_their_input() {
+        let pal = builtin_themes()[0].colors.palette(true);
+        let clip = Rgba8::rgb(0x5B8DEF).to_hsla();
+        let f = |m, key, v, c| note_fill_in(&pal, m, clip, key, v, c);
+        assert_eq!(f(NoteColor::Clip, 60, 0.2, 0.1), clip);
+        assert_ne!(f(NoteColor::Velocity, 60, 0.1, 1.), f(NoteColor::Velocity, 60, 0.9, 1.));
+        assert_eq!(f(NoteColor::Pitch, 60, 0.5, 1.), f(NoteColor::Pitch, 72, 0.9, 0.2));
+        assert_ne!(f(NoteColor::Pitch, 60, 0.5, 1.), f(NoteColor::Pitch, 61, 0.5, 1.));
+        assert_eq!(f(NoteColor::Chance, 60, 0.5, 1.), clip);
+        assert_eq!(f(NoteColor::Chance, 60, 0.5, 0.), pal.muted);
     }
 }

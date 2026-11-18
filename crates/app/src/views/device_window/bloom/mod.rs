@@ -1,18 +1,25 @@
-//! The Bloom window: the field at full size, the DNA of the selected sound
-//! beside it, the sixteen pads with their locks, and every control in
-//! groups (Grow, Macros, Morph, Play). Rendered through the Workspace with
-//! the same commands as the Device View card.
+//! The Bloom window, laid out like a plugin: a top bar (title, seed, the
+//! species, the material picker), the generator on the left (Roll and
+//! Mutate, the history, Deviance, the selected sound's envelope, the macros,
+//! the export chip), the stage on the right (the matter and the sixteen
+//! swatches), and tabs under them (the DNA, Morph, Play, Tools). Rendered
+//! through the Workspace with the same commands as the Device View card.
 
 pub mod dna;
 pub mod field;
+pub mod layout;
 pub mod look;
+pub mod matter;
+pub mod stage;
 pub mod view;
 pub mod visual;
 
-use crate::icons::{Icon, icon};
+pub use layout::render;
+
+use crate::icons::Icon;
 use crate::theme::*;
 use crate::views::device_ui::kit::{self, Handle, PlotCfg, ax};
-use crate::views::device_ui::{Dev, instr};
+use crate::views::device_ui::Dev;
 use crate::views::devices::knob_control_sized;
 use crate::widgets::{self, knob_cell, label, mono, text_button};
 use crate::workspace::{KnobTarget, Workspace};
@@ -99,58 +106,6 @@ pub fn species_chips(dev: &Dev, scene: &Scene, cx: &mut Context<Workspace>) -> D
                     view::roll(this, &d, Some(s));
                     cx.notify();
                 })),
-        );
-    }
-    row
-}
-
-/// The sixteen pads: colour, role, lock. Click selects and plays, the lock toggles.
-fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, cx: &mut Context<Workspace>) -> Div {
-    let pal = p();
-    let looks = view::looks(ws, scene);
-    let selected = dev.choice(p::SELECTED);
-    let mut row = div().flex_none().w_full().flex().flex_wrap().gap(px(SP1));
-    for (i, lk) in looks.iter().enumerate() {
-        let rgb = lk.rgb;
-        let e = look::encode;
-        let color: gpui::Hsla = gpui::Rgba { r: e(rgb[0]), g: e(rgb[1]), b: e(rgb[2]), a: 1. }.into();
-        let locked = scene.locked(i);
-        let (d1, d2) = (dev.clone(), dev.clone());
-        let lit = dev.m(i).clamp(0., 1.);
-        row = row.child(
-            div()
-                .id(("bloom-pad", dev.key(0x100 | i)))
-                .flex_1()
-                .min_w(px(52.))
-                .h(px(36.))
-                .px(px(SP2))
-                .flex()
-                .items_center()
-                .gap(px(SP1))
-                .rounded(px(r_sm()))
-                .cursor_pointer()
-                .bg(mix(content(0.04), with_alpha(color, 0.35), lit))
-                .border_1()
-                .border_color(if i == selected { with_alpha(color, 0.9) } else { border() })
-                .hover(|st| st.bg(content(0.09)))
-                .child(div().size(px(8.)).rounded_full().bg(color))
-                .child(div().flex().flex_col().child(mono(format!("{:02}", i + 1), TEXT_XS, pal.faint)).child(label(scene.sounds[i].role.short(), TEXT_XS, pal.text).font_weight(FontWeight::MEDIUM)))
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id(("bloom-pad-lock", dev.key(0x200 | i)))
-                        .child(icon(Icon::Lock, 10., if locked { pal.accent } else { with_alpha(pal.faint, 0.6) }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            view::toggle_lock(this, &d1, i);
-                            cx.notify();
-                        })),
-                )
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.fx.bloom.view(d2.id).dna_cell = Some(i);
-                    visual::audition(this, &d2, i, cx);
-                }))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.release_audition(cx))),
         );
     }
     row
@@ -285,42 +240,3 @@ pub fn pick_and_match(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>
     .detach();
 }
 
-pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let scene = view::shown(ws, dev);
-    let cell = ws.fx.bloom.view(dev.id).dna_cell.unwrap_or_else(|| dev.choice(p::SELECTED)).min(SOUNDS - 1);
-    let looks = view::looks(ws, &scene);
-    let e = look::encode;
-    let rgb = looks[cell].rgb;
-    let cell_color: gpui::Hsla = gpui::Rgba { r: e(rgb[0]), g: e(rgb[1]), b: e(rgb[2]), a: 1. }.into();
-    let visual = visual::visual(ws, dev, &scene, true, cx);
-    let dna = dna::panel(ws, dev, &scene, cell, cell_color, cx);
-    let cost = ws.fx.bloom.view(dev.id).cost.get();
-    let mut title = vec![
-        instr::tag("SEED", format!("{:06}", scene.seed), pal.accent, false),
-        instr::tag("VOICES", format!("{:.0}", dev.m(82) * aitrack_stock::instrument::bloom::VOICES as f32), pal.accent2, dev.m(82) > 0.),
-    ];
-    title.extend(grow_buttons(ws, dev, cx).into_iter().map(|e| div().child(e)));
-    let main = div()
-        .flex_1()
-        .min_h(px(340.))
-        .flex()
-        .gap(px(SP3))
-        .child(instr::stage(340.).min_w(px(420.)).child(visual))
-        .child(div().flex_none().w(px(320.)).h_full().child(dna));
-    let groups = vec![
-        instr::group("GROW", pal.accent, vec![dial(dev, p::DEVIANCE, 36., cx), tools(ws, dev, cx).into_any_element()]),
-        instr::group("MACROS", series(1), [p::DECAY, p::BODY, p::TONE, p::GRIT, p::SPACE].iter().map(|&id| dial(dev, id, 36., cx)).collect()),
-        instr::group("MORPH", series(2), vec![morph(ws, dev, 88., cx).into_any_element()]),
-        instr::group("PLAY", pal.muted, vec![instr::chips(dev, p::MODE, cx), dial(dev, p::BASE, 30., cx), dial(dev, p::SELECTED, 30., cx), instr::chips(dev, p::CHOKE, cx), dial(dev, p::VELOCITY, 30., cx), dial(dev, p::TUNE, 30., cx), dial(dev, p::VOLUME, 30., cx)]),
-    ];
-    instr::root(1000.)
-        .child(div().flex_none().flex().items_center().gap(px(SP3)).child(instr::title("BLOOM · GENERATIVE SCENE", title)).child(species_chips(dev, &scene, cx)))
-        .child(main)
-        .child(pads(ws, dev, &scene, cx))
-        .child(instr::groups(groups))
-        .child(instr::hint(&format!(
-            "Click a cell to hear it · drag it out to grow it further from its core, in to bring it back · Alt-click locks · drop a sample on the field to match it · field {cost:.2} ms"
-        )))
-        .into_any_element()
-}

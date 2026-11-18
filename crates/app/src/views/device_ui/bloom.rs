@@ -1,8 +1,8 @@
-//! `instrument.bloom`: the generative scene. The card is the field (sixteen
-//! cells whose colour and shape come from their sound, glowing as they
-//! play) with Roll, Mutate, Deviance and the four macros; the expanded card
-//! adds the species, the morph pad and the tools; the device window has
-//! everything, the DNA panel included ([`window`]).
+//! `instrument.bloom`: the generative scene. The card is a smaller live
+//! render of the window's matter (the GPU stage, `bloom/stage.rs`) with
+//! Roll, Mutate, Deviance and the four macros; the expanded card adds the
+//! species, the morph pad and the tools; the device window has everything,
+//! the material picker and the DNA panel included ([`window`]).
 
 use super::{Dev, caption, kit};
 use crate::theme::*;
@@ -17,7 +17,7 @@ use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, px};
 #[path = "../device_window/bloom/mod.rs"]
 pub mod window;
 
-use window::{dial, view, visual};
+use window::{dial, stage, view};
 
 pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Workspace>) -> AnyElement {
     if kit::in_window() {
@@ -27,7 +27,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
     let scene = view::shown(ws, dev);
     let w = if dev.big { 720. } else { 460. };
     let selected = dev.choice(p::SELECTED).min(15);
-    let field = visual::visual(ws, dev, &scene, dev.big, cx);
+    // The same matter as the window, smaller, in a bezel its corners take the colour of.
+    let bezel = pal.surface;
+    let field = stage::stage(ws, dev, &scene, stage::Opts { swatches: false, outer: bezel, slot: 1 }, cx);
     let mut side = div().flex_none().w(px(112.)).flex().flex_col().gap(px(SP1));
     let buttons = window::grow_buttons(ws, dev, cx);
     let mut it = buttons.into_iter();
@@ -49,7 +51,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
     }
     let mut panel = kit::panel(w)
         .child(header)
-        .child(div().flex_1().min_h(px(96.)).flex().gap(px(SP2)).child(div().flex_1().min_w(px(0.)).h_full().child(field)).child(side));
+        .child(div().flex_1().min_h(px(96.)).flex().gap(px(SP2)).child(div().flex_1().min_w(px(0.)).h_full().p(px(SP1)).rounded(px(r_lg())).bg(bezel).border_1().border_color(border()).child(field)).child(side));
     if dev.big {
         macros = macros.child(dial(dev, p::SPACE, 26., cx)).child(dial(dev, p::VOLUME, 26., cx));
         let morph = window::morph(ws, dev, 64., cx);

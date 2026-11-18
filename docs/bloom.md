@@ -16,7 +16,7 @@ itself.
 | `crates/stock/src/instrument/bloom/mod.rs` | The device: params, voices, meter, state |
 | `crates/ai/src/generate/bloom.rs` | Matching a sample (evolution search over the embedding) |
 | `crates/app/src/views/device_ui/bloom.rs` | The Device View card, dev views |
-| `crates/app/src/views/device_window/bloom/` | The window, the field renderer, the look mapping, the DNA panel |
+| `crates/app/src/views/device_window/bloom/` | The window (`layout.rs`), the GPU stage (`stage.rs`, `matter/`), the CPU field fallback, the look mapping, the DNA panel |
 
 ## The scene
 
@@ -102,7 +102,44 @@ mapped by `look::look`:
 Colours are built in OkLCH and brought into the sRGB gamut by lowering the
 chroma, so equal lightness looks equal across hues.
 
-## The field
+## The matter (the stage)
+
+The window and the card show the scene as one liquid mass, raymarched in a
+WGSL shader on the GPU (`bloom/matter/`): glossy black ferrofluid by default,
+its colour and shape driven by the sound playing.
+
+| Piece | What |
+|---|---|
+| `matter/matter.wgsl` | The shader: SDF of six warped balls melted together (smooth-min), quintic value-noise folds and creases, an FM standing wave, ferrofluid spikes on a spherical Fibonacci lattice (cones grown on top and towards the pointer), sphere tracing (≤ 80 steps, bounding sphere, a spike-free bound for long steps), a procedural studio (softboxes, strips, a floor that picks up the panel), Schlick Fresnel, a GGX clearcoat hotspot, thin-film iridescence, a rim, occlusion, a 2.5D vapour plume, a contact shadow, analytic edge AA. The noise lattice is a 32³ volume read with exact loads (hardware filtering grains the highlights). |
+| `matter/material.rs` | Obsidian, Mercury, Oil Slick, Pearl, Ember (molten veins), Glass, Ink: uniform sets. Stored by key in the state (`extra.visual`), one undo step (`SetDeviceState`); the sound never depends on it. |
+| `matter/mapping.rs` | A timbre → its look (below). |
+| `matter/frame.rs` | The motion: the playing sound takes the stage (its look blends in on a hit and decays back to the selected sound), spikes rise at once and sink in 0.3 s, a hit shakes and puffs the vapour, the pointer attracts from outside the mass and pushes in over it. A few µs a frame. |
+| `matter/gpu.rs`, `service.rs` | One wgpu device (Metal / DX12) for every Bloom, created lazily on the `bloom-matter` thread. The UI posts the frame's uniforms and paints the newest finished frame (one frame behind, never waiting). |
+| `matter/surface.rs` | macOS: frames are NV12 IOSurface `CVPixelBuffer`s that wgpu renders into through Metal textures made from the IOSurface planes, shown with `Window::paint_surface` (zero-copy; three rotate). Elsewhere frames are read back as BGRA and uploaded with `paint_image`. |
+| `stage.rs` | The GPUI element: the frame, the sixteen swatches, the gestures. |
+
+Frames are at most 512 device pixels on their long side (scaled up by the
+GPU). The stage draws at full rate while it moves (hits, the pointer, a
+drag) and breathes at about 12 frames a second when idle, only while shown;
+with reduced motion it is one still frame, redrawn when the look changes.
+Without a GPU adapter the CPU field below is drawn instead.
+
+| Measure | Becomes (per sound, on top of the material) |
+|---|---|
+| Spectral centroid | Thin-film shift (low sounds thick magenta–green films, bright ones thin gold–blue) and the vapour's hue |
+| Noisiness, brightness, decay | The vapour's three colours (pale holographic bands around the sound's hue, greyer for noise, deeper on light themes) and its amount (noise and long decays smoke more) |
+| Transient speed, inharmonicity | Spike sharpness (cone → needle) and count (36 → 150) |
+| Noisiness, FM | Roughness; wobble frequency and depth |
+| Energy, decay | Size and how far a hit swells it |
+| Live meter (envelope, pulse, centroid, noisiness) | The playing sound's look leans to what it sounds like now; pulses spike, shake and puff |
+
+Offline preview (headless, no window):
+`cargo run -p aitrack-app --release --example bloom_matter_render -- <out_dir>`
+writes every material at rest and on a hit, six sounds' looks, light and dark
+panels, a 30-frame strip and `timing.txt`. `MATTER_WGSL=<file>` renders with
+another copy of the shader, to tune it without rebuilding.
+
+## The field (CPU fallback)
 
 Sixteen cells orbit a core at a radius set by their distance. Each frame the
 cells' kernels `(1 − q/4)³` (q = distance² over the radius² in that
@@ -144,6 +181,10 @@ neighbours. It never runs on the audio thread and stops when cancelled.
   another sound later), hats in one choke group.
 - **Render samples**: sixteen 24-bit WAVs in `AI-Track/Bloom/<species> <seed>`
   of the music folder, added to the library.
+- **Export sound** (the chip under the macros): the selected sound as one
+  WAV in the same folder; the chip then drags it onto a track or a pad as a
+  sample (inside the app: GPUI has no drag out to the OS).
+- **Matter**: the material picker in the top bar (previous, the menu, next).
 
 ## Dev views
 

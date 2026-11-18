@@ -132,19 +132,35 @@ pub fn effective_scene(stored: Option<&Scene>, seed: u64, species: Species) -> S
 
 /// The state blob for a scene and its corners (what the editor stores).
 pub fn state_json(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners) -> Vec<u8> {
+    state_json_with(params, scene, corners, None)
+}
+
+/// [`state_json`] with the editor's visual look (`visual`: the key of the
+/// visual's material; the sound never depends on it).
+pub fn state_json_with(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners, visual: Option<&str>) -> Vec<u8> {
     let mut p = serde_json::Map::new();
     for (k, v) in params {
         p.insert(k.to_string(), Value::from(f64::from(*v)));
     }
-    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners) });
+    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners, visual) });
     serde_json::to_vec(&root).unwrap_or_default()
 }
 
-fn extra_json(scene: &Scene, corners: &Corners) -> Value {
-    json!({
+fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>) -> Value {
+    let mut extra = json!({
         "scene": scene.to_json(),
         "corners": corners.iter().map(|c| c.as_ref().map_or(Value::Null, |s| serde_json::to_value(**s).unwrap_or(Value::Null))).collect::<Vec<_>>(),
-    })
+    });
+    if let (Some(v), Some(map)) = (visual, extra.as_object_mut()) {
+        map.insert("visual".into(), Value::from(v));
+    }
+    extra
+}
+
+/// The visual's material a state blob names, if any.
+pub fn visual_of(data: Option<&[u8]>) -> Option<String> {
+    let root = data.and_then(|d| serde_json::from_slice::<Value>(d).ok())?;
+    root.get("extra")?.get("visual")?.as_str().map(str::to_owned)
 }
 
 /// The scene and corners a state blob holds (`None` parts when absent).
@@ -192,6 +208,8 @@ pub struct Bloom {
     /// Bit `i` set: sound `i`'s level has been measured.
     measured: u16,
     corners: [Option<Box<Corner>>; 4],
+    /// The editor's visual material, kept so a saved state round-trips it.
+    visual: Option<String>,
     voices: Box<[Voice; VOICES]>,
     age: u64,
     scratch: Vec<f32>,
@@ -261,6 +279,7 @@ impl Bloom {
             gains,
             measured: u16::MAX,
             corners: Default::default(),
+            visual: None,
             voices: Box::new([idle; VOICES]),
             age: 0,
             scratch: vec![0.0; MEASURE_FRAMES * 2],
@@ -570,13 +589,14 @@ impl Processor for Bloom {
 
     fn save_state(&self) -> Vec<u8> {
         let corners: Corners = std::array::from_fn(|k| self.corners[k].as_ref().map(|c| Box::new(c.sounds)));
-        save_state(&self.params, extra_json(&self.scene, &corners))
+        save_state(&self.params, extra_json(&self.scene, &corners, self.visual.as_deref()))
     }
 
     fn load_state(&mut self, data: &[u8]) {
         let extra = load_state(&mut self.params, data);
-        let wrapped = json!({ "extra": extra });
-        let (stored, corners) = parse_state(serde_json::to_vec(&wrapped).ok().as_deref());
+        let wrapped = serde_json::to_vec(&json!({ "extra": extra })).ok();
+        let (stored, corners) = parse_state(wrapped.as_deref());
+        self.visual = visual_of(wrapped.as_deref());
         let (seed, species) = self.target();
         let scene = effective_scene(stored.as_ref(), seed, species);
         self.apply_scene(scene);
@@ -702,6 +722,24 @@ mod tests {
         let (parsed, corners) = parse_state(Some(&blob));
         assert_eq!(parsed.as_ref(), Some(&edited));
         assert!(corners.iter().all(Option::is_none));
+        assert_eq!(visual_of(Some(&blob)), None);
+    }
+
+    #[test]
+    fn the_visual_material_round_trips_and_leaves_the_sound_alone() {
+        let a = Bloom::new();
+        let params: std::collections::BTreeMap<u32, f32> = [(p::SEED, a.get_param(p::SEED)), (p::SPECIES, a.get_param(p::SPECIES))].into();
+        let plain = state_json(&params, a.scene(), &Default::default());
+        let blob = state_json_with(&params, a.scene(), &Default::default(), Some("mercury"));
+        assert_eq!(visual_of(Some(&blob)).as_deref(), Some("mercury"));
+        assert_eq!(parse_state(Some(&blob)).0, parse_state(Some(&plain)).0, "the same scene");
+        let mut b = Bloom::new();
+        b.load_state(&blob);
+        assert_eq!(b.scene(), a.scene());
+        // Saved by the device, the material survives.
+        assert_eq!(visual_of(Some(&b.save_state())).as_deref(), Some("mercury"));
+        assert_eq!(visual_of(None), None);
+        assert_eq!(visual_of(Some(b"not json")), None);
     }
 
     /// All sixteen sounds hit every 125 ms (up to 24 voices ringing):

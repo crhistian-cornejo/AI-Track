@@ -8,6 +8,7 @@
 
 use super::field::Field;
 use super::look::{self, Look};
+use super::matter::Material;
 use crate::views::device_ui::Dev;
 use crate::workspace::Workspace;
 use aitrack_ai::progress::CancelToken;
@@ -30,6 +31,8 @@ pub use aitrack_stock::instrument::bloom::Corners;
 pub struct Parsed {
     pub stored: Option<Scene>,
     pub corners: Corners,
+    /// The visual's material (Obsidian when the state names none).
+    pub material: Material,
 }
 
 /// Timbre analysis on a worker thread, cached by genome hash.
@@ -113,6 +116,8 @@ pub struct CellDrag {
     pub from: (f32, f32),
     pub moved: bool,
     pub distance: f32,
+    /// The distance when the drag began.
+    pub start: f32,
 }
 
 /// A gene being dragged in the DNA panel.
@@ -183,6 +188,9 @@ pub struct BloomView {
     /// Next-best matches for a cell, offered as neighbours.
     pub alternatives: Option<(usize, Vec<Genome>)>,
     pub rendering: Option<RenderJob>,
+    /// The selected sound being written for dragging, and the last one written.
+    pub export: Option<ExportJob>,
+    pub exported: Option<Exported>,
     pub painter: Rc<RefCell<Painter>>,
     /// Field cost per frame, ms (moving average).
     pub cost: Rc<Cell<f32>>,
@@ -190,6 +198,8 @@ pub struct BloomView {
     pub fake: Option<[f32; SOUNDS]>,
     pub rolls: u64,
     pub dna_cell: Option<usize>,
+    /// The GPU stage (the matter visual).
+    pub stage: super::stage::StageState,
 }
 
 impl Default for BloomView {
@@ -213,11 +223,14 @@ impl Default for BloomView {
             matching: None,
             alternatives: None,
             rendering: None,
+            export: None,
+            exported: None,
             painter: Rc::default(),
             cost: Rc::default(),
             fake: None,
             rolls: 0,
             dna_cell: None,
+            stage: Default::default(),
         }
     }
 }
@@ -241,11 +254,24 @@ impl BloomState {
     pub fn prune(&mut self, alive: &dyn Fn(DeviceId) -> bool) {
         self.views.retain(|id, v| {
             let keep = alive(*id);
-            if !keep && let Some(m) = &v.matching {
-                m.cancel.cancel();
+            if !keep {
+                if let Some(m) = &v.matching {
+                    m.cancel.cancel();
+                }
+                // Free the stage's buffers on the render thread.
+                if super::matter::service::ready() {
+                    for k in v.stage.keys() {
+                        super::matter::service::service().forget(k);
+                    }
+                }
             }
             keep
         });
+    }
+
+    /// Whether a shown stage wants its idle breathing frame now.
+    pub fn wants_tick(&self) -> bool {
+        self.views.values().any(|v| v.stage.wants_tick())
     }
 
     /// Whether any editor still moves or waits for a job.
@@ -281,7 +307,8 @@ pub fn parsed(ws: &mut Workspace, device: DeviceId) -> Rc<Parsed> {
     }
     let state = ws.s.project.device(device).and_then(|d| d.state.clone());
     let (stored, corners) = bloom::parse_state(state.as_deref());
-    let p = Rc::new(Parsed { stored, corners });
+    let material = bloom::visual_of(state.as_deref()).and_then(|k| Material::from_key(&k)).unwrap_or_default();
+    let p = Rc::new(Parsed { stored, corners, material });
     v.parsed = Some((h, p.clone()));
     p
 }
@@ -326,12 +353,13 @@ pub fn shown(ws: &mut Workspace, dev: &Dev) -> Scene {
 pub fn commit(ws: &mut Workspace, dev: &Dev, scene: &Scene, corners: Option<Corners>, label: &str) {
     let Some(d) = ws.s.project.device(dev.id) else { return };
     let corners = corners.unwrap_or_else(|| bloom::parse_state(d.state.as_deref()).1);
+    let visual = bloom::visual_of(d.state.as_deref());
     let seed = dev.to_norm(p::SEED, scene.seed.min(MAX_SEED) as f32);
     let species = dev.to_norm(p::SPECIES, scene.species.index() as f32);
     let mut params: BTreeMap<u32, f32> = d.params.clone();
     params.insert(p::SEED, seed);
     params.insert(p::SPECIES, species);
-    let state = bloom::state_json(&params, scene, &corners);
+    let state = bloom::state_json_with(&params, scene, &corners, visual.as_deref());
     let device = dev.id;
     let cmds = vec![
         Command::SetDeviceState { device, state: Some(state), preset: d.preset.clone() },
@@ -407,6 +435,25 @@ pub fn toggle_lock(ws: &mut Workspace, dev: &Dev, cell: usize) {
     commit(ws, dev, &s, None, if on { "Lock sound" } else { "Unlock sound" });
 }
 
+/// The visual's material (a look only: the sound does not change), as one
+/// undo step through the device state.
+pub fn set_material(ws: &mut Workspace, dev: &Dev, material: Material) {
+    if parsed(ws, dev.id).material == material {
+        return;
+    }
+    let s = scene(ws, dev);
+    let Some(d) = ws.s.project.device(dev.id) else { return };
+    let corners = bloom::parse_state(d.state.as_deref()).1;
+    let mut params: BTreeMap<u32, f32> = d.params.clone();
+    params.insert(p::SEED, dev.to_norm(p::SEED, s.seed.min(MAX_SEED) as f32));
+    params.insert(p::SPECIES, dev.to_norm(p::SPECIES, s.species.index() as f32));
+    let state = bloom::state_json_with(&params, &s, &corners, Some(material.key()));
+    let cmd = Command::SetDeviceState { device: dev.id, state: Some(state), preset: d.preset.clone() };
+    ws.s.seal();
+    ws.s.edit(&format!("Bloom material: {}", material.name()), vec![cmd]);
+    ws.s.seal();
+}
+
 /// Store the current scene's sounds in morph corner `k`, or clear it.
 pub fn set_corner(ws: &mut Workspace, dev: &Dev, k: usize, clear: bool) {
     let s = scene(ws, dev);
@@ -434,11 +481,16 @@ pub fn played(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> Scene {
 /// The look of every sound of `scene` (estimated until analysed).
 pub fn looks(ws: &mut Workspace, scene: &Scene) -> [Look; SOUNDS] {
     let dark = crate::theme::is_dark();
+    let t = timbres(ws, scene);
+    std::array::from_fn(|i| look::look(&t[i], dark))
+}
+
+/// The timbre of every sound of `scene` (estimated from the genes until analysed).
+pub fn timbres(ws: &mut Workspace, scene: &Scene) -> [Timbre; SOUNDS] {
     let an = ws.fx.bloom.analyzer();
     std::array::from_fn(|i| {
         let g = scene.sounds[i];
-        let t = an.get(&g).unwrap_or_else(|| look::estimate(&g));
-        look::look(&t, dark)
+        an.get(&g).unwrap_or_else(|| look::estimate(&g))
     })
 }
 
@@ -613,29 +665,63 @@ pub fn start_render(ws: &mut Workspace, dev: &Dev) {
 /// Write every sound of `scene` into `dir` as `NN Role.wav`.
 pub fn render_all(scene: &Scene, dir: &std::path::Path, progress: &mut dyn FnMut(usize)) -> Result<Vec<PathBuf>, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    let sr = 48_000u32;
     let mut out = Vec::new();
     for (i, g) in scene.sounds.iter().enumerate() {
-        let max = (sr * 4) as usize;
-        let (l, r) = bloom::render::render_normalised(g, sr as f32, max, 1.0);
-        let n = bloom::render::tail_frames(&l, &r, sr as f32, max).max(256);
         let path = dir.join(format!("{:02} {}.wav", i + 1, g.role.label()));
-        let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
-        let mut w = hound::WavWriter::create(&path, spec).map_err(|e| format!("{}: {e}", path.display()))?;
-        let fade = (sr as usize / 200).min(n);
-        for k in 0..n {
-            // A short fade at the end so a trimmed tail never clicks.
-            let gain = if k + fade >= n { (n - k) as f32 / fade as f32 } else { 1.0 };
-            for v in [l[k], r[k]] {
-                let q = ((v * gain).clamp(-1.0, 1.0) * 8_388_607.0) as i32;
-                w.write_sample(q).map_err(|e| e.to_string())?;
-            }
-        }
-        w.finalize().map_err(|e| e.to_string())?;
+        let _ = write_wav(g, &path)?;
         out.push(path);
         progress(i + 1);
     }
     Ok(out)
+}
+
+/// Write one sound as a 24-bit 48 kHz stereo WAV; returns its length in seconds.
+pub fn write_wav(g: &Genome, path: &std::path::Path) -> Result<f32, String> {
+    let sr = 48_000u32;
+    let max = (sr * 4) as usize;
+    let (l, r) = bloom::render::render_normalised(g, sr as f32, max, 1.0);
+    let n = bloom::render::tail_frames(&l, &r, sr as f32, max).max(256);
+    let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(path, spec).map_err(|e| format!("{}: {e}", path.display()))?;
+    let fade = (sr as usize / 200).min(n);
+    for k in 0..n {
+        // A short fade at the end so a trimmed tail never clicks.
+        let gain = if k + fade >= n { (n - k) as f32 / fade as f32 } else { 1.0 };
+        for v in [l[k], r[k]] {
+            let q = ((v * gain).clamp(-1.0, 1.0) * 8_388_607.0) as i32;
+            w.write_sample(q).map_err(|e| e.to_string())?;
+        }
+    }
+    w.finalize().map_err(|e| e.to_string())?;
+    Ok(n as f32 / sr as f32)
+}
+
+/// A sound exported for dragging: the genome it was rendered from and the file.
+#[derive(Clone)]
+pub struct Exported {
+    pub genome: u64,
+    pub item: crate::bridge::LibraryItem,
+}
+
+/// Render the selected sound to a WAV off the UI thread (then it can be
+/// dragged onto a track or a pad as a sample).
+pub fn start_export(ws: &mut Workspace, dev: &Dev) {
+    let s = scene(ws, dev);
+    let cell = dev.choice(p::SELECTED).min(SOUNDS - 1);
+    let g = s.sounds[cell];
+    let path = render_folder(&s).join(format!("{:02} {} {:08x}.wav", cell + 1, g.role.label(), g.hash() as u32));
+    let (tx, rx) = unbounded();
+    let _ = std::thread::Builder::new().name("bloom-export".into()).spawn(move || {
+        let r = path.parent().map_or(Ok(()), |d| std::fs::create_dir_all(d).map_err(|e| e.to_string())).and_then(|_| write_wav(&g, &path)).map(|secs| (path, secs));
+        let _ = tx.send(r);
+    });
+    ws.fx.bloom.view(dev.id).export = Some(ExportJob { rx, genome: g.hash(), role: g.role.label() });
+}
+
+pub struct ExportJob {
+    pub rx: Receiver<Result<(PathBuf, f32), String>>,
+    pub genome: u64,
+    pub role: &'static str,
 }
 
 /// Pick up job results; returns whether the editor should repaint.
@@ -715,6 +801,29 @@ pub fn poll(ws: &mut Workspace, dev: &Dev, cx: &mut gpui::Context<Workspace>) ->
             Err(e) => ws.toast(e, cx),
         }
     }
+    // A sound written for dragging.
+    let v = ws.fx.bloom.view(device);
+    let got = v.export.as_ref().and_then(|j| match j.rx.try_recv() {
+        Ok(r) => Some((j.genome, j.role, r)),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => Some((j.genome, j.role, Err("The export stopped unexpectedly".to_owned()))),
+        Err(crossbeam_channel::TryRecvError::Empty) => None,
+    });
+    if let Some((genome, role, r)) = got {
+        changed = true;
+        v.export = None;
+        match r {
+            Ok((path, secs)) => {
+                let name = path.file_stem().map_or_else(|| role.to_owned(), |s| s.to_string_lossy().into_owned());
+                let item = crate::bridge::LibraryItem { id: 0, name, path: path.clone(), category: role.to_owned(), key: None, bpm: None, duration: secs, is_loop: false, favorite: false };
+                v.exported = Some(Exported { genome, item });
+                if let Some(dir) = path.parent() {
+                    let _ = ws.b.library.add_folder(dir);
+                }
+                ws.toast("Rendered the sound: drag it onto a track or a pad", cx);
+            }
+            Err(e) => ws.toast(e, cx),
+        }
+    }
     changed
 }
 
@@ -729,6 +838,7 @@ pub fn drum_rack_commands(project: &mut aitrack_model::Project, device: DeviceId
     let plain = |params: &BTreeMap<u32, f32>, id: u32| infos.iter().find(|i| i.id == id).map_or(0., |i| i.to_plain(params.get(&id).copied().unwrap_or_else(|| i.default_normalized())));
     let source = project.device(device)?;
     let corners = bloom::parse_state(source.state.as_deref()).1;
+    let visual = bloom::visual_of(source.state.as_deref());
     let base_params = source.params.clone();
     let base = plain(&base_params, p::BASE).round().clamp(0., 112.) as u8;
     let mut rack = Rack::new(RackKind::Drum);
@@ -745,7 +855,7 @@ pub fn drum_rack_commands(project: &mut aitrack_model::Project, device: DeviceId
         params.insert(p::SEED, norm(p::SEED, scene.seed.min(MAX_SEED) as f32));
         params.insert(p::SPECIES, norm(p::SPECIES, scene.species.index() as f32));
         let mut d = Device::stock(project.alloc_device_id(), bloom::ID, format!("Bloom {}", g.role.label()));
-        d.state = Some(bloom::state_json(&params, scene, &corners));
+        d.state = Some(bloom::state_json_with(&params, scene, &corners, visual.as_deref()));
         d.params = params;
         chain.devices.push(d);
         rack.chains.push(chain);

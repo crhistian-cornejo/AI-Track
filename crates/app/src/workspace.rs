@@ -1376,6 +1376,8 @@ impl Workspace {
         changed |= views::sounds::tick(self, cx);
         changed |= self.waves.poll();
         changed |= views::palette::poll(self, cx);
+        // A shown Bloom stage breathes at about 12 frames a second while idle.
+        changed |= self.fx.bloom.wants_tick();
         if let Some(r) = self.b.library.organize_result() {
             self.organize.running = false;
             self.organize.preview = None;

@@ -192,7 +192,7 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
             return;
         }
         let dist = view::scene(this, &d).distances[i];
-        this.fx.bloom.view(d.id).drag = Some(CellDrag { cell: i, from: (f32::from(e.position.x), f32::from(e.position.y)), moved: false, distance: dist });
+        this.fx.bloom.view(d.id).drag = Some(CellDrag { cell: i, from: (f32::from(e.position.x), f32::from(e.position.y)), moved: false, distance: dist, start: dist });
         this.fx.bloom.view(d.id).dna_cell = Some(i);
         audition(this, &d, i, cx);
     });

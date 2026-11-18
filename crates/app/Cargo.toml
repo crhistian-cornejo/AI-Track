@@ -44,11 +44,21 @@ async-channel = "2"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Background images: decode, downscale and pre-blur once, off the UI thread.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# The Bloom visual's shaders (MIT OR Apache-2.0): the wgpu the GPUI crates
+# already pin, Metal on macOS and DX12 on Windows, created lazily off the UI thread.
+wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "metal", "dx12", "wgsl"] }
+# Waits for wgpu's adapter and device on the Bloom render thread (Apache-2.0 OR MIT OR Zlib).
+pollster = "0.4"
 
 # `AITRACK_DEV_HIDDEN`: moves the window out of sight for background visual checks (MIT).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 raw-window-handle = "0.6"
+# The Bloom visual renders into IOSurfaces that GPUI shows as surfaces, zero-copy (MIT OR Apache-2.0 OR Zlib).
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLAllocation", "MTLPixelFormat", "MTLTypes", "objc2-io-surface"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFBase", "CFDictionary", "CFString", "CFNumber"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

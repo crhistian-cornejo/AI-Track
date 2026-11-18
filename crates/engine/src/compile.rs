@@ -394,6 +394,32 @@ fn usable(lane: &AutomationLane) -> bool {
 }
 
 /// Compile a project snapshot.
+/// What a frozen track plays: its render as one audio clip from tick 0.
+struct FrozenPlay {
+    clip: aitrack_model::Clip,
+    data: AudioClipData,
+}
+
+/// The frozen playback of `t`, or `None` when it plays live: not frozen, or
+/// its file is gone or unreadable (the track falls back to its devices, with
+/// a warning). A file that is still loading plays silence until it lands and
+/// the cache asks for a recompile.
+fn frozen_play(project: &Project, t: &Track, cx: &CompileContext<'_>, warnings: &mut Vec<String>) -> Option<FrozenPlay> {
+    let file = &t.freeze.as_ref().filter(|_| t.kind.has_clips())?.file;
+    let audio = cx.samples.get(&file.path, cx.sample_rate as u32);
+    if audio.is_none() {
+        let failed = cx.samples.error(&file.path, cx.sample_rate as u32);
+        let virtual_path = file.path.to_str().is_some_and(|s| s.contains("://"));
+        if failed.is_some() || (!virtual_path && !file.path.exists()) {
+            warnings.push(format!("track '{}': the frozen audio '{}' is missing; playing live", t.name, file.path.display()));
+            return None;
+        }
+    }
+    let bpm = project.tempo.initial_bpm();
+    let clip = aitrack_model::Clip::new("Frozen", aitrack_model::Color(0), aitrack_model::SourceId(0), file.length_ticks(bpm).max(1));
+    Some(FrozenPlay { clip, data: AudioClipData::of_bpm_in(&file.warp, audio, bpm, cx.samples) })
+}
+
 pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<CompiledGraph, CompileError> {
     let tracks = &project.tracks;
     let index: HashMap<TrackId, usize> = tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
@@ -401,6 +427,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
     let sr = cx.sample_rate;
     let max = cx.max_frames;
     let mut warnings = Vec::new();
+
+    // Frozen tracks play their render and run no devices.
+    let mut frozen: Vec<Option<FrozenPlay>> = tracks.iter().map(|t| frozen_play(project, t, cx, &mut warnings)).collect();
 
     // Routing.
     let mut dest = Vec::with_capacity(tracks.len());
@@ -444,7 +473,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
     // to a track's input and nothing to delay compensation.
     let mut side_src: Vec<Vec<usize>> = vec![Vec::new(); tracks.len()];
     for (i, t) in tracks.iter().enumerate() {
-        if !t.kind.carries_audio() {
+        if !t.kind.carries_audio() || frozen[i].is_some() {
             continue;
         }
         let mut sources = Vec::new();
@@ -570,7 +599,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
             let mut overrides = HashMap::new();
             collect_macro_overrides(&t.devices, &mut overrides);
             let mut dc = DevCx { cx: &mut *cx, overrides, handles: HashMap::new(), warnings: Vec::new(), side_slots: &side_slots, track: t.id };
-            let (nodes, lat) = if t.kind.carries_audio() { compile_devices(&t.devices, &mut dc) } else { (Vec::new(), 0) };
+            let (nodes, lat) = if t.kind.carries_audio() && frozen[i].is_none() { compile_devices(&t.devices, &mut dc) } else { (Vec::new(), 0) };
             warnings.append(&mut dc.warnings);
             chain_lat[i] = lat;
             chains.push(nodes);
@@ -635,6 +664,8 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         let handles = &handles_per_track[i];
 
         // Clips.
+        let frozen_here = frozen[i].take();
+        let is_frozen = frozen_here.is_some();
         let mut clips: Vec<CompiledClip> = Vec::new();
         let mut clip_index: HashMap<ClipId, usize> = HashMap::new();
         let mut get_clip = |id: ClipId, clips: &mut Vec<CompiledClip>, warnings: &mut Vec<String>| -> Option<usize> {
@@ -664,7 +695,10 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         };
         let mut arrangement = Vec::new();
         let mut slots = vec![None; scenes.len()];
-        if t.kind.has_clips() {
+        if let Some(f) = frozen_here {
+            clips.push(CompiledClip::audio(ClipId(0), &f.clip, f.data));
+            arrangement.push(ArrPlacement { clip: 0, start: 0 });
+        } else if t.kind.has_clips() {
             for p in t.arrangement.iter().filter(|p| p.lane == 0) {
                 if let Some(k) = get_clip(p.clip, &mut clips, &mut warnings) {
                     arrangement.push(ArrPlacement { clip: k, start: p.start });
@@ -698,6 +732,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
                 AutomationTarget::Send { index } => {
                     send_lanes.insert(index, lane.clone());
                 }
+                AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. } if is_frozen => {}
                 AutomationTarget::DeviceParam { device, param } => match handles.get(&device).and_then(|h| h.proc.as_ref()) {
                     // Hosted and stock alike: timed events in the device's node.
                     Some(_) => {
@@ -783,8 +818,9 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
 
         nodes[gpos[i]] = Some(TrackNode {
             id: t.id,
-            kind: t.kind,
-            arm: t.arm,
+            // A frozen track is a plain audio track that cannot be armed.
+            kind: if is_frozen { TrackKind::Audio } else { t.kind },
+            arm: t.arm && !is_frozen,
             monitor: t.monitor,
             input_sel: None,
             no_input: false,
@@ -940,15 +976,16 @@ pub(crate) fn param_patches(old: &Project, new: &Project) -> Option<Vec<Patch>> 
         }
         let Track {
             id, kind, name: _, color: _, volume_db, pan, mute, solo, arm, monitor, input, output, sends, parent, vca, collapsed: _, height: _, devices, session_slots, arrangement, automation,
-            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _,
+            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _, freeze,
         } = a;
         let Track {
             id: id_b, kind: kind_b, name: _, color: _, volume_db: volume_b, pan: pan_b, mute: mute_b, solo: solo_b, arm: arm_b, monitor: monitor_b, input: input_b, output: output_b, sends: sends_b,
             parent: parent_b, vca: vca_b, collapsed: _, height: _, devices: devices_b, session_slots: session_b, arrangement: arrangement_b, automation: automation_b,
-            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _,
+            reported_latency: _, scale: _, keyboard_input: _, take_lanes: _, comp: _, freeze: freeze_b,
         } = b;
         if id != id_b
             || kind != kind_b
+            || freeze != freeze_b
             || mute != mute_b
             || solo != solo_b
             || arm != arm_b

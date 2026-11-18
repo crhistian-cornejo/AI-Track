@@ -240,6 +240,20 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
             }));
         }
     }
+    // Freeze (Live): render the track so its devices stop running; Flatten makes the render audio.
+    let selection = ws.s.selected_tracks();
+    let (can_freeze, can_unfreeze) = (!ws.s.freezable(&selection).is_empty(), !ws.s.frozen_among(&selection).is_empty());
+    if can_freeze || can_unfreeze {
+        card = card.child(widgets::divider_h());
+    }
+    if can_freeze {
+        card = card.child(action("track-freeze", Icon::Snowflake, if many { "Freeze Tracks" } else { "Freeze Track" }, None, false, cx, |this, _, cx| this.freeze_selected(cx)));
+    }
+    if can_unfreeze {
+        card = card
+            .child(action("track-unfreeze", Icon::Snowflake, if many { "Unfreeze Tracks" } else { "Unfreeze Track" }, None, true, cx, |this, _, cx| this.unfreeze_selected(cx)))
+            .child(action("track-flatten", Icon::Waveform, "Flatten", None, false, cx, |this, _, cx| this.flatten_selected(cx)));
+    }
     card.child(widgets::divider_h())
         .child(
             item(

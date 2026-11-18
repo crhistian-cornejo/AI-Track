@@ -375,6 +375,8 @@ pub struct Workspace {
     pub look: views::prefs::Look,
     pub modal: Option<views::prefs::Modal>,
     pub export: views::export::ExportDialog,
+    /// Freeze renders in flight (progress on the track headers).
+    pub freeze: crate::freeze::FreezeUi,
     pub export_name: Entity<TextInput>,
     /// Audio-to-MIDI engine picked in the assistant panel.
     pub midi_mode: MidiMode,
@@ -541,6 +543,7 @@ impl Workspace {
             look,
             modal: None,
             export: views::export::ExportDialog::default(),
+            freeze: Default::default(),
             export_name,
             midi_mode: MidiMode::default(),
             analysis_jobs: Default::default(),
@@ -661,6 +664,8 @@ impl Workspace {
                         views::prefs::PrefsPage::Performance,
                     ))
                 }
+                // The first track with clips shown as frozen (header, clips, locked devices).
+                "frozen" => self.fake_freeze(),
                 "play" => self.b.engine.play(),
                 // A MIDI track with three take lanes and a comp made of parts of them.
                 "takes" => {

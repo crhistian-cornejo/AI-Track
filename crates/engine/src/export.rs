@@ -433,11 +433,170 @@ pub fn consolidate_to_wav_with(
         std::fs::create_dir_all(dir).map_err(EngineError::Io)?;
     }
     write_wav(path, &buf, sample_rate, WavFormat::Float32)?;
-    let steady = project.tempo.points().len() == 1
-        && !project.tracks.iter().any(|t| t.kind == TrackKind::Main && t.automation.iter().any(|l| l.target == AutomationTarget::Tempo && l.enabled && !l.points.is_empty()));
-    let warp = if steady { Warp { enabled: true, original_bpm: Some(project.tempo.initial_bpm()), ..Warp::default() } } else { Warp::default() };
+    let warp = follow_song_warp(project);
     let key = files.first().and_then(|a| a.key).filter(|k| files.iter().all(|a| a.key == Some(*k)));
     Ok(AudioSource { path: path.to_path_buf(), hash: None, sample_rate, channels: buf.channels() as u16, frames: buf.frames() as u64, warp, key })
+}
+
+/// The warp that makes a file rendered at the song tempo keep following it:
+/// on at the song's BPM when the tempo never changes, else off.
+fn follow_song_warp(project: &Project) -> Warp {
+    let steady = project.tempo.points().len() == 1
+        && !project.tracks.iter().any(|t| t.kind == TrackKind::Main && t.automation.iter().any(|l| l.target == AutomationTarget::Tempo && l.enabled && !l.points.is_empty()));
+    if steady { Warp { enabled: true, original_bpm: Some(project.tempo.initial_bpm()), ..Warp::default() } } else { Warp::default() }
+}
+
+// ───────────────────────────── Freeze ─────────────────────────────
+
+/// Seconds a frozen render may ring on after the last clip ends (reverb and
+/// delay tails; trailing silence is trimmed off afterwards).
+pub const FREEZE_TAIL_SECONDS: f64 = 10.0;
+/// Below this level (about -100 dBFS) the end of a frozen render counts as silence.
+const FREEZE_SILENCE: f32 = 1.0e-5;
+
+/// Where the last clip of `track` ends (at least one bar), the end of the
+/// range a freeze renders.
+pub fn freeze_end(project: &Project, track: TrackId) -> Tick {
+    let end = project
+        .track(track)
+        .into_iter()
+        .flat_map(|t| t.arrangement.iter())
+        .filter_map(|pl| project.clips.get(&pl.clip).map(|c| pl.start + c.length.max(0)))
+        .max()
+        .unwrap_or(0);
+    end.max(4 * aitrack_model::PPQ)
+}
+
+fn sidechain_sources(devices: &[aitrack_model::Device], out: &mut Vec<TrackId>) {
+    for d in devices {
+        out.extend(d.sidechain);
+        if let aitrack_model::DeviceKind::Rack(r) = &d.kind {
+            for c in r.chains.iter().chain(r.returns.iter()) {
+                sidechain_sources(&c.devices, out);
+            }
+        }
+    }
+}
+
+/// A project that renders only `track` through its clips and whole device
+/// chain, before the fader: unity volume, centred, no sends, straight to a
+/// bare Main. The tracks its devices listen to (sidechains) stay, with
+/// their groups' members, but go nowhere audible.
+fn freeze_scratch(project: &Project, track: TrackId) -> Result<Project, EngineError> {
+    let target = project.track(track).ok_or_else(|| EngineError::Export("the track is gone".into()))?;
+    if !target.can_freeze() {
+        return Err(EngineError::Export("only Instrument and Audio tracks can be frozen".into()));
+    }
+    let mut keep = vec![track];
+    let mut at = 0;
+    while at < keep.len() {
+        let mut found = Vec::new();
+        if let Some(t) = project.track(keep[at]) {
+            sidechain_sources(&t.devices, &mut found);
+        }
+        for id in found {
+            for t in std::iter::once(id).chain(aitrack_model::groups::descendants(project, id)) {
+                if !keep.contains(&t) {
+                    keep.push(t);
+                }
+            }
+        }
+        at += 1;
+    }
+    let mut p = project.clone();
+    p.tracks.retain(|t| t.kind == TrackKind::Main || keep.contains(&t.id));
+    let kept: Vec<TrackId> = p.tracks.iter().map(|t| t.id).collect();
+    for t in &mut p.tracks {
+        t.solo = false;
+        t.arm = false;
+        if t.kind == TrackKind::Main {
+            t.volume_db = 0.0;
+            t.pan = 0.0;
+            t.mute = false;
+            t.vca = None;
+            t.devices.clear();
+            t.automation.retain(|l| l.target == AutomationTarget::Tempo);
+        } else if t.id == track {
+            t.freeze = None;
+            t.output = aitrack_model::Output::Main;
+            t.parent = None;
+            t.vca = None;
+            t.sends.clear();
+            t.volume_db = 0.0;
+            t.pan = 0.0;
+            t.mute = false;
+            t.automation.retain(|l| matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }));
+        } else {
+            t.sends.clear();
+            t.vca = None;
+            t.freeze = None;
+            if !t.parent.is_some_and(|g| kept.contains(&g)) {
+                t.parent = None;
+                t.output = aitrack_model::Output::None;
+            }
+        }
+    }
+    Ok(p)
+}
+
+/// Freeze `track`: render its clips and full device chain (instrument,
+/// effects, hosted plugins) offline from tick 0 to the end of its last clip
+/// plus the ring-out tail, before the fader, and write it to `path` as a
+/// 32-bit float stereo WAV. The result is the file to give to
+/// `Command::FreezeTrack`: warped at the song tempo when the tempo does not
+/// change, so it keeps following the song.
+///
+/// Runs the same offline renderer as export on a scratch project; call it off
+/// the audio and UI threads. `progress` receives 0..1 and returns `false` to
+/// cancel ([`EngineError::Cancelled`]); no file is left behind then.
+pub fn freeze_track_to_wav(
+    project: &Project,
+    track: TrackId,
+    sample_rate: u32,
+    path: &Path,
+    samples: Option<SampleCache>,
+    factory: &dyn ProcessorFactory,
+    progress: Option<Progress<'_>>,
+) -> Result<AudioSource, EngineError> {
+    let scratch = freeze_scratch(project, track)?;
+    let end = freeze_end(project, track);
+    let opts = RenderOptions {
+        range: RenderRange::Ticks(0, end),
+        session_rate: sample_rate as f64,
+        export_rate: sample_rate,
+        block: 512,
+        tail_seconds: FREEZE_TAIL_SECONDS,
+        normalize_db: None,
+        samples,
+    };
+    let mut rendered = render(&scratch, factory, &opts, &[], progress)?.mix;
+    // Keep the whole clip range, but cut the tail where it has died away.
+    let play = project.tempo.tick_to_samples(end, sample_rate as f64).round().max(0.0) as usize;
+    let last_loud = (0..rendered.frames()).rev().find(|&i| (0..rendered.channels()).any(|c| rendered.channel(c)[i].abs() > FREEZE_SILENCE));
+    let keep = last_loud.map_or(0, |i| i + 1 + sample_rate as usize / 20).max(play).min(rendered.frames());
+    if keep < rendered.frames() {
+        let mut trimmed = AudioBuffer::new(rendered.channels(), keep);
+        for c in 0..rendered.channels() {
+            trimmed.channel_mut(c).copy_from_slice(&rendered.channel(c)[..keep]);
+        }
+        rendered = trimmed;
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(EngineError::Io)?;
+    }
+    if let Err(e) = write_wav(path, &rendered, sample_rate, WavFormat::Float32) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(AudioSource {
+        path: path.to_path_buf(),
+        hash: None,
+        sample_rate,
+        channels: rendered.channels() as u16,
+        frames: rendered.frames() as u64,
+        warp: follow_song_warp(project),
+        key: None,
+    })
 }
 
 // ───────────────────────────── WAV ─────────────────────────────

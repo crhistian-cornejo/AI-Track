@@ -53,6 +53,8 @@ pub fn duplicate_track(p: &mut Project, id: TrackId) -> Option<Duplicated> {
             copy.parent = orig.parent.map(remap_track);
         }
         copy.arm = false;
+        // The copy starts without the original's clips, so it cannot play their render.
+        copy.freeze = None;
         copy.keyboard_input = false;
         copy.reported_latency = 0;
         copy.output = match orig.output {

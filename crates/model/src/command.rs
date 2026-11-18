@@ -45,6 +45,9 @@ pub enum CommandError {
     /// Routing `from` to `to` would feed `from` with its own signal.
     #[error("routing {from} to {to} would make a loop")]
     RoutingCycle { from: TrackId, to: TrackId },
+    /// The command would edit the clips or devices of a frozen track.
+    #[error("the track is frozen: unfreeze it to edit its clips and devices")]
+    Frozen(TrackId),
     #[error("{0}")]
     Invalid(String),
 }
@@ -220,6 +223,20 @@ pub enum Command {
     /// The global groove amount, 0..=1.3 (Live's Global Groove Amount).
     SetGrooveAmount { amount: f32 },
 
+    /// Freeze an Instrument or Audio track: from now on the engine plays
+    /// `file` (the track's clips and device chain rendered offline from tick
+    /// 0) and runs none of its devices. Mixer and mixer automation stay live.
+    FreezeTrack { track: TrackId, file: AudioSource },
+    /// Drop the frozen render; the track plays live again.
+    UnfreezeTrack { track: TrackId },
+    /// Turn a frozen track into a plain Audio track that holds the render as
+    /// one clip at tick 0: devices, device automation and the old clips go.
+    /// Ids come from `Project::alloc_*`.
+    FlattenTrack { track: TrackId, source: SourceId, clip: ClipId, placement: PlacementId },
+    /// The inverse of `FlattenTrack`: put the saved track back and drop the
+    /// source and clip the flatten made.
+    RestoreFlattened { track: Box<Track>, source: SourceId, clip: ClipId },
+
     Batch { commands: Vec<Command> },
 }
 
@@ -299,6 +316,10 @@ impl Command {
             SetMacroDef { .. } => "Map macro",
             SetVariations { .. } => "Store variation",
             SetAutomation { .. } => "Edit automation",
+            FreezeTrack { .. } => "Freeze track",
+            UnfreezeTrack { .. } => "Unfreeze track",
+            FlattenTrack { .. } => "Flatten track",
+            RestoreFlattened { .. } => "Undo flatten",
             Batch { .. } => "Edit",
         }
     }
@@ -311,6 +332,47 @@ impl Command {
             | RemovePlacement { .. } | RemoveTakeLane { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
             Batch { commands } => commands.iter().any(Command::is_destructive),
             _ => false,
+        }
+    }
+
+    /// The frozen track whose clips, notes, devices or arming this command
+    /// would edit, if any: a frozen track plays its render, so those edits
+    /// would do nothing until it is unfrozen (the mixer stays editable).
+    /// `History` refuses such commands.
+    pub fn frozen_target(&self, p: &Project) -> Option<TrackId> {
+        use Command::*;
+        if !p.tracks.iter().any(Track::is_frozen) {
+            return None;
+        }
+        let frozen = |t: TrackId| p.track(t).is_some_and(Track::is_frozen).then_some(t);
+        let device = |d: DeviceId| p.device_track(d).and_then(frozen);
+        // The frozen track playing a clip / a source.
+        let clip_track = |c: ClipId| {
+            p.tracks.iter().filter(|t| t.is_frozen()).find(|t| t.arrangement.iter().any(|pl| pl.clip == c) || t.session_slots.values().any(|&s| s == c)).map(|t| t.id)
+        };
+        let source_track = |s: SourceId| p.clips.iter().filter(|(_, c)| c.source == s).find_map(|(&id, _)| clip_track(id));
+        match self {
+            PlaceClip { track, .. } | RemovePlacement { track, .. } | SetSessionSlot { track, .. } => frozen(*track),
+            MovePlacement { track, to_track, .. } => frozen(*track).or_else(|| frozen(*to_track)),
+            UpdateClip { id, .. } => clip_track(*id),
+            SetClipGroove { clip, .. } => clip_track(*clip),
+            AddNotes { source, .. } | RemoveNotes { source, .. } | UpdateNotes { source, .. } | SetWarp { source, .. } => source_track(*source),
+            AddDevice { slot, .. } | MoveDevice { to: slot, .. } => match slot {
+                DeviceSlot::Track { track, .. } => frozen(*track),
+                DeviceSlot::Rack { rack, .. } | DeviceSlot::Return { rack, .. } => device(*rack),
+            },
+            RemoveDevice { id } => device(*id),
+            SetParam { device: d, .. } | SetDeviceEnabled { device: d, .. } | SetSidechain { device: d, .. } | SetDeviceState { device: d, .. } | RenameDevice { device: d, .. } => device(*d),
+            AddChain { rack, .. } | RemoveChain { rack, .. } | UpdateChain { rack, .. } | SetChainProp { rack, .. } | SetReturnProp { rack, .. } | AddReturn { rack, .. } | RemoveReturn { rack, .. }
+            | AddMapping { rack, .. } | RemoveMapping { rack, .. } | SetMappingRange { rack, .. } | SetRackSelector { rack, .. } | SetMacro { rack, .. } | SetMacroDef { rack, .. }
+            | SetVariations { rack, .. } => device(*rack),
+            SetAutomation { track, target, .. } => match target {
+                AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. } => frozen(*track),
+                _ => None,
+            },
+            SetTrack { id, change: TrackProp::Arm(true) | TrackProp::KeyboardInput(true) } => frozen(*id),
+            Batch { commands } => commands.iter().find_map(|c| c.frozen_target(p)),
+            _ => None,
         }
     }
 
@@ -832,6 +894,67 @@ impl Command {
                     (None, None) => None,
                 };
                 Ok(SetAutomation { track, target, lane: old })
+            }
+
+            FreezeTrack { track, file } => {
+                let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
+                if !t.can_freeze() {
+                    return Err(CommandError::Invalid("only Instrument and Audio tracks can be frozen".into()));
+                }
+                if t.is_frozen() {
+                    return Err(CommandError::Invalid("the track is already frozen".into()));
+                }
+                t.freeze = Some(Freeze { file });
+                t.arm = false;
+                Ok(UnfreezeTrack { track })
+            }
+            UnfreezeTrack { track } => {
+                let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
+                let frozen = t.freeze.take().ok_or_else(|| CommandError::Invalid("the track is not frozen".into()))?;
+                Ok(FreezeTrack { track, file: frozen.file })
+            }
+            FlattenTrack { track, source, clip, placement } => {
+                if p.sources.contains_key(&source) {
+                    return Err(CommandError::DuplicateId(source.to_string()));
+                }
+                if p.clips.contains_key(&clip) {
+                    return Err(CommandError::DuplicateId(clip.to_string()));
+                }
+                let t = p.track(track).ok_or(CommandError::TrackNotFound(track))?;
+                let file = t.freeze.as_ref().ok_or_else(|| CommandError::Invalid("only a frozen track can be flattened".into()))?.file.clone();
+                if t.arrangement.iter().any(|pl| pl.id == placement) {
+                    return Err(CommandError::DuplicateId(placement.to_string()));
+                }
+                let saved = t.clone();
+                let length = file.length_ticks(p.tempo.initial_bpm()).max(1);
+                p.ids.observe(source.0);
+                p.ids.observe(clip.0);
+                p.ids.observe(placement.0);
+                p.sources.insert(source, Source::Audio(file));
+                let name = saved.name.clone();
+                p.clips.insert(clip, Clip::new(name, saved.color, source, length));
+                let t = p.track_mut(track).expect("checked above");
+                t.freeze = None;
+                if t.kind == TrackKind::Instrument {
+                    t.kind = TrackKind::Audio;
+                    t.session_slots.clear();
+                    t.keyboard_input = false;
+                    t.scale = None;
+                }
+                t.arm = false;
+                t.devices.clear();
+                t.automation.retain(|l| !matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }));
+                t.arrangement = vec![Placement { id: placement, clip, start: 0, lane: 0 }];
+                Ok(RestoreFlattened { track: Box::new(saved), source, clip })
+            }
+            RestoreFlattened { track, source, clip } => {
+                let id = track.id;
+                let index = p.track_index(id).ok_or(CommandError::TrackNotFound(id))?;
+                let flattened = std::mem::replace(&mut p.tracks[index], *track);
+                p.sources.remove(&source);
+                p.clips.remove(&clip);
+                let placement = flattened.arrangement.first().map_or(PlacementId(0), |pl| pl.id);
+                Ok(FlattenTrack { track: id, source, clip, placement })
             }
 
             Batch { commands } => {
@@ -2314,5 +2437,111 @@ mod tests {
         assert!(p.track(track).unwrap().keyboard_input);
         undo_kbd.apply(&mut p).unwrap();
         assert!(!p.track(track).unwrap().keyboard_input);
+    }
+    fn frozen_file() -> AudioSource {
+        AudioSource { path: "/tmp/Lead Frozen.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 96_000, warp: Warp::default(), key: None }
+    }
+
+    #[test]
+    fn freeze_and_unfreeze_undo_cleanly() {
+        let (mut p, track) = project_with_track();
+        let before = p.clone();
+        let undo = Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        assert!(p.track(track).unwrap().is_frozen());
+        assert!(Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).is_err(), "already frozen");
+        let redo = undo.apply(&mut p).unwrap();
+        assert_eq!(p, before);
+        redo.apply(&mut p).unwrap();
+        let undo_unfreeze = Command::UnfreezeTrack { track }.apply(&mut p).unwrap();
+        assert!(!p.track(track).unwrap().is_frozen());
+        assert!(Command::UnfreezeTrack { track }.apply(&mut p).is_err(), "not frozen");
+        undo_unfreeze.apply(&mut p).unwrap();
+        assert_eq!(p.track(track).unwrap().freeze.as_ref().map(|f| f.file.clone()), Some(frozen_file()));
+        let main = p.main_track().id;
+        assert!(Command::FreezeTrack { track: main, file: frozen_file() }.apply(&mut p).is_err(), "Main cannot be frozen");
+    }
+
+    #[test]
+    fn flatten_turns_the_frozen_track_into_an_audio_track_and_undoes() {
+        let (mut p, track) = project_with_track();
+        let dev = p.alloc_device_id();
+        Command::AddDevice { slot: DeviceSlot::Track { track, index: 0 }, device: Box::new(Device::stock(dev, "fx.eq", "EQ")) }.apply(&mut p).unwrap();
+        let mut param = AutomationLane::new(AutomationTarget::DeviceParam { device: dev, param: 0 });
+        param.insert(AutomationPoint { tick: 0, value: 0.5, curve: 0.0 });
+        let mut volume = AutomationLane::new(AutomationTarget::Volume);
+        volume.insert(AutomationPoint { tick: 0, value: 0.5, curve: 0.0 });
+        Command::SetAutomation { track, target: param.target, lane: Some(param) }.apply(&mut p).unwrap();
+        Command::SetAutomation { track, target: volume.target, lane: Some(volume) }.apply(&mut p).unwrap();
+        let (source, clip, placement) = (p.alloc_source_id(), p.alloc_clip_id(), p.alloc_placement_id());
+        let flatten = Command::FlattenTrack { track, source, clip, placement };
+        assert!(flatten.clone().apply(&mut p).is_err(), "only a frozen track can be flattened");
+
+        Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        let frozen = p.clone();
+        let undo = flatten.apply(&mut p).unwrap();
+        let t = p.track(track).unwrap();
+        assert_eq!((t.kind, t.is_frozen(), t.devices.len()), (TrackKind::Audio, false, 0));
+        assert_eq!(t.arrangement.len(), 1);
+        assert_eq!(t.automation.len(), 1, "the mixer lane stays, the device lane goes");
+        assert_eq!(t.arrangement[0].start, 0);
+        let c = &p.clips[&t.arrangement[0].clip];
+        assert_eq!(c.length, 4 * PPQ,"two seconds at 120 BPM are four beats");
+        assert!(matches!(p.sources.get(&c.source), Some(Source::Audio(a)) if *a == frozen_file()));
+
+        let redo = undo.apply(&mut p).unwrap();
+        assert_eq!(p, frozen, "undo gives back the frozen track exactly");
+        redo.apply(&mut p).unwrap();
+        assert_eq!(p.track(track).unwrap().kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn a_frozen_track_refuses_clip_and_device_edits_but_not_the_mixer() {
+        use crate::history::{History, Origin};
+        let (mut p, track) = project_with_track();
+        let (src, clip, pl, dev) = (p.alloc_source_id(), p.alloc_clip_id(), p.alloc_placement_id(), p.alloc_device_id());
+        let mut h = History::default();
+        let setup = vec![
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource::default())) },
+            Command::AddClip { id: clip, clip: Box::new(Clip::new("c", Color(0), src, PPQ)) },
+            Command::PlaceClip { track, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
+            Command::AddDevice { slot: DeviceSlot::Track { track, index: 0 }, device: Box::new(Device::stock(dev, "fx.eq", "EQ")) },
+        ];
+        h.apply(&mut p, "setup", Origin::User, setup).unwrap();
+        h.apply(&mut p, "freeze", Origin::User, vec![Command::FreezeTrack { track, file: frozen_file() }]).unwrap();
+        let n = p.alloc_note_id();
+        for refused in [
+            Command::SetParam { device: dev, param: 0, value: Some(0.5) },
+            Command::RemoveDevice { id: dev },
+            Command::AddNotes { source: src, notes: vec![Note::new(n, 60, 0, PPQ, 1.0)] },
+            Command::RemovePlacement { track, id: pl },
+            Command::MovePlacement { track, id: pl, to_track: track, start: PPQ, lane: 0 },
+            Command::SetTrack { id: track, change: TrackProp::Arm(true) },
+            Command::SetAutomation { track, target: AutomationTarget::DeviceParam { device: dev, param: 0 }, lane: Some(AutomationLane::new(AutomationTarget::DeviceParam { device: dev, param: 0 })) },
+            Command::Batch { commands: vec![Command::SetParam { device: dev, param: 0, value: None }] },
+        ] {
+            assert_eq!(h.apply(&mut p, "edit", Origin::User, vec![refused]), Err(CommandError::Frozen(track)));
+        }
+        for allowed in [
+            Command::SetTrack { id: track, change: TrackProp::VolumeDb(-3.0) },
+            Command::SetTrack { id: track, change: TrackProp::Mute(true) },
+            Command::SetTrack { id: track, change: TrackProp::Arm(false) },
+            Command::SetAutomation { track, target: AutomationTarget::Volume, lane: Some(AutomationLane::new(AutomationTarget::Volume)) },
+        ] {
+            h.apply(&mut p, "mix", Origin::User, vec![allowed]).unwrap();
+        }
+        h.apply(&mut p, "unfreeze", Origin::User, vec![Command::UnfreezeTrack { track }]).unwrap();
+        h.apply(&mut p, "edit", Origin::User, vec![Command::SetParam { device: dev, param: 0, value: Some(0.5) }]).unwrap();
+    }
+
+    #[test]
+    fn a_frozen_track_survives_json() {
+        let (mut p, track) = project_with_track();
+        Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        let back = Project::from_json(&p.to_json().unwrap()).unwrap();
+        assert_eq!(back.tracks, p.tracks);
+        // An old file without the field loads unfrozen.
+        let mut val = serde_json::to_value(p.track(track).unwrap()).unwrap();
+        val.as_object_mut().unwrap().remove("freeze");
+        assert!(serde_json::from_value::<Track>(val).unwrap().freeze.is_none());
     }
 }

@@ -340,6 +340,10 @@ pub struct Track {
     /// parts of the takes the arrangement highlights). Sorted, never overlapping.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comp: Vec<CompSpan>,
+    /// The track's rendered audio while it is frozen: the engine plays it
+    /// instead of the clips and the device chain (see `Command::FreezeTrack`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<Freeze>,
 }
 
 /// A take lane of a track (see [`Track::take_lanes`]).
@@ -355,6 +359,15 @@ pub struct CompSpan {
     pub lane: u16,
     pub start: Tick,
     pub end: Tick,
+}
+
+/// What a frozen track plays: its clips and whole device chain rendered
+/// offline from tick 0, ring-out tail included, before the fader.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Freeze {
+    /// The rendered file, a stereo (or mono) WAV that starts at tick 0. Its
+    /// warp follows the song tempo when the tempo does not change.
+    pub file: AudioSource,
 }
 
 impl Track {
@@ -386,7 +399,19 @@ impl Track {
             keyboard_input: false,
             take_lanes: Vec::new(),
             comp: Vec::new(),
+            freeze: None,
         }
+    }
+
+    /// True while the track plays its frozen render instead of running live.
+    pub fn is_frozen(&self) -> bool {
+        self.freeze.is_some()
+    }
+
+    /// Whether the track kind can be frozen: those that hold clips and a
+    /// device chain.
+    pub fn can_freeze(&self) -> bool {
+        self.kind.has_clips()
     }
 }
 

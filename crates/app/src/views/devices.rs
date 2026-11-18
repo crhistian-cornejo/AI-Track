@@ -86,7 +86,42 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     );
     // Only the x axis scrolls: a mouse wheel moves the chain sideways and a
     // trackpad pans it with its own pixel deltas.
+    if track.is_frozen() {
+        return frozen_cover(row, tid, cx);
+    }
     row.into_any_element()
+}
+
+/// A frozen track's chain, greyed and locked (Live): nothing under the cover
+/// takes clicks, and a badge says why with the way out.
+fn frozen_cover(row: Stateful<Div>, track: aitrack_model::TrackId, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    div()
+        .relative()
+        .size_full()
+        .child(row.opacity(0.4))
+        .child(
+            div().id("frozen-lock").absolute().top_0().left_0().right_0().bottom_0().occlude().flex().items_start().justify_center().pt(px(SP3)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SP3))
+                    .pl(px(SP3))
+                    .pr(px(SP2))
+                    .py(px(SP1))
+                    .rounded(px(r_lg()))
+                    .bg(pal.raised)
+                    .border_1()
+                    .border_color(with_alpha(pal.frozen, 0.6))
+                    .child(icon(Icon::Snowflake, 16., pal.frozen))
+                    .child(label("Frozen: the devices are locked and use no CPU", TEXT_SM, pal.text))
+                    .child(widgets::text_button("frozen-unfreeze", "Unfreeze", None, false).on_click(cx.listener(move |this, _, _, cx| {
+                        this.s.unfreeze_tracks(&[track]);
+                        cx.notify();
+                    }))),
+            ),
+        )
+        .into_any_element()
 }
 
 /// Live's chain: devices left to right in signal order, an insertion point

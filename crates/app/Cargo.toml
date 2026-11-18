@@ -57,3 +57,8 @@ gpui-pre-apple = "=0.3.9"
 
 [lints]
 workspace = true
+
+# Icon and version info of aitrack.exe (MIT; the crate gpui already uses for its manifest).
+# Only built on Windows.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

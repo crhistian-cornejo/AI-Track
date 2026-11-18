@@ -18,6 +18,10 @@ tar = "0.4"
 lzma-rs = "0.3"
 sevenz-rust2 = { version = "0.20", default-features = false, features = ["bzip2", "deflate", "ppmd", "util"] }
 walkdir = "2.5"
+# Release tooling (all MIT/Apache): icons rendered from the brand SVG, minisign updater signatures.
+resvg = { version = "0.46", default-features = false }
+minisign = "0.10"
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

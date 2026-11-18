@@ -23,7 +23,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/crhistian-cornejo/AI-Track"
@@ -71,11 +71,16 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 
-# Small, fast release binaries.
+# Release binaries. Debug info is not shipped inside the executables:
+# `split-debuginfo = "packed"` puts it in a `.dSYM` (macOS) / `.pdb` (Windows) next to
+# each binary, `cargo xtask package` archives those as `symbols-*` artifacts for
+# symbolicating crash reports, and `debug = "line-tables-only"` keeps them small.
+# (`strip = "debuginfo"` would also drop the .pdb on MSVC, so it is not used.)
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "debuginfo"
+debug = "line-tables-only"
+split-debuginfo = "packed"
 panic = "unwind" # plugin hosts need unwinding to contain panics
 
 # Fast iteration builds that still run DSP at a usable speed.

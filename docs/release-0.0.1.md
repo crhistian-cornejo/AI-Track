@@ -92,3 +92,52 @@ En una máquina limpia de cada sistema, sin Rust ni el repo:
 6. Tag `v0.0.1`, borrador, prueba en máquinas limpias, publicar.
 
 Fuera de la 0.0.1: actualizaciones automáticas (Sparkle en macOS, el propio instalador NSIS en Windows), Mac App Store / Microsoft Store (la tienda de Mac exige sandbox, incompatible con cargar plugins de terceros en proceso), Linux.
+
+---
+
+## 9. Implementación: comandos, secretos y primera versión
+
+Todo está en `xtask` (`package.rs`, `updates.rs`, `icons.rs`), `release/` y `.github/workflows/release.yml`.
+
+### Comandos
+
+```
+cargo xtask icons                                   # regenera release/icons/AppIcon.icns y aitrack.ico desde assets/brand/aitrack-logo.svg
+cargo xtask package --target mac [--universal] [--sign]   # en un Mac
+cargo xtask package --target win [--sign]                 # en Windows (necesita makensis)
+cargo xtask package manifest --version 0.0.1 --base-url https://github.com/crhistian-cornejo/AI-Track/releases/download/v0.0.1 --notes-file notes.md
+cargo xtask updater-keygen --out <carpeta fuera del repo>   # solo si hubiera que rotar la clave
+```
+
+`package` deja en `target/dist/`: `AI-Track-<v>-macos-universal.{app.tar.gz,dmg}`, `AI-Track-<v>-windows-x86_64-{setup.exe,portable.zip}`, un `.minisig` junto a `.app.tar.gz` y `setup.exe`, `*-symbols.*` (dSYM/PDB para symbolicar informes de fallos), `platform-<clave>.json` (fragmento para el manifiesto) y `SHA256SUMS.txt`. `--skip-build` reutiliza los binarios ya compilados.
+
+Decisiones: el perfil `release` usa `lto = "thin"`, `codegen-units = 1`, `debug = "line-tables-only"` y `split-debuginfo = "packed"`: los símbolos van a `.dSYM`/`.pdb` aparte (que se publican como artefacto `symbols`) y no dentro del ejecutable. No se usa `strip = "debuginfo"` porque en MSVC también suprime el `.pdb`. En macOS el paquete ejecuta además `strip -x`. Windows enlaza el CRT estático (`.cargo/config.toml`); `onnxruntime.dll` y los plugins se cargan en ejecución con su propio CRT. El icono y la versión de `aitrack.exe` se incrustan desde `crates/app/build.rs` con `embed-resource` (MIT; ya estaba en el árbol por GPUI; `winresource` no se pudo añadir sin red).
+
+Entitlements (`release/macos/`): `app.entitlements` (audio-input, disable-library-validation) para la app y `aitrack-ml-worker`; `plugin-host.entitlements` (más allow-unsigned-executable-memory y allow-jit) para `aitrack-plugin-host` y `aitrack-plugin-scanner` (el escáner también carga plugins).
+
+### Actualizaciones: la clave ya existe
+
+La clave pública (minisign, id `7BA4992810D26F12`) está en `release/updater.pub` y la app la incrusta. La privada es el secreto `UPDATER_PRIVATE_KEY` (contenido completo del archivo creado con `minisign -G -W`, **sin contraseña**; `UPDATER_KEY_PASSWORD` no hace falta y, si falta o está vacío, se usa la clave sin cifrar). `updater-keygen` queda como ayuda documentada (genera una pareja protegida con contraseña y se niega a sobrescribir `release/updater.pub` sin `--force`); rotar la clave deja sin actualización automática a las versiones ya instaladas.
+
+### Secretos de GitHub (todos opcionales)
+
+| Secreto | Para qué |
+|---|---|
+| `UPDATER_PRIVATE_KEY` (+ `UPDATER_KEY_PASSWORD` si está cifrada) | Firmar `.app.tar.gz` y `setup.exe`; sin él no hay `latest.json` |
+| `APPLE_CERT_P12` (base64), `APPLE_CERT_PASSWORD` | Certificado Developer ID Application |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | Notarización (`notarytool`) |
+| `WINDOWS_PFX_BASE64`, `WINDOWS_PFX_PASSWORD` | Authenticode con un `.pfx` (`signtool`) |
+| `WINDOWS_SIGN_COMMAND` | Alternativa: comando de firma con `{file}` (p. ej. `azuresigntool sign ... {file}`) para Azure Trusted Signing |
+
+### Lanzar
+
+`release.yml` corre con un tag `v*` (publica) o a mano con `workflow_dispatch` (borrador salvo `publish: true`). Compila `macos-14` (universal) y `windows-latest`, y un último job une los fragmentos en `latest.json`, escribe `SHA256SUMS.txt` y crea el release con `gh release create` (notas = commits desde el tag anterior). Un tag con sufijo (`v0.0.2-rc1`) se marca prerelease. **`releases/latest/download/latest.json` solo resuelve para releases publicados y que no sean prerelease ni borrador**; mientras sea borrador, las apps instaladas no verán la versión.
+
+### Checklist de la primera versión (0.0.1, sin firmas de Apple/Windows)
+
+1. Confirmar que `release/updater.pub` coincide con el secreto `UPDATER_PRIVATE_KEY` (`gh secret list`).
+2. Ejecutar el workflow a mano con `publish` desmarcado y descargar el borrador; pasar el checklist de §6 en máquinas limpias.
+3. `git tag v0.0.1 && git push origin v0.0.1` (publica) o volver a lanzar a mano con `publish: true`.
+4. Comprobar `https://github.com/crhistian-cornejo/AI-Track/releases/latest/download/latest.json`.
+
+Sin certificados la primera versión sale así: el `.app` va firmado ad hoc (con hardened runtime) y sin notarizar, así que Gatekeeper pide clic derecho > Abrir; el instalador de Windows no lleva Authenticode y SmartScreen avisa. Las firmas minisign del actualizador son independientes y funcionan igual. El actualizador de macOS extrae el `.app` desde el tar.gz (sin atributo de cuarentena), por lo que las actualizaciones posteriores no repiten el aviso.

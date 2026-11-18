@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Windows: link the C runtime statically so the installer does not depend on the
+# VC++ redistributable. Plugins and onnxruntime.dll are loaded at run time and bring
+# their own CRT, so nothing is shared across the DLL boundary.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

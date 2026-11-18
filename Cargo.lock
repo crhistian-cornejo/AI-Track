@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-ai"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-app"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-ai",
  "aitrack-dsp",
@@ -131,6 +131,7 @@ dependencies = [
  "async-channel",
  "cpal",
  "crossbeam-channel",
+ "embed-resource",
  "gpui-pre",
  "gpui-pre-apple",
  "gpui-pre-platform",
@@ -149,14 +150,14 @@ dependencies = [
 
 [[package]]
 name = "aitrack-dsp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "realfft",
 ]
 
 [[package]]
 name = "aitrack-engine"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -178,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-host"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -203,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-library"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-ai",
  "aitrack-model",
@@ -231,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-model"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -240,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-splice"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -257,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-stock"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -269,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-update"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "log",
@@ -7632,13 +7633,16 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aitrack-library",
  "anyhow",
  "flate2",
+ "getrandom 0.4.3",
  "hound",
  "lzma-rs",
+ "minisign",
+ "resvg",
  "serde_json",
  "sevenz-rust2",
  "sha1",

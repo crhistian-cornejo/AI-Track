@@ -97,6 +97,20 @@ The list below only covers what is implemented in the repository today.
 
 The screenshots show the bundled demo project ("Midnight Drive") running on macOS.
 
+## Install
+
+Download the installer for your system from the [latest release](https://github.com/crhistian-cornejo/AI-Track/releases/latest):
+
+- **macOS 13+** (Apple Silicon and Intel): `AI-Track-<version>-macos-universal.dmg`. Open it and drag AI-Track to Applications.
+- **Windows 10/11 (x64)**: `AI-Track-<version>-windows-x86_64-setup.exe` (per-user, no administrator rights), or the `-portable.zip`.
+
+`SHA256SUMS.txt` lists the checksums of every file. Installed copies check for new versions by themselves.
+
+Early builds are not signed with an Apple or Windows certificate yet, so the system warns the first time:
+
+- **macOS** ("cannot be opened because the developer cannot be verified"): right-click AI-Track in Applications, choose **Open**, then **Open** again. Or run `xattr -dr com.apple.quarantine /Applications/AI-Track.app`.
+- **Windows** ("Windows protected your PC"): choose **More info**, then **Run anyway**.
+
 ## Building
 
 **Requirements**

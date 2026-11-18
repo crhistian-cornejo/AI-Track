@@ -171,7 +171,7 @@ jobs:
           key="$RUNNER_TEMP/updater.key"
           umask 077
           printf '%s\n' "$UPDATER_PRIVATE_KEY" > "$key"
-          for f in target/dist/AI-Track-*.app.tar.gz target/dist/AI-Track-*-setup.exe; do
+          for f in target/dist/AI-Track-*.app.tar.gz target/dist/AI-Track-*setup.exe; do
             [ -f "$f" ] || continue
             minisign -S -s "$key" -m "$f" -t "AI-Track ${VERSION} $(basename "$f")"
           done
@@ -183,13 +183,24 @@ jobs:
             --base-url "https://github.com/${{ github.repository }}/releases/download/${TAG}" \
             --notes-file "$RUNNER_TEMP/notes.md"
           ls -l target/dist
+      # Everything the release needs, signed, kept with the run: if creating the
+      # release fails, it can be published from here without rebuilding.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.meta.outputs.tag }}
+          path: |
+            target/dist/AI-Track-*
+            target/dist/latest.json
+            target/dist/SHA256SUMS.txt
+          if-no-files-found: error
       - name: Create the release
         run: |
           flags=()
           if [ "$PUBLISH" != "true" ]; then flags+=(--draft); fi
           # A tag with a suffix (v0.0.2-rc1) is a prerelease; those never become "latest".
           case "$TAG" in *-*) flags+=(--prerelease) ;; esac
-          files=(target/dist/AI-Track-* target/dist/SHA256SUMS.txt)
+          # Debug symbols stay in the run's artifacts, not in the public release.
+          files=($(ls target/dist/AI-Track-* | grep -v -- '-symbols\.') target/dist/SHA256SUMS.txt)
           if [ -f target/dist/latest.json ]; then files+=(target/dist/latest.json); fi
           gh release create "$TAG" "${files[@]}" "${flags[@]}" \
             --title "AI-Track ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md" \

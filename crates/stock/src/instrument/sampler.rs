@@ -10,12 +10,17 @@
 //! State: `extra.path` (single WAV) or `extra.sfz_path` (SFZ instrument),
 //! loaded on the control thread in `load_state` / [`Sampler::load_sfz`].
 //!
+//! Voices read through the band-limited kernel of [`aitrack_dsp::resample`]
+//! (windowed sinc, cutoff following the playback ratio), so transposing up
+//! does not fold the top of the sample back; Interpolation picks its length.
+//!
 //! Meter layout: `[active voices, playhead of the newest voice (0..1), peak, sfz zone count]`.
 
 use super::sample::{DEFAULT_PREROLL_FRAMES, DEFAULT_STREAM_THRESHOLD_FRAMES, SampleData, StreamBacking, StreamWorker, load_wav};
 use super::sfz::{LoopMode, RegionDef, Trigger, parse_sfz};
 use crate::common::{ParamStore, Segmented, drive, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::envelope::Adsr;
+use aitrack_dsp::resample::{Kernel, Quality};
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
 use serde_json::{Value, json};
@@ -53,10 +58,14 @@ pub mod p {
     pub const GLIDE: u32 = 21;
     pub const POLYPHONY: u32 = 22;
     pub const BEND_RANGE: u32 = 23;
+    /// Interpolation quality (added later: a new id, old projects get the default).
+    pub const QUALITY: u32 = 24;
 }
 
 pub const MODES: &[&str] = &["Classic", "One-Shot", "Loop"];
 pub const FILTER_TYPES: &[&str] = &["Off", "Low-pass", "High-pass", "Band-pass"];
+/// Band-limited interpolation: [`Quality::Normal`] (16 taps at unity) or [`Quality::High`] (32).
+pub const QUALITIES: &[&str] = &["Normal", "High"];
 
 pub fn params() -> Vec<ParamInfo> {
     let t = |id, name, d| ParamInfo::new(id, name, 0.5, 10_000.0, d).unit("ms").log();
@@ -85,6 +94,7 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::GLIDE, "Glide", 0.0, 2000.0, 0.0).unit("ms").power(2.0),
         ParamInfo::new(p::POLYPHONY, "Polyphony", 1.0, 16.0, 16.0).choices(&[]).short("Poly"),
         ParamInfo::new(p::BEND_RANGE, "Pitch Bend Range", 0.0, 24.0, 2.0).choices(&[]).unit("st").short("Bend"),
+        ParamInfo::new(p::QUALITY, "Interpolation", 0.0, 1.0, 1.0).choices(QUALITIES).short("Interp"),
     ]
 }
 
@@ -184,6 +194,7 @@ pub struct Sampler {
     poly: usize,
     bend_range: f32,
     bend: f32,
+    kernel: &'static Kernel,
     last_pitch: f32,
     age: u64,
     peak: f32,
@@ -240,6 +251,7 @@ impl Sampler {
             poly: MAX_VOICES,
             bend_range: 2.0,
             bend: 0.0,
+            kernel: Kernel::get(Quality::High),
             last_pitch: 60.0,
             age: 0,
             peak: 0.0,
@@ -385,6 +397,7 @@ impl Sampler {
         self.glide_ms = pr.plain(p::GLIDE);
         self.poly = (pr.plain(p::POLYPHONY).round() as usize).clamp(1, MAX_VOICES);
         self.bend_range = pr.plain(p::BEND_RANGE).round();
+        self.kernel = Kernel::get(if pr.choice(p::QUALITY) == 0 { Quality::Normal } else { Quality::High });
         let (a, d, s, r) = (pr.plain(p::ATTACK), pr.plain(p::DECAY), pr.plain(p::SUSTAIN) / 100.0, pr.plain(p::RELEASE));
         for v in &mut self.voices {
             v.env.set(a, d, s, r);
@@ -615,20 +628,24 @@ impl Segmented for Sampler {
                     }
                 };
                 self.control(vi, n, src_sr, z_root, z_tune);
+                let kernel = self.kernel;
                 let v = &mut self.voices[vi];
+                // The cutoff follows the speed: reading faster than the file
+                // was recorded low-passes at the new Nyquist first.
+                let fc = kernel.cutoff(v.rate);
                 let mut done = false;
                 for i in pos..pos + n {
                     let (mut a, mut b) = match (zi, &smp) {
-                        (Some(z_idx), _) => (zones[z_idx].audio.read(0, v.pos), zones[z_idx].audio.read(1, v.pos)),
-                        (_, Some(s)) => (s.read(0, v.pos), s.read(1, v.pos)),
+                        (Some(z_idx), _) => (zones[z_idx].audio.read_bl(kernel, 0, v.pos, fc), zones[z_idx].audio.read_bl(kernel, 1, v.pos, fc)),
+                        (_, Some(s)) => (s.read_bl(kernel, 0, v.pos, fc), s.read_bl(kernel, 1, v.pos, fc)),
                         _ => (0.0, 0.0),
                     };
                     if looping && r.xfade > 0.0 && v.pos >= r.loop_end - r.xfade {
                         let t = ((v.pos - (r.loop_end - r.xfade)) / r.xfade) as f32;
                         let p2 = v.pos - (r.loop_end - r.loop_start);
                         let (a2, b2) = match (zi, &smp) {
-                            (Some(z_idx), _) => (zones[z_idx].audio.read(0, p2), zones[z_idx].audio.read(1, p2)),
-                            (_, Some(s)) => (s.read(0, p2), s.read(1, p2)),
+                            (Some(z_idx), _) => (zones[z_idx].audio.read_bl(kernel, 0, p2, fc), zones[z_idx].audio.read_bl(kernel, 1, p2, fc)),
+                            (_, Some(s)) => (s.read_bl(kernel, 0, p2, fc), s.read_bl(kernel, 1, p2, fc)),
                             _ => (0.0, 0.0),
                         };
                         a = a * (1.0 - t) + a2 * t;
@@ -721,6 +738,7 @@ impl Processor for Sampler {
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
         self.sr = sample_rate;
+        aitrack_dsp::resample::init();
         for v in &mut self.voices {
             v.env.set_sample_rate(sample_rate);
         }
@@ -959,4 +977,37 @@ mod tests {
         assert_eq!(restored.zone_count(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Report 24.01 §11 / 24.02 §7.1: a 13 kHz sine played an octave up must
+    /// vanish (26 kHz is past Nyquist) instead of folding back to 22 kHz, and
+    /// a tone that stays in the band keeps its level.
+    #[test]
+    fn transposing_up_does_not_alias() {
+        for (quality, limit) in [(1.0, -80.0), (0.0, -60.0)] {
+            let play = |freq: f64, key: u8| {
+                let mut s = Sampler::new();
+                s.set_sample(&sine_sample(freq, SR, 1.0), 1, SR);
+                set_plain(&mut s, p::ROOT_KEY, 60.0);
+                set_plain(&mut s, p::QUALITY, quality);
+                let (l, _) = render_notes(&mut s, &[(0, key, 1.0, true)], 20_000);
+                l[4_000..18_000].to_vec()
+            };
+            let reference = play(4_000.0, 72);
+            let alias = crate::test_util::rel_db(&play(13_000.0, 72), &reference);
+            let pass = 20.0 * (rms(&reference) / (0.8 / 2f32.sqrt())).log10();
+            eprintln!("sampler +12 st, quality {quality}: 13 kHz residual {alias:.1} dB, 4 kHz -> 8 kHz gain {pass:+.2} dB");
+            assert!(alias < limit, "13 kHz an octave up leaves {alias:.1} dB");
+            assert!(pass.abs() < 0.2, "passband gain {pass:+.2} dB");
+        }
+        // At the root key the voice plays the file's own samples.
+        let x = sine_sample(1_234.0, SR, 0.5);
+        let mut s = Sampler::new();
+        s.set_sample(&x, 1, SR);
+        set_plain(&mut s, p::ROOT_KEY, 60.0);
+        set_plain(&mut s, p::ATTACK, 0.5);
+        let (l, _) = render_notes(&mut s, &[(0, 60, 1.0, true)], 8_000);
+        let g = l[4_000] / x[4_000];
+        assert!(l[4_000..6_000].iter().zip(&x[4_000..6_000]).all(|(a, b)| (a - b * g).abs() < 1e-5), "unity reads are the samples");
+    }
+
 }

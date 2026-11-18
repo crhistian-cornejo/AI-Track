@@ -378,3 +378,11 @@ pub fn level_match(preset: &mut crate::presets::Preset) -> f32 {
     trim(preset);
     measure(preset).0
 }
+
+/// Level of `x` relative to `reference` in dB (RMS against RMS). The
+/// aliasing tests (report 24.01 §11) play a 13 kHz sine an octave up, where
+/// all of it should vanish (26 kHz is past Nyquist), and compare what is left
+/// with the same path playing a tone that stays in the band.
+pub fn rel_db(x: &[f32], reference: &[f32]) -> f32 {
+    20.0 * (rms(x).max(1e-12) / rms(reference).max(1e-12)).log10()
+}

@@ -1,6 +1,6 @@
 //! In-memory and windowed disk-streamed audio samples for the sampler and
-//! drum sampler: a WAV reader (via `hound`) and a cubic-Hermite reader for
-//! fractional playback.
+//! drum sampler: a WAV reader (via `hound`), a cubic-Hermite reader and the
+//! band-limited reader ([`aitrack_dsp::resample`]) the voices play with.
 //!
 //! Loading and decoding run on the control thread (`load_state`, explicit
 //! `load_*` calls), and large WAV files (> [`DEFAULT_STREAM_THRESHOLD_FRAMES`])
@@ -8,6 +8,7 @@
 //! a background reader thread. The audio thread never allocates, locks, or blocks.
 
 use aitrack_dsp::delay::hermite;
+use aitrack_dsp::resample::Kernel;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -81,6 +82,15 @@ impl SampleData {
         let t = (pos - i) as f32;
         let i = i as isize;
         hermite(t, self.at(ch, i - 1), self.at(ch, i), self.at(ch, i + 1), self.at(ch, i + 2))
+    }
+
+    /// Band-limited read at `pos` with cutoff `fc` (see
+    /// [`Kernel::cutoff`]); zero outside the data, mono fans out.
+    #[inline]
+    pub fn read_bl(&self, kernel: &Kernel, ch: usize, pos: f64, fc: f32) -> f32 {
+        let ch = ch.min(self.channels - 1);
+        let (frames, base) = (self.frames as i64, ch * self.frames);
+        kernel.read_with(pos, fc, |i| if i >= 0 && i < frames { self.data[base + i as usize] } else { 0.0 })
     }
 
     /// Peak absolute value (for normalisation / display).
@@ -384,6 +394,16 @@ impl StreamBacking {
         let t = (pos - i) as f32;
         let i = i as isize;
         hermite(t, self.at(ch, i - 1), self.at(ch, i), self.at(ch, i + 1), self.at(ch, i + 2))
+    }
+
+    /// Audio-thread band-limited read (see [`SampleData::read_bl`]).
+    #[inline]
+    pub fn read_bl(&self, kernel: &Kernel, ch: usize, pos: f64, fc: f32) -> f32 {
+        if !self.is_streamed() {
+            return self.preroll.read_bl(kernel, ch, pos, fc);
+        }
+        let ch = ch.min(self.channels - 1);
+        kernel.read_with(pos, fc, |i| self.at(ch, i as isize))
     }
 
     /// Service any pending page request (called by worker thread).

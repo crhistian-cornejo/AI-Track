@@ -7,8 +7,15 @@
 //! raised cosine whose two copies sum to exactly one, so a steady tone keeps
 //! its level and the jump of a head back to the far end of the grain is
 //! silent. In the reverb, the grain smear is hidden by the tank's diffusion.
+//!
+//! The heads read through the band-limited kernel of
+//! [`aitrack_dsp::resample`] with its cutoff at the new Nyquist, so shifting
+//! up does not fold the top of the band back on every trip round the loop
+//! (the linear reads left a 13 kHz sine at −2.7 dB an octave up). The heads
+//! sit [`PitchShifter::OFFSET`] samples behind the input so the kernel fits.
 
 use aitrack_dsp::delay::DelayLine;
+use aitrack_dsp::resample::{Kernel, Quality};
 use std::f32::consts::TAU;
 
 /// The intervals the shimmer can shift by, in semitones.
@@ -23,19 +30,28 @@ pub struct PitchShifter {
     grain: f32,
     phase: f32,
     inc: f32,
+    fc: f32,
+    kernel: &'static Kernel,
 }
 
 impl PitchShifter {
+    /// Delay of a head at the start of its grain: room for the kernel at
+    /// the largest interval (+24 st).
+    pub const OFFSET: f32 = 80.0;
+
     /// Allocates: call from `prepare`.
     pub fn new(sample_rate: f64) -> Self {
         let grain = GRAIN_MS * 0.001 * sample_rate as f32;
-        Self { line: DelayLine::new(grain as usize + 8), grain, phase: 0.0, inc: 0.0 }
+        let kernel = Kernel::get(Quality::High);
+        debug_assert!(kernel.reach(kernel.cutoff(4.0)) < Self::OFFSET);
+        Self { line: DelayLine::new((grain + 2.0 * Self::OFFSET) as usize + 8), grain, phase: 0.0, inc: 0.0, fc: 1.0, kernel }
     }
 
     /// Shift by `semitones`.
     pub fn set_semitones(&mut self, semitones: f32) {
         let ratio = 2f32.powf(semitones / 12.0);
         self.inc = (1.0 - ratio) / self.grain;
+        self.fc = self.kernel.cutoff(ratio as f64);
     }
 
     pub fn clear(&mut self) {
@@ -56,8 +72,8 @@ impl PitchShifter {
         let ph2 = if ph >= 0.5 { ph - 0.5 } else { ph + 0.5 };
         // Raised cosine: w(φ) + w(φ + ½) = 1.
         let w = 0.5 - 0.5 * (TAU * ph).cos();
-        let a = self.line.read_linear(1.0 + ph * self.grain);
-        let b = self.line.read_linear(1.0 + ph2 * self.grain);
+        let a = self.kernel.read_delay(&self.line, Self::OFFSET + ph * self.grain, self.fc);
+        let b = self.kernel.read_delay(&self.line, Self::OFFSET + ph2 * self.grain, self.fc);
         w * a + (1.0 - w) * b
     }
 }
@@ -106,4 +122,25 @@ mod tests {
             }
         }
     }
+
+    /// Report 24.01 §10 #2: the shimmer's octave up must not fold 13 kHz
+    /// back to 22 kHz (it is fed back, so every pass would add more).
+    #[test]
+    fn octave_up_does_not_alias() {
+        let sr = 48_000.0f64;
+        let run = |freq: f64| {
+            let mut p = PitchShifter::new(sr);
+            p.set_semitones(12.0);
+            let y: Vec<f32> = (0..48_000).map(|n| p.process((0.5 * (std::f64::consts::TAU * freq * n as f64 / sr).sin()) as f32)).collect();
+            y[12_000..44_000].to_vec()
+        };
+        let rms = |x: &[f32]| (x.iter().map(|v| (v * v) as f64).sum::<f64>() / x.len() as f64).sqrt();
+        let reference = run(4_000.0);
+        let alias = 20.0 * (rms(&run(13_000.0)) / rms(&reference)).log10();
+        let pass = 20.0 * (rms(&reference) / (0.5 / 2f64.sqrt())).log10();
+        eprintln!("shimmer +12 st: 13 kHz residual {alias:.1} dB, 4 kHz -> 8 kHz gain {pass:+.2} dB");
+        assert!(alias < -60.0, "13 kHz an octave up leaves {alias:.1} dB");
+        assert!(pass.abs() < 0.5, "passband gain {pass:+.2} dB");
+    }
+
 }

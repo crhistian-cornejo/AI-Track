@@ -6,7 +6,7 @@
 //! Meter layout: `[LFO phase (0..1)]`.
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
-use aitrack_dsp::delay::DelayLine;
+use aitrack_dsp::delay::{DelayLine, SincKernel};
 use aitrack_dsp::lfo::{SYNC_DIVISIONS, division_beats, division_hz};
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
@@ -85,6 +85,9 @@ pub struct Chorus {
     params: ParamStore,
     sr: f64,
     lines: [DelayLine; 2],
+    /// 8-tap windowed-sinc reader (as `fx.delay`): the sweeping taps keep
+    /// high tones at a steady level, where Hermite dipped with the fraction.
+    sinc: SincKernel,
     ap: [AllpassChain; 2],
     fb_state: [f32; 2],
     phase: f64,
@@ -125,6 +128,7 @@ impl Chorus {
             params: ParamStore::new(&params),
             sr: 0.0,
             lines: [DelayLine::new(16), DelayLine::new(16)],
+            sinc: SincKernel::new(),
             ap: [AllpassChain::default(); 2],
             fb_state: [0.0; 2],
             phase: 0.0,
@@ -215,7 +219,7 @@ impl Segmented for Chorus {
                             let p = ph + v as f32 / voices as f32 + off;
                             let lfo = 0.5 + 0.5 * (TAU * p).sin();
                             let d = (base * (1.0 + 0.13 * v as f32) + sweep * lfo).clamp(1.0, max_d);
-                            acc += self.lines[c].read_cubic(d);
+                            acc += self.sinc.read(&self.lines[c], d);
                         }
                         self.fb_state[c] = sanitize(acc * voice_norm);
                         out[c] = acc * voice_norm;
@@ -229,7 +233,7 @@ impl Segmented for Chorus {
                         let lfo = 0.5 + 0.5 * (TAU * (ph + off)).sin();
                         let d = (0.1 * ms + base * depth.max(0.02) * lfo + 1.0).clamp(1.0, max_d);
                         self.lines[c].push(input[c] + fb * self.fb_state[c]);
-                        let y = self.lines[c].read_cubic(d);
+                        let y = self.sinc.read(&self.lines[c], d);
                         self.fb_state[c] = sanitize(y.clamp(-4.0, 4.0));
                         out[c] = y;
                     }
@@ -388,4 +392,39 @@ mod tests {
         process_stereo_prepared(&mut c, sine(440.0, 0.1), 1, &tr);
         assert!((c.lfo_phase() - 0.25).abs() < 0.01, "{}", c.lfo_phase());
     }
+
+    /// Report 24.01 §5.1 / §10 #6: a sweeping delay read with Hermite
+    /// changes the level of high tones with the fraction of the delay (the
+    /// "images" of a moving read). The windowed-sinc reader keeps a 15 kHz
+    /// tone through the flanger steady.
+    #[test]
+    fn flanger_sweep_keeps_high_tones_steady() {
+        let mut c = Chorus::new();
+        set_plain(&mut c, p::MODE, 1.0);
+        set_plain(&mut c, p::MIX, 100.0);
+        set_plain(&mut c, p::FEEDBACK, 0.0);
+        set_plain(&mut c, p::DEPTH, 100.0);
+        set_plain(&mut c, p::DELAY, 3.0);
+        set_plain(&mut c, p::RATE, 2.0);
+        let (l, _) = process_stereo(&mut c, sine(15_000.0, 0.5), 48_000);
+        let levels: Vec<f32> = l[4_800..].chunks(96).map(rms).collect();
+        let (lo, hi) = levels.iter().fold((f32::MAX, 0.0f32), |(a, b), &v| (a.min(v), b.max(v)));
+        let ripple = 20.0 * (hi / lo).log10();
+        // The same sweep read straight off a line with Hermite, as before.
+        let mut line = DelayLine::new(512);
+        let hermite: Vec<f32> = (0..48_000)
+            .map(|i| {
+                line.push((0.5 * (std::f64::consts::TAU * 15_000.0 * i as f64 / SR).sin()) as f32);
+                let d = 10.0 + 120.0 * (0.5 + 0.5 * (std::f64::consts::TAU * 2.0 * i as f64 / SR).sin()) as f32;
+                line.read_cubic(d)
+            })
+            .collect();
+        let levels: Vec<f32> = hermite[4_800..].chunks(96).map(rms).collect();
+        let (lo, hi) = levels.iter().fold((f32::MAX, 0.0f32), |(a, b), &v| (a.min(v), b.max(v)));
+        let before = 20.0 * (hi / lo).log10();
+        eprintln!("flanger sweep, 15 kHz level ripple {ripple:.2} dB (Hermite read {before:.2} dB)");
+        assert!(ripple < 0.6, "15 kHz level ripple {ripple:.2} dB");
+        assert!(ripple < before, "sinc {ripple:.2} dB, Hermite {before:.2} dB");
+    }
+
 }

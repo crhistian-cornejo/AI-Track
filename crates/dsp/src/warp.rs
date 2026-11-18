@@ -6,13 +6,20 @@
 //! - [`WarpAlgorithm::Texture`]: stochastic multi-grain granular overlap-add
 //! - [`WarpAlgorithm::Complex`]: Laroche–Dolson peak-phase-locked STFT phase vocoder with transient reset
 //! - [`WarpAlgorithm::ComplexPro`]: phase-locked STFT phase vocoder with real-cepstrum formant envelope preservation
-//! - [`WarpAlgorithm::Repitch`]: speed-linked cubic Hermite resampling
+//! - [`WarpAlgorithm::Repitch`]: speed-linked band-limited resampling ([`crate::resample`])
+//!
+//! Complex and Complex Pro render with Signalsmith Stretch (MIT) when the
+//! `signalsmith` feature is on (the default); [`Stretcher::Native`] keeps our
+//! own phase vocoder for A/B and for clips too short for its window. Beats,
+//! Tones and Texture are always ours. Every transposition is resampled through the
+//! band-limited kernel, whose cutoff follows the ratio.
 //!
 //! Offline warping ([`warp_audio`]) produces pre-rendered planar audio off the
 //! real-time audio thread (cached by the engine). For dynamic live tempo ramps
 //! or uncached tempo changes on the audio thread, [`sample_warped_beats`] and
 //! [`sample_warped_grain`] evaluate statelessly with zero heap allocations.
 
+use crate::resample::Quality;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 use std::f32::consts::{PI, TAU};
@@ -53,19 +60,13 @@ pub fn read_cubic(slice: &[f32], pos: f64) -> f32 {
     cubic_hermite(at(idx - 1), at(idx), at(idx + 1), at(idx + 2), t)
 }
 
+/// Read `channels` to `out_len` frames at `in_len / out_len` frames per
+/// frame, through the band-limited [`resample`](crate::resample) kernel:
+/// the cutoff follows the ratio, so transposing up does not fold the top
+/// of the band back (Hermite used to leave a 13 kHz sine at full level at
+/// 22 kHz an octave up).
 fn resample_channels(channels: &[&[f32]], out_len: usize) -> Vec<Vec<f32>> {
-    let in_len = channels.first().map_or(0, |c| c.len());
-    if in_len == 0 || out_len == 0 {
-        return channels.iter().map(|_| Vec::new()).collect();
-    }
-    if in_len == out_len {
-        return channels.iter().map(|c| c.to_vec()).collect();
-    }
-    let step = in_len as f64 / out_len as f64;
-    channels
-        .iter()
-        .map(|ch| (0..out_len).map(|i| read_cubic(ch, i as f64 * step)).collect())
-        .collect()
+    crate::resample::resample(channels, out_len, Quality::Offline)
 }
 
 fn periodic_hann(size: usize) -> Vec<f32> {
@@ -639,6 +640,70 @@ fn phase_vocoder(channels: &[&[f32]], time_scale: f64, pitch_ratio: f64, formant
     }
 }
 
+// ───────────────────────────── Signalsmith Stretch (Complex / Complex Pro) ─────────────────────────────
+
+/// Which time-stretch engine renders Complex and Complex Pro (Beats, Tones
+/// and Texture are always ours: on Tones, Signalsmith's default window is
+/// the same as Complex and a 60 ms one smeared chords, −3 dB of spurious
+/// energy against −29.5 dB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Stretcher {
+    /// Signalsmith Stretch (MIT, crate `signalsmith-stretch`): multi-resolution
+    /// phase vocoder with spectral transposition. The default when the
+    /// `signalsmith` feature is on.
+    #[default]
+    Signalsmith,
+    /// Our own phase vocoder, kept for A/B and as the fallback
+    /// for clips too short for Signalsmith's window.
+    Native,
+}
+
+#[cfg(feature = "signalsmith")]
+mod ss {
+    use signalsmith_stretch::Stretch;
+
+    /// Largest stretch of one pass. Above a factor of 2 Signalsmith
+    /// randomises each bin's phase advance with a generator seeded from
+    /// `std::random_device`, which the crate's C API cannot seed: a longer
+    /// stretch is done in several passes so the render is the same every
+    /// time (the margin covers its per-block rounding of the input hop).
+    const MAX_PASS: f64 = 1.9;
+
+    /// Stretch planar `channels` by `time_scale` and transpose by
+    /// `pitch_ratio` (formants kept with `formants`). `None` when the
+    /// output is too short for the analysis window (twice its latency).
+    pub(super) fn stretch(channels: &[&[f32]], sample_rate: u32, time_scale: f64, pitch_ratio: f64, formants: bool) -> Option<Vec<Vec<f32>>> {
+        let n_ch = channels.len();
+        let in_len = channels.first()?.len();
+        if n_ch == 0 || in_len == 0 || channels.iter().any(|c| c.len() != in_len) {
+            return None;
+        }
+        let out_len = ((in_len as f64 * time_scale).round() as usize).max(1);
+        let passes = if time_scale > MAX_PASS { (time_scale.ln() / MAX_PASS.ln()).ceil() as usize } else { 1 };
+        let mut cur: Vec<f32> = (0..in_len).flat_map(|i| channels.iter().map(move |c| c[i])).collect();
+        for pass in 0..passes {
+            let len = if pass + 1 == passes { out_len } else { ((in_len as f64 * time_scale.powf((pass + 1) as f64 / passes as f64)).round() as usize).max(1) };
+            let mut st = Stretch::preset_default(n_ch as u32, sample_rate);
+            if pass == 0 && pitch_ratio != 1.0 {
+                st.set_transpose_factor(pitch_ratio as f32, None);
+                if formants {
+                    st.set_formant_factor(1.0, true);
+                }
+            }
+            if len < 2 * st.output_latency() {
+                return None;
+            }
+            let mut out = vec![0.0f32; len * n_ch];
+            if !st.exact(&cur, &mut out) {
+                return None;
+            }
+            cur = out;
+        }
+        let out: Vec<Vec<f32>> = (0..n_ch).map(|c| cur.iter().skip(c).step_by(n_ch).map(|v| if v.is_finite() { *v } else { 0.0 }).collect()).collect();
+        Some(out)
+    }
+}
+
 /// Offline full-quality warp (time-stretch and/or pitch-shift) for a planar buffer.
 pub fn warp_audio(
     channels: &[&[f32]],
@@ -647,6 +712,19 @@ pub fn warp_audio(
     time_scale: f64,
     pitch_ratio: f64,
     transients: Option<&[usize]>,
+) -> Vec<Vec<f32>> {
+    warp_audio_with(channels, sample_rate, algo, time_scale, pitch_ratio, transients, Stretcher::default())
+}
+
+/// [`warp_audio`] with the engine for Complex and Complex Pro chosen.
+pub fn warp_audio_with(
+    channels: &[&[f32]],
+    sample_rate: u32,
+    algo: WarpAlgorithm,
+    time_scale: f64,
+    pitch_ratio: f64,
+    transients: Option<&[usize]>,
+    stretcher: Stretcher,
 ) -> Vec<Vec<f32>> {
     let in_len = channels.first().map_or(0, |c| c.len());
     if in_len == 0 || sample_rate == 0 {
@@ -703,8 +781,18 @@ pub fn warp_audio(
                 resample_channels(&refs, out_len)
             }
         }
-        WarpAlgorithm::Complex => phase_vocoder(channels, time_scale, pitch_ratio, false),
-        WarpAlgorithm::ComplexPro => phase_vocoder(channels, time_scale, pitch_ratio, true),
+        WarpAlgorithm::Complex | WarpAlgorithm::ComplexPro => {
+            let formants = algo == WarpAlgorithm::ComplexPro;
+            #[cfg(feature = "signalsmith")]
+            if stretcher == Stretcher::Signalsmith
+                && let Some(out) = ss::stretch(channels, sample_rate, time_scale, pitch_ratio, formants)
+            {
+                return out;
+            }
+            #[cfg(not(feature = "signalsmith"))]
+            let _ = stretcher;
+            phase_vocoder(channels, time_scale, pitch_ratio, formants)
+        }
     }
 }
 
@@ -916,4 +1004,190 @@ mod tests {
             assert!(out[0].iter().all(|v| v.is_finite()));
         }
     }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64).sqrt()
+    }
+
+    /// Report 24.01 §7.2 / §11 (`warpalias`): a 13 kHz sine transposed +12 st
+    /// must vanish (26 kHz is past Nyquist). Before the band-limited
+    /// resampler every mode folded it back to 22 kHz at full level.
+    #[test]
+    fn transposing_up_an_octave_does_not_alias() {
+        let sr = 48_000;
+        // In f64: an f32 phase this far into the signal is noisy at -50 dB.
+        let x: Vec<f32> = (0..2 * sr as usize).map(|i| (0.5 * (std::f64::consts::TAU * 13_000.0 * i as f64 / sr as f64).sin()) as f32).collect();
+        let rms_in = rms(&x);
+        for (algo, limit) in [
+            (WarpAlgorithm::Repitch, -60.0),
+            (WarpAlgorithm::Tones, -60.0),
+            (WarpAlgorithm::Texture, -60.0),
+            (WarpAlgorithm::Beats, -60.0),
+            (WarpAlgorithm::Complex, -60.0),
+            (WarpAlgorithm::ComplexPro, -60.0),
+        ] {
+            let out = warp_audio(&[&x], sr, algo, 1.0, 2.0, None);
+            let o = &out[0][8192..out[0].len() - 8192];
+            let db = 20.0 * (rms(o) / rms_in).max(1e-9).log10();
+            eprintln!("warp {algo:?} +12 st: 13 kHz residual {db:.1} dB");
+            assert!(db < limit, "{algo:?}: 13 kHz an octave up leaves {db:.1} dB");
+        }
+    }
+
+
+    /// Frequency from interpolated rising zero crossings (sub-Hz precision on a sine).
+    fn crossing_hz(x: &[f32], sr: f64) -> f64 {
+        let c: Vec<f64> = (1..x.len()).filter(|&i| x[i - 1] <= 0.0 && x[i] > 0.0).map(|i| i as f64 - 1.0 + (x[i - 1] / (x[i - 1] - x[i])) as f64).collect();
+        (c.len() - 1) as f64 / (c[c.len() - 1] - c[0]) * sr
+    }
+
+    /// Report 24.01 §11 `stretch`: energy (dB) more than 6 bins away from the
+    /// partials of a stationary chord, Blackman-Harris window of 65 536.
+    fn spurious_db(x: &[f32], partials: &[f64]) -> f64 {
+        let n = 65_536;
+        let seg = &x[16_384..16_384 + n];
+        let mut buf: Vec<f64> = seg
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let t = std::f64::consts::TAU * i as f64 / n as f64;
+                v as f64 * (0.35875 - 0.48829 * t.cos() + 0.14128 * (2.0 * t).cos() - 0.01168 * (3.0 * t).cos())
+            })
+            .collect();
+        let mut planner = RealFftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let mut spec = fft.make_output_vec();
+        fft.process(&mut buf, &mut spec).unwrap();
+        let bin = 48_000.0 / n as f64;
+        let (mut on, mut off) = (0.0, 0.0);
+        for (k, c) in spec.iter().enumerate() {
+            let f = k as f64 * bin;
+            if partials.iter().any(|p| (f - p).abs() < 6.0 * bin) {
+                on += c.norm_sqr();
+            } else {
+                off += c.norm_sqr();
+            }
+        }
+        10.0 * (off / on).log10()
+    }
+
+    /// Click train every 0.5 s stretched by `scale`: (share of energy more than
+    /// 2 ms before each click's peak in dB, spread of the peak positions
+    /// against where the clicks belong, in samples).
+    fn click_smear(out: &[f32], n: usize, scale: f64) -> (f64, i64) {
+        let (mut pre, mut total) = (0.0f64, 0.0f64);
+        let mut offs = Vec::new();
+        let mut k = 4_800;
+        while k < n - 9_600 {
+            let e0 = (k as f64 * scale) as usize;
+            let c = (e0 - 1_920..e0 + 1_920).max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs())).unwrap();
+            offs.push(c as i64 - e0 as i64);
+            for (i, v) in out.iter().enumerate().take(c + 1_920).skip(c - 1_920) {
+                let e = (*v as f64).powi(2);
+                total += e;
+                if i + 96 < c {
+                    pre += e;
+                }
+            }
+            k += 24_000;
+        }
+        let spread = offs.iter().max().unwrap() - offs.iter().min().unwrap();
+        (10.0 * (pre / total).log10(), spread)
+    }
+
+    fn click_train(n: usize) -> Vec<f32> {
+        let mut x = vec![0.0f32; n];
+        let mut k = 4_800;
+        while k < n - 4_800 {
+            for j in 0..48 {
+                x[k + j] = (1.0 - j as f32 / 48.0) * if j % 2 == 0 { 1.0 } else { -1.0 };
+            }
+            k += 24_000;
+        }
+        x
+    }
+
+    fn chord(n: usize) -> Vec<f32> {
+        let tau = std::f64::consts::TAU;
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                (0.2 * ((tau * 220.0 * t).sin() + (tau * 277.18 * t).sin() + (tau * 329.63 * t).sin() + 0.5 * (tau * 880.0 * t).sin())) as f32
+            })
+            .collect()
+    }
+
+    /// Item #7: Complex and Complex Pro through Signalsmith keep the exact
+    /// length and the pitch of a sine at 0.5×, 0.8×, 1.25× and 2× speed.
+    #[cfg(feature = "signalsmith")]
+    #[test]
+    fn signalsmith_keeps_length_and_pitch_at_any_speed() {
+        let sr = 48_000;
+        let x = sine(sr, 440.0, 1.5);
+        for speed in [0.5, 0.8, 1.25, 2.0] {
+            let ts = 1.0 / speed;
+            for algo in [WarpAlgorithm::Complex, WarpAlgorithm::ComplexPro] {
+                let out = warp_audio(&[&x, &x], sr, algo, ts, 1.0, None);
+                let n = out[0].len();
+                assert_eq!(n, (x.len() as f64 * ts).round() as usize, "{algo:?} at {speed}×");
+                let hz = crossing_hz(&out[0][n / 4..3 * n / 4], sr as f64);
+                eprintln!("signalsmith {algo:?} {speed}×: {hz:.2} Hz");
+                assert!((hz - 440.0).abs() < 0.5, "{algo:?} at {speed}×: {hz} Hz");
+                let diff = out[0].iter().zip(&out[1]).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(diff < 1e-3, "linked channels stay together: {diff}");
+            }
+        }
+        // A fifth up at unchanged length.
+        let out = warp_audio(&[&x], sr, WarpAlgorithm::Complex, 1.0, 1.5, None);
+        let hz = crossing_hz(&out[0][12_000..60_000], sr as f64);
+        assert!((hz - 660.0).abs() < 0.5, "{hz}");
+    }
+
+    /// The render is the same every time, including stretches past 2× (done
+    /// in passes, since Signalsmith randomises phases above that and its C
+    /// API cannot be seeded).
+    #[cfg(feature = "signalsmith")]
+    #[test]
+    fn signalsmith_renders_are_deterministic() {
+        let x = chord(48_000);
+        for (ts, pitch) in [(0.8, 1.0), (1.25, 1.5), (2.0, 1.0), (3.0, 0.75), (6.0, 1.0)] {
+            for algo in [WarpAlgorithm::Complex, WarpAlgorithm::ComplexPro] {
+                let a = warp_audio(&[&x], 48_000, algo, ts, pitch, None);
+                let b = warp_audio(&[&x], 48_000, algo, ts, pitch, None);
+                assert_eq!(a[0].len(), (x.len() as f64 * ts).round() as usize);
+                assert!(a[0].iter().zip(&b[0]).all(|(p, q)| p.to_bits() == q.to_bits()), "{algo:?} ×{ts} pitch {pitch}");
+                assert!(a[0].iter().all(|v| v.is_finite()));
+            }
+        }
+    }
+
+    /// Report 24.01 §7.2, A/B against our own vocoder: spurious energy on a
+    /// stationary chord stretched ×1.25 and the timing of clicks.
+    #[cfg(feature = "signalsmith")]
+    #[test]
+    fn signalsmith_beats_the_native_vocoder() {
+        let n = 48_000 * 4;
+        let x = chord(n);
+        let partials = [220.0, 277.18, 329.63, 880.0];
+        let clicks = click_train(n);
+        let mut rows = Vec::new();
+        for (name, algo, engine) in [
+            ("native Complex", WarpAlgorithm::Complex, Stretcher::Native),
+            ("signalsmith Complex", WarpAlgorithm::Complex, Stretcher::Signalsmith),
+            ("signalsmith Complex Pro", WarpAlgorithm::ComplexPro, Stretcher::Signalsmith),
+            ("native Tones", WarpAlgorithm::Tones, Stretcher::Native),
+        ] {
+            let tonal = warp_audio_with(&[&x], 48_000, algo, 1.25, 1.0, None, engine);
+            let spur = spurious_db(&tonal[0], &partials);
+            let hits = warp_audio_with(&[&clicks], 48_000, algo, 1.25, 1.0, None, engine);
+            let (pre, spread) = click_smear(&hits[0], n, 1.25);
+            eprintln!("{name}: chord ×1.25 spurious {spur:.1} dB, clicks pre-echo {pre:.1} dB, peak spread {spread} samples");
+            rows.push((spur, pre, spread));
+        }
+        let (native, ss) = (rows[0], rows[1]);
+        assert!(ss.0 < native.0 - 8.0, "spurious: signalsmith {:.1} dB, native {:.1} dB", ss.0, native.0);
+        assert!(ss.2 < native.2, "click spread: signalsmith {}, native {}", ss.2, native.2);
+        assert!(ss.1 < native.1, "pre-echo: signalsmith {:.1} dB, native {:.1} dB", ss.1, native.1);
+    }
+
 }

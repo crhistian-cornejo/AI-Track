@@ -28,6 +28,7 @@
 
 use crate::sample_cache::{DecodedAudio, SampleCache};
 use aitrack_dsp::event::Expression;
+use aitrack_dsp::resample::{Kernel, Quality};
 use aitrack_dsp::warp::{pitch_taps, sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
 use aitrack_model::groove::{grooved_velocity, random_unit, Groove, GrooveParams, GrooveSettings, NoteGroove, PoolGroove, MAX_GROOVE_AMOUNT};
@@ -374,6 +375,28 @@ impl AudioClipData {
         audio.sample(ch, if self.reverse { (audio.frames as f64 - 1.0) - pos } else { pos })
     }
 
+    /// Read at a fractional frame with the band-limited kernel at cutoff
+    /// `fc` (see [`Kernel::cutoff`]), mirrored when reversed. At the full
+    /// band (reading at the file's speed or slower) it is the file's own
+    /// interpolator, [`DecodedAudio::sample`], so nothing changes there;
+    /// faster than that the cutoff follows the speed, so a clip transposed
+    /// up does not fold the top of the file back into the band.
+    #[inline]
+    fn sample_at(&self, audio: &DecodedAudio, ch: usize, pos: f64, fc: f32) -> f32 {
+        let kernel = Kernel::get(CLIP_QUALITY);
+        let p = if self.reverse { (audio.frames as f64 - 1.0) - pos } else { pos };
+        // Within the kernel's reach of either end of the file the read would
+        // fade into the silence outside it over a longer span than the short
+        // interpolator does (a loop that ends at the end of the file would
+        // dip before its seam): those few frames keep the file's own reader.
+        let reach = kernel.reach(fc) as f64;
+        if fc >= 1.0 || audio.channels.is_empty() || p < reach || p > audio.frames as f64 - reach {
+            return self.sample(audio, ch, pos);
+        }
+        let data = &audio.channels[ch.min(audio.channels.len() - 1)];
+        kernel.read(&data[..audio.frames.min(data.len())], p, fc)
+    }
+
     /// Warp hook: fractional source frame for a source tick. Unwarped clips
     /// map ticks at the tempo where the clip started (`unwarped_spt` =
     /// samples per tick there); warped clips at their original tempo. A
@@ -389,6 +412,9 @@ impl AudioClipData {
         }
     }
 }
+
+/// Interpolation of clips read faster than the file's own speed.
+const CLIP_QUALITY: Quality = Quality::High;
 
 /// Whether the tempo stays at `bpm` from tick `from` up to tick `to`: no
 /// tempo point inside the span differs from it and no ramp crosses it. Reads
@@ -709,6 +735,8 @@ impl CompiledClip {
     }
 
     pub fn audio(id: ClipId, clip: &Clip, data: AudioClipData) -> Self {
+        // The read kernel's table is built here, off the audio thread.
+        let _ = Kernel::get(CLIP_QUALITY);
         let looping = clip.looping.filter(|l| l.end > l.start).map(|l| (l.start, l.end));
         Self { shape: ClipShape::of(clip), ..Self::base(id, clip, looping, ClipContent::Audio(data)) }
     }
@@ -1029,6 +1057,11 @@ impl CompiledClip {
             let frame_0 = data.source_frame(offset as f64 + reads(t0), spt);
             let frame_1 = data.source_frame(offset as f64 + reads(t1), spt);
             let local_step = (frame_1 - frame_0) / len;
+            // How fast the read moves through the file (the taps of a
+            // transpose envelope also move at the shifted speed): the
+            // kernel's cutoff follows it.
+            let speed = if shift_env && t1 > t0 { local_step * (shape.pitch_integral(t1) - shape.pitch_integral(t0)) / (t1 - t0) } else { local_step };
+            let fc = Kernel::get(CLIP_QUALITY).cutoff(speed);
             for k in n..chunk_end {
                 let tau = t0 + (t1 - t0) * (k - n) as f64 / len;
                 if tau < 0.0 || limit.is_some_and(|lim| tau >= lim as f64) {
@@ -1051,7 +1084,7 @@ impl CompiledClip {
                 // The clip read at file frame `at`, both channels.
                 let read = |at: f64| -> (f32, f32) {
                     if tempo_steady {
-                        (data.sample(audio, 0, at), if stereo { data.sample(audio, 1, at) } else { 0.0 })
+                        (data.sample_at(audio, 0, at, fc), if stereo { data.sample_at(audio, 1, at, fc) } else { 0.0 })
                     } else if data.mode == WarpMode::Beats {
                         let s0 = sample_warped_beats(ch0, &data.transients, at, sr, data.reverse);
                         let s1 = if stereo { sample_warped_beats(ch1, &data.transients, at, sr, data.reverse) } else { s0 };
@@ -1081,8 +1114,8 @@ impl CompiledClip {
                 }
                 if w > 0.0 {
                     let lead = data.source_frame(src - span, spt).max(lead_floor);
-                    let pl = data.sample(audio, 0, lead);
-                    let pr = if stereo { data.sample(audio, 1, lead) } else { pl };
+                    let pl = data.sample_at(audio, 0, lead, fc);
+                    let pr = if stereo { data.sample_at(audio, 1, lead, fc) } else { pl };
                     sl += (pl - sl) * w;
                     sr_s += (pr - sr_s) * w;
                 }
@@ -1294,6 +1327,27 @@ mod tests {
             let hz = crossings as f32 * 48_000.0 / seg.len() as f32;
             assert!((hz - 880.0).abs() < 45.0, "{mode:?} +12st expected ~880 Hz, got {hz}");
         }
+    }
+
+    /// Report 24.01 §11: a Re-Pitch clip transposed +12 st reads the file
+    /// twice as fast; a 13 kHz sine must vanish instead of folding to 22 kHz,
+    /// and a tone that stays in the band keeps its level.
+    #[test]
+    fn transposed_clip_does_not_alias() {
+        let len = 96_000usize;
+        let c = clip(0, 4 * PPQ, None);
+        let run = |freq: f32| {
+            // In f64: an f32 phase this far in is noisy at about -50 dB.
+            let data: Vec<f32> = (0..len).map(|i| (0.5 * (std::f64::consts::TAU * freq as f64 * i as f64 / 48_000.0).sin()) as f32).collect();
+            let compiled = pitched_clip(&c, data, 2.0, false);
+            play(&compiled, 120.0, 0, Some(4 * PPQ), 48_000)[4_000..44_000].to_vec()
+        };
+        let reference = run(4_000.0);
+        let alias = 20.0 * (energy(&run(13_000.0)) / energy(&reference)).max(1e-24).log10() * 0.5;
+        let pass = 10.0 * (energy(&reference) / reference.len() as f32 / 0.125).log10();
+        eprintln!("clip Re-Pitch +12 st: 13 kHz residual {alias:.1} dB, 4 kHz -> 8 kHz gain {pass:+.2} dB");
+        assert!(alias < -60.0, "13 kHz an octave up leaves {alias:.1} dB");
+        assert!(pass.abs() < 0.2, "passband gain {pass:+.2} dB");
     }
 
     #[test]

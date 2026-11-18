@@ -177,7 +177,13 @@ pub fn manifest_command(args: &[String], default_dir: &Path) -> Result<()> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         if name.starts_with("platform-") && name.ends_with(".json") {
             let v: Value = serde_json::from_slice(&std::fs::read(&path)?).with_context(|| format!("parsing {name}"))?;
-            fragments.push(Fragment::from_json(&v)?);
+            let mut f = Fragment::from_json(&v)?;
+            // The release workflow signs in its publish job with the minisign tool, which
+            // leaves `<artifact>.minisig` next to the artifact.
+            if f.signature.is_none() {
+                f.signature = std::fs::read_to_string(dir.join(format!("{}.minisig", f.file))).ok();
+            }
+            fragments.push(f);
         }
     }
     fragments.sort_by(|a, b| a.key.cmp(&b.key));
@@ -294,6 +300,19 @@ mod tests {
         assert_eq!(mac["signature"], "SIG-MAC\n");
         assert_eq!(mac["size"], 42);
         assert_eq!(m["platforms"]["windows-x86_64"]["sha256"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_minisig_next_to_the_artifact_signs_its_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let frag = fragment("macos-universal", "AI-Track-0.0.2-macos-universal.app.tar.gz", None);
+        std::fs::write(dir.path().join("platform-macos-universal.json"), frag.to_json().to_string()).unwrap();
+        std::fs::write(dir.path().join("AI-Track-0.0.2-macos-universal.app.tar.gz"), b"x").unwrap();
+        std::fs::write(dir.path().join("AI-Track-0.0.2-macos-universal.app.tar.gz.minisig"), "SIG-FROM-TOOL\n").unwrap();
+        let args: Vec<String> = ["--version", "0.0.2", "--base-url", "https://example.com/v0.0.2", "--dir"].iter().map(|s| s.to_string()).chain([dir.path().display().to_string()]).collect();
+        manifest_command(&args, dir.path()).unwrap();
+        let latest: Value = serde_json::from_slice(&std::fs::read(dir.path().join("latest.json")).unwrap()).unwrap();
+        assert_eq!(latest["platforms"]["macos-universal"]["signature"], "SIG-FROM-TOOL\n");
     }
 
     #[test]

@@ -46,6 +46,21 @@ mod tests {
     use super::*;
     use crate::test_util::{Signed, signed, temp_dir};
 
+    /// What the release workflow does: the `minisign` command-line tool (an
+    /// unencrypted `-G -W` key, `-S` signing) must produce signatures the app
+    /// accepts. A throwaway key, not the release key.
+    #[test]
+    fn a_signature_made_by_the_minisign_tool_verifies() {
+        const PUB: &str = "untrusted comment: minisign public key C03F007792E27BA5\nRWSle+KSdwA/wIRGrzLMosUZlxcQu3BnwFzGBh/0JrzbGLm+kkNE4tX/\n";
+        const SIG: &str = "untrusted comment: signature from minisign secret key\nRUSle+KSdwA/wPlv0flA9V19ZQEX8PJnUCfGRv1RR2Kgqhx3NZb5URS6xFezrjJtnJqpUZ1xks+gPORoxXC8yvB09ee6R/mN2QQ=\ntrusted comment: test vector\nAEOBYNujW7XhM4zCCvpimBFOh//jAvhFXSPF99956YPcRLWR2Ezh8hDzwnPwT3F78iG547kdgvVcx8jRSzjOCQ==\n";
+        let path = temp_dir("cli-signature").join("payload.txt");
+        std::fs::write(&path, b"AI-Track updater test vector\n").unwrap();
+        let asset = |sha256: &str| Asset { url: String::new(), signature: SIG.into(), sha256: sha256.into(), size: 29 };
+        verify_file(&path, &asset("089b1b72ecb57d3b1266e555091fbf47fdca1c2b365d06d8d358c9ecf4c4cd1c"), PUB).expect("a minisign tool signature verifies");
+        std::fs::write(&path, b"AI-Track updater test vectoR\n").unwrap();
+        assert!(verify_file(&path, &asset("089b1b72ecb57d3b1266e555091fbf47fdca1c2b365d06d8d358c9ecf4c4cd1c"), PUB).is_err());
+    }
+
     #[test]
     fn a_good_file_verifies() {
         let dir = temp_dir("verify-ok");

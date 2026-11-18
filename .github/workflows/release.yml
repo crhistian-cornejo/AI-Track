@@ -62,8 +62,6 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-      UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
-      UPDATER_KEY_PASSWORD: ${{ secrets.UPDATER_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -103,8 +101,6 @@ jobs:
       WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
       WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
       WINDOWS_SIGN_COMMAND: ${{ secrets.WINDOWS_SIGN_COMMAND }}
-      UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
-      UPDATER_KEY_PASSWORD: ${{ secrets.UPDATER_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -134,6 +130,7 @@ jobs:
       TAG: ${{ needs.meta.outputs.tag }}
       VERSION: ${{ needs.meta.outputs.version }}
       PUBLISH: ${{ needs.meta.outputs.publish }}
+      UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,6 +151,21 @@ jobs:
             if [ -n "$prev" ]; then git log --no-merges --pretty='- %s (%h)' "${prev}..${ref}"; else git log --no-merges --pretty='- %s (%h)' -n 50 "$ref"; fi
           } > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
+      # The updater signatures (docs/updater.md) are made here, once, with the minisign tool:
+      # the key is an unencrypted `minisign -G -W` key and only this job sees it.
+      - name: Sign the updater artifacts
+        if: env.UPDATER_PRIVATE_KEY != ''
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/updater.key"
+          umask 077
+          printf '%s\n' "$UPDATER_PRIVATE_KEY" > "$key"
+          for f in target/dist/AI-Track-*.app.tar.gz target/dist/AI-Track-*-setup.exe; do
+            [ -f "$f" ] || continue
+            minisign -S -s "$key" -m "$f" -t "AI-Track ${VERSION} $(basename "$f")"
+          done
+          rm -f "$key"
+          minisign -V -p release/updater.pub -m target/dist/AI-Track-*.app.tar.gz
       - name: latest.json and SHA256SUMS.txt
         run: |
           cargo xtask package manifest --version "$VERSION" \

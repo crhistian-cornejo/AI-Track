@@ -239,6 +239,8 @@ struct ClipPaint {
     muted: bool,
     /// Where a looping audio clip starts over, in pixels from its left edge.
     repeats: Vec<f32>,
+    /// On a frozen track: drawn in ice blue, locked.
+    frozen: bool,
 }
 
 /// What a group's lane shows: where each track inside it has clips, one
@@ -364,6 +366,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 offset: c.offset,
                 muted: c.muted,
                 repeats,
+                frozen: t.is_frozen(),
             });
         }
         for (k, &target) in r.autos.iter().enumerate() {
@@ -405,6 +408,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 offset: 0,
                 muted: false,
                 repeats: Vec::new(),
+                frozen: false,
             });
         }
     }
@@ -812,6 +816,7 @@ fn paint_group_lane(window: &mut Window, o: Point<Pixels>, canvas_w: f32, g: &Gr
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint, canvas_w: f32, hot: Option<Zone>) {
     let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
     let fill = if c.muted { mix(clip_fill(c.color), p().well, 0.7) } else { clip_fill(c.color) };
+    let fill = if c.frozen { mix(fill, p().frozen, 0.45) } else { fill };
     let fg = if c.muted { p().muted } else { clip_text(c.color) };
     window.paint_quad(paint::rrect_border(body, r_sm(), with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
     window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), r_sm(), fill));
@@ -915,6 +920,14 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
     let tall = layout == HeaderLayout::Tall && audio;
     let single = layout == HeaderLayout::Single;
     let (mute, solo, arm, collapsed) = (t.mute, t.solo, t.arm, t.collapsed);
+    // Frozen (Live): an ice-blue header with a snowflake; rendering: a progress bar and a way out.
+    let frozen = t.is_frozen();
+    let rendering = ws.freeze.progress(id);
+    let tint = |c: Hsla| if frozen { mix(c, pal.frozen, 0.14) } else { c };
+    let shown_name = match rendering {
+        Some(f) => format!("{} · freezing {}%", t.name, (f * 100.).round() as u32),
+        None => t.name.clone(),
+    };
     // One step per group the track is in, capped so deep trees keep their names.
     let indent = SP3 * r.depth.min(4) as f32;
     // The pieces of the header, laid out by `layout`: one row on short tracks.
@@ -955,7 +968,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
             }))
             .into_any_element(),
     ];
-    if t.kind.has_clips() {
+    if t.kind.has_clips() && !frozen {
         chips.push(
             chip(("a-r", id.0 as usize), "R", arm, pal.record)
                 .tooltip(widgets::tip("Arm for recording", None))
@@ -999,8 +1012,8 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
         .relative()
         .h(px(r.h))
         .flex()
-        .bg(if selected { pal.raised } else { pal.surface })
-        .when(!selected, |d| d.hover(|s| s.bg(mix(pal.surface, pal.raised, 0.55))))
+        .bg(tint(if selected { pal.raised } else { pal.surface }))
+        .when(!selected, |d| d.hover(|s| s.bg(tint(mix(pal.surface, pal.raised, 0.55)))))
         .border_b_1()
         .border_color(border())
         .cursor_pointer()
@@ -1054,9 +1067,10 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                         .items_center()
                         .gap(if single { px(SP1) } else { px(SP2) })
                         .children(fold)
-                        .when(!single, |d| d.child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted)))
+                        .when(!single && !frozen, |d| d.child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted)))
+                        .when(frozen, |d| d.child(div().id(("arr-frozen", id.0 as usize)).child(icon(Icon::Snowflake, 14., pal.frozen)).tooltip(widgets::tip("Frozen: the track plays its rendered audio and runs no devices. Unfreeze to edit it.", None))))
                         .child(
-                            label(paint::fit(&t.name, name_w, TEXT_MD), TEXT_MD, if selected { pal.text } else { with_alpha(pal.text, 0.92) })
+                            label(paint::fit(&shown_name, name_w, TEXT_MD), TEXT_MD, if selected { pal.text } else { with_alpha(pal.text, 0.92) })
                                 .font_weight(if selected || is_group { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                                 .flex_1(),
                         )
@@ -1080,6 +1094,25 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                 })
                 .when(tall, |d| d.child(volume_slider(id, t.volume_db, cx))),
         )
+        // A render in flight: its progress along the bottom edge; click to cancel.
+        .when_some(rendering, |d, f| {
+            d.child(
+                div()
+                    .id(("arr-freeze", id.0 as usize))
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(SP1))
+                    .bg(with_alpha(pal.frozen, 0.2))
+                    .tooltip(widgets::tip("Freezing… click to cancel", None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.cancel_freeze(id, cx);
+                    }))
+                    .child(div().h_full().w(gpui::relative(f.clamp(0.02, 1.))).bg(pal.frozen)),
+            )
+        })
         // Drag the bottom edge to change the track's height.
         .child(
             div()

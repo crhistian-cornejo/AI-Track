@@ -737,7 +737,7 @@ pub fn fresh_wav(dir: &Path, name: &str, taken: &[&Path]) -> PathBuf {
 }
 
 /// A project name that is a valid file name on Windows and macOS.
-fn safe_name(name: &str) -> String {
+pub(crate) fn safe_name(name: &str) -> String {
     let cleaned: String = name.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '-' } else { c }).collect();
     let trimmed = cleaned.trim().trim_end_matches('.');
     if trimmed.is_empty() { "Untitled".to_owned() } else { trimmed.to_owned() }

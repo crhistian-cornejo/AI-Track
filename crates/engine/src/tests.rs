@@ -1312,3 +1312,4 @@ fn idle_device_sleeps_after_tail_and_wakes_on_audio() {
 
 mod clips;
 mod device_state;
+mod freeze;

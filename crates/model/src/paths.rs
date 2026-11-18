@@ -57,6 +57,13 @@ pub fn relativize(p: &Project, base: &Path) -> Project {
             a.path = rel;
         }
     }
+    for t in &mut out.tracks {
+        if let Some(f) = &mut t.freeze
+            && let Some(rel) = relative_path(&f.file.path, base)
+        {
+            f.file.path = rel;
+        }
+    }
     out
 }
 
@@ -66,6 +73,11 @@ pub fn resolve(p: &mut Project, base: &Path) {
     for source in p.sources.values_mut() {
         if let Source::Audio(a) = source {
             a.path = absolute_path(&a.path, base);
+        }
+    }
+    for t in &mut p.tracks {
+        if let Some(f) = &mut t.freeze {
+            f.file.path = absolute_path(&f.file.path, base);
         }
     }
 }
@@ -231,6 +243,20 @@ mod tests {
     fn path_of(p: &Project, id: SourceId) -> PathBuf {
         let Some(Source::Audio(a)) = p.sources.get(&id) else { panic!("audio") };
         a.path.clone()
+    }
+
+    #[test]
+    fn a_frozen_tracks_file_is_saved_relative_and_resolved_on_open() {
+        let (mut p, _) = project(&[]);
+        let id = p.alloc_track_id();
+        let mut t = Track::new(id, TrackKind::Audio, "a", Color(0));
+        t.freeze = Some(Freeze { file: match audio("/music/song/Samples/Frozen/a Frozen.wav", None) { Source::Audio(a) => a, _ => unreachable!() } });
+        p.tracks.push(t);
+        let saved = relativize(&p, Path::new("/music/song"));
+        assert_eq!(saved.track(id).unwrap().freeze.as_ref().unwrap().file.path, PathBuf::from("Samples/Frozen/a Frozen.wav"));
+        let mut opened = saved;
+        resolve(&mut opened, Path::new("/elsewhere/song"));
+        assert_eq!(opened.track(id).unwrap().freeze.as_ref().unwrap().file.path, PathBuf::from("/elsewhere/song/Samples/Frozen/a Frozen.wav"));
     }
 
     #[test]

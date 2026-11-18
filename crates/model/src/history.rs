@@ -167,6 +167,9 @@ impl History {
         if self.undo.is_empty() {
             return self.apply(project, "Edit", Origin::User, commands);
         }
+        if let Some(track) = commands.iter().find_map(|c| c.frozen_target(project)) {
+            return Err(CommandError::Frozen(track));
+        }
         let inverse = Command::Batch { commands: commands.clone() }.apply(project)?;
         let Command::Batch { commands: mut backward } = inverse else { unreachable!() };
         self.redo.clear();
@@ -189,6 +192,9 @@ impl History {
     fn apply_inner(&mut self, project: &mut Project, label: String, origin: Origin, commands: Vec<Command>, coalesce: Option<String>) -> Result<(), CommandError> {
         if commands.is_empty() {
             return Ok(());
+        }
+        if let Some(track) = commands.iter().find_map(|c| c.frozen_target(project)) {
+            return Err(CommandError::Frozen(track));
         }
         let inverse = Command::Batch { commands: commands.clone() }.apply(project)?;
         let Command::Batch { commands: backward } = inverse else { unreachable!() };

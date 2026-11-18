@@ -331,6 +331,19 @@ pub struct Track {
     /// Whether this Instrument track receives notes from the computer MIDI keyboard.
     #[serde(default)]
     pub keyboard_input: bool,
+    /// The track's rendered audio while it is frozen: the engine plays it
+    /// instead of the clips and the device chain (see `Command::FreezeTrack`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<Freeze>,
+}
+
+/// What a frozen track plays: its clips and whole device chain rendered
+/// offline from tick 0, ring-out tail included, before the fader.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Freeze {
+    /// The rendered file, a stereo (or mono) WAV that starts at tick 0. Its
+    /// warp follows the song tempo when the tempo does not change.
+    pub file: AudioSource,
 }
 
 impl Track {
@@ -360,7 +373,19 @@ impl Track {
             reported_latency: 0,
             scale: None,
             keyboard_input: false,
+            freeze: None,
         }
+    }
+
+    /// True while the track plays its frozen render instead of running live.
+    pub fn is_frozen(&self) -> bool {
+        self.freeze.is_some()
+    }
+
+    /// Whether the track kind can be frozen: those that hold clips and a
+    /// device chain.
+    pub fn can_freeze(&self) -> bool {
+        self.kind.has_clips()
     }
 }
 

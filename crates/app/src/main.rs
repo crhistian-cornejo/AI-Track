@@ -8,6 +8,7 @@ mod actions;
 mod commands;
 mod editing;
 mod fps;
+mod freeze;
 mod gesture;
 mod keys;
 mod nav;

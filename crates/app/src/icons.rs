@@ -102,6 +102,7 @@ icons! {
     Send => "send",
     Shuffle => "shuffle",
     Sliders => "sliders",
+    Snowflake => "snowflake",
     Sparkles => "sparkles",
     Split => "split",
     SquareFill => "square-fill",

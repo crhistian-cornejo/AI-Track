@@ -3,7 +3,7 @@
 //! SQLite. Only the newest query is answered; each is capped.
 
 use crate::bridge::LibraryItem;
-use aitrack_library::{BpmFilter, Filters, KeyFilter, KeyMatch, Library, Sample, SearchQuery, SortBy};
+use aitrack_library::{BpmFilter, DspEmbedder, Filters, KeyFilter, KeyMatch, Library, Sample, SampleId, SearchQuery, SimilarFinder, SortBy};
 use aitrack_model::Scale;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::{BTreeMap, HashSet};
@@ -32,6 +32,8 @@ pub struct SampleQuery {
     pub key: Option<Scale>,
     /// Every one of these tags (lower case).
     pub tags: Vec<String>,
+    /// Instead of a text search: the sounds that sound like this sample (bridge id), most alike first.
+    pub similar: Option<u64>,
 }
 
 /// One local sample as the palette lists it.
@@ -56,6 +58,8 @@ pub struct SampleRow {
     pub splice: bool,
     /// Text relevance, higher first.
     pub score: f32,
+    /// In a "Similar to…" list: how alike this sound is to the reference, -1..1.
+    pub similarity: Option<f32>,
 }
 
 impl SampleRow {
@@ -95,6 +99,7 @@ impl SampleRow {
             cloud: s.cloud,
             splice: false,
             score: 0.,
+            similarity: None,
         }
     }
 
@@ -115,6 +120,7 @@ impl SampleRow {
             cloud: false,
             splice: false,
             score: 0.,
+            similarity: None,
         }
     }
 
@@ -153,15 +159,47 @@ pub fn finish(mut rows: Vec<SampleRow>, q: &SampleQuery) -> (Vec<SampleRow>, Vec
     // Stable: equal scores keep the index's own order.
     rows.sort_by(|a, b| b.score.total_cmp(&a.score));
     rows.truncate(SHOWN);
+    let tags = tag_counts(&rows);
+    (rows, tags)
+}
+
+/// The tags of the rows with how many carry each, most common first.
+pub fn tag_counts(rows: &[SampleRow]) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for r in &rows {
+    for r in rows {
         for t in &r.tags {
             *counts.entry(t.clone()).or_default() += 1;
         }
     }
     let mut tags: Vec<(String, usize)> = counts.into_iter().collect();
     tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    (rows, tags)
+    tags
+}
+
+/// The rows of a "Similar to…" list, most alike first and one per file.
+fn similar_rows(libs: &[Option<Library>; 2], finder: &mut SimilarFinder, id: u64) -> Vec<SampleRow> {
+    let (lib, sample) = ((id >> 48) as u8, SampleId((id & ((1 << 48) - 1)) as i64));
+    let refs = [libs[FACTORY].as_ref(), libs[USER].as_ref()];
+    let hits = match finder.find(refs, lib, sample, &DspEmbedder, SHOWN) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("palette: similar sounds: {e}");
+            return Vec::new();
+        }
+    };
+    let splice_roots = splice_roots(libs[USER].as_ref());
+    let mut seen = HashSet::new();
+    hits.iter()
+        .filter(|h| seen.insert(h.sample.path.clone()))
+        .map(|h| SampleRow { splice: h.lib as usize == USER && splice_roots.contains(&h.sample.root_id.0), similarity: Some(h.similarity), ..SampleRow::from_sample(h.lib as usize, &h.sample) })
+        .collect()
+}
+
+/// Which of the user's folders is Splice's.
+fn splice_roots(user: Option<&Library>) -> HashSet<i64> {
+    user.and_then(|l| l.roots().ok())
+        .map(|r| r.into_iter().filter(|r| r.kind == aitrack_library::RootKind::Splice).map(|r| r.id.0).collect())
+        .unwrap_or_default()
 }
 
 fn search_query(q: &SampleQuery) -> SearchQuery {
@@ -228,6 +266,7 @@ impl Worker {
                 let _ = out.send(Reply::NoIndex);
                 return;
             }
+            let mut finder = SimilarFinder::new();
             while let Ok(mut q) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     q = newer;
@@ -236,16 +275,20 @@ impl Worker {
                 if libs[USER].is_none() && user.is_file() {
                     libs[USER] = open(&user);
                 }
+                if let Some(id) = q.similar {
+                    let rows = similar_rows(&libs, &mut finder, id);
+                    let tags = tag_counts(&rows);
+                    if out.send(Reply::Samples { generation: q.generation, rows, tags }).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let sq = search_query(&q);
                 let mut rows = Vec::new();
                 for (i, lib) in libs.iter().enumerate() {
                     if let Some(lib) = lib {
                         // Which of the user's folders is Splice's.
-                        let splice_roots: HashSet<i64> = if i == USER {
-                            lib.roots().map(|r| r.into_iter().filter(|r| r.kind == aitrack_library::RootKind::Splice).map(|r| r.id.0).collect()).unwrap_or_default()
-                        } else {
-                            HashSet::new()
-                        };
+                        let splice_roots: HashSet<i64> = if i == USER { splice_roots(Some(lib)) } else { HashSet::new() };
                         match lib.search(&sq) {
                             Ok(mut found) => {
                                 fill_keys(libs[USER].as_ref(), &mut found);
@@ -307,6 +350,7 @@ mod tests {
             cloud: false,
             splice: false,
             score: 0.,
+            similarity: None,
         }
     }
 
@@ -330,6 +374,12 @@ mod tests {
         let (rows, tags) = finish(vec![row("a", &["dark", "bass"]), row("b", &["bass"]), row("c", &["dark"]), row("c", &["dark"])], &q);
         assert_eq!(rows.len(), 2, "filtered and de-duplicated by path");
         assert_eq!(tags[0], ("dark".into(), 2));
+    }
+
+    #[test]
+    fn tag_counts_sort_by_count_then_name() {
+        let tags = tag_counts(&[row("a", &["kick", "dark"]), row("b", &["dark"]), row("c", &["bass", "dark"])]);
+        assert_eq!(tags, vec![("dark".to_owned(), 3), ("bass".to_owned(), 1), ("kick".to_owned(), 1)]);
     }
 
     #[test]

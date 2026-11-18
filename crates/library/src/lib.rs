@@ -13,6 +13,7 @@
 //! - [`hub`]: the sound bank manifest (bundled packs + Content Hub links).
 //! - [`install`]: one-click download of the optional packs, with progress.
 //! - [`reanalyse`]: key/BPM from audio for samples that miss them, cached by file hash.
+//! - [`similar`]: an embedding per sample (the [`Embedder`](similar::Embedder) trait) and "find similar sounds".
 //! - [`cover`]: sample pack artwork found in the pack's folders.
 //! - [`text`]: folding and word scoring shared by every search box.
 //! - [`labels`]: a static catalogue of popular sample labels by genre.
@@ -36,6 +37,7 @@ pub mod plugins;
 pub mod query;
 pub mod reanalyse;
 pub mod scan;
+pub mod similar;
 pub mod splice;
 pub mod taxonomy;
 pub mod text;
@@ -49,7 +51,7 @@ pub(crate) mod test_util;
 pub use rusqlite;
 
 #[cfg(feature = "ai")]
-pub use ai::AiDetector;
+pub use ai::{AiDetector, DspEmbedder};
 pub use analyze::{Analysis, Analyzer, AudioInfo, BasicAnalyzer, Source};
 pub use cloud::{CloudFolder, HydrateEvent, HydrateJob, OsProbe, PlaceholderProbe, Provider};
 pub use db::{Library, PackInfo, Preset, Root, RootId, RootKind, RootStats, Sample, SampleId};
@@ -67,6 +69,9 @@ pub use reanalyse::{
     Detection, KeyBpmDetector, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, ReanalyseProgress, ReanalyseSource, ReanalyseStats,
 };
 pub use scan::{ScanEvent, ScanJob, ScanOptions, ScanProgress, ScanStats};
+pub use similar::{
+    EmbedEvent, EmbedJob, EmbedOptions, EmbedProgress, EmbedStats, Embedder, Neighbour, SimilarEntry, SimilarFinder, SimilarHit, SimilarIndex, SimilarOptions,
+};
 pub use taxonomy::{Category, SampleKind};
 pub use tree::{TreeNode, VirtualFolder};
 pub use watch::{LibraryWatcher, WatchEvent};

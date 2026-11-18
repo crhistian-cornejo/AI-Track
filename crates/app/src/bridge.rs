@@ -1558,6 +1558,14 @@ pub struct LibraryItem {
     pub favorite: bool,
 }
 
+/// A sound that sounds like another, with how much (see `LibraryBridge::similar_sounds`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimilarSound {
+    pub item: LibraryItem,
+    /// -1..1, about 1 for the same sound.
+    pub similarity: f32,
+}
+
 /// A note played during a take.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecNote {
@@ -1886,6 +1894,12 @@ pub trait LibraryBridge {
     fn take_installed_plugins(&mut self) -> Vec<PathBuf> {
         Vec::new()
     }
+    /// The sounds that sound most like sample `id`, nearest first, never `id` itself: the same
+    /// kind of sound, closer when they share its key and tempo. Empty when the library has
+    /// not listened to enough of its samples yet. May take a moment for a big library.
+    fn similar_sounds(&self, _id: u64, _limit: usize) -> Vec<SimilarSound> {
+        Vec::new()
+    }
     /// Samples ranked for the project's key and tempo.
     fn recommend(&self, scale: Option<Scale>, _bpm: f64) -> Vec<LibraryItem> {
         self.search("", scale)
@@ -2013,6 +2027,28 @@ impl LibraryBridge for StubLibrary {
             .collect();
         // Exact key matches first.
         out.sort_by_key(|i| (i.key != key, i.name.clone()));
+        out
+    }
+
+    fn similar_sounds(&self, id: u64, limit: usize) -> Vec<SimilarSound> {
+        let Some(me) = self.items.iter().find(|i| i.id == id) else { return Vec::new() };
+        let words = |i: &LibraryItem| aitrack_library::text::words(&i.name).into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mine = words(me);
+        let mut out: Vec<SimilarSound> = self
+            .items
+            .iter()
+            .filter(|i| i.id != id && i.category.split_whitespace().next() == me.category.split_whitespace().next())
+            .map(|i| {
+                // A made-up closeness from the name, the kind of sound and the length.
+                let shared = mine.intersection(&words(i)).count() as f32;
+                let length = 1. / (1. + (i.duration - me.duration).abs());
+                let kind = if i.is_loop == me.is_loop { 0.15 } else { 0. };
+                let key = if i.key.is_some() && i.key == me.key { 0.1 } else { 0. };
+                SimilarSound { item: i.clone(), similarity: (0.55 + 0.1 * shared + 0.2 * length + kind + key).min(0.99) }
+            })
+            .collect();
+        out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity).then_with(|| a.item.name.cmp(&b.item.name)));
+        out.truncate(limit);
         out
     }
 
@@ -2677,6 +2713,18 @@ mod tests {
         let found = lib.search("", Some(am));
         assert!(found.iter().all(|i| i.key.is_none_or(|k| k.mask() == am.mask())));
         assert!(lib.search("kick", None).iter().all(|i| i.name.to_lowercase().contains("kick") || i.category == "Kick"));
+    }
+
+    #[test]
+    fn the_stub_finds_similar_sounds_of_the_same_kind() {
+        let lib = StubLibrary::default();
+        let kick = lib.search("Kick Punchy", None).remove(0);
+        let similar = lib.similar_sounds(kick.id, 10);
+        assert_eq!(similar.len(), 4, "the other four kicks");
+        assert!(similar.iter().all(|s| s.item.category == "Kick" && s.item.id != kick.id));
+        assert!(similar.windows(2).all(|w| w[0].similarity >= w[1].similarity));
+        assert_eq!(lib.similar_sounds(kick.id, 2).len(), 2);
+        assert!(lib.similar_sounds(9_999, 5).is_empty());
     }
 
     #[test]

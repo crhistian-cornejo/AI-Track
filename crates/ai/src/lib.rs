@@ -17,6 +17,7 @@ pub mod audio;
 pub mod chords;
 pub mod classify;
 pub mod drum_extract;
+pub mod embedding;
 pub mod dsp;
 mod error;
 pub mod features;
@@ -39,6 +40,7 @@ pub use drum_extract::{
     DrumClass, DrumExtractOptions, DrumExtractionResult, ExtractedLoop, ExtractedOneShot,
     ExtractionEngine, extract_drums,
 };
+pub use embedding::{DSP_EMBEDDING_DIM, DSP_EMBEDDING_ID, DSP_EMBEDDING_VERSION, dsp_embedding, embed_file};
 pub use error::{Error, Result};
 pub use key::{KeyEstimate, detect_key};
 pub use midi::{MidiEngine, MidiOptions, extract_midi};

@@ -58,6 +58,10 @@ const WAVE_W: f32 = 120.;
 const TIME_W: f32 = 48.;
 const KEY_W: f32 = 44.;
 const BPM_W: f32 = 44.;
+/// The "92%" of a similar sound.
+const SIM_W: f32 = 40.;
+/// How the "Similar" action is reached from the keyboard, as the tooltip and the footer say it.
+const SIMILAR_KEYS: &str = if cfg!(target_os = "macos") { "⇧⌘F" } else { "Ctrl+Shift+F" };
 /// Rows per section on the All tab.
 const ALL_COMMANDS: usize = 4;
 const ALL_DEVICES: usize = 6;
@@ -196,6 +200,14 @@ pub enum Row {
     Item(Item),
 }
 
+/// The sample a "Similar to…" list is made for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimilarTo {
+    /// Bridge id of the sample.
+    pub id: u64,
+    pub name: String,
+}
+
 /// Open state, the typed query, the filters and the current results.
 #[derive(Default)]
 pub struct PaletteState {
@@ -217,6 +229,8 @@ pub struct PaletteState {
     pub plugin_prefs: crate::plugin_prefs::PluginPrefs,
     pub bpm: Option<(u32, u32)>,
     pub tags: Vec<String>,
+    /// Samples tab only: list the sounds that sound like this one instead of a text search.
+    pub similar: Option<SimilarTo>,
     pub sort: SortCol,
     pub ascending: bool,
     pub shuffle: Option<u64>,
@@ -472,6 +486,7 @@ pub fn refresh(ws: &mut Workspace) {
             bpm: if all { None } else { pal.bpm },
             key: if in_key { key } else { None },
             tags: if all { Vec::new() } else { pal.tags.clone() },
+            similar: pal.similar.as_ref().filter(|_| pal.tab == Tab::Samples).map(|s| s.id),
         });
     }
     let (kind, bpm, tags, shuffle, tab) = (pal.kind, pal.bpm, pal.tags.clone(), pal.shuffle, pal.tab);
@@ -634,6 +649,7 @@ pub fn rebuild(ws: &mut Workspace) {
                 section(&mut rows, "Packs", pack_rows(ws, &q).into_iter().map(Item::Pack).collect(), 4, true);
             }
         }
+        Tab::Samples if ws.palette.similar.is_some() => section(&mut rows, "", samples(), search::SHOWN, false),
         Tab::Samples | Tab::InKey => {
             let (from_splice, rest) = split_splice(samples());
             let (yours, factory) = split_yours(rest);
@@ -709,6 +725,12 @@ fn split_splice(items: Vec<Item>) -> (Vec<Item>, Vec<Item>) {
 /// Search the library bridge directly (stub bridges have no index).
 fn bridge_search(ws: &mut Workspace) {
     ws.palette.answered = ws.palette.generation;
+    if let Some(s) = ws.palette.similar.clone().filter(|_| ws.palette.tab == Tab::Samples) {
+        let rows: Vec<SampleRow> = ws.b.library.similar_sounds(s.id, search::SHOWN).iter().map(|h| SampleRow { similarity: Some(h.similarity), ..SampleRow::from_item(&h.item) }).collect();
+        ws.palette.sample_tags = search::tag_counts(&rows);
+        ws.palette.samples = rows;
+        return;
+    }
     let key = if ws.palette.tab == Tab::InKey { ws.s.project.scale } else { None };
     let q = ws.palette.query.trim().to_owned();
     let mut items = if key.is_some() && q.is_empty() { ws.b.library.recommend(key, ws.s.project.tempo.initial_bpm()) } else { ws.b.library.search(&q, key) };
@@ -935,6 +957,7 @@ fn set_tab(ws: &mut Workspace, tab: Tab, cx: &mut Context<Workspace>) {
     if ws.palette.tab != tab {
         ws.palette.tab = tab;
         ws.palette.selected = 0;
+        ws.palette.similar = None;
         ws.palette.tags.clear();
         ws.palette.tags_expanded = false;
         ws.palette.device_groups_expanded = false;
@@ -942,6 +965,32 @@ fn set_tab(ws: &mut Workspace, tab: Tab, cx: &mut Context<Workspace>) {
         refresh(ws);
     }
     cx.notify();
+}
+
+/// List the sounds that sound like sample `r`, or go back to the normal list when it is already the one shown.
+fn toggle_similar(ws: &mut Workspace, r: &SampleRow, cx: &mut Context<Workspace>) {
+    if ws.palette.similar.as_ref().is_some_and(|s| s.id == r.id) {
+        return clear_similar(ws, cx);
+    }
+    ws.palette.audition.stop();
+    ws.b.engine.preview(None);
+    ws.palette.similar = Some(SimilarTo { id: r.id, name: r.name.clone() });
+    ws.palette.tab = Tab::Samples;
+    ws.palette.selected = 0;
+    ws.palette.tags.clear();
+    ws.palette.scroll.scroll_to_item(0);
+    refresh(ws);
+    cx.notify();
+}
+
+/// Leave the "Similar to…" list.
+fn clear_similar(ws: &mut Workspace, cx: &mut Context<Workspace>) {
+    if ws.palette.similar.take().is_some() {
+        ws.palette.selected = 0;
+        ws.palette.scroll.scroll_to_item(0);
+        refresh(ws);
+        cx.notify();
+    }
 }
 
 fn visible_tabs(ws: &Workspace) -> Vec<Tab> {
@@ -1150,10 +1199,23 @@ fn show_pack(ws: &mut Workspace, name: &str, cx: &mut Context<Workspace>) {
 fn on_key(ws: &mut Workspace, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Workspace>) {
     let k = &e.keystroke;
     let handled = match k.key.as_str() {
+        // In a "Similar to…" list Escape goes back to the search first.
+        "escape" if ws.palette.similar.is_some() => {
+            clear_similar(ws, cx);
+            true
+        }
         "escape" => {
             close(ws, window, cx);
             true
         }
+        // ⇧⌘F: sounds like the selected sample (again: back to the list).
+        "f" if k.modifiers.secondary() && k.modifiers.shift => match ws.palette.selected_item().cloned() {
+            Some(Item::Sample(r)) => {
+                toggle_similar(ws, &r, cx);
+                true
+            }
+            _ => false,
+        },
         "up" => {
             move_selection(ws, -1, cx);
             true
@@ -1343,9 +1405,23 @@ fn render_sample(ws: &mut Workspace, i: usize, r: &SampleRow, selected: bool, cx
                 .child(chips),
         )
         .child(if remote { cloud_status(&fetch_state) } else { mini_wave(bars, if selected { pal.accent } else { content(0.45) }) })
+        .children(r.similarity.map(|sim| column(SIM_W, mono(format!("{:.0}%", sim.clamp(0., 1.) * 100.), TEXT_SM, if selected { pal.accent } else { pal.muted }))))
         .child(column(TIME_W, mono(if r.duration > 0. { format!("{:.1}s", r.duration) } else { "–".into() }, TEXT_SM, pal.muted)))
         .child(column(KEY_W, mono(r.key.map(short_key).unwrap_or_else(|| "–".into()), TEXT_SM, if in_key { pal.accent } else { pal.muted })))
         .child(column(BPM_W, mono(r.bpm.map_or("–".into(), |b| format!("{b:.0}")), TEXT_SM, pal.muted)))
+        .child({
+            let row = r.clone();
+            let on = ws.palette.similar.as_ref().is_some_and(|s| s.id == r.id);
+            div()
+                .id(("palette-similar", i))
+                .flex_none()
+                .child(icon(Icon::Layers, 12., if on { pal.accent } else { content(0.2) }))
+                .tooltip(widgets::tip("Find similar sounds", Some(SIMILAR_KEYS)))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    toggle_similar(this, &row, cx);
+                }))
+        })
         .child({
             let (id, fav) = (r.id, r.favorite);
             div()
@@ -1797,6 +1873,12 @@ fn filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         })));
     }
     let relevant = ws.palette.sort == SortCol::Relevant && ws.palette.shuffle.is_none();
+    let similar = ws.palette.similar.as_ref().map(|s| {
+        chip("similar-chip", format!("Similar to {}", crate::paint::fit(&s.name, 220., TEXT_SM)), true)
+            .child(icon(Icon::X, 10., pal.muted))
+            .tooltip(widgets::tip("Back to the list", Some("Esc")))
+            .on_click(cx.listener(|this, _, _, cx| clear_similar(this, cx)))
+    });
     let count = ws.palette.rows.iter().filter(|r| matches!(r, Row::Item(_))).count();
     let loading = ws.palette.tab == Tab::Splice && ws.palette.splice.as_ref().is_some_and(|s| s.loading);
     div()
@@ -1804,6 +1886,7 @@ fn filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .flex()
         .items_center()
         .gap(px(SP3))
+        .children(similar)
         .child(kinds)
         .child(widgets::divider_v(16.))
         .child(bpm_control(ws, cx))
@@ -2073,6 +2156,7 @@ fn empty_state(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             Some(s) if s.loading => "Searching Splice…".into(),
             _ => "Type to search Splice.".into(),
         },
+        Tab::Samples if ws.palette.similar.is_some() => "No similar sounds yet. The library is still being listened to; try again in a moment.".into(),
         Tab::InKey if ws.s.project.scale.is_none() => "Set the song's key to see samples in it.".into(),
         Tab::InKey => "Nothing in this key yet. Detect keys from the library menu to find more.".into(),
         _ if ws.palette.query.trim().is_empty() => "Nothing here yet.".into(),
@@ -2116,6 +2200,9 @@ fn footer(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .border_color(border())
         .child(hint("↑↓", if auditions { "Move and audition".into() } else { "Move".into() }))
         .when(auditions, |d| d.child(hint("→", "Replay".into())))
+        .when(ws.palette.tab == Tab::Samples && matches!(ws.palette.selected_item(), Some(Item::Sample(_))), |d| {
+            d.child(hint(SIMILAR_KEYS, if ws.palette.similar.is_some() { "Back to the list".into() } else { "Similar".into() }))
+        })
         .child(hint("↵", match ws.palette.tab {
             Tab::Commands => "Run".into(),
             Tab::Packs => "Download or open".into(),

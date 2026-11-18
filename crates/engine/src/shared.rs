@@ -42,7 +42,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// # Safety contract
 /// * While a graph containing the cell is installed on the audio thread,
-///   only that thread calls [`SharedProcessor::get_mut`].
+///   only the thread processing the track that holds it calls
+///   [`SharedProcessor::get_mut`]: the audio thread, or the DSP worker
+///   running that track for the current level ([`crate::multicore`]). A
+///   processor belongs to one track of a graph (a graph where two tracks
+///   share one never runs in parallel), and a track runs on one thread at a
+///   time, so the calls never overlap; the levels' countdown orders a
+///   worker's calls before the audio thread's next ones.
 /// * The control thread calls [`SharedProcessor::get_mut`] only before the
 ///   cell is first sent to the audio thread, or after the audio stream has
 ///   been torn down (device change), when no graph can be running.

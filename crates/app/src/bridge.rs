@@ -257,6 +257,16 @@ pub trait EngineBridge {
         false
     }
     fn set_sandbox_plugins(&mut self, _on: bool) {}
+    /// The "Audio threads" preference: `0` = Auto, otherwise how many threads
+    /// (the audio thread included) the graph and offline renders run on.
+    fn audio_threads(&self) -> usize {
+        0
+    }
+    fn set_audio_threads(&mut self, _setting: usize) {}
+    /// Threads the running graph actually uses.
+    fn active_audio_threads(&self) -> usize {
+        1
+    }
     /// Audition an audio file at a low level (`None` stops).
     fn preview(&mut self, _path: Option<&Path>) {}
     /// Audition a sound adjusted to the song: stretched to its tempo and

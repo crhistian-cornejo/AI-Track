@@ -91,7 +91,7 @@ pub(crate) fn load(info: &HostedPluginInfo) -> Result<Loaded> {
     let flags = Arc::new(ClapFlags::default());
     let (f1, f2) = (flags.clone(), flags.clone());
     let mut instance =
-        PluginInstance::<ClapHost>::new(move |_| ClapShared { flags: f1 }, move |_| ClapMainThread::new(f2), &entry, &id, &host_info()?)
+        PluginInstance::<ClapHost>::new(move |_| ClapShared::new(f1), move |_| ClapMainThread::new(f2), &entry, &id, &host_info()?)
             .map_err(|e| Error::Instantiate(format!("{e:?}")))?;
 
     let tail_ext: Option<PluginTail> = instance.plugin_shared_handle().get_extension();
@@ -216,7 +216,13 @@ impl ClapMain {
 
     pub fn deactivate(&mut self, audio: &mut ClapAudio) {
         if let Some(p) = audio.processor.take() {
-            self.instance.deactivate(p.into_stopped());
+            // `stop_processing` is an [audio-thread] call; no block runs now,
+            // so this thread stands in for the audio thread while making it.
+            let stopped = {
+                let _audio = aitrack_dsp::AudioThreadScope::enter();
+                p.into_stopped()
+            };
+            self.instance.deactivate(stopped);
         }
     }
 

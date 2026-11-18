@@ -15,6 +15,11 @@
 //!   with them, possibly the last reference to a plugin) off the audio and
 //!   control threads.
 //! * **audio** — the cpal callback running [`AudioProcessor`].
+//! * **DSP workers** (`aitrack-dsp-N`) — help the audio thread run the
+//!   tracks of a block in parallel ([`crate::workers`], [`crate::multicore`]);
+//!   as many as the "Audio threads" setting asks for, minus the audio
+//!   thread itself. Built here, on the control thread, and swapped in by the
+//!   audio thread between blocks.
 
 use crate::audio_io::{self, ActiveAudio, AudioConfig, AudioDeviceInfo, ChannelSelection, OpenStream};
 use crate::compile::{compile, CompileContext};
@@ -27,6 +32,7 @@ use crate::sample_cache::SampleCache;
 use crate::shared::{ProcessorPool, SharedProcessor};
 use crate::status::{AudioHealth, ClipSlotStatus, LatencyReport, MeterReading, PlayheadAnchor, SharedStatus};
 use crate::tap::{DeviceMeter, TapReader};
+use crate::workers::{resolve_threads, PoolKind, WorkerPool};
 use crate::EngineError;
 use aitrack_model::{DeviceId, Monitor, Project, Quantize, SceneId, Tick, TrackId};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
@@ -41,6 +47,7 @@ pub const MIDI_QUEUES: usize = 8;
 const GRAPH_QUEUE: usize = 8;
 const COMMAND_QUEUE: usize = 1024;
 const MIDI_QUEUE: usize = 1024;
+const POOL_QUEUE: usize = 4;
 
 /// Engine start-up settings.
 #[derive(Clone, Debug)]
@@ -61,6 +68,9 @@ pub struct EngineConfig {
     /// cannot stall the caller. Watch [`EngineHandle::audio_generation`]
     /// and [`EngineHandle::last_error`] for the outcome.
     pub open_in_background: bool,
+    /// Threads the graph runs on, the audio thread included: `0` = Auto
+    /// ([`crate::auto_threads`]), `1` = the single-threaded path.
+    pub audio_threads: usize,
 }
 
 impl Default for EngineConfig {
@@ -72,13 +82,16 @@ impl Default for EngineConfig {
             midi_inputs: Vec::new(),
             count_in_bars: 0,
             open_in_background: false,
+            audio_threads: 0,
         }
     }
 }
 
 impl EngineConfig {
+    /// No device; one audio thread (tests and tools drive the processor by
+    /// hand; set `audio_threads` for more).
     pub fn headless(sample_rate: f64) -> Self {
-        Self { audio: None, headless_sample_rate: sample_rate, ..Self::default() }
+        Self { audio: None, headless_sample_rate: sample_rate, audio_threads: 1, ..Self::default() }
     }
 }
 
@@ -102,6 +115,8 @@ enum Msg {
     Macro(DeviceId, u16, f32),
     /// A fast-path edit also made to the control thread's copy of the project.
     Patch(crate::compile::Patch),
+    /// The "Audio threads" setting (`0` = Auto).
+    AudioThreads(usize),
     Shutdown,
 }
 
@@ -225,6 +240,11 @@ impl Engine {
             watch: DeviceWatch::default(),
             seen_callback_panics: 0,
             panic_seen_at: None,
+            audio_threads: config.audio_threads,
+            period: Duration::from_secs_f64(config.max_block.clamp(32, 8192) as f64 / config.headless_sample_rate.max(1.0)),
+            pool_tx: None,
+            pool_retire_rx: None,
+            pending_pool: None,
         };
         let manual = match &config.audio {
             // `check_device` opens it on the control thread's first tick.
@@ -684,6 +704,19 @@ impl EngineHandle {
         self.status.xruns.load(Ordering::Relaxed)
     }
 
+    /// Run the graph on this many threads, the audio thread included (`0` =
+    /// Auto, [`crate::auto_threads`]; `1` = the single-threaded path). The
+    /// new workers start on the control thread and the audio thread swaps
+    /// them in between two blocks: no dropout.
+    pub fn set_audio_threads(&self, setting: usize) {
+        let _ = self.tx.send(Msg::AudioThreads(setting));
+    }
+
+    /// Threads the running graph uses (the audio thread included).
+    pub fn audio_threads(&self) -> usize {
+        self.status.audio_threads.load(Ordering::Relaxed).max(1) as usize
+    }
+
     /// Launch state of every Session slot holding a clip.
     pub fn clip_states(&self) -> Vec<ClipSlotStatus> {
         lock(&self.status.session).snapshot()
@@ -975,6 +1008,16 @@ struct Control {
     /// graph is rebuilt shortly after, so the halted callback can restart.
     seen_callback_panics: u64,
     panic_seen_at: Option<Instant>,
+    /// The "Audio threads" setting (`0` = Auto) and the device buffer's
+    /// duration the workers' real-time policy is set for.
+    audio_threads: usize,
+    period: Duration,
+    /// New worker pools for the running processor, and the old ones back.
+    pool_tx: Option<Producer<WorkerPool>>,
+    pool_retire_rx: Option<Consumer<WorkerPool>>,
+    /// A pool built while the queue was full (the audio thread is not
+    /// running blocks); queued as soon as there is room.
+    pending_pool: Option<WorkerPool>,
 }
 
 impl Control {
@@ -1124,6 +1167,7 @@ impl Control {
                 }
             }
             Msg::Macro(rack, index, value) => self.move_macro(rack, index, value),
+            Msg::AudioThreads(setting) => self.set_audio_threads(setting),
             Msg::TrackNoInput(track, none) => {
                 self.track_io.entry(track).or_default().none = none;
                 // (The list of tracks that would record changes with it.)
@@ -1227,6 +1271,26 @@ impl Control {
                 let _ = self.graveyard.send(g);
             }
         }
+        // Old worker pools are joined here (their workers are parked: quick).
+        if let Some(rx) = &mut self.pool_retire_rx {
+            while let Ok(p) = rx.pop() {
+                drop(p);
+            }
+        }
+    }
+
+    /// A worker pool for the current setting and device.
+    fn make_pool(&self) -> WorkerPool {
+        WorkerPool::new(resolve_threads(self.audio_threads), PoolKind::Live(self.period))
+    }
+
+    /// The setting changed: build the new pool here and queue it for the
+    /// audio thread.
+    fn set_audio_threads(&mut self, setting: usize) {
+        self.audio_threads = setting;
+        // (A pool still waiting for the queue is replaced by this one.)
+        self.pending_pool = Some(self.make_pool());
+        self.flush_pending();
     }
 
     fn flush_pending(&mut self) {
@@ -1234,6 +1298,11 @@ impl Control {
             && let Err(rtrb::PushError::Full(g)) = tx.push(g) {
                 self.pending = Some(g);
             }
+        if let (Some(p), Some(tx)) = (self.pending_pool.take(), self.pool_tx.as_mut())
+            && let Err(rtrb::PushError::Full(p)) = tx.push(p)
+        {
+            self.pending_pool = Some(p);
+        }
     }
 
     fn recompile(&mut self) {
@@ -1356,6 +1425,13 @@ impl Control {
             input_rx: input.map(|(rx, stamps, channels, first, count)| InputQueue { rx, stamps, channels, first, count }),
         };
         let mut runner = AudioProcessor::new(q, self.status.clone(), sample_rate, self.max_frames, init);
+        let (pool_tx, pool_rx) = RingBuffer::new(POOL_QUEUE);
+        let (pool_retire_tx, pool_retire_rx) = RingBuffer::new(POOL_QUEUE);
+        runner.attach_pools(pool_rx, pool_retire_tx);
+        self.pool_tx = Some(pool_tx);
+        self.pool_retire_rx = Some(pool_retire_rx);
+        self.pending_pool = None;
+        runner.set_pool(self.make_pool());
         let (rec_midi_tx, rec_midi_rx) = RingBuffer::new(REC_MIDI_QUEUE);
         let (rec_audio_tx, rec_audio_rx) = RingBuffer::new(AUDIO_QUEUE);
         runner.attach_recorder(rec_midi_tx, rec_audio_tx);
@@ -1384,6 +1460,7 @@ impl Control {
 
     /// A runner with no device: a stereo input queue the caller feeds by hand.
     fn headless_runner(&mut self, rate: f64) -> AudioProcessor {
+        self.period = Duration::from_secs_f64(self.max_frames as f64 / rate.max(1.0));
         let (sink, rx, stamps) = input_ring(rate as usize, 2);
         *lock(&self.shared.virtual_input) = Some(sink);
         self.new_runner(rate, Some((rx, stamps, 2, 0, 2)))
@@ -1430,6 +1507,8 @@ impl Control {
         } else {
             (None, None)
         };
+        let buffer = prepared.active.buffer_size.map_or(self.max_frames, |b| b as usize).clamp(16, 8192);
+        self.period = Duration::from_secs_f64(buffer as f64 / sr.max(1.0));
         let runner = self.new_runner(sr, input_rx);
         let stream = audio_io::start(prepared, runner, input_tx, self.status.clone())?;
         let active = stream.active.clone();

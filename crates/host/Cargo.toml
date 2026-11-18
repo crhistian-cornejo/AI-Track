@@ -20,7 +20,7 @@ rtrb.workspace = true
 vst3 = "0.3"
 # CLAP: prokopyl/clack (MIT OR Apache-2.0).
 clack-host = "0.2"
-clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "tail", "log", "timer"] }
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "tail", "log", "timer", "thread-check"] }
 libloading = "0.8"
 # Plugin editor thumbnails (PNG only; already in the build for the app).
 image = { version = "0.25", default-features = false, features = ["png"] }

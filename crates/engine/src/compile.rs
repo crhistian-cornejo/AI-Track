@@ -993,6 +993,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
     track_lookup.sort();
     let mut warnings_out = warnings;
     warnings_out.dedup();
+    let schedule = crate::multicore::Schedule::build(&tracks_out);
 
     Ok(CompiledGraph {
         sample_rate: sr,
@@ -1015,6 +1016,7 @@ pub fn compile(project: &Project, cx: &mut CompileContext<'_>) -> Result<Compile
         midi_dropped: 0,
         sanitized: 0,
         generation: 0,
+        schedule,
     })
 }
 

@@ -2,7 +2,16 @@
 //!
 //! Host extensions provided to plugins: `log`, `params`, `state`,
 //! `latency`, `gui`, `audio-ports`, `note-ports`, `timer-support`, `tail`,
-//! plus the core `request_restart` / `request_process` / `request_callback`.
+//! `thread-check`, plus the core `request_restart` / `request_process` /
+//! `request_callback`.
+//!
+//! `thread-check`: the main thread is the one that created the instance;
+//! an audio thread is any thread the engine marks as one
+//! ([`aitrack_dsp::is_audio_thread`]): the device callback, every DSP
+//! worker of the engine's pool (the tracks of a block run on several
+//! threads), an offline render while it renders, the sandbox host's
+//! real-time thread. Nothing in this crate assumes a single audio thread:
+//! each instance is processed by one thread at a time, whichever it is.
 //! Callbacks only set flags; the work happens on the main thread in
 //! [`ClapMain::idle`] or at the next `prepare`.
 
@@ -24,6 +33,7 @@ use clack_extensions::note_ports::{HostNotePorts, HostNotePortsImpl, NoteDialect
 use clack_extensions::params::{HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags};
 use clack_extensions::state::{HostState, HostStateImpl};
 use clack_extensions::tail::{HostTail, HostTailImpl};
+use clack_extensions::thread_check::{HostThreadCheck, HostThreadCheckImpl};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, TimerId};
 use clack_host::prelude::*;
 
@@ -65,12 +75,35 @@ impl HostHandlers for ClapHost {
             .register::<HostAudioPorts>()
             .register::<HostNotePorts>()
             .register::<HostTimer>()
-            .register::<HostTail>();
+            .register::<HostTail>()
+            .register::<HostThreadCheck>();
     }
 }
 
 pub(crate) struct ClapShared {
     pub flags: Arc<ClapFlags>,
+    /// The thread that created the instance: its main thread.
+    main: std::thread::ThreadId,
+}
+
+impl ClapShared {
+    /// On the thread that creates the instance (its main thread).
+    pub fn new(flags: Arc<ClapFlags>) -> Self {
+        Self { flags, main: std::thread::current().id() }
+    }
+}
+
+impl HostThreadCheckImpl for ClapShared {
+    fn is_main_thread(&self) -> bool {
+        // An audio thread is never the main thread; asking it first also
+        // keeps `thread::current()` (which may allocate a handle on a thread
+        // std did not start, like CoreAudio's) off the audio threads.
+        !aitrack_dsp::is_audio_thread() && std::thread::current().id() == self.main
+    }
+
+    fn is_audio_thread(&self) -> bool {
+        aitrack_dsp::is_audio_thread()
+    }
 }
 
 impl SharedHandler<'_> for ClapShared {
@@ -263,4 +296,33 @@ pub fn probe(path: &Path) -> Result<Vec<HostedPluginInfo>> {
         }
     }
     Ok(infos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_thread_check_knows_the_main_thread_and_every_audio_thread() {
+        let shared = Arc::new(ClapShared::new(Arc::new(ClapFlags::default())));
+        assert!(shared.is_main_thread());
+        assert!(!shared.is_audio_thread());
+        {
+            // The engine's callback, or the main thread standing in for it.
+            let _audio = aitrack_dsp::AudioThreadScope::enter();
+            assert!(shared.is_audio_thread());
+            assert!(!shared.is_main_thread());
+        }
+        // A DSP worker: another thread, marked for good.
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            assert!(!s.is_audio_thread() && !s.is_main_thread(), "an unmarked thread is neither");
+            aitrack_dsp::mark_audio_thread();
+            assert!(s.is_audio_thread());
+            assert!(!s.is_main_thread());
+        })
+        .join()
+        .unwrap();
+        assert!(shared.is_main_thread() && !shared.is_audio_thread());
+    }
 }

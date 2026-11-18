@@ -2830,6 +2830,7 @@ impl Workspace {
     fn render_usage(&mut self) -> AnyElement {
         let pal = p();
         let dsp = self.b.engine.cpu_load().clamp(0., 1.);
+        let threads = self.b.engine.active_audio_threads();
         let cpu = self.usage.cpu;
         let hot = |v: f32| if v > 0.8 { pal.record } else if v > 0.5 { pal.meter_mid } else { pal.muted };
         let cell = |name: &'static str, value: String, color: gpui::Hsla| {
@@ -2841,7 +2842,11 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(px(SP3))
-            .tooltip(crate::widgets::tip("Resource use: audio engine load, this app's CPU share and memory", None))
+            .tooltip(crate::widgets::tip_owned(format!(
+                "Resource use: audio engine load (on {} audio thread{}), this app's CPU share and memory",
+                threads,
+                if threads == 1 { "" } else { "s" }
+            )))
             .child(cell("DSP", format!("{:>2.0}%", dsp * 100.), hot(dsp)))
             .child(cell("CPU", format!("{:>2.0}%", cpu * 100.), hot(cpu)))
             .child(cell("RAM", self.usage.memory_label(), pal.muted))

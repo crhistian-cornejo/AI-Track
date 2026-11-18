@@ -11,6 +11,11 @@
 //! as 16-bit (optional TPDF dither, optionally noise-shaped), 24-bit or
 //! 32-bit float. MP3 is always 320 kbps CBR joint stereo through a
 //! dynamically loaded LAME (see [`crate::mp3`]). Stems are always WAV.
+//!
+//! A render runs the graph on [`RenderOptions::threads`] threads (by
+//! default the process-wide setting, [`set_render_threads`]), with workers
+//! at normal priority. The result is bit-identical to a single-threaded
+//! render (see [`crate::multicore`]).
 
 use crate::compile::{compile, CompileContext};
 use crate::factory::ProcessorFactory;
@@ -19,12 +24,31 @@ use crate::rt::{AudioProcessor, RtCommand, RtQueues, TransportInit};
 use crate::sample_cache::{resample, SampleCache};
 use crate::shared::ProcessorPool;
 use crate::status::SharedStatus;
+use crate::workers::{resolve_threads, PoolKind, WorkerPool};
 use crate::EngineError;
 use aitrack_dsp::AudioBuffer;
 use aitrack_model::{AudioSource, AutomationTarget, Placement, PlacementId, Project, Source, Tick, Track, TrackId, TrackKind, Color, Warp};
 use rtrb::RingBuffer;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// The "Audio threads" setting offline renders use when their options do
+/// not say (`0` = Auto). One until the app sets it.
+static RENDER_THREADS: AtomicUsize = AtomicUsize::new(1);
+
+/// Threads offline renders (export, stems, freeze, consolidate) run on when
+/// [`RenderOptions::threads`] is `None`: `0` = Auto ([`crate::auto_threads`]),
+/// `1` = one thread. The app sets it from the same preference as the live
+/// engine.
+pub fn set_render_threads(setting: usize) {
+    RENDER_THREADS.store(setting, Ordering::Relaxed);
+}
+
+/// The setting [`set_render_threads`] stored.
+pub fn render_threads() -> usize {
+    RENDER_THREADS.load(Ordering::Relaxed)
+}
 
 /// What part of the song to render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +110,9 @@ pub struct RenderOptions {
     pub normalize_db: Option<f32>,
     /// Decoded audio to reuse (the live engine's cache); `None` decodes.
     pub samples: Option<SampleCache>,
+    /// Threads to render on (`Some(0)` = Auto); `None` = the process-wide
+    /// setting ([`set_render_threads`]). The output does not depend on it.
+    pub threads: Option<usize>,
 }
 
 impl Default for RenderOptions {
@@ -98,6 +125,7 @@ impl Default for RenderOptions {
             tail_seconds: 2.0,
             normalize_db: None,
             samples: None,
+            threads: None,
         }
     }
 }
@@ -160,6 +188,10 @@ pub fn render(
     let status = Arc::new(SharedStatus::new());
     let init = TransportInit { playing: true, position_ticks: start as f64, ..TransportInit::default() };
     let mut runner = AudioProcessor::new(q, status, sr, block, init);
+    let threads = resolve_threads(opts.threads.unwrap_or_else(render_threads));
+    if threads > 1 {
+        runner.set_pool(WorkerPool::new(threads, PoolKind::Offline));
+    }
     graph_tx.push(Box::new(graph)).map_err(|_| EngineError::Export("graph queue".into()))?;
 
     let play_frames = (tempo.tick_to_samples(end, sr) - tempo.tick_to_samples(start, sr)).round().max(0.0) as usize;
@@ -274,6 +306,7 @@ pub fn render_offline(
         tail_seconds: 0.0,
         normalize_db: None,
         samples: None,
+        threads: None,
     };
     Ok(render(project, factory, &opts, &[], None)?.mix)
 }
@@ -295,6 +328,7 @@ pub fn render_offline_with(
         tail_seconds: 0.0,
         normalize_db: None,
         samples: Some(samples),
+        threads: None,
     };
     Ok(render(project, factory, &opts, &[], None)?.mix)
 }
@@ -585,6 +619,7 @@ pub fn freeze_track_to_wav(
         tail_seconds: FREEZE_TAIL_SECONDS,
         normalize_db: None,
         samples,
+        threads: None,
     };
     let mut rendered = render(&scratch, factory, &opts, &[], progress)?.mix;
     // Keep the whole clip range, but cut the tail where it has died away.

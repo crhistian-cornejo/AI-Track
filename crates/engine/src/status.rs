@@ -172,6 +172,8 @@ pub(crate) struct SharedStatus {
     pub cpu_load: AtomicU32,
     pub cpu_peak: AtomicU32,
     pub xruns: AtomicU64,
+    /// Threads the graph runs on (the audio thread included), as installed.
+    pub audio_threads: AtomicU32,
     /// Loop range the transport is using (`-1` start = off).
     pub loop_start: AtomicI64,
     pub loop_end: AtomicI64,
@@ -469,6 +471,7 @@ impl SharedStatus {
             position_ticks: AtomicU64::new(0f64.to_bits()),
             position_samples: AtomicI64::new(0),
             cpu_load: AtomicU32::new(0),
+            audio_threads: AtomicU32::new(1),
             cpu_peak: AtomicU32::new(0),
             xruns: AtomicU64::new(0),
             loop_start: AtomicI64::new(-1),

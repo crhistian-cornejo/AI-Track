@@ -18,6 +18,7 @@ pub mod export;
 pub mod factory;
 pub mod fallback;
 pub(crate) mod graph;
+pub(crate) mod multicore;
 pub mod midi_io;
 pub mod mp3;
 pub mod record;
@@ -27,6 +28,7 @@ pub mod shared;
 pub mod status;
 pub mod tap;
 pub mod thread_priority;
+pub mod workers;
 
 #[cfg(test)]
 mod alloc_counter;
@@ -38,7 +40,7 @@ pub use compile::{compile, CompileContext, CompileError};
 pub use engine::{Engine, EngineConfig, EngineHandle};
 pub use export::{
     consolidate_to_wav, consolidate_to_wav_with, export_mp3, freeze_end, freeze_track_to_wav, FREEZE_TAIL_SECONDS, export_stems, export_wav, render, render_clips, render_clips_with, render_offline, render_offline_with,
-    write_wav, Dither, Progress, RenderOptions, RenderRange, Rendered, WavFormat,
+    write_wav, render_threads, set_render_threads, Dither, Progress, RenderOptions, RenderRange, Rendered, WavFormat,
 };
 pub use factory::{FactoryStack, NullFactory, ProcessorFactory};
 pub use graph::CompiledGraph;
@@ -49,6 +51,7 @@ pub use sample_cache::{DecodedAudio, SampleCache};
 pub use shared::{ProcessorPool, SharedProcessor};
 pub use status::{ClipSlotStatus, MeterReading, SlotState};
 pub use tap::{AnalysisTap, DeviceMeter, TapReader, DEVICE_METER_LEN, TAP_FRAMES};
+pub use workers::{auto_threads, resolve_threads};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

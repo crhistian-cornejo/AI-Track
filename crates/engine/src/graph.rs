@@ -11,13 +11,20 @@
 //! clip player → device chain (racks, sub-blocked for automation) →
 //! pre-fader sends → volume/pan/mute (ramped every 32 samples) →
 //! post-fader sends → meter → PDC delay → destination input.
+//!
+//! The tracks of a segment run one after the other in graph order, or —
+//! with a [`WorkerPool`] of more than one thread — level by level on
+//! several threads; see [`crate::multicore`] for the levels, the two phases
+//! of a track and why the output is the same either way.
 
 use crate::automation::{lane_value, pan_from_normalized, pan_gains, volume_db_from_normalized, volume_normalized_from_db, CONTROL_BLOCK};
 use crate::clip::{ActiveNotes, CompiledClip, EventList, Rng, TimeCtx};
 use crate::delay::DelayLine;
+use crate::multicore::{Schedule, SideBus};
 use crate::shared::SharedProcessor;
 use crate::status::{MeterBank, SessionStatus, NO_SCENE, STOP_SCENE};
 use crate::tap::{AnalysisTap, DeviceMeter, DEVICE_METER_LEN};
+use crate::workers::WorkerPool;
 use aitrack_dsp::{db_to_gain, AudioBuffer, Event, EventKind, EventSink, MidiContext, ModBlock, ProcessContext, Transport};
 use aitrack_model::{AutomationLane, DeviceId, FollowAction, LaunchMode, Monitor, Quantize, RackKind, SceneId, TempoMap, Tick, TrackId, TrackKind, PPQ};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -292,7 +299,7 @@ impl ProcNode {
 pub(crate) struct SideIn<'a> {
     /// One buffer per source track: the block being processed when the
     /// source comes earlier in the graph, otherwise the previous one.
-    pub bufs: &'a [AudioBuffer],
+    pub bufs: &'a SideBus<'a>,
     /// The frames of the current chunk, copied out for the device.
     pub scratch: &'a mut AudioBuffer,
     /// Where the current chunk starts inside the segment.
@@ -1455,7 +1462,7 @@ pub(crate) struct TapNode {
 }
 
 impl TrackNode {
-    fn carries_audio(&self) -> bool {
+    pub(crate) fn carries_audio(&self) -> bool {
         self.kind.carries_audio()
     }
 
@@ -1533,6 +1540,8 @@ pub struct CompiledGraph {
     /// thread publishes the one it runs so the control thread can tell
     /// whether the newest graph is the installed one.
     pub(crate) generation: u64,
+    /// How the tracks spread over threads (built with the graph).
+    pub(crate) schedule: Schedule,
 }
 
 /// Replace NaN and infinities in `buf` by zero; returns how many.
@@ -1925,11 +1934,14 @@ impl CompiledGraph {
         self.midi_dropped = midi_dropped;
     }
 
-    /// Process one segment (no transport discontinuity inside it).
-    pub(crate) fn process_segment(&mut self, io: &mut SegmentIo<'_>) {
+    /// Process one segment (no transport discontinuity inside it). With a
+    /// parallel `pool` and a graph worth spreading, the tracks run level by
+    /// level on its threads ([`crate::multicore`]); otherwise one after the
+    /// other on this thread. The output is the same either way.
+    pub(crate) fn process_segment(&mut self, io: &mut SegmentIo<'_>, pool: &mut WorkerPool) {
         let n = io.frames;
         let sr = self.sample_rate;
-        let Self { tracks, inputs, side, out_bus, tempo, scenes, out_acc, sanitized, .. } = self;
+        let Self { tracks, inputs, side, out_bus, tempo, scenes, out_acc, sanitized, schedule, .. } = self;
         let ctx = TimeCtx { tempo, sr, seg_start: io.seg_start };
         let t0 = ctx.tick_of(io.seg_start);
         let t1 = ctx.tick_of(io.seg_start + n as i64);
@@ -1944,12 +1956,6 @@ impl CompiledGraph {
             loop_range_beats: io.loop_range.map(|(a, b)| (a as f64 / PPQ as f64, b as f64 / PPQ as f64)),
         };
 
-        for (i, t) in tracks.iter().enumerate() {
-            if t.has_input {
-                inputs[i].set_frames(n);
-                inputs[i].clear();
-            }
-        }
         out_bus.set_frames(n);
         out_bus.clear();
 
@@ -1967,11 +1973,43 @@ impl CompiledGraph {
             }
         }
 
-        for (i, t) in tracks.iter_mut().enumerate() {
-            if !t.carries_audio() {
-                continue;
+        // The track the analysis tap wants this segment, read once: one
+        // writer, however many threads run the tracks.
+        let tap_track = tracks.iter().find_map(|t| t.analysis.as_deref()).and_then(AnalysisTap::wanted_track);
+        let env = TrackEnv {
+            ctx,
+            transport,
+            scene_count: scenes.len(),
+            tap_track,
+            seg_start: io.seg_start,
+            frames: n,
+            playing: io.playing,
+            recording: io.recording,
+            input: io.input,
+            raw: io.raw,
+            out_offset: io.out_offset,
+        };
+        if pool.is_parallel() && schedule.parallel {
+            if !crate::multicore::process_levels(schedule, tracks, inputs, side, out_bus, &env, pool) {
+                // As on one thread, where it would have unwound from here.
+                panic!("a track's processing panicked on a DSP worker");
             }
-            process_track(t, i, &ctx, &*io, &transport, inputs, side, out_bus, scenes.len());
+        } else {
+            for (i, t) in tracks.iter().enumerate() {
+                if t.has_input {
+                    inputs[i].set_frames(n);
+                    inputs[i].clear();
+                }
+            }
+            let mut bus = SideBus::new(side);
+            for (i, t) in tracks.iter_mut().enumerate() {
+                if !t.carries_audio() {
+                    continue;
+                }
+                let input = if t.has_input { Some(&inputs[i]) } else { None };
+                compute_track(t, &env, input, &mut bus);
+                mix_track(t, inputs, out_bus);
+            }
         }
 
         // The last line of defence: whatever a device, a clip or an automation
@@ -1992,28 +2030,40 @@ impl SendNode {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_track(
-    t: &mut TrackNode,
-    index: usize,
-    ctx: &TimeCtx<'_>,
-    io: &SegmentIo<'_>,
-    transport: &Transport,
-    inputs: &mut [AudioBuffer],
-    side: &mut [AudioBuffer],
-    out_bus: &mut AudioBuffer,
-    scene_count: usize,
-) {
+/// What every track of a segment reads: time, transport and the device
+/// input. Shared by the threads that run the tracks (read only).
+pub(crate) struct TrackEnv<'a> {
+    pub ctx: TimeCtx<'a>,
+    pub transport: Transport,
+    pub scene_count: usize,
+    /// The track whose post-fader signal feeds the analysis tap.
+    pub tap_track: Option<TrackId>,
+    pub seg_start: i64,
+    pub frames: usize,
+    pub playing: bool,
+    pub recording: bool,
+    pub input: Option<(&'a AudioBuffer, usize)>,
+    pub raw: Option<(&'a [f32], usize)>,
+    pub out_offset: usize,
+}
+
+/// The compute phase of a track (see [`crate::multicore`]): clips, live
+/// input, devices, sends' buffers, fader, meter, taps and PDC delay, from its
+/// `input` (the sum of what feeds it, `None` when nothing does) and the
+/// sidechain slots of other tracks. Writes only `t` and `t`'s own sidechain
+/// slot; [`mix_track`] (or the next level's gather) moves the result on.
+pub(crate) fn compute_track(t: &mut TrackNode, env: &TrackEnv<'_>, input: Option<&AudioBuffer>, side: &mut SideBus<'_>) {
+    let (ctx, transport, io) = (&env.ctx, &env.transport, env);
+    let scene_count = env.scene_count;
     let n = io.frames;
     let sr = ctx.sr;
     let lo = io.seg_start;
     let hi = lo + n as i64;
 
     t.buf.set_frames(n);
-    if t.has_input {
-        t.buf.copy_from(&inputs[index]);
-    } else {
-        t.buf.clear();
+    match input {
+        Some(input) => t.buf.copy_from(input),
+        None => t.buf.clear(),
     }
 
     // Events: pending releases, live input, clip playback.
@@ -2201,7 +2251,6 @@ fn process_track(
                 a = b;
             }
             s.delay.process(&mut s.buf);
-            inputs[s.target].add_from(&s.buf, 1.0);
         }
         if pass {
             // The fader itself.
@@ -2233,7 +2282,7 @@ fn process_track(
 
     t.meter_acc.add(&t.buf);
     if let Some(a) = &t.analysis
-        && a.wants_track(t.id)
+        && env.tap_track == Some(t.id)
     {
         a.write(t.buf.channel(0), t.buf.channel(1));
     }
@@ -2246,6 +2295,17 @@ fn process_track(
         }
     }
     t.out_delay.process(&mut t.buf);
+}
+
+/// The mix phase of a track (one thread): its sends and its output into the
+/// inputs of their targets and the output bus, in the order the parallel
+/// path gathers them ([`crate::multicore::Schedule::feeds`]).
+fn mix_track(t: &TrackNode, inputs: &mut [AudioBuffer], out_bus: &mut AudioBuffer) {
+    for pass in [true, false] {
+        for s in t.sends.iter().filter(|s| s.pre_fader == pass) {
+            inputs[s.target].add_from(&s.buf, 1.0);
+        }
+    }
     match t.output {
         OutputTarget::Track(j) => inputs[j].add_from(&t.buf, 1.0),
         OutputTarget::Out => out_bus.add_from(&t.buf, 1.0),

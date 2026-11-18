@@ -66,13 +66,16 @@ impl AnalysisTap {
         self.is_enabled() && self.source.load(Ordering::Relaxed) == SOURCE_MAIN
     }
 
-    /// Audio thread: whether `track`'s output is what readers want.
+    /// Audio thread: the track whose output readers want, if it is one.
     #[inline]
-    pub(crate) fn wants_track(&self, track: TrackId) -> bool {
-        self.is_enabled() && self.source.load(Ordering::Relaxed) == track.0 + 1
+    pub(crate) fn wanted_track(&self) -> Option<TrackId> {
+        let s = self.source.load(Ordering::Relaxed);
+        (self.is_enabled() && s != SOURCE_MAIN).then(|| TrackId(s - 1))
     }
 
     /// Audio thread: append a block. Wait-free; overwrites the oldest frames.
+    /// One writer at a time: the audio thread decides, once per segment,
+    /// which track writes ([`Self::wanted_track`]).
     #[inline]
     pub(crate) fn write(&self, left: &[f32], right: &[f32]) {
         let mut w = self.written.load(Ordering::Relaxed);
@@ -276,14 +279,14 @@ mod tests {
         let (l, rr) = block(0, 512);
         tap.write(&l, &rr);
         r.set_enabled(true);
-        assert!(tap.wants_main() && !tap.wants_track(TrackId(3)));
+        assert!(tap.wants_main() && tap.wanted_track().is_none());
         let mut out = Vec::new();
         r.read(&mut out);
         assert!(out.is_empty(), "frames from before enabling are skipped");
         r.set_source(Some(TrackId(3)));
-        assert!(tap.wants_track(TrackId(3)) && !tap.wants_main());
+        assert!(tap.wanted_track() == Some(TrackId(3)) && !tap.wants_main());
         r.set_enabled(false);
-        assert!(!tap.wants_track(TrackId(3)));
+        assert!(tap.wanted_track().is_none());
     }
 
     #[test]

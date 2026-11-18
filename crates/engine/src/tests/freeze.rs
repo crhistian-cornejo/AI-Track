@@ -137,3 +137,15 @@ fn a_flattened_track_plays_the_render_without_devices() {
     assert!(worst < 1e-4, "flattened audio differs by {worst}");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_silent_take_does_not_lengthen_the_freeze() {
+    let (mut b, t, _) = song();
+    let end = crate::freeze_end(&b.p, t);
+    assert_eq!(end, 4 * PPQ);
+    edit(&mut b.p, Command::AddTakeLane { track: t, index: 0, name: "Take 1".into() });
+    let long = b.notes(&[(60, 0, PPQ)], 40 * PPQ, None);
+    let id = b.p.alloc_placement_id();
+    edit(&mut b.p, Command::PlaceClip { track: t, placement: Placement { id, clip: long, start: 0, lane: 1 } });
+    assert_eq!(crate::freeze_end(&b.p, t), end, "a take lane is silent");
+}

@@ -1,8 +1,9 @@
 //! `mod.envfollow` — envelope follower modulator. It measures the track's
 //! audio at its place in the chain (peak or RMS, with rise and fall times)
 //! and passes it through untouched; the engine adds the measured level, scaled
-//! by each mapping's range, to the parameters it drives. The level of one
-//! block steers the next, so the control lags by a block.
+//! by each mapping's range, to the parameters it drives. The control lags the
+//! audio by a fixed [`LAG_STEPS`] control steps (about 11 ms), whatever the
+//! block size, so the live result and the export (512-frame blocks) match.
 //!
 //! The output is `depth · level · gain` clamped to 0..1 (`Invert` flips it).
 //!
@@ -25,6 +26,13 @@ pub mod p {
 
 const MODES: &[&str] = &["Peak", "RMS"];
 const OFF_ON: &[&str] = &["Off", "On"];
+/// Frames between two measured levels (the engine's control step).
+const STEP: usize = 32;
+/// Control steps the output lags the audio: the longest block the engine
+/// runs a modulator for without hearing its audio first (512 frames).
+pub const LAG_STEPS: usize = 16;
+/// Levels kept; a power of two above [`LAG_STEPS`].
+const RING: usize = 64;
 /// Outputs kept for the display.
 pub const HISTORY: usize = 96;
 
@@ -46,6 +54,12 @@ pub struct EnvFollow {
     env: EnvelopeFollower,
     out: f32,
     history: [f32; HISTORY],
+    /// The detector level at the end of each control step (`done % RING`).
+    levels: [f32; RING],
+    /// Control steps completed since the reset.
+    done: u64,
+    /// Frames into the step in progress.
+    into: usize,
 }
 
 pub fn create() -> Box<dyn Processor> {
@@ -78,6 +92,9 @@ impl EnvFollow {
             env: EnvelopeFollower::new(DetectorMode::Peak),
             out: 0.0,
             history: [0.0; HISTORY],
+            levels: [0.0; RING],
+            done: 0,
+            into: 0,
         };
         c.prepare(48_000.0, 512);
         c
@@ -105,6 +122,9 @@ impl Processor for EnvFollow {
         self.env.reset();
         self.out = self.output(0.0);
         self.history = [0.0; HISTORY];
+        self.levels = [0.0; RING];
+        self.done = 0;
+        self.into = 0;
     }
 
     fn process(&mut self, ctx: &mut ProcessContext<'_>) {
@@ -118,6 +138,12 @@ impl Processor for EnvFollow {
         for i in 0..frames {
             let (a, b) = (l[i], r[i]);
             self.env.process(if a.abs() >= b.abs() { a } else { b });
+            self.into += 1;
+            if self.into == STEP {
+                self.into = 0;
+                self.levels[(self.done % RING as u64) as usize] = self.env.value();
+                self.done += 1;
+            }
         }
         self.out = self.output(self.env.value());
         self.history.copy_within(1.., 0);
@@ -125,8 +151,15 @@ impl Processor for EnvFollow {
     }
 
     fn modulate(&mut self, _m: &ModBlock<'_>, out: &mut [f32]) -> bool {
-        // Re-derived so a knob turn is heard before the next block arrives.
-        out.fill(self.output(self.env.value()));
+        // Step `k` of this block hears the level `LAG_STEPS` steps before it (the newest
+        // one measured when the block is longer than the lag). Re-derived from the
+        // knobs here so a turn is heard before the next block arrives.
+        for (k, o) in out.iter_mut().enumerate() {
+            let want = self.done as i64 + k as i64 - LAG_STEPS as i64;
+            let at = want.min(self.done as i64 - 1);
+            let level = if at < 0 { 0.0 } else { self.levels[(at as u64 % RING as u64) as usize] };
+            *o = self.output(level);
+        }
         true
     }
 
@@ -166,7 +199,7 @@ mod tests {
         let m = ModBlock { sample_rate: SR, playing: true, bpm: 120.0, step: 32, frames: 128, start_samples: 0, beats: &[0.0; 4], events: &[] };
         let mut out = [0.0; 4];
         assert!(p.modulate(&m, &mut out));
-        assert!(out.iter().all(|x| *x == out[0]));
+        assert!(out.iter().all(|x| (*x - out[0]).abs() < 0.05));
         out[0]
     }
 
@@ -185,6 +218,44 @@ mod tests {
         assert!((0.4..=0.55).contains(&loud), "{loud}");
         process_stereo_prepared(&mut p, |_| (0.0, 0.0), 24_000, &Transport::default());
         assert!(modulate(&mut p) < 0.01, "falls back");
+    }
+
+    #[test]
+    fn the_modulation_does_not_depend_on_the_block_size() {
+        use aitrack_dsp::AudioBuffer;
+        let run = |block: usize| -> Vec<f32> {
+            let mut p = EnvFollow::new();
+            p.prepare(SR, block);
+            set_plain(&mut p, p::GAIN, 0.0);
+            set_plain(&mut p, p::RISE, 1.0);
+            set_plain(&mut p, p::FALL, 20.0);
+            let mut buf = AudioBuffer::new(2, block);
+            let tr = Transport::default();
+            let (mut all, mut pos) = (Vec::new(), 0usize);
+            let beats = vec![0.0f64; block / 32];
+            while pos < 24_000 {
+                let mut out = vec![0.0f32; block / 32];
+                let m = ModBlock { sample_rate: SR, playing: true, bpm: 120.0, step: 32, frames: block, start_samples: pos as i64, beats: &beats, events: &[] };
+                assert!(p.modulate(&m, &mut out));
+                all.extend(out);
+                buf.set_frames(block);
+                for i in 0..block {
+                    // Bursts: loud for 3000 frames, quiet for 3000.
+                    let v = if ((pos + i) / 3000) % 2 == 0 { 0.8 * ((pos + i) as f32 * 0.05).sin() } else { 0.0 };
+                    buf.channel_mut(0)[i] = v;
+                    buf.channel_mut(1)[i] = v;
+                }
+                let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+                p.process(&mut ctx);
+                pos += block;
+            }
+            all.truncate(24_000 / 32);
+            all
+        };
+        let (a, b, c) = (run(64), run(256), run(512));
+        assert!(a.iter().any(|v| *v > 0.3) && a.iter().any(|v| *v < 0.05), "the signal does modulate");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
     }
 
     #[test]

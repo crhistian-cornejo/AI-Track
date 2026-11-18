@@ -197,6 +197,12 @@ impl Segmented for FreqShifter {
         }
         let ring = self.params.choice(p::MODE) == 1;
         let inv_sr = 1.0 / self.sr;
+        // With the transport running the LFO sits at the song position (as the Auto Pan's does),
+        // so a render from the start and one that begins at bar 5 agree there.
+        if ctx.transport.playing {
+            let pos = ctx.transport.position_samples + start as i64;
+            self.lfo.set_phase(pos as f64 * f64::from(self.params.plain(p::LFO_RATE)) * inv_sr);
+        }
         for_frames(ctx.buffer, start, end, |_, l, r| {
             let lfo = self.lfo.next();
             self.lfo_value = lfo;
@@ -349,6 +355,32 @@ mod tests {
         let tail = &l[8_000..];
         assert!(level_at(tail, 1000.0) < 0.3);
         assert!(peak(tail) > 0.3);
+    }
+
+    #[test]
+    fn the_lfo_follows_the_song_position() {
+        use crate::test_util::process_stereo_prepared;
+        use aitrack_dsp::Transport;
+        let bar5 = 8 * 48_000; // 16 beats at 120 BPM
+        let make = || {
+            let mut s = FreqShifter::new();
+            set_plain(&mut s, p::LFO_DEPTH, 400.0);
+            set_plain(&mut s, p::LFO_RATE, 0.7);
+            s.prepare(SR, 512);
+            s
+        };
+        let lfo_at_end = |from: i64, len: usize| {
+            let mut s = make();
+            let tr = Transport { playing: true, position_samples: from, position_beats: from as f64 / 24_000.0, ..Transport::default() };
+            process_stereo_prepared(&mut s, sine(1000.0, 0.5), len, &tr);
+            let mut m = [0.0f32; 8];
+            s.meter(&mut m);
+            m[4]
+        };
+        let continuous = lfo_at_end(0, bar5 + 4096);
+        let from_bar5 = lfo_at_end(bar5 as i64, 4096);
+        assert!(continuous.abs() > 0.05 || from_bar5.abs() > 0.05, "the LFO is moving at bar 5");
+        assert!((continuous - from_bar5).abs() < 1e-3, "{continuous} vs {from_bar5}");
     }
 
     #[test]

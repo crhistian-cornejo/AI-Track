@@ -266,3 +266,37 @@ fn a_live_knob_is_the_new_base_a_range_edit_applies_and_nothing_allocates() {
     });
     assert_eq!(n, 0, "modulating allocates nothing");
 }
+
+#[test]
+fn a_frozen_track_keeps_its_fader_modulation_live_and_does_not_bake_it_in() {
+    use crate::export::freeze_track_to_wav;
+    let mut p = Project::new("mod");
+    let t = p.alloc_track_id();
+    let mut track = Track::new(t, TrackKind::Instrument, "synth", Color(0));
+    track.pan = 0.5;
+    let (synth, m) = (p.alloc_device_id(), p.alloc_device_id());
+    track.devices.push(Device::stock(synth, TEST_SYNTH, "synth"));
+    track.devices.push(modulator(m, "mod.saw", vec![ModMapping { target: ModTarget::Pan, min: -0.5, max: 0.0 }, ModMapping { target: ModTarget::Volume, min: -0.2, max: 0.0 }]));
+    p.tracks.push(track);
+    let sid = p.alloc_source_id();
+    let mut src = NoteSource::default();
+    let nid = p.alloc_note_id();
+    src.notes.push(Note::new(nid, 60, 0, 2 * PPQ, 1.0));
+    p.sources.insert(sid, Source::Notes(src));
+    let cid = p.alloc_clip_id();
+    p.clips.insert(cid, Clip::new("c", Color(0), sid, 2 * PPQ));
+    let pid = p.alloc_placement_id();
+    p.track_mut(t).unwrap().arrangement.push(Placement { id: pid, clip: cid, start: 0, lane: 0 });
+    let live = render(&p, 256);
+    assert!(live.channel(0).iter().any(|s| s.abs() > 0.01));
+
+    let path = std::env::temp_dir().join(format!("aitrack-freeze-mod-{}.wav", std::process::id()));
+    let file = freeze_track_to_wav(&p, t, 48_000, &path, None, &Factory, None).unwrap();
+    Command::FreezeTrack { track: t, file }.apply(&mut p).unwrap();
+    let frozen = render(&p, 256);
+    let _ = std::fs::remove_file(&path);
+    for ch in 0..2 {
+        let worst = live.channel(ch).iter().zip(frozen.channel(ch)).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 2e-3, "channel {ch}: frozen differs from live by {worst}");
+    }
+}

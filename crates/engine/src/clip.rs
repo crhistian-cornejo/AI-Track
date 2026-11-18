@@ -31,6 +31,7 @@ use aitrack_dsp::event::Expression;
 use aitrack_dsp::warp::{pitch_taps, sample_warped_beats, sample_warped_grain};
 use aitrack_dsp::{AudioBuffer, Event, EventKind};
 use aitrack_model::groove::{grooved_velocity, random_unit, Groove, GrooveParams, GrooveSettings, NoteGroove, PoolGroove, MAX_GROOVE_AMOUNT};
+use aitrack_model::pitch::{points_at, PitchCurve};
 use aitrack_model::{clip_pan_gains, curve_shape, AutomationPoint, Clip, ClipEnv, ClipId, Fade, FollowAction, GrooveId, LaunchMode, NoteSource, Quantize, TempoMap, Tick, WarpMode, PPQ};
 use std::sync::Arc;
 
@@ -429,49 +430,11 @@ pub(crate) struct ClipShape {
     pub envelope: Box<[AutomationPoint]>,
     /// Points of the enabled pan envelope (-1..=1), sorted by tick.
     pub pan: Box<[AutomationPoint]>,
-    /// Points of the enabled transpose envelope (semitones), sorted by tick.
-    pub pitch: Box<[AutomationPoint]>,
-    /// `∫ 2^(semitones/12) dt` from clip time 0 to `k × pitch_step`, in ticks
-    /// (the speed of a Re-Pitch clip is the transpose as a ratio; this is how
-    /// far into the file it has read). Empty without a transpose envelope.
-    pitch_area: Box<[f64]>,
-    pitch_step: f64,
-}
-
-/// Finest spacing of the transpose area table, in ticks.
-const PITCH_STEP: f64 = (PPQ / 16) as f64;
-/// Most cells the transpose area table gets (a very long envelope widens the step).
-const PITCH_CELLS: f64 = 131_072.0;
-
-/// Value of sorted `pts` at clip time `t` with a cursor `seg` (start it at 0
-/// and pass it back, so consecutive samples do not search again). `None`
-/// without points.
-#[inline]
-fn points_at(pts: &[AutomationPoint], t: f64, seg: &mut usize) -> Option<f32> {
-    let first = pts.first()?;
-    if t <= first.tick as f64 {
-        return Some(first.value);
-    }
-    let mut i = (*seg).min(pts.len() - 1);
-    while i + 1 < pts.len() && pts[i + 1].tick as f64 <= t {
-        i += 1;
-    }
-    while i > 0 && pts[i].tick as f64 > t {
-        i -= 1;
-    }
-    *seg = i;
-    let a = pts[i];
-    let Some(b) = pts.get(i + 1) else { return Some(a.value) };
-    let x = (t - a.tick as f64) / b.tick.saturating_sub(a.tick).max(1) as f64;
-    Some(a.value + (b.value - a.value) * curve_shape(x as f32, a.curve))
-}
-
-/// [`points_at`] without a cursor: a binary search, for random access.
-#[inline]
-fn points_search(pts: &[AutomationPoint], t: f64) -> Option<f32> {
-    let first = pts.first()?;
-    let mut seg = if t <= first.tick as f64 { 0 } else { pts.partition_point(|p| p.tick as f64 <= t).saturating_sub(1) };
-    points_at(pts, t, &mut seg)
+    /// The enabled transpose envelope (semitones) and the integral of its
+    /// speed (the speed of a Re-Pitch clip is the transpose as a ratio; the
+    /// integral is how far into the file it has read). The model owns it so
+    /// editing operations place offsets with the same curve.
+    pub pitch: PitchCurve,
 }
 
 impl ClipShape {
@@ -487,27 +450,7 @@ impl ClipShape {
             pts.sort_by_key(|p| p.tick);
             pts.into_boxed_slice()
         };
-        let mut shape = Self { fade_in: fade(clip.fade_in), fade_out: fade(clip.fade_out), envelope: points(ClipEnv::Volume), pan: points(ClipEnv::Pan), pitch: points(ClipEnv::Pitch), ..Self::default() };
-        shape.build_pitch_area();
-        shape
-    }
-
-    /// Fill the transpose area table (control thread, once per compile).
-    fn build_pitch_area(&mut self) {
-        let Some(last) = self.pitch.last().map(|p| p.tick.max(0) as f64) else { return };
-        let step = PITCH_STEP.max((last / PITCH_CELLS).ceil());
-        let cells = (last / step).ceil() as usize + 1;
-        let speed = |t: f64| 2f64.powf(points_search(&self.pitch, t).unwrap_or(0.0) as f64 / 12.0);
-        let mut area = Vec::with_capacity(cells + 1);
-        let mut sum = 0.0;
-        area.push(sum);
-        for k in 0..cells {
-            let (a, b) = (k as f64 * step, (k + 1) as f64 * step);
-            sum += step / 6.0 * (speed(a) + 4.0 * speed((a + b) / 2.0) + speed(b));
-            area.push(sum);
-        }
-        self.pitch_area = area.into_boxed_slice();
-        self.pitch_step = step;
+        Self { fade_in: fade(clip.fade_in), fade_out: fade(clip.fade_out), envelope: points(ClipEnv::Volume), pan: points(ClipEnv::Pan), pitch: PitchCurve::of_clip(clip) }
     }
 
     /// Whether the clip has any fade or envelope at all, except the transpose
@@ -560,27 +503,16 @@ impl ClipShape {
     }
 
     /// Transpose in semitones at clip time `t`.
+    #[cfg(test)]
     #[inline]
     pub fn semitones(&self, t: f64) -> f64 {
-        points_search(&self.pitch, t).map_or(0.0, f64::from)
+        self.pitch.semitones(t)
     }
 
-    /// `∫ 2^(transpose/12) dτ` for τ in `0..t`: the clip ticks of the file
-    /// read after `t` ticks of clip time at the envelope's speed (plain `t`
-    /// without a transpose envelope). No allocation: a table lookup and a
-    /// trapezoid inside one cell.
+    /// See [`PitchCurve::integral`].
     #[inline]
     pub fn pitch_integral(&self, t: f64) -> f64 {
-        let speed = |t: f64| 2f64.powf(self.semitones(t) / 12.0);
-        let Some(&end) = self.pitch_area.last() else { return t };
-        if t <= 0.0 {
-            return t * speed(0.0);
-        }
-        let last = (self.pitch_area.len() - 1) as f64;
-        let k = (t / self.pitch_step).floor().min(last);
-        let a = k * self.pitch_step;
-        let base = if k >= last { end } else { self.pitch_area[k as usize] };
-        base + (t - a) * 0.5 * (speed(a) + speed(t))
+        self.pitch.integral(t)
     }
 }
 

@@ -147,11 +147,16 @@ fn copy_devices(p: &mut Project, devices: &[Device], map: &mut HashMap<DeviceId,
         .collect()
 }
 
-/// Point what the copies refer to at the copies: rack macros at the copied
-/// devices, sidechains at the copied tracks (when the source was copied too).
+/// Point what the copies refer to at the copies: rack macros and modulator
+/// targets at the copied devices, sidechains at the copied tracks (when the source was copied too).
 fn relink_devices(devices: &mut [Device], map: &HashMap<DeviceId, DeviceId>, track: &impl Fn(TrackId) -> TrackId) {
     for d in devices {
         d.sidechain = d.sidechain.map(track);
+        for m in &mut d.mods {
+            if let ModTarget::Param { device, .. } = &mut m.target {
+                *device = map.get(device).copied().unwrap_or(*device);
+            }
+        }
         if let DeviceKind::Rack(rack) = &mut d.kind {
             for m in &mut rack.macros {
                 for mapping in &mut m.mappings {
@@ -440,6 +445,26 @@ mod tests {
         });
         ids.extend(t.arrangement.iter().map(|pl| pl.id.0));
         ids
+    }
+
+    #[test]
+    fn duplicating_a_track_points_modulators_at_the_copied_devices() {
+        let mut r = rich();
+        let m = r.p.alloc_device_id();
+        Command::AddDevice { slot: DeviceSlot::Track { track: r.track, index: 2 }, device: Box::new(Device::stock(m, "mod.lfo", "LFO")) }.apply(&mut r.p).unwrap();
+        for target in [ModTarget::Param { device: r.comp, param: 1 }, ModTarget::Param { device: r.inner, param: 2 }, ModTarget::Pan] {
+            Command::AddModMapping { device: m, index: 9, mapping: ModMapping { target, min: 0.0, max: 0.5 } }.apply(&mut r.p).unwrap();
+        }
+        let dup = duplicate_track(&mut r.p, r.track).expect("duplicates");
+        let mut p = r.p.clone();
+        Command::Batch { commands: dup.commands }.apply(&mut p).unwrap();
+        let copy = p.track(dup.track).unwrap();
+        let DeviceKind::Rack(rack) = &copy.devices[0].kind else { panic!("rack") };
+        let (new_inner, new_comp) = (rack.chains[0].devices[0].id, copy.devices[1].id);
+        let new_mod = copy.devices.iter().find(|d| d.is_modulator()).unwrap();
+        let targets: Vec<ModTarget> = new_mod.mods.iter().map(|x| x.target).collect();
+        assert_eq!(targets, vec![ModTarget::Param { device: new_comp, param: 1 }, ModTarget::Param { device: new_inner, param: 2 }, ModTarget::Pan]);
+        assert_eq!(p.device(m).unwrap().mods[0].target, ModTarget::Param { device: r.comp, param: 1 }, "the original is untouched");
     }
 
     #[test]

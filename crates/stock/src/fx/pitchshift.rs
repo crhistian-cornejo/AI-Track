@@ -13,8 +13,9 @@
 //! shimmer-style stacks.
 //!
 //! The dry signal is delayed by the same latency as the wet path, so the Mix
-//! knob never combs. `latency()` reports it for delay compensation: it grows
-//! with the grain size.
+//! knob never combs. `latency()` reports it for delay compensation: it is
+//! that of the longest grain whatever the Grain knob says (a shorter grain
+//! reads further back), so automating Grain never moves the delay.
 //!
 //! Formants are not preserved: material is resampled, as in any
 //! delay-line shifter, so large shifts of voices sound like a different singer.
@@ -217,9 +218,14 @@ impl Segmented for PitchShifter {
         let ms = 0.001 * self.sr as f32;
         let max_d = self.lines[0].max_delay() as f32 - 3.0;
         let span = self.search as f32;
+        // The delay of the longest grain: the one the plugin reports.
+        let lat = self.latency_for(MAX_GRAIN_MS);
+        let max_grain = MAX_GRAIN_MS * ms;
         for_frames(ctx.buffer, start, end, |_, l, r| {
             let semi = self.semitones.next();
             let grain = (self.grain.next() * ms).max(8.0);
+            // A shorter grain reads further back so the middle of the grain stays at `lat`.
+            let pad = (0.5 * (max_grain - grain)).max(0.0);
             let byp = self.bypass.next();
             let fb = self.feedback.next();
             self.cur_semi = semi;
@@ -245,8 +251,8 @@ impl Segmented for PitchShifter {
                 if wrapped && byp < 1.0 {
                     if align {
                         let j = 1 - k;
-                        let d_ref = self.base + self.off[j] + ph[j] * grain;
-                        let nominal = self.base + ph[k] * grain;
+                        let d_ref = self.base + pad + self.off[j] + ph[j] * grain;
+                        let nominal = self.base + pad + ph[k] * grain;
                         self.off[k] = self.best_offset(nominal, d_ref).clamp(-span, span);
                     } else {
                         self.off[k] = 0.0;
@@ -257,12 +263,11 @@ impl Segmented for PitchShifter {
             for k in 0..2 {
                 let w = 0.5 - 0.5 * (std::f32::consts::TAU * ph[k]).cos();
                 self.win[k] = w;
-                let d = (self.base + self.off[k] + ph[k] * grain).clamp(2.0, max_d);
+                let d = (self.base + pad + self.off[k] + ph[k] * grain).clamp(2.0, max_d);
                 for c in 0..2 {
                     wet[c] += w * self.lines[c].read_cubic(d);
                 }
             }
-            let lat = self.base + 0.5 * grain;
             let (w, dg) = (self.wet.next(), self.dry_gain.next());
             let mut out = [0.0f32; 2];
             for c in 0..2 {
@@ -330,7 +335,7 @@ impl Processor for PitchShifter {
     }
 
     fn latency(&self) -> u32 {
-        self.latency_for(self.params.plain(p::GRAIN)).round() as u32
+        self.latency_for(MAX_GRAIN_MS).round() as u32
     }
 
     fn tail(&self) -> u32 {
@@ -443,6 +448,26 @@ mod tests {
         let at = l.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
         assert!((at as i64 - 2000 - lat as i64).abs() <= 2, "impulse at {at}, latency {lat}");
         assert!(l[at] > 0.95);
+    }
+
+    #[test]
+    fn latency_does_not_follow_the_grain_knob() {
+        let mut reported = Vec::new();
+        for grain in [10.0, 40.0, 120.0] {
+            let mut s = PitchShifter::new();
+            set_plain(&mut s, p::GRAIN, grain);
+            let lat = s.latency() as usize;
+            reported.push(lat);
+            let (l, _) = process_stereo(&mut s, |i| if i == 2000 { (1.0, 1.0) } else { (0.0, 0.0) }, 16_000);
+            let at = l.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+            assert!((at as i64 - 2000 - lat as i64).abs() <= 2, "grain {grain}: impulse at {at}, latency {lat}");
+        }
+        assert!(reported.windows(2).all(|w| w[0] == w[1]), "{reported:?}");
+        // Shifted, the wet path is as late as the dry one: a short grain still centres on the latency.
+        let mut s = PitchShifter::new();
+        set_plain(&mut s, p::GRAIN, 10.0);
+        set_plain(&mut s, p::SEMITONES, 12.0);
+        assert_eq!(s.latency() as usize, reported[0]);
     }
 
     #[test]

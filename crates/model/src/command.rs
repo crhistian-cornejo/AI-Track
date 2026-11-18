@@ -349,7 +349,7 @@ impl Command {
     /// `History` refuses such commands.
     pub fn frozen_target(&self, p: &Project) -> Option<TrackId> {
         use Command::*;
-        if !p.tracks.iter().any(Track::is_frozen) {
+        if !p.tracks.iter().any(Track::is_frozen) && !matches!(self, Batch { .. }) {
             return None;
         }
         let frozen = |t: TrackId| p.track(t).is_some_and(Track::is_frozen).then_some(t);
@@ -380,7 +380,23 @@ impl Command {
                 _ => None,
             },
             SetTrack { id, change: TrackProp::Arm(true) | TrackProp::KeyboardInput(true) } => frozen(*id),
-            Batch { commands } => commands.iter().find_map(|c| c.frozen_target(p)),
+            Batch { commands } => {
+                // A batch that changes the freeze state itself is checked as it applies:
+                // `[Unfreeze, SetParam]` edits an unfrozen track.
+                if commands.iter().any(|c| matches!(c, FreezeTrack { .. } | UnfreezeTrack { .. } | FlattenTrack { .. } | RestoreFlattened { .. })) {
+                    let mut sim = p.clone();
+                    for c in commands {
+                        if let Some(t) = c.frozen_target(&sim) {
+                            return Some(t);
+                        }
+                        if c.clone().apply(&mut sim).is_err() {
+                            break;
+                        }
+                    }
+                    return None;
+                }
+                commands.iter().find_map(|c| c.frozen_target(p))
+            }
             _ => None,
         }
     }
@@ -584,6 +600,11 @@ impl Command {
                 p.ids.observe(placement.id.0);
                 let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
                 let id = placement.id;
+                let mut placement = placement;
+                // A take lane the track does not have would hide the clip from every lane.
+                if usize::from(placement.lane) > t.take_lanes.len() {
+                    placement.lane = 0;
+                }
                 let i = t.arrangement.partition_point(|x| x.start <= placement.start);
                 t.arrangement.insert(i, placement);
                 Ok(RemovePlacement { track, id })
@@ -595,9 +616,10 @@ impl Command {
                 Ok(PlaceClip { track, placement })
             }
             MovePlacement { track, id, to_track, start, lane } => {
-                if p.track(to_track).is_none() {
+                let Some(dest_lanes) = p.track(to_track).map(|t| t.take_lanes.len()) else {
                     return Err(CommandError::TrackNotFound(to_track));
-                }
+                };
+                let lane = if usize::from(lane) > dest_lanes { 0 } else { lane };
                 let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
                 let i = t.arrangement.iter().position(|x| x.id == id).ok_or(CommandError::PlacementNotFound(id))?;
                 let mut placement = t.arrangement.remove(i);
@@ -684,12 +706,15 @@ impl Command {
             }
             RemoveDevice { id } => {
                 let links = valid_links(p);
+                let mod_links = valid_mod_links(p);
                 let (slot, device) = take_device(p, id)?;
-                let restores = drop_broken_mappings(p, &links);
+                let mut restores = drop_broken_mappings(p, &links);
+                restores.extend(drop_broken_mod_mappings(p, &mod_links));
                 Ok(with_restores(AddDevice { slot, device: Box::new(device) }, restores))
             }
             MoveDevice { id, to } => {
                 let links = valid_links(p);
+                let mod_links = valid_mod_links(p);
                 let (from, device) = take_device(p, id)?;
                 let chain = match chain_for_slot(p, to) {
                     Ok(c) => c,
@@ -702,7 +727,8 @@ impl Command {
                 };
                 let index = slot_index(to).min(chain.len());
                 chain.insert(index, device);
-                let restores = drop_broken_mappings(p, &links);
+                let mut restores = drop_broken_mappings(p, &links);
+                restores.extend(drop_broken_mod_mappings(p, &mod_links));
                 Ok(with_restores(MoveDevice { id, to: from }, restores))
             }
             SetParam { device, param, value } => {
@@ -958,8 +984,10 @@ impl Command {
                     return Err(CommandError::Invalid("the track is already frozen".into()));
                 }
                 t.freeze = Some(Freeze { file });
-                t.arm = false;
-                Ok(UnfreezeTrack { track })
+                // A frozen track plays its render and records nothing; undo gives the arming back.
+                let was_armed = std::mem::replace(&mut t.arm, false);
+                let unfreeze = UnfreezeTrack { track };
+                Ok(if was_armed { Batch { commands: vec![unfreeze, SetTrack { id: track, change: TrackProp::Arm(true) }] } } else { unfreeze })
             }
             UnfreezeTrack { track } => {
                 let t = p.track_mut(track).ok_or(CommandError::TrackNotFound(track))?;
@@ -995,6 +1023,9 @@ impl Command {
                     t.scale = None;
                 }
                 t.arm = false;
+                // The takes and the comp described the clips that are gone.
+                t.take_lanes.clear();
+                t.comp.clear();
                 t.devices.clear();
                 t.automation.retain(|l| !matches!(l.target, AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }));
                 t.arrangement = vec![Placement { id: placement, clip, start: 0, lane: 0 }];
@@ -1118,6 +1149,58 @@ fn drop_broken_mappings(p: &mut Project, before: &std::collections::HashSet<(Dev
             }
         });
     }
+    restores
+}
+
+/// Which `(modulator, target device)` pairs are sound now: the target exists
+/// and sits on the modulator's own track.
+fn valid_mod_links(p: &Project) -> std::collections::HashSet<(DeviceId, DeviceId)> {
+    let mut out = std::collections::HashSet::new();
+    for t in &p.tracks {
+        visit_devices(&t.devices, &mut |d| {
+            for m in &d.mods {
+                if let ModTarget::Param { device, .. } = m.target
+                    && p.device_track(device) == Some(t.id)
+                {
+                    out.insert((d.id, device));
+                }
+            }
+        });
+    }
+    out
+}
+
+/// After a device was deleted or moved, drop the modulator mappings that were
+/// sound in `before` ([`valid_mod_links`]) and no longer are (the target is
+/// gone, or left the modulator's track, or the modulator did), and return the
+/// `AddModMapping`s that put them back, in the order that restores their
+/// positions.
+fn drop_broken_mod_mappings(p: &mut Project, before: &std::collections::HashSet<(DeviceId, DeviceId)>) -> Vec<Command> {
+    let mut restores = Vec::new();
+    if before.is_empty() {
+        return restores;
+    }
+    let sound: Vec<(DeviceId, DeviceId)> = before.iter().copied().filter(|&(m, t)| matches!((p.device_track(m), p.device_track(t)), (Some(a), Some(b)) if a == b)).collect();
+    let mut tracks = std::mem::take(&mut p.tracks);
+    for t in &mut tracks {
+        visit_devices_mut(&mut t.devices, &mut |d| {
+            let modulator = d.id;
+            if d.mods.is_empty() {
+                return;
+            }
+            let mut kept = Vec::with_capacity(d.mods.len());
+            for (i, mapping) in std::mem::take(&mut d.mods).into_iter().enumerate() {
+                let broken = matches!(mapping.target, ModTarget::Param { device, .. } if before.contains(&(modulator, device)) && !sound.contains(&(modulator, device)));
+                if broken {
+                    restores.push(Command::AddModMapping { device: modulator, index: i, mapping });
+                } else {
+                    kept.push(mapping);
+                }
+            }
+            d.mods = kept;
+        });
+    }
+    p.tracks = tracks;
     restores
 }
 
@@ -2047,6 +2130,64 @@ mod tests {
     }
 
     #[test]
+    fn removing_or_moving_a_modulated_device_drops_its_modulation_and_undo_restores_it() {
+        let mut r = rack_rig();
+        let (m, other_track) = (r.p.alloc_device_id(), r.p.alloc_track_id());
+        Command::AddTrack { track: Box::new(Track::new(other_track, TrackKind::Audio, "B", Color::palette(2))), index: 2 }.apply(&mut r.p).unwrap();
+        Command::AddDevice { slot: DeviceSlot::Track { track: r.track, index: 1 }, device: Box::new(Device::stock(m, "mod.lfo", "LFO")) }.apply(&mut r.p).unwrap();
+        let on = |t: ModTarget| ModMapping { target: t, min: -0.25, max: 0.25 };
+        for t in [ModTarget::Pan, ModTarget::Param { device: r.eq, param: 1 }, ModTarget::Param { device: r.eq, param: 2 }, ModTarget::Volume] {
+            Command::AddModMapping { device: m, index: 9, mapping: on(t) }.apply(&mut r.p).unwrap();
+        }
+        let before = r.p.clone();
+        let check = |p: &Project, want: usize| {
+            let mods = &p.device(m).unwrap().mods;
+            assert_eq!(mods.len(), want, "{mods:?}");
+            assert!(mods.iter().all(|x| !matches!(x.target, ModTarget::Param { device, .. } if p.device_track(device) != p.device_track(m))));
+        };
+        // Removing the target drops the mappings to it, and only those.
+        let mut p = r.p.clone();
+        let undo = Command::RemoveDevice { id: r.eq }.apply(&mut p).unwrap();
+        check(&p, 2);
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, before, "undo restores the mappings in order");
+        // Moving the target to another track leaves the modulator without it.
+        let undo = Command::MoveDevice { id: r.eq, to: DeviceSlot::Track { track: other_track, index: 0 } }.apply(&mut p).unwrap();
+        check(&p, 2);
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, before);
+        // Moving the modulator away takes its parameter targets out but keeps the fader ones.
+        let undo = Command::MoveDevice { id: m, to: DeviceSlot::Track { track: other_track, index: 0 } }.apply(&mut p).unwrap();
+        check(&p, 2);
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn placements_cannot_land_on_a_take_lane_the_track_does_not_have() {
+        let (mut p, a) = project_with_track();
+        let b = p.alloc_track_id();
+        Command::AddTrack { track: Box::new(Track::new(b, TrackKind::Instrument, "B", Color::palette(1))), index: 2 }.apply(&mut p).unwrap();
+        Command::AddTakeLane { track: a, index: 0, name: "Take 1".into() }.apply(&mut p).unwrap();
+        let (src, clip) = (p.alloc_source_id(), p.alloc_clip_id());
+        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource::default())) }.apply(&mut p).unwrap();
+        Command::AddClip { id: clip, clip: Box::new(Clip::new("c", Color(0), src, PPQ)) }.apply(&mut p).unwrap();
+        let lane_of = |p: &Project, t: TrackId, id: PlacementId| p.track(t).unwrap().arrangement.iter().find(|x| x.id == id).map(|x| x.lane);
+        let (ok, bad) = (p.alloc_placement_id(), p.alloc_placement_id());
+        Command::PlaceClip { track: a, placement: Placement { id: ok, clip, start: 0, lane: 1 } }.apply(&mut p).unwrap();
+        Command::PlaceClip { track: a, placement: Placement { id: bad, clip, start: PPQ, lane: 2 } }.apply(&mut p).unwrap();
+        assert_eq!((lane_of(&p, a, ok), lane_of(&p, a, bad)), (Some(1), Some(0)), "lane 2 does not exist; lane 1 does");
+        // Moving to a track without take lanes puts the clip in its main lane; undo gives the lane back.
+        let before = p.clone();
+        let undo = Command::MovePlacement { track: a, id: ok, to_track: b, start: 0, lane: 1 }.apply(&mut p).unwrap();
+        assert_eq!(lane_of(&p, b, ok), Some(0));
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, before);
+        Command::MovePlacement { track: a, id: ok, to_track: a, start: 0, lane: 7 }.apply(&mut p).unwrap();
+        assert_eq!(lane_of(&p, a, ok), Some(0));
+    }
+
+    #[test]
     fn mapping_commands_reject_bad_targets() {
         let mut r = rack_rig();
         let rack = r.rack;
@@ -2552,6 +2693,22 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_freeze_gives_the_arming_back() {
+        let (mut p, track) = project_with_track();
+        p.track_mut(track).unwrap().arm = true;
+        let before = p.clone();
+        let undo = Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        assert!(!p.track(track).unwrap().arm);
+        let redo = undo.apply(&mut p).unwrap();
+        assert!(!p.track(track).unwrap().is_frozen() && p.track(track).unwrap().arm, "undo restores the arm");
+        assert_eq!(p, before);
+        let undo = redo.apply(&mut p).unwrap();
+        assert!(p.track(track).unwrap().is_frozen() && !p.track(track).unwrap().arm, "redo freezes again");
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
     fn flatten_turns_the_frozen_track_into_an_audio_track_and_undoes() {
         let (mut p, track) = project_with_track();
         let dev = p.alloc_device_id();
@@ -2582,6 +2739,38 @@ mod tests {
         assert_eq!(p, frozen, "undo gives back the frozen track exactly");
         redo.apply(&mut p).unwrap();
         assert_eq!(p.track(track).unwrap().kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn flatten_clears_the_takes_and_the_comp_and_undoes() {
+        let (mut p, track) = project_with_track();
+        Command::AddTakeLane { track, index: 0, name: "Take 1".into() }.apply(&mut p).unwrap();
+        p.track_mut(track).unwrap().comp.push(CompSpan { start: 0, end: PPQ, lane: 1 });
+        Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        let (source, clip, placement) = (p.alloc_source_id(), p.alloc_clip_id(), p.alloc_placement_id());
+        let frozen = p.clone();
+        let undo = Command::FlattenTrack { track, source, clip, placement }.apply(&mut p).unwrap();
+        let t = p.track(track).unwrap();
+        assert!(t.take_lanes.is_empty() && t.comp.is_empty(), "the takes and comp described the clips that are gone");
+        undo.apply(&mut p).unwrap();
+        assert_eq!(p, frozen);
+        assert_eq!(p.track(track).unwrap().take_lanes.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_that_unfreezes_may_edit_the_track_after_it() {
+        let (mut p, track) = project_with_track();
+        let dev = p.alloc_device_id();
+        Command::AddDevice { slot: DeviceSlot::Track { track, index: 0 }, device: Box::new(Device::stock(dev, "fx.eq", "EQ")) }.apply(&mut p).unwrap();
+        Command::FreezeTrack { track, file: frozen_file() }.apply(&mut p).unwrap();
+        let set = Command::SetParam { device: dev, param: 0, value: Some(0.5) };
+        let unfreeze = Command::UnfreezeTrack { track };
+        let after = Command::Batch { commands: vec![unfreeze.clone(), set.clone()] };
+        assert_eq!(after.frozen_target(&p), None, "the track is live by the time the parameter changes");
+        let before = Command::Batch { commands: vec![set.clone(), unfreeze] };
+        assert_eq!(before.frozen_target(&p), Some(track));
+        let refreeze = Command::Batch { commands: vec![Command::UnfreezeTrack { track }, Command::FreezeTrack { track, file: frozen_file() }, set] };
+        assert_eq!(refreeze.frozen_target(&p), Some(track));
     }
 
     #[test]

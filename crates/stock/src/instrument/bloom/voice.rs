@@ -141,6 +141,48 @@ pub struct Patch {
     sr: f32,
 }
 
+/// Bloom's performance knobs, read when a note starts. The default is the
+/// identity (the genome as grown).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Perform {
+    /// −1..1: attack ×⅛..×8 (and up to +20 ms at the top).
+    pub attack: f32,
+    /// −1..1: pitch sweep (−1 none, 0 as grown, +1 two more octaves).
+    pub drop: f32,
+    /// 0..2: FM depth.
+    pub motion: f32,
+    /// Filter brightness offset, octaves (the per-hit Vary).
+    pub tone: f32,
+    /// Level multiplier (the per-hit Vary).
+    pub level: f32,
+}
+
+impl Default for Perform {
+    fn default() -> Self {
+        Self { attack: 0.0, drop: 0.0, motion: 1.0, tone: 0.0, level: 1.0 }
+    }
+}
+
+impl Patch {
+    /// Apply the performance knobs (nothing at all at their defaults).
+    pub fn perform(&mut self, k: &Perform) {
+        if *k == Perform::default() {
+            return;
+        }
+        if k.attack != 0.0 {
+            let a = k.attack.clamp(-1.0, 1.0);
+            let ms = self.attack as f32 * 1000.0 / self.sr;
+            let ms = ms * 2f32.powf(a * 3.0) + a.max(0.0) * 20.0;
+            self.attack = (ms * 0.001 * self.sr) as u32;
+        }
+        let d = k.drop.clamp(-1.0, 1.0);
+        self.sweep_st = if d >= 0.0 { self.sweep_st + d * 24.0 } else { self.sweep_st * (1.0 + d) };
+        self.fm_index = (self.fm_index * k.motion.clamp(0.0, 2.0)).min(24.0);
+        self.cutoff *= 2f32.powf(k.tone);
+        self.gain *= k.level.max(0.0);
+    }
+}
+
 /// Per-sample decay multiplier for a time constant of `ms`.
 #[inline]
 fn coef(ms: f32, sr: f32) -> f32 {

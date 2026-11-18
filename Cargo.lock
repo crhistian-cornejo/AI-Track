@@ -295,6 +295,7 @@ dependencies = [
  "aitrack-dsp",
  "aitrack-model",
  "hound",
+ "image",
  "realfft",
  "serde",
  "serde_json",

@@ -137,6 +137,7 @@ impl SynthFx {
         }
         self.eq = [[SvfState::default(); 2]; 3];
         self.delay_time.snap_to_target();
+        self.chorus_phase = 0.0;
     }
 
     #[inline]

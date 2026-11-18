@@ -1,36 +1,58 @@
 //! `instrument.bloom` — a generative scene instrument: one press grows
-//! sixteen percussive and tonal sounds at once, coherent with each other.
+//! sixteen sounds at once, coherent with each other: a drum scene, or
+//! sixteen patches of one tonal kind (bass, lead, pad, pluck, keys, FX,
+//! texture) played by an embedded Wavetable Synth.
 //!
-//! * **Scene** ([`genome::Scene`]): sixteen sounds grown from one seed as one
-//!   species (`grow.rs`). Sound `i` plays on MIDI note `Base + i` (C1..D#2 by
-//!   default, a drum-rack layout); *Chromatic* plays the selected sound
-//!   across the keyboard (C3 = its own pitch), *Single* plays it on any key
-//!   (a pad of a Drum Rack). Velocity scales the level and, by each sound's
-//!   `Vel > Tone` gene, its brightness and FM index.
+//! * **Kind** ([`patch::Kind`], parameter [`p::KIND`]): *Drums* (the default,
+//!   the original engine, unchanged) or a tonal kind.
+//! * **Drum scene** ([`genome::Scene`]): sixteen sounds grown from one seed
+//!   as one species (`grow.rs`). Sound `i` plays on MIDI note `Base + i`
+//!   (C1..D#2 by default, a drum-rack layout); *Chromatic* plays the
+//!   selected sound across the keyboard (C3 = its own pitch), *Single*
+//!   plays it on any key (a pad of a Drum Rack). Velocity scales the level
+//!   and, by each sound's `Vel > Tone` gene, its brightness and FM index.
+//! * **Tonal scene** ([`patch::PatchScene`], `tonal.rs`): sixteen Wavetable
+//!   Synth patches of the kind, grown from the seed out of the hand-made
+//!   factory presets of that kind. The **selected** patch plays,
+//!   chromatically: *Kit* and *Chromatic* both play it across the keyboard
+//!   at the synth's own pitch (key 60 = C3 is the patch's home), *Single*
+//!   plays it at key 60 whatever the key. Base and Choke do nothing there,
+//!   and Morph X/Y does not morph tonal scenes (yet).
 //! * **Engines** (`voice.rs`): a Body (oscillators, pitch sweep, FM, noise,
 //!   drive, filter, AHD-R amp) exciting a modal Resonator, plus a shared
-//!   ambience (`space.rs`).
-//! * **State**: the genomes live in the state blob (`extra.scene`, plus the
-//!   four morph corners), never as parameters. The parameters are the
-//!   performance surface: Seed and Species (what the scene was grown from),
-//!   Deviance (read by the editor's Roll and Mutate), the Decay / Body /
-//!   Tone / Grit / Space macros, Morph X/Y between the corner scenes, the
-//!   selected sound, mode, base note, choke and volume.
+//!   ambience (`space.rs`). Tonal kinds: the embedded
+//!   [`WavetableSynth`] (allocated at creation), its output into the same
+//!   ambience.
+//! * **State**: the genomes live in the state blob (`extra.scene`, the four
+//!   morph corners, and for a tonal kind `extra.patches`), never as
+//!   parameters. The parameters are the performance surface: Seed, Species
+//!   and Kind (what the scene was grown from), Deviance (read by the
+//!   editor's Roll and Mutate), the Decay / Body / Tone / Grit / Space
+//!   macros, Morph X/Y, the selected sound, mode, base note, choke, volume,
+//!   and the performance knobs (Attack, Drop, Motion, Width, Drive, Filter,
+//!   Vary, Glide, React).
 //!
 //! The scene the device plays is the state's scene when it was grown from
-//! the Seed and Species parameters, else the scene those parameters grow
-//! (a factory preset is a seed and a species). Growing on a parameter
-//! change happens on the audio thread without allocating: the genomes are
-//! fixed-size arrays and the level of each new sound is measured with a
-//! short render, one sound per block.
+//! the Seed and Species (Kind) parameters, else the scene those parameters
+//! grow (a factory preset is a seed, a species or kind, and knobs). Growing
+//! on a parameter change happens on the audio thread without allocating:
+//! genomes and patches are fixed-size arrays; the level of each new drum
+//! sound is measured with a short render, one sound per block, and of each
+//! new tonal patch by [`tonal::Leveler`], a chunk per block (the selected
+//! patch first).
 //!
-//! Each sound's level is normalised by such a render (`render.rs`), so a
-//! random scene comes out playable. Notes allocate from [`VOICES`] voices
-//! (oldest stolen with a 5 ms fade; at most two per sound in Kit mode);
-//! sounds in the same choke group cut each other when Choke is on.
+//! Each sound's level is normalised by such a render (`render.rs`,
+//! `tonal.rs`), so a random scene comes out playable. Drum notes allocate
+//! from [`VOICES`] voices (oldest stolen with a 5 ms fade; at most two per
+//! sound in Kit mode); sounds in the same choke group cut each other when
+//! Choke is on.
 //!
-//! Live and export are identical: every hit of a sound uses the same noise
-//! seed, and nothing depends on a clock.
+//! Live and export are identical: every hit of a drum sound uses the same
+//! noise seed, Vary is seeded by the sound, the key and the song position
+//! (a hit counter while the transport stops), and nothing reads a clock.
+//! The embedded synth runs block-accurately (Bloom's parameter changes
+//! reach it at the block start, notes at their sample), so a tonal render is
+//! the same for the same block size.
 //!
 //! # Meter (`meter()`, [`METER_LEN`] values)
 //! `[0..16)` envelope per sound, `[16..32)` transient pulse per sound (1 at a
@@ -39,34 +61,49 @@
 //! log), `[64..80)` live noisiness per sound, `[80]` output RMS, `[81]`
 //! output peak, `[82]` voices in use / [`VOICES`], `[83]` ambience level,
 //! `[84]` share of the scene's levels measured, `[85]` the playing scene's
-//! seed, `[86]` its species.
+//! seed, `[86]` its species, `[87]` the playing kind ([`Kind::index`]),
+//! `[88]` the selected tonal patch's level gain. For a tonal kind the
+//! per-sound slots of the selected sound follow the synth (its amp
+//! envelope, notes, live centroid, the patch's noise share).
 
 pub mod genome;
 pub mod grow;
+pub mod patch;
 pub mod render;
 pub mod rng;
 pub mod space;
 pub mod timbre;
+pub mod tonal;
 pub mod voice;
 
 use crate::common::{ParamStore, Segmented, drive, load_state, save_state};
-use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
+use crate::instrument::vault::kit::soft;
+use crate::instrument::wavetable::WavetableSynth;
+use aitrack_dsp::event::Expression;
+use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
+use aitrack_dsp::{AudioBuffer, Category, Event, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, Transport, db_to_gain};
 use genome::{Genome, SOUNDS, Scene, Species, g};
 use grow::{GrowOpts, generate, morph4};
+use patch::{KIND_NAMES, Kind, PATCH_LEN, Patch, PatchScene};
 use render::{MEASURE_FRAMES, measure_gain, noise_seed};
 use serde_json::{Value, json};
 use space::Space;
-use voice::{Macros, Patch, Voice};
+use tonal::{Knobs, Leveler};
+use voice::{Macros, Patch as DrumPatch, Perform, Voice};
 
 pub const ID: &str = "instrument.bloom";
 pub const VOICES: usize = 24;
 /// Voices one sound may hold in Kit mode (a third hit fades the oldest).
 const PER_SOUND: usize = 2;
-pub const METER_LEN: usize = 87;
+pub const METER_LEN: usize = 89;
 /// Highest seed (the Seed parameter's range).
 pub const MAX_SEED: u64 = 999_999;
 /// The scene a new Bloom grows.
 pub const DEFAULT_SEED: u64 = 1_337;
+/// How much of the synth goes to the shared ambience.
+const TONAL_SEND: f32 = 0.35;
+/// Most events handed to the synth in one block.
+const SYNTH_EVENTS: usize = 1024;
 
 pub mod p {
     pub const SEED: u32 = 0;
@@ -86,6 +123,33 @@ pub mod p {
     pub const VOLUME: u32 = 14;
     pub const VELOCITY: u32 = 15;
     pub const TUNE: u32 = 16;
+    /// Drums (the scene engine) or a tonal kind played by the embedded
+    /// Wavetable Synth ([`super::patch::KIND_NAMES`]).
+    pub const KIND: u32 = 17;
+    /// −100..100 %: every sound's attack (drum AHD attack; tonal amp and mod
+    /// env attack), ×⅛..×8 (+20 ms at the top).
+    pub const ATTACK: u32 = 18;
+    /// −100..100 %: pitch drop (drum pitch sweep −100 none … +100 two more
+    /// octaves; tonal a pitch envelope at the note start, up to 12 st from
+    /// above (+) or below (−)).
+    pub const DROP: u32 = 19;
+    /// 0..200 %: modulation depth (drum FM index; tonal LFO and envelope
+    /// routes).
+    pub const MOTION: u32 = 20;
+    /// 0..200 %: stereo width of the output (mid/side).
+    pub const WIDTH: u32 = 21;
+    /// 0..100 %: saturation on the output, level-compensated.
+    pub const DRIVE: u32 = 22;
+    /// −100..100 %: a resonant DJ filter on the output (− low-pass sweeping
+    /// down, + high-pass sweeping up; bypassed at 0).
+    pub const FILTER: u32 = 23;
+    /// 0..100 %: per-hit humanise of pitch, tone and level (seeded by sound,
+    /// key and song position).
+    pub const VARY: u32 = 24;
+    /// 0..1000 ms: glide of tonal kinds (at least this much; drums ignore it).
+    pub const GLIDE: u32 = 25;
+    /// 0..200 %: how strongly the editor's visual reacts (the audio ignores it).
+    pub const REACT: u32 = 26;
 }
 
 pub const MODES: &[&str] = &["Kit", "Chromatic", "Single"];
@@ -110,6 +174,16 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::VOLUME, "Volume", -48.0, 6.0, 0.0).unit("dB").short("Vol"),
         ParamInfo::new(p::VELOCITY, "Velocity", 0.0, 100.0, 80.0).unit("%").short("Vel"),
         ParamInfo::new(p::TUNE, "Tune", -24.0, 24.0, 0.0).unit("st"),
+        ParamInfo::new(p::KIND, "Kind", 0.0, (KIND_NAMES.len() - 1) as f32, 0.0).choices(KIND_NAMES),
+        ParamInfo::new(p::ATTACK, "Attack", -100.0, 100.0, 0.0).unit("%").short("Atk"),
+        ParamInfo::new(p::DROP, "Drop", -100.0, 100.0, 0.0).unit("%"),
+        ParamInfo::new(p::MOTION, "Motion", 0.0, 200.0, 100.0).unit("%").short("Mot"),
+        ParamInfo::new(p::WIDTH, "Width", 0.0, 200.0, 100.0).unit("%"),
+        ParamInfo::new(p::DRIVE, "Drive", 0.0, 100.0, 0.0).unit("%"),
+        ParamInfo::new(p::FILTER, "Filter", -100.0, 100.0, 0.0).unit("%").short("Filt"),
+        ParamInfo::new(p::VARY, "Vary", 0.0, 100.0, 0.0).unit("%"),
+        ParamInfo::new(p::GLIDE, "Glide", 0.0, 1000.0, 0.0).unit("ms").power(2.0),
+        ParamInfo::new(p::REACT, "React", 0.0, 200.0, 100.0).unit("%"),
     ]
 }
 
@@ -130,6 +204,15 @@ pub fn effective_scene(stored: Option<&Scene>, seed: u64, species: Species) -> S
     }
 }
 
+/// The tonal scene a device with these parameters plays: `stored` when it
+/// was grown from `seed` and `kind`, else the scene they grow.
+pub fn effective_patches(stored: Option<&PatchScene>, seed: u64, kind: Kind) -> PatchScene {
+    match stored {
+        Some(s) if s.seed == seed && s.kind == kind => s.clone(),
+        _ => tonal::generate(seed, kind),
+    }
+}
+
 /// The state blob for a scene and its corners (what the editor stores).
 pub fn state_json(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners) -> Vec<u8> {
     state_json_with(params, scene, corners, None)
@@ -138,21 +221,32 @@ pub fn state_json(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, 
 /// [`state_json`] with the editor's visual look (`visual`: the key of the
 /// visual's material; the sound never depends on it).
 pub fn state_json_with(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners, visual: Option<&str>) -> Vec<u8> {
+    state_json_full(params, scene, corners, visual, None)
+}
+
+/// [`state_json_with`] with a tonal scene (`extra.patches`; stored only
+/// when given, i.e. when the Kind parameter is tonal).
+pub fn state_json_full(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>) -> Vec<u8> {
     let mut p = serde_json::Map::new();
     for (k, v) in params {
         p.insert(k.to_string(), Value::from(f64::from(*v)));
     }
-    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners, visual) });
+    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners, visual, patches) });
     serde_json::to_vec(&root).unwrap_or_default()
 }
 
-fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>) -> Value {
+fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>) -> Value {
     let mut extra = json!({
         "scene": scene.to_json(),
         "corners": corners.iter().map(|c| c.as_ref().map_or(Value::Null, |s| serde_json::to_value(**s).unwrap_or(Value::Null))).collect::<Vec<_>>(),
     });
-    if let (Some(v), Some(map)) = (visual, extra.as_object_mut()) {
-        map.insert("visual".into(), Value::from(v));
+    if let Some(map) = extra.as_object_mut() {
+        if let Some(v) = visual {
+            map.insert("visual".into(), Value::from(v));
+        }
+        if let Some(t) = patches {
+            map.insert("patches".into(), t.to_json());
+        }
     }
     extra
 }
@@ -177,6 +271,12 @@ pub fn parse_state(data: Option<&[u8]>) -> (Option<Scene>, Corners) {
     (scene, corners)
 }
 
+/// The tonal scene a state blob holds, if any.
+pub fn parse_patches(data: Option<&[u8]>) -> Option<PatchScene> {
+    let root = data.and_then(|d| serde_json::from_slice::<Value>(d).ok())?;
+    root.get("extra")?.get("patches").and_then(PatchScene::from_json)
+}
+
 struct Corner {
     sounds: [Genome; SOUNDS],
     gains: [f32; SOUNDS],
@@ -199,6 +299,47 @@ impl Default for Meters {
     }
 }
 
+/// The output stage: width, drive and the DJ filter, each smoothed.
+struct Output {
+    width: f32,
+    drive: f32,
+    filter: f32,
+    coeffs: SvfCoeffs,
+    coeffs_at: f32,
+    svf: [SvfState; 2],
+}
+
+impl Output {
+    fn new() -> Self {
+        Self { width: 1.0, drive: 0.0, filter: 0.0, coeffs: SvfCoeffs::passthrough(), coeffs_at: f32::NAN, svf: [SvfState::default(), SvfState::default()] }
+    }
+
+    fn reset(&mut self, width: f32, drive: f32, filter: f32) {
+        self.width = width;
+        self.drive = drive;
+        self.filter = filter;
+        self.coeffs_at = f32::NAN;
+        for s in &mut self.svf {
+            s.reset();
+        }
+    }
+
+    /// The DJ filter's coefficients at position `f` (−1..1).
+    fn configure(&mut self, f: f32, sr: f32) {
+        let a = f.abs();
+        let (mode, fc) = if f < 0.0 { (SvfMode::Lowpass, 20_000.0 * 2f32.powf(-a * 9.6)) } else { (SvfMode::Highpass, 20.0 * 2f32.powf(a * 9.6)) };
+        let q = 0.707 + 1.6 * a;
+        self.coeffs = SvfCoeffs::new(mode, fc.clamp(20.0, sr * 0.45), q, 0.0, f64::from(sr));
+        self.coeffs_at = f;
+    }
+}
+
+/// Saturation with its level compensated (a −10 dBFS sine keeps its level).
+#[inline]
+fn saturate(x: f32, gain: f32, comp: f32) -> f32 {
+    soft(x * gain) * comp
+}
+
 pub struct Bloom {
     info: PluginInfo,
     params: ParamStore,
@@ -218,8 +359,38 @@ pub struct Bloom {
     bus_r: Vec<f32>,
     send: Vec<f32>,
     meters: Meters,
+    // The tonal engine.
+    kind: Kind,
+    tonal: Box<PatchScene>,
+    tonal_gains: [f32; SOUNDS],
+    tonal_measured: u16,
+    leveler: Box<Leveler>,
+    synth: Box<WavetableSynth>,
+    synth_buf: AudioBuffer,
+    synth_events: Vec<Event>,
+    /// Send every synth note off at the next block.
+    synth_kill: bool,
+    /// Frames the synth still renders after the kind left the tonal ones.
+    synth_tail: usize,
+    /// What the synth holds (normalised by slot; NaN = not sent yet).
+    applied: Box<[f32; PATCH_LEN]>,
+    synth_gain: f32,
+    synth_gain_now: f32,
+    synth_env: f32,
+    synth_prev: f32,
+    synth_dc: [tonal::DcBlock; 2],
+    tonal_noise: f32,
+    // Where the block is, for Vary's seeds.
+    block_pos: i64,
+    playing: bool,
+    seg: usize,
+    hit_count: u32,
+    out: Output,
     // Cached parameters.
     macros: Macros,
+    perform: Perform,
+    vary: f32,
+    glide: f32,
     vel_amount: f32,
     mode: usize,
     base: i32,
@@ -231,6 +402,9 @@ pub struct Bloom {
     vol_now: f32,
     space_amt: f32,
     space_now: f32,
+    width: f32,
+    drive_amt: f32,
+    filter_amt: f32,
 }
 
 pub fn create() -> Box<dyn Processor> {
@@ -255,19 +429,30 @@ fn default_scene() -> &'static (Scene, [f32; SOUNDS]) {
     })
 }
 
+/// A seeded value in −1..1 (Vary), from arithmetic only.
+#[inline]
+fn vary_draw(seed: u64, k: u64) -> f32 {
+    let x = rng::splitmix64(seed ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (x >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+}
+
 impl Bloom {
     pub fn new() -> Self {
         crate::instrument::vault::kit::init();
+        // The tonal priors and patch layout: built here, never on the audio thread.
+        let _ = tonal::priors();
         let params = params();
         let (scene, gains) = default_scene().clone();
         let idle = Voice::blank();
+        let mut synth = Box::new(WavetableSynth::new());
+        synth.prepare(48_000.0, 512);
         let mut s = Self {
             info: PluginInfo {
                 id: ID,
                 name: "Bloom",
                 vendor: "AI-Track",
                 category: Category::Instrument,
-                tags: &["generative", "drums", "percussion", "random", "kit", "resonator", "fm"],
+                tags: &["generative", "drums", "percussion", "random", "kit", "resonator", "fm", "synth", "bass", "pad", "lead"],
                 params: params.clone(),
                 inputs: 0,
                 outputs: 2,
@@ -288,7 +473,32 @@ impl Bloom {
             bus_r: Vec::new(),
             send: Vec::new(),
             meters: Meters::default(),
+            kind: Kind::Drums,
+            tonal: Box::new(PatchScene::empty(Kind::Drums)),
+            tonal_gains: [1.0; SOUNDS],
+            tonal_measured: 0,
+            leveler: Box::new(Leveler::new()),
+            synth,
+            synth_buf: AudioBuffer::new(2, 512),
+            synth_events: Vec::with_capacity(SYNTH_EVENTS),
+            synth_kill: false,
+            synth_tail: 0,
+            applied: Box::new([f32::NAN; PATCH_LEN]),
+            synth_gain: 1.0,
+            synth_gain_now: 1.0,
+            synth_env: 0.0,
+            synth_prev: 0.0,
+            synth_dc: Default::default(),
+            tonal_noise: 0.0,
+            block_pos: 0,
+            playing: false,
+            seg: 0,
+            hit_count: 0,
+            out: Output::new(),
             macros: Macros::default(),
+            perform: Perform::default(),
+            vary: 0.0,
+            glide: 0.0,
             vel_amount: 0.8,
             mode: 0,
             base: 36,
@@ -300,19 +510,66 @@ impl Bloom {
             vol_now: 1.0,
             space_amt: 0.25,
             space_now: 0.25,
+            width: 1.0,
+            drive_amt: 0.0,
+            filter_amt: 0.0,
         };
         s.prepare(48_000.0, 512);
         s
     }
 
-    /// The scene being played.
+    /// A device playing `patch` (in every cell) at its measured level,
+    /// Chromatic mode, every knob at its default: what a tonal sound's
+    /// export, drag and audition render through. Allocates; control thread.
+    pub fn with_patch(patch: &Patch) -> Self {
+        let mut b = Self::new();
+        let kind = if patch.kind.is_tonal() { patch.kind } else { Kind::Bass };
+        let set = |b: &mut Self, id: u32, plain: f32| {
+            let n = b.info.params.iter().find(|i| i.id == id).map_or(0.0, |i| i.to_normalized(plain));
+            b.params.set(id, n);
+        };
+        set(&mut b, p::KIND, kind.index() as f32);
+        set(&mut b, p::MODE, 1.0);
+        let seed = seed_of(b.params.plain(p::SEED));
+        let mut scene = PatchScene::empty(kind);
+        scene.seed = seed;
+        let mut one = patch.folded();
+        one.kind = kind;
+        scene.patches = [one; SOUNDS];
+        scene.cores = [one; SOUNDS];
+        let gain = b.leveler.measure(&one);
+        *b.tonal = scene;
+        b.tonal_gains = [gain; SOUNDS];
+        b.tonal_measured = u16::MAX;
+        b.params.mark_dirty();
+        b.update();
+        b.synth_gain_now = b.synth_gain;
+        b
+    }
+
+    /// The drum scene (what Drums plays).
     pub fn scene(&self) -> &Scene {
         &self.scene
     }
 
-    /// Normalised levels of the playing scene's sounds.
+    /// Normalised levels of the drum scene's sounds.
     pub fn gains(&self) -> &[f32; SOUNDS] {
         &self.gains
+    }
+
+    /// The kind playing.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The tonal scene (meaningful while the kind is tonal).
+    pub fn patches(&self) -> &PatchScene {
+        &self.tonal
+    }
+
+    /// Level gains of the tonal scene's patches.
+    pub fn patch_gains(&self) -> &[f32; SOUNDS] {
+        &self.tonal_gains
     }
 
     fn target(&self) -> (u64, Species) {
@@ -322,8 +579,14 @@ impl Bloom {
     fn update(&mut self) {
         let pr = &self.params;
         self.macros = Macros { decay: pr.plain(p::DECAY) / 100.0, body: pr.plain(p::BODY) / 100.0, tone: pr.plain(p::TONE) / 100.0, grit: pr.plain(p::GRIT) / 100.0 };
+        self.perform = Perform { attack: pr.plain(p::ATTACK) / 100.0, drop: pr.plain(p::DROP) / 100.0, motion: pr.plain(p::MOTION) / 100.0, tone: 0.0, level: 1.0 };
+        self.vary = pr.plain(p::VARY) / 100.0;
+        self.glide = pr.plain(p::GLIDE);
+        self.width = pr.plain(p::WIDTH) / 100.0;
+        self.drive_amt = pr.plain(p::DRIVE) / 100.0;
+        self.filter_amt = pr.plain(p::FILTER) / 100.0;
         self.vel_amount = pr.plain(p::VELOCITY) / 100.0;
-        self.mode = pr.choice(p::MODE);
+        let mode = pr.choice(p::MODE);
         self.base = pr.plain(p::BASE).round() as i32;
         self.choke = pr.choice(p::CHOKE) == 1;
         self.selected = pr.choice(p::SELECTED).min(SOUNDS - 1);
@@ -331,12 +594,85 @@ impl Bloom {
         self.tune = pr.plain(p::TUNE);
         self.volume = db_to_gain(pr.plain(p::VOLUME));
         self.space_amt = pr.plain(p::SPACE) / 100.0;
+        let kind = Kind::from_index(pr.choice(p::KIND));
         let (seed, species) = self.target();
         if seed != self.scene.seed || species != self.scene.species {
             // Grow in place: no allocation; levels follow one per block.
             *self.scene = generate(seed, GrowOpts { species, spread: 1.0 });
             self.measured = 0;
         }
+        if kind != self.kind {
+            if kind.is_tonal() && !self.kind.is_tonal() {
+                self.all_off();
+            }
+            self.synth_kill = true;
+            self.kind = kind;
+        }
+        if mode != self.mode && kind.is_tonal() {
+            // Keys map differently: end what the synth holds.
+            self.synth_kill = true;
+        }
+        self.mode = mode;
+        if kind.is_tonal() {
+            if self.tonal.seed != seed || self.tonal.kind != kind {
+                tonal::generate_into(&mut self.tonal, seed, kind);
+                self.tonal_measured = 0;
+                self.leveler.cancel();
+            }
+            self.apply_patch();
+        }
+    }
+
+    /// Send the selected patch, shaped by the knobs, to the synth: only the
+    /// values that changed. No allocation.
+    fn apply_patch(&mut self) {
+        let knobs = Knobs { macros: self.macros, space: self.space_amt, velocity: self.vel_amount, attack: self.perform.attack, drop: self.perform.drop, motion: self.perform.motion, glide: self.glide };
+        let patch = &self.tonal.patches[self.selected];
+        let shaped = tonal::shape_knobs(patch, &knobs);
+        let l = patch::layout();
+        for k in 0..l.len {
+            let v = shaped.v[k];
+            if self.applied[k].to_bits() != v.to_bits() {
+                self.synth.set_param(l.ids[k], v);
+                self.applied[k] = v;
+            }
+        }
+        self.tonal_noise = tonal::noise_share(patch);
+        self.synth_gain = self.tonal_gains[self.selected];
+    }
+
+    /// Measure the next tonal patch still waiting (a chunk per block, the
+    /// selected one first).
+    fn measure_tonal(&mut self) {
+        if !self.kind.is_tonal() || self.tonal_measured == u16::MAX {
+            return;
+        }
+        if self.leveler.busy().is_none() {
+            let sel = self.selected;
+            let i = if self.tonal_measured & (1 << sel) == 0 { sel } else { (0..SOUNDS).find(|i| self.tonal_measured & (1 << i) == 0).unwrap_or(0) };
+            self.leveler.start(i, &self.tonal.patches[i]);
+        }
+        if let Some((i, g)) = self.leveler.step() {
+            self.tonal_gains[i] = g;
+            self.tonal_measured |= 1 << i;
+            if i == self.selected {
+                self.synth_gain = g;
+            }
+        }
+    }
+
+    fn measure_tonal_all(&mut self) {
+        self.leveler.cancel();
+        if !self.kind.is_tonal() {
+            return;
+        }
+        for i in 0..SOUNDS {
+            if self.tonal_measured & (1 << i) == 0 {
+                self.tonal_gains[i] = self.leveler.measure(&self.tonal.patches[i]);
+                self.tonal_measured |= 1 << i;
+            }
+        }
+        self.synth_gain = self.tonal_gains[self.selected];
     }
 
     /// Measure the level of the next sound still waiting (one per block).
@@ -367,6 +703,14 @@ impl Bloom {
         let top = c[0].1 + (c[1].1 - c[0].1) * x;
         let bottom = c[2].1 + (c[3].1 - c[2].1) * x;
         (genome, top + (bottom - top) * y)
+    }
+
+    /// The seed of a hit's Vary: the sound, the key and where the hit is
+    /// (the song position while playing, else a hit counter).
+    fn vary_seed(&mut self, sound: usize, key: u8, offset: i64) -> u64 {
+        self.hit_count = self.hit_count.wrapping_add(1);
+        let at = if self.playing { (self.block_pos + offset) as u64 } else { u64::from(self.hit_count) ^ 0xA5A5_0000_0000 };
+        rng::part(at, sound as u64, u64::from(key))
     }
 
     fn note_on(&mut self, key: u8, velocity: f32) {
@@ -414,7 +758,16 @@ impl Bloom {
             Some(k) => k,
             None => self.voices.iter().enumerate().min_by(|a, b| (!a.1.is_fading(), a.1.age).cmp(&(!b.1.is_fading(), b.1.age))).map_or(0, |x| x.0),
         };
-        let patch = Patch::new(&genome, self.sr, transpose + self.tune, velocity, self.vel_amount, &self.macros, gain);
+        let mut perform = self.perform;
+        let mut pitch = 0.0;
+        if self.vary > 0.0 {
+            let s = self.vary_seed(sound, key, self.seg as i64);
+            pitch = vary_draw(s, 1) * 0.6 * self.vary;
+            perform.tone = vary_draw(s, 2) * 0.7 * self.vary;
+            perform.level = 1.0 + vary_draw(s, 3) * 0.25 * self.vary;
+        }
+        let mut patch = DrumPatch::new(&genome, self.sr, transpose + self.tune + pitch, velocity, self.vel_amount, &self.macros, gain);
+        patch.perform(&perform);
         self.age += 1;
         let vseed = noise_seed(sound, key) ^ (velocity * 127.0) as u32;
         self.voices[slot].start(patch, sound, key, self.age, vseed);
@@ -441,6 +794,66 @@ impl Bloom {
         self.measured = 0;
         self.measure_all();
     }
+
+    /// The key the synth plays for an incoming key.
+    fn synth_key(&self, key: u8) -> u8 {
+        if self.mode == 2 { 60 } else { key }
+    }
+
+    /// Run the synth over the whole block into `synth_buf` (tonal notes and
+    /// controllers; Bloom's own parameters reach it as patch values).
+    fn render_synth(&mut self, ctx: &ProcessContext<'_>) {
+        let frames = ctx.buffer.frames();
+        self.synth_buf.set_frames(frames);
+        self.synth_buf.clear();
+        self.synth_events.clear();
+        if std::mem::take(&mut self.synth_kill) {
+            self.synth_events.push(Event { offset: 0, kind: EventKind::AllNotesOff });
+        }
+        let tonal = self.kind.is_tonal();
+        let cap = self.synth_events.capacity();
+        for ev in ctx.events {
+            if self.synth_events.len() + 2 > cap {
+                break;
+            }
+            match ev.kind {
+                EventKind::NoteOn { channel, key, velocity, note_id } if tonal => {
+                    let k = self.synth_key(key);
+                    let (mut tune, mut vel) = (self.tune, velocity);
+                    if self.vary > 0.0 && velocity > 0.0 {
+                        let s = self.vary_seed(self.selected, key, i64::from(ev.offset));
+                        tune += vary_draw(s, 1) * 0.3 * self.vary;
+                        vel = (vel * (1.0 + vary_draw(s, 3) * 0.25 * self.vary)).clamp(0.01, 1.0);
+                    }
+                    self.synth_events.push(Event { offset: ev.offset, kind: EventKind::NoteOn { channel, key: k, velocity: vel, note_id } });
+                    if tune != 0.0 && velocity > 0.0 {
+                        self.synth_events.push(Event { offset: ev.offset, kind: EventKind::NoteExpression { note_id, key: k, expr: Expression::Tuning, value: tune } });
+                    }
+                }
+                EventKind::NoteOff { channel, key, velocity, note_id } => {
+                    let k = self.synth_key(key);
+                    self.synth_events.push(Event { offset: ev.offset, kind: EventKind::NoteOff { channel, key: k, velocity, note_id } });
+                }
+                EventKind::PitchBend { .. } | EventKind::ControlChange { .. } | EventKind::ChannelPressure { .. } | EventKind::AllNotesOff => self.synth_events.push(*ev),
+                EventKind::NoteExpression { note_id, key, expr, value } if tonal => {
+                    let value = if expr == Expression::Tuning { value + self.tune } else { value };
+                    self.synth_events.push(Event { offset: ev.offset, kind: EventKind::NoteExpression { note_id, key: self.synth_key(key), expr, value } });
+                }
+                _ => {}
+            }
+        }
+        let mut sub = ProcessContext { sample_rate: ctx.sample_rate, buffer: &mut self.synth_buf, sidechain: None, events: &self.synth_events, transport: ctx.transport };
+        self.synth.process(&mut sub);
+        if tonal {
+            self.synth_tail = self.synth.tail() as usize + frames;
+        } else {
+            self.synth_tail = self.synth_tail.saturating_sub(frames);
+        }
+        let mut m = [0f32; 16];
+        let n = self.synth.meter(&mut m);
+        // The newest voice's amp envelope (meter layout of the synth).
+        self.synth_env = if n > 10 && m[0] > 0.0 { m[10].clamp(0.0, 1.0) } else { 0.0 };
+    }
 }
 
 impl Segmented for Bloom {
@@ -456,9 +869,21 @@ impl Segmented for Bloom {
                 if self.params.take_dirty() {
                     self.update();
                 }
-                self.note_on(key, velocity);
+                if self.kind.is_tonal() {
+                    if velocity > 0.0 {
+                        let s = self.selected;
+                        self.meters.pulse[s] = 1.0;
+                        self.meters.hits[s] = (self.meters.hits[s] + 1.0) % 4096.0;
+                    }
+                } else {
+                    self.note_on(key, velocity);
+                }
             }
-            EventKind::NoteOff { key, .. } => self.note_off(key),
+            EventKind::NoteOff { key, .. } => {
+                if !self.kind.is_tonal() {
+                    self.note_off(key);
+                }
+            }
             EventKind::AllNotesOff | EventKind::ControlChange { cc: 120 | 123, .. } => self.all_off(),
             _ => {}
         }
@@ -468,6 +893,7 @@ impl Segmented for Bloom {
         if self.params.take_dirty() {
             self.update();
         }
+        self.seg = end;
         let n = end - start;
         if n == 0 || self.bus_l.len() < n {
             return;
@@ -485,18 +911,90 @@ impl Segmented for Bloom {
         }
         // Smooth the live levels to avoid zipper steps.
         let k = 1.0 - (-(n as f32) / (0.02 * self.sr)).exp();
+        // The synth's share of the block.
+        let synth_on = self.synth_buf.frames() >= end && (self.kind.is_tonal() || self.synth_tail > 0);
+        let (mut t_sig, mut t_diff) = (0.0f32, 0.0f32);
+        if synth_on {
+            let g_from = self.synth_gain_now;
+            self.synth_gain_now += (self.synth_gain - self.synth_gain_now) * k;
+            let (sl, sr) = (self.synth_buf.channel(0), self.synth_buf.channel(1));
+            let mut prev = self.synth_prev;
+            let pole = tonal::DcBlock::pole(self.sr);
+            let dc = &mut self.synth_dc;
+            for i in 0..n {
+                let gn = g_from + (self.synth_gain_now - g_from) * (i as f32 / n as f32);
+                let (l, r) = (dc[0].process(sl[start + i], pole) * gn, dc[1].process(sr[start + i], pole) * gn);
+                bl[i] += l;
+                br[i] += r;
+                let m = (l + r) * 0.5;
+                bs[i] += m * TONAL_SEND;
+                t_sig += m * m;
+                t_diff += (m - prev) * (m - prev);
+                prev = m;
+            }
+            self.synth_prev = prev;
+        }
         self.space_now += (self.space_amt - self.space_now) * k;
         // An idle scene with a silent tail costs nothing (a Drum Rack holds sixteen).
-        if active > 0 || self.space.level > 1e-7 {
+        if active > 0 || synth_on || self.space.level > 1e-7 {
             self.space.process(bs, bl, br, self.space_now * 1.6);
+        }
+        // The output stage: volume, width, drive, the DJ filter.
+        let vol_from = self.vol_now;
+        self.vol_now += (self.volume - self.vol_now) * k;
+        let o = &mut self.out;
+        let (w_from, d_from) = (o.width, o.drive);
+        o.width += (self.width - o.width) * k;
+        o.drive += (self.drive_amt - o.drive) * k;
+        if (o.width - self.width).abs() < 1e-4 {
+            o.width = self.width;
+        }
+        if (o.drive - self.drive_amt).abs() < 1e-5 {
+            o.drive = self.drive_amt;
+        }
+        let f_from = o.filter;
+        o.filter += (self.filter_amt - o.filter) * k;
+        if (o.filter - self.filter_amt).abs() < 1e-4 {
+            o.filter = self.filter_amt;
+        }
+        let width_on = w_from != 1.0 || o.width != 1.0;
+        let drive_on = d_from > 0.0 || o.drive > 0.0;
+        let filter_on = f_from != 0.0 || o.filter != 0.0;
+        if !filter_on && !o.coeffs_at.is_nan() {
+            // Back at 0: bypassed, and fresh when it comes back.
+            o.reset(o.width, o.drive, 0.0);
         }
         let buf = &mut *ctx.buffer;
         let (mut sum, mut peak) = (0.0f32, 0.0f32);
-        let vol_from = self.vol_now;
-        self.vol_now += (self.volume - self.vol_now) * k;
         for i in 0..n {
-            let vol = vol_from + (self.vol_now - vol_from) * (i as f32 / n as f32);
-            let (l, r) = (crate::common::sanitize(bl[i] * vol).clamp(-4.0, 4.0), crate::common::sanitize(br[i] * vol).clamp(-4.0, 4.0));
+            let t = i as f32 / n as f32;
+            let vol = vol_from + (self.vol_now - vol_from) * t;
+            let (mut l, mut r) = (bl[i] * vol, br[i] * vol);
+            if width_on {
+                let wd = w_from + (o.width - w_from) * t;
+                let (m, s) = ((l + r) * 0.5, (l - r) * 0.5 * wd);
+                l = m + s;
+                r = m - s;
+            }
+            if drive_on {
+                let d = d_from + (o.drive - d_from) * t;
+                let gain = 1.0 + 9.0 * d;
+                let comp = 0.3 / soft(0.3 * gain);
+                let wet = (d * 10.0).min(1.0);
+                l += (saturate(l, gain, comp) - l) * wet;
+                r += (saturate(r, gain, comp) - r) * wet;
+            }
+            if filter_on {
+                if i % 32 == 0 {
+                    let f = f_from + (o.filter - f_from) * t;
+                    if (f - o.coeffs_at).abs() > 1e-4 || o.coeffs_at.is_nan() {
+                        o.configure(f, self.sr);
+                    }
+                }
+                l = o.svf[0].process(&o.coeffs, l);
+                r = o.svf[1].process(&o.coeffs, r);
+            }
+            let (l, r) = (crate::common::sanitize(l).clamp(-4.0, 4.0), crate::common::sanitize(r).clamp(-4.0, 4.0));
             sum += l * l + r * r;
             peak = peak.max(l.abs()).max(r.abs());
             if buf.channels() >= 2 {
@@ -518,6 +1016,13 @@ impl Segmented for Bloom {
             sig[v.sound] += v.e_sig;
             diff[v.sound] += v.e_diff;
             noise[v.sound] += v.e_noise;
+        }
+        if synth_on {
+            let s = self.selected;
+            env[s] = env[s].max(self.synth_env);
+            sig[s] += t_sig;
+            diff[s] += t_diff;
+            noise[s] += t_sig * self.tonal_noise;
         }
         for i in 0..SOUNDS {
             m.env[i] = env[i].max(m.env[i] * fall);
@@ -546,10 +1051,14 @@ impl Processor for Bloom {
         self.bus_l = vec![0.0; max_frames.max(1)];
         self.bus_r = vec![0.0; max_frames.max(1)];
         self.send = vec![0.0; max_frames.max(1)];
+        self.synth.prepare(sample_rate, max_frames.max(1));
+        self.synth_buf = AudioBuffer::new(2, max_frames.max(1));
         self.space.prepare(self.sr);
         self.params.mark_dirty();
         self.update();
         self.measure_all();
+        self.measure_tonal_all();
+        self.apply_patch_if_tonal();
         self.reset();
     }
 
@@ -562,6 +1071,15 @@ impl Processor for Bloom {
         self.meters = Meters::default();
         self.vol_now = self.volume;
         self.space_now = self.space_amt;
+        self.synth.restart();
+        self.synth_kill = false;
+        self.synth_tail = 0;
+        self.synth_gain_now = self.synth_gain;
+        self.synth_env = 0.0;
+        self.synth_prev = 0.0;
+        self.synth_dc = Default::default();
+        self.hit_count = 0;
+        self.out.reset(self.width, self.drive_amt, self.filter_amt);
     }
 
     fn process(&mut self, ctx: &mut ProcessContext<'_>) {
@@ -571,6 +1089,26 @@ impl Processor for Bloom {
             // A block larger than prepared: render silence rather than allocate.
             ctx.buffer.clear();
             return;
+        }
+        self.block_pos = ctx.transport.position_samples;
+        self.playing = ctx.transport.playing;
+        self.seg = 0;
+        let kind_event = ctx.events.iter().any(|e| matches!(e.kind, EventKind::Param { id: p::KIND, .. }));
+        if self.kind.is_tonal() || kind_event || self.synth_tail > 0 {
+            // The synth runs over the whole block: Bloom's parameter changes
+            // reach it at the block start.
+            for ev in ctx.events {
+                if let EventKind::Param { id, value } = ev.kind {
+                    self.params.set(id, value);
+                }
+            }
+            if self.params.take_dirty() {
+                self.update();
+            }
+            self.measure_tonal();
+            self.render_synth(ctx);
+        } else {
+            self.synth_buf.set_frames(0);
         }
         drive(self, ctx);
     }
@@ -584,12 +1122,14 @@ impl Processor for Bloom {
     }
 
     fn tail(&self) -> u32 {
-        (self.sr * 6.0) as u32
+        let drums = (self.sr * 6.0) as u32;
+        if self.kind.is_tonal() { drums.max(self.synth.tail()) } else { drums }
     }
 
     fn save_state(&self) -> Vec<u8> {
         let corners: Corners = std::array::from_fn(|k| self.corners[k].as_ref().map(|c| Box::new(c.sounds)));
-        save_state(&self.params, extra_json(&self.scene, &corners, self.visual.as_deref()))
+        let patches = self.kind.is_tonal().then_some(&*self.tonal);
+        save_state(&self.params, extra_json(&self.scene, &corners, self.visual.as_deref(), patches))
     }
 
     fn load_state(&mut self, data: &[u8]) {
@@ -606,7 +1146,18 @@ impl Processor for Bloom {
                 Box::new(Corner { sounds: *sounds, gains })
             });
         }
+        let kind = Kind::from_index(self.params.choice(p::KIND));
+        if kind.is_tonal() {
+            let stored = parse_patches(wrapped.as_deref());
+            *self.tonal = effective_patches(stored.as_ref(), seed, kind);
+            self.tonal_measured = 0;
+            self.kind = kind;
+            self.measure_tonal_all();
+            self.synth_kill = true;
+        }
         self.params.mark_dirty();
+        self.update();
+        self.synth_gain_now = self.synth_gain;
     }
 
     fn meter(&self, out: &mut [f32]) -> usize {
@@ -621,11 +1172,130 @@ impl Processor for Bloom {
         buf[81] = m.peak;
         buf[82] = self.voices.iter().filter(|v| v.active).count() as f32 / VOICES as f32;
         buf[83] = self.space.level;
-        buf[84] = self.measured.count_ones() as f32 / SOUNDS as f32;
+        let measured = if self.kind.is_tonal() { self.tonal_measured } else { self.measured };
+        buf[84] = measured.count_ones() as f32 / SOUNDS as f32;
         buf[85] = self.scene.seed as f32;
         buf[86] = self.scene.species.index() as f32;
+        buf[87] = self.kind.index() as f32;
+        buf[88] = if self.kind.is_tonal() { self.synth_gain } else { 0.0 };
         crate::common::write_meter(out, 0, &buf)
     }
+}
+
+impl Bloom {
+    fn apply_patch_if_tonal(&mut self) {
+        if self.kind.is_tonal() {
+            self.apply_patch();
+        }
+    }
+}
+
+// ── Offline renders of tonal patches ────────────────────────────────────────
+
+/// Render notes `(frame, key, velocity, on)` through `b` at `sr` in blocks
+/// of 256 (prepares it). Control thread.
+pub fn render_device(b: &mut Bloom, notes: &[(usize, u8, f32, bool)], frames: usize, sr: f64) -> (Vec<f32>, Vec<f32>) {
+    const BLOCK: usize = 256;
+    b.prepare(sr, BLOCK);
+    let mut buf = AudioBuffer::new(2, BLOCK);
+    let (mut l, mut r) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
+    let tr = Transport::default();
+    let mut events = Vec::new();
+    let mut pos = 0;
+    while pos < frames {
+        let len = BLOCK.min(frames - pos);
+        buf.set_frames(len);
+        buf.clear();
+        events.clear();
+        for &(f, key, vel, on) in notes {
+            if f >= pos && f < pos + len {
+                let kind = if on { EventKind::NoteOn { channel: 0, key, velocity: vel, note_id: -1 } } else { EventKind::NoteOff { channel: 0, key, velocity: 0.0, note_id: -1 } };
+                events.push(Event { offset: (f - pos) as u32, kind });
+            }
+        }
+        let mut ctx = ProcessContext { sample_rate: sr, buffer: &mut buf, sidechain: None, events: &events, transport: &tr };
+        b.process(&mut ctx);
+        l.extend_from_slice(buf.channel(0));
+        r.extend_from_slice(buf.channel(1));
+        pos += len;
+    }
+    (l, r)
+}
+
+/// The note a kind is heard with: `(key, hold seconds, tail seconds)` — a
+/// held bass note, a lead note, a long pad, a plucked note, a struck key,
+/// an FX hit, a texture swell.
+pub fn demo_note(kind: Kind) -> (u8, f32, f32) {
+    match kind {
+        Kind::Bass => (36, 0.7, 0.4),
+        Kind::Lead => (67, 1.0, 0.6),
+        Kind::Pad => (60, 2.2, 2.0),
+        Kind::Pluck => (64, 0.25, 1.0),
+        Kind::Keys => (60, 0.9, 0.8),
+        Kind::Fx => (60, 2.0, 1.5),
+        Kind::Texture => (60, 2.5, 2.0),
+        Kind::Drums => (60, 0.5, 0.5),
+    }
+}
+
+/// Render `patch` (its kind's [`demo_note`], velocity 0.8) as the device
+/// plays it with `knobs` and `tune`: what an export or a drag of a tonal
+/// sound writes. Control thread (allocates a device).
+pub fn render_patch(patch: &Patch, knobs: &Knobs, tune: f32, sr: f64) -> (Vec<f32>, Vec<f32>) {
+    let mut b = Bloom::with_patch(patch);
+    set_knobs(&mut b, knobs, tune);
+    let (key, hold, tail) = demo_note(patch.kind);
+    let on = (hold as f64 * sr) as usize;
+    let frames = on + (tail as f64 * sr) as usize;
+    render_device(&mut b, &[(0, key, 0.8, true), (on, key, 0.0, false)], frames, sr)
+}
+
+/// Set a device's knobs from [`Knobs`] (plain values on its parameters).
+pub fn set_knobs(b: &mut Bloom, k: &Knobs, tune: f32) {
+    let vals = [
+        (p::DECAY, k.macros.decay * 100.0),
+        (p::BODY, k.macros.body * 100.0),
+        (p::TONE, k.macros.tone * 100.0),
+        (p::GRIT, k.macros.grit * 100.0),
+        (p::SPACE, k.space * 100.0),
+        (p::VELOCITY, k.velocity * 100.0),
+        (p::ATTACK, k.attack * 100.0),
+        (p::DROP, k.drop * 100.0),
+        (p::MOTION, k.motion * 100.0),
+        (p::GLIDE, k.glide),
+        (p::TUNE, tune),
+    ];
+    for (id, plain) in vals {
+        if let Some(info) = b.info.params.iter().find(|i| i.id == id) {
+            let n = info.to_normalized(plain);
+            b.params.set(id, n);
+        }
+    }
+    if b.params.take_dirty() {
+        b.update();
+    }
+}
+
+/// The timbre of a tonal patch as the device plays it (its Tune and
+/// knobs): the first 750 ms of its demo note at [`timbre::RATE`], measured
+/// like a drum sound, with the patch's modulation as the wobble. Off the
+/// audio and UI threads.
+pub fn patch_timbre(patch: &Patch, knobs: &Knobs, tune: f32) -> timbre::Timbre {
+    let (l, r) = render_patch(patch, knobs, tune, f64::from(timbre::RATE));
+    let n = ((timbre::RATE * 0.75) as usize).min(l.len());
+    let mono: Vec<f32> = l[..n].iter().zip(&r[..n]).map(|(a, b)| (a + b) * 0.5).collect();
+    let mut t = timbre::analyze_signal(&mono, timbre::RATE);
+    t.wobble = tonal::motion(&tonal::shape_knobs(patch, knobs));
+    t
+}
+
+/// A generated patch as an `instrument.wavetable` preset named `name`,
+/// shaped by `knobs` and at the level Bloom plays it.
+pub fn patch_preset(patch: &Patch, knobs: &Knobs, name: &str) -> crate::presets::Preset {
+    let shaped = tonal::shape_knobs(patch, knobs);
+    let mut preset = shaped.to_preset(name, tonal::measure_gain(patch));
+    preset.tags.push(tonal::patch_name(patch).to_ascii_lowercase());
+    preset
 }
 
 #[cfg(test)]
@@ -777,5 +1447,180 @@ mod tests {
         let (at_b, _) = render_notes(&mut b, &[(0, 38, 1.0, true)], 9_600);
         let diff: f32 = at_a.iter().zip(&at_b).map(|(x, y)| (x - y).abs()).sum();
         assert!(diff > 1.0, "{diff}");
+    }
+
+    fn tonal(kind: Kind) -> Bloom {
+        let mut b = Bloom::new();
+        set_plain(&mut b, p::KIND, kind.index() as f32);
+        b
+    }
+
+    #[test]
+    fn the_performance_knobs_at_their_defaults_leave_the_drums_alone() {
+        let notes = [(0, 36, 1.0, true), (2_000, 38, 0.8, true), (5_000, 42, 0.6, true)];
+        let mut a = Bloom::new();
+        let (la, ra) = render_notes(&mut a, &notes, 12_000);
+        let mut b = Bloom::new();
+        for (id, v) in [(p::ATTACK, 0.0), (p::DROP, 0.0), (p::MOTION, 100.0), (p::WIDTH, 100.0), (p::DRIVE, 0.0), (p::FILTER, 0.0), (p::VARY, 0.0), (p::GLIDE, 300.0), (p::REACT, 170.0)] {
+            set_plain(&mut b, id, v);
+        }
+        let (lb, rb) = render_notes(&mut b, &notes, 12_000);
+        assert_eq!(la, lb, "Glide and React do nothing to drums, the rest is the identity");
+        assert_eq!(ra, rb);
+        assert_eq!(b.kind(), Kind::Drums);
+        let defaults = params();
+        for id in p::KIND..=p::REACT {
+            let info = defaults.iter().find(|i| i.id == id).unwrap();
+            assert_eq!(a.get_param(id), info.default_normalized());
+        }
+    }
+
+    #[test]
+    fn the_performance_knobs_shape_drums() {
+        let hit = [(0, 36, 1.0, true)];
+        let base = render_notes(&mut Bloom::new(), &hit, 9_600);
+        let with = |id: u32, v: f32| {
+            let mut b = Bloom::new();
+            set_plain(&mut b, id, v);
+            render_notes(&mut b, &hit, 9_600)
+        };
+        let diff = |a: &(Vec<f32>, Vec<f32>), b: &(Vec<f32>, Vec<f32>)| a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs()).sum::<f32>();
+        for (id, v) in [(p::ATTACK, 80.0), (p::DROP, 70.0), (p::MOTION, 200.0), (p::DRIVE, 80.0), (p::FILTER, -70.0), (p::VARY, 100.0)] {
+            assert!(diff(&base, &with(id, v)) > 0.5, "param {id} does nothing");
+        }
+        // Width 0 is mono.
+        let (l, r) = with(p::WIDTH, 0.0);
+        assert!(l.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-5));
+        // Soft attack: the first 2 ms are quieter.
+        let soft = with(p::ATTACK, 100.0);
+        assert!(rms(&soft.0[..96]) < rms(&base.0[..96]) * 0.5);
+        // The DJ filter darkens a hat.
+        let hat = [(0, 42, 1.0, true)];
+        let open = render_notes(&mut Bloom::new(), &hat, 6_000);
+        let mut f = Bloom::new();
+        set_plain(&mut f, p::FILTER, -80.0);
+        let dark = render_notes(&mut f, &hat, 6_000);
+        assert!(rms(&dark.0) < rms(&open.0) * 0.5, "{} vs {}", rms(&dark.0), rms(&open.0));
+        // Vary is seeded: two devices agree.
+        let a = with(p::VARY, 100.0);
+        let b = with(p::VARY, 100.0);
+        assert_eq!(a.0, b.0);
+    }
+
+    #[test]
+    fn tonal_kinds_play_the_selected_patch_chromatically() {
+        for kind in Kind::TONAL {
+            let mut b = tonal(kind);
+            let (key, _, _) = demo_note(kind);
+            let (l, _) = render_notes(&mut b, &[(0, key, 0.9, true), (20_000, key, 0.0, false)], 40_000);
+            assert!(l.iter().all(|v| v.is_finite()));
+            assert!(rms(&l) > 1e-3, "{kind:?} is silent");
+            assert_eq!(b.kind(), kind);
+            assert_eq!(b.patches().kind, kind);
+            assert_eq!(b.patches().seed, DEFAULT_SEED);
+            let mut m = [0f32; 320];
+            assert_eq!(b.meter(&mut m), METER_LEN);
+            assert_eq!(m[87], kind.index() as f32);
+            assert_eq!(m[84], 1.0);
+            assert!(m[32] >= 1.0, "the selected cell counts the note");
+        }
+        // Another selection is another sound; an octave up is an octave up.
+        let mut b = tonal(Kind::Lead);
+        let (a, _) = render_notes(&mut b, &[(0, 60, 0.9, true)], 9_600);
+        set_plain(&mut b, p::SELECTED, 5.0);
+        let (c, _) = render_notes(&mut b, &[(0, 60, 0.9, true)], 9_600);
+        assert!(a.iter().zip(&c).map(|(x, y)| (x - y).abs()).sum::<f32>() > 1.0);
+        // Single mode: every key plays the patch at C3.
+        set_plain(&mut b, p::MODE, 2.0);
+        let (s1, _) = render_notes(&mut b, &[(0, 40, 0.9, true)], 9_600);
+        let (s2, _) = render_notes(&mut b, &[(0, 60, 0.9, true)], 9_600);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn tonal_live_and_offline_renders_match() {
+        let notes = [(0, 48, 0.9, true), (5_000, 48, 0.0, false), (6_000, 55, 0.7, true), (14_000, 55, 0.0, false)];
+        for kind in [Kind::Bass, Kind::Pad, Kind::Pluck] {
+            let (a, _) = render_notes(&mut tonal(kind), &notes, 24_000);
+            let (b, _) = render_notes(&mut tonal(kind), &notes, 24_000);
+            assert_eq!(a, b, "{kind:?}");
+        }
+        // The export path is the device.
+        let b = tonal(Kind::Keys);
+        let patch = b.patches().patches[0];
+        let (l1, _) = render_patch(&patch, &Knobs::default(), 0.0, 48_000.0);
+        let (l2, _) = render_patch(&patch, &Knobs::default(), 0.0, 48_000.0);
+        assert_eq!(l1, l2);
+        assert!(rms(&l1) > 1e-3);
+    }
+
+    #[test]
+    fn a_seed_automation_regrows_the_tonal_scene_on_the_audio_side() {
+        let mut b = tonal(Kind::Pluck);
+        let _ = render_notes(&mut b, &[], 256);
+        let before = b.patches().clone();
+        set_plain(&mut b, p::SEED, 4242.0);
+        let _ = render_notes(&mut b, &[], 128);
+        assert_eq!(b.patches().seed, 4242);
+        assert_ne!(b.patches().patches, before.patches);
+        assert_eq!(*b.patches(), tonal::generate(4242, Kind::Pluck), "the same scene as grown off-thread");
+        // render_notes prepares (measuring everything); measure in blocks instead.
+        let mut buf = AudioBuffer::new(2, 128);
+        let tr = Transport::default();
+        let ev = [Event { offset: 0, kind: EventKind::Param { id: p::SEED, value: b.info.params[0].to_normalized(9_999.0) } }];
+        let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &ev, transport: &tr };
+        b.process(&mut ctx);
+        let mut m = [0f32; 320];
+        b.meter(&mut m);
+        assert!(m[84] < 1.0, "levels are measured over the next blocks");
+        for _ in 0..400 {
+            let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &[], transport: &tr };
+            b.process(&mut ctx);
+        }
+        b.meter(&mut m);
+        assert_eq!(m[84], 1.0);
+        let fresh = Bloom::with_patch(&b.patches().patches[3]);
+        assert_eq!(fresh.patch_gains()[0], b.patch_gains()[3], "measured on the audio side = measured at once");
+    }
+
+    #[test]
+    fn the_tonal_state_round_trips() {
+        let mut a = tonal(Kind::Pad);
+        set_plain(&mut a, p::SEED, 31_337.0);
+        let _ = render_notes(&mut a, &[], 256);
+        let bytes = a.save_state();
+        let parsed = parse_patches(Some(&bytes)).expect("patches stored");
+        assert_eq!(parsed, *a.patches());
+        let mut b = Bloom::new();
+        b.load_state(&bytes);
+        assert_eq!(b.kind(), Kind::Pad);
+        assert_eq!(b.patches(), a.patches());
+        assert_eq!(b.patch_gains(), a.patch_gains());
+        // An edited tonal scene plays when its seed and kind match.
+        let mut edited = a.patches().clone();
+        edited.patches[0].set_plain(crate::instrument::wavetable::p::CUTOFF, 700.0);
+        let params: std::collections::BTreeMap<u32, f32> = [(p::SEED, a.get_param(p::SEED)), (p::KIND, a.get_param(p::KIND))].into();
+        let blob = state_json_full(&params, a.scene(), &Default::default(), None, Some(&edited));
+        let mut c = Bloom::new();
+        c.load_state(&blob);
+        assert_eq!(c.patches().patches[0], edited.patches[0]);
+        // Drums store no patches.
+        assert!(parse_patches(Some(&Bloom::new().save_state())).is_none());
+    }
+
+    #[test]
+    fn tonal_timbres_and_presets() {
+        let bass = tonal::generate(5, Kind::Bass).patches[0];
+        let lead = tonal::generate(5, Kind::Lead).patches[0];
+        let tb = patch_timbre(&bass, &Knobs::default(), 0.0);
+        let tl = patch_timbre(&lead, &Knobs::default(), 0.0);
+        assert!(tb.centroid < tl.centroid, "{} vs {}", tb.centroid, tl.centroid);
+        let up = patch_timbre(&bass, &Knobs::default(), 12.0);
+        assert!(up.centroid > tb.centroid);
+        let preset = patch_preset(&lead, &Knobs::default(), "Test Lead");
+        let mut synth = crate::instrument::wavetable::WavetableSynth::new();
+        assert!(preset.apply(&mut synth) > 300);
+        let (l, _) = render_notes(&mut synth, &[(0, 67, 0.8, true)], 9_600);
+        assert!(rms(&l) > 1e-3);
     }
 }

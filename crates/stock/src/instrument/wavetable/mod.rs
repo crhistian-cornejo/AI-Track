@@ -114,6 +114,11 @@ pub fn params() -> Vec<ParamInfo> {
     params::all().to_vec()
 }
 
+/// Every parameter, without a copy (built once).
+pub fn params_static() -> &'static [ParamInfo] {
+    params::all()
+}
+
 // ── Banks ───────────────────────────────────────────────────────────────────
 
 struct Bank {
@@ -1055,6 +1060,44 @@ impl WavetableSynth {
 
     pub fn lfo_curve(&self, lfo: usize) -> LfoCurve {
         self.curves.get(lfo).map_or_else(LfoCurve::default, |c| **c)
+    }
+
+    /// [`reset`](Processor::reset) and restart every random stream (unison
+    /// phases, drift, noise, S&H LFOs) and controller from its initial
+    /// state, so the next notes render exactly as on a new synth with the
+    /// same parameters. No allocation (hosts that measure or audition a
+    /// patch on the audio thread use it).
+    pub fn restart(&mut self) {
+        self.reset();
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            let seed = 0x9E37_79B9u32.wrapping_mul(i as u32 + 1);
+            v.rng = Noise::new(seed.wrapping_mul(31));
+            v.noise = [NoiseGen::new(seed ^ 0x5555), NoiseGen::new(seed ^ 0xAAAA_0000)];
+            v.lfo = std::array::from_fn(|l| LfoState::new(seed.wrapping_add(l as u32 * 7919)));
+            v.age = 0;
+            v.key = 60;
+            v.pitch = 60.0;
+            v.target = 60.0;
+            v.tuning = 0.0;
+            v.pressure = 0.0;
+            v.osc = [OscState::default(); OSCS];
+            v.sub = BlepOsc::default();
+            v.sub_gain = 0.0;
+            v.noise_gain = 0.0;
+            v.amp_mod = 1.0;
+            v.amp_step = 0.0;
+            v.src = [0.0; src::COUNT];
+            v.mods = [0.0; MAX_TARGETS];
+        }
+        self.gmods = [0.0; MAX_TARGETS];
+        self.glfo = std::array::from_fn(|i| LfoState::new(11 + 12 * i as u32));
+        self.rng = Noise::new(0xC0FF_EE11);
+        self.last_beats = f64::NAN;
+        self.age = 0;
+        self.last_pitch = 60.0;
+        self.bend = 0.0;
+        self.mod_wheel = 0.0;
+        self.aftertouch = 0.0;
     }
 
 

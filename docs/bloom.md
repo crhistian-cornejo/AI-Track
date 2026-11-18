@@ -1,9 +1,11 @@
 # Bloom
 
 `instrument.bloom` is a generative scene instrument: one press grows sixteen
-percussive and tonal sounds at once, coherent with each other, and a visual
-in which every sound is a cell whose colour and shape come from the sound
-itself.
+sounds at once, coherent with each other, and a visual in which every sound
+is a cell whose colour and shape come from the sound itself. The **Kind**
+picks what grows: a drum scene (the original engine) or sixteen patches of a
+tonal kind (Bass, Lead, Pad, Pluck, Keys, FX, Texture) played by an
+embedded Wavetable Synth (see [Tonal kinds](#tonal-kinds)).
 
 | Where | What |
 |---|---|
@@ -13,10 +15,47 @@ itself.
 | `crates/stock/src/instrument/bloom/space.rs` | The shared ambience |
 | `crates/stock/src/instrument/bloom/render.rs` | Offline renders: level normalisation, export, matching |
 | `crates/stock/src/instrument/bloom/timbre.rs` | The measures the colours come from |
-| `crates/stock/src/instrument/bloom/mod.rs` | The device: params, voices, meter, state |
+| `crates/stock/src/instrument/bloom/patch.rs` | `Kind`, `Patch` (a full Wavetable Synth parameter set, fixed-size), `PatchScene` (the tonal state blob) |
+| `crates/stock/src/instrument/bloom/tonal.rs` | Tonal growth: priors from the factory presets, rules per kind, paths, roll/mutate/regrow, names, the knobs' shaping, level measurement |
+| `crates/stock/src/instrument/bloom/mod.rs` | The device: params, voices, the embedded synth, the output stage, meter, state, offline renders of patches |
+| `crates/stock/examples/bloom_kinds.rs` | Offline audition: per kind, a WAV of sixteen patches playing a phrase, a spectrogram PNG, a stats table |
 | `crates/ai/src/generate/bloom.rs` | Matching a sample (evolution search over the embedding) |
 | `crates/app/src/views/device_ui/bloom.rs` | The Device View card, dev views |
 | `crates/app/src/views/device_window/bloom/` | The window (`layout.rs`), the GPU stage (`stage.rs`, `matter/`), the CPU field fallback, the look mapping, the DNA panel |
+
+## Parameters
+
+| Id | Name | Range (default) | Drums | Tonal kinds |
+|---|---|---|---|---|
+| 0 | Seed | 0–999 999 (1337) | the scene's seed | the scene's seed |
+| 1 | Species | Drum Kit, Tonal Perc, Metallic, Glitch, Mixed | the drum species | — |
+| 2 | Deviance | 0–100 % (100) | how far Roll / Mutate move (editor) | same |
+| 3–6 | Decay, Body, Tone, Grit | −100–100 % (0) | per-voice macros | amp / mod / env-3 decay and release ×0.35–2.8; sub and unison width; both cutoffs ±2 oct (and the EQ's top); distortion and filter drive |
+| 7 | Space | 0–100 % (25) | ambience return | ambience return, and the patch's reverb ×(0.4 + 2.4·Space) |
+| 8, 9 | Morph X / Y | 0–1 | corner scenes | — (not yet) |
+| 10 | Selected Sound | 0–15 | the sound of Chromatic / Single | the patch that plays |
+| 11 | Play Mode | Kit, Chromatic, Single | as below | Kit = Chromatic; Single = key 60 for any key |
+| 12, 13 | Base Note, Choke | | kit layout, hat choke | — |
+| 14 | Volume | −48–6 dB (0) | output | output |
+| 15 | Velocity | 0–100 % (80) | level by velocity | scales the patch's velocity sensitivity (×1 at 80 %) |
+| 16 | Tune | ±24 st | transpose | per-note tuning (an expression) |
+| 17 | Kind | Drums, Bass, Lead, Pad, Pluck, Keys, FX, Texture (+4 "—") | | |
+| 18 | Attack | −100–100 % (0) | AHD attack ×⅛–×8 (+20 ms at the top) | amp and mod env attack, the same scale |
+| 19 | Drop | −100–100 % (0) | pitch sweep (−100 none, +100 two more octaves) | a pitch envelope at the note start, up to 12 st from above (+) or below (−), 60–250 ms (env 3, or a one-shot LFO when env 3 is taken) |
+| 20 | Motion | 0–200 % (100) | FM index | every LFO and envelope route of the matrices |
+| 21 | Width | 0–200 % (100) | output mid/side width | same |
+| 22 | Drive | 0–100 % (0) | output saturation, level-compensated | same |
+| 23 | Filter | −100–100 % (0) | output DJ filter: − low-pass down to 26 Hz, + high-pass up to 15.5 kHz, resonance rising with the amount, bypassed at 0 | same |
+| 24 | Vary | 0–100 % (0) | per hit: ±0.6 st, ±0.7 oct of filter, ±25 % level | per note: ±0.3 st, ±25 % velocity |
+| 25 | Glide | 0–1000 ms (0) | — | at least this much glide |
+| 26 | React | 0–200 % (100) | the visual's reaction (the audio ignores it) | same |
+
+Every default leaves the sound exactly as it was before these parameters
+existed (tested). Width, Drive and Filter are smoothed (20 ms) on the
+output; Attack, Drop, Motion and Vary apply when a note starts, so
+automating them never clicks. Vary is seeded by the sound, the key and the
+song position (a hit counter while the transport stops): live and export
+agree.
 
 ## The scene
 
@@ -83,6 +122,119 @@ Species parameters, else the scene those parameters grow; that is what a
 factory preset is (a seed, a species and the macros). Growing on a parameter
 change happens on the audio thread without allocating (fixed-size genomes),
 the new sounds' levels measured one per block.
+
+## Tonal kinds
+
+A tonal scene is sixteen **patches** of the Wavetable Synth
+(`instrument.wavetable`). A `Patch` is every synth parameter, normalised,
+in a fixed-size array (no heap), stored sparsely by parameter id;
+`extra.patches` holds the `PatchScene` (seed, kind, patches, cores, paths,
+distances, locks). Only the **selected** patch plays: the device embeds one
+`WavetableSynth` (allocated at creation) and sends it the selected patch,
+shaped by the knobs, whenever something changes (only the values that
+changed; no allocation). Kit and Chromatic both play it across the keyboard
+(key 60 is the patch's home pitch), Single plays it at key 60 for any key.
+The synth's output (after an 8 Hz DC blocker and the patch's level) joins
+the drum bus: the shared ambience, Volume and the output stage.
+
+### Growth
+
+1. **Priors** (`tonal::priors`, built once at device creation): per kind,
+   the hand-made `instrument.wavetable` factory presets in `tonal::PARENTS`
+   (Bass: the 14 basses + Fold Bass, Ladder Reese, Talking Growl; Lead: 12
+   + Sync Sweep, Bit Glitch, Vox; Pad: 9 + Harmonic Bloom Pad; Pluck: 8 +
+   Trance / House / Bubble Arp + Comb Metal Pluck; Keys: 7 + four Chords +
+   PD Keys, Asym Comb Keys, FM Glass Bell; FX: 6; Texture: five pads, Wind
+   Atmosphere, Spectral Mist, Harmonic Bloom Pad) and the range each
+   parameter spans across them. The list is pinned by name: editing it or
+   those presets changes what every tonal seed grows.
+2. **Character** (per scene): a lineage parent most cells descend from, a
+   wave family from the kind's factory tables, brightness (±0.7 oct),
+   unison width, grit, movement, a time scale, and a shared room (reverb,
+   delay, chorus) every cell sits in.
+3. **Core** (per cell): two parents crossed by module blocks (oscillators;
+   filters with the mod envelope that drives them; amp; motion = LFOs, both
+   matrices, env 3; voicing), the room, the kind's **design moves** (a bank
+   wavetable, a Reese pair, a ladder filter, a vibrato, a pad's slow LFO on
+   the table position, a pluck's filter envelope, keys' velocity → cutoff,
+   an FX archetype: riser, downer, impact, zap, siren, sweep), the scene's
+   colour, a small mutation, then the **rules**.
+4. **Path and distance**, as for drums: a fixed direction over ~100
+   explorable values (positions, levels, unison, cutoff, resonance, drive,
+   envelopes, LFO rates, route depths — pitch and amp routes move a tenth as
+   far — and the FX), folded into the kind's band, plus switches of the
+   wavetable, the filter model and LFO 1's shape at seeded distances. Every
+   grown sound is held to the rules again.
+
+**Rules** (`tonal::rules`, `tonal::constrain`), per kind: Bass — mono or
+legato, oscillator 1 at −1/0 oct, a sub at −1 oct (24–60 %), low-pass
+140–2600 Hz, attack ≤ 6 ms, short release, almost no reverb; Lead — attack
+≤ 30 ms, sustain ≥ 62 %, cutoff 2.2–13 kHz, a harmonic-rich oscillator
+(a plain sine or triangle becomes the sine→saw table), glide ≤ 160 ms,
+vibrato ≤ 2 %; Pad — poly, attack 180–2200 ms, release 1.3–4.5 s, ≥ 3
+unison voices detuned 12–42 % and spread wide, a slow movement route
+always, reverb 25–55 %; Pluck — no sustain, decay 120–650 ms, a filter
+envelope (28–80 %, mod env decay 60–420 ms) over a 250–3000 Hz cutoff;
+Keys — velocity sensitivity ≥ 65 %, velocity → cutoff (lowering a
+high-pass instead), attacks ≤ 8 / 12 ms, decay 0.35–2.4 s, sustain ≤ 45 %,
+≤ 2 unison voices; FX — wide ranges, decays ≥ 280 ms, synced sweeps
+within a bar, always movement (a pitch or filter route) or noise, and only
+the parents' timbre crosses over (their envelopes and motion are the
+archetype); Texture — noise 15–50 % (white or pink), slow attack and long
+release, a slow route always, a big room. Everywhere: enough source level,
+no high-pass where the body matters, pitch and amp modulation capped per
+kind (free for FX).
+
+Growth, `roll` (Deviance), `mutate`, `regrow`, `replace` and locks work like
+the drum scene's. Morph X/Y does not morph tonal scenes in this version.
+Names (`tonal::patch_name`, `scene_names`): an adjective from what the
+patch is (dark, bright, wide, gritty, moving, noisy, soft) and a noun of its
+kind ("Velvet Reese", "Glass Choir"), picked by its fingerprint.
+
+### Real-time safety and determinism
+
+A tonal scene grows on the audio thread when Seed or Kind is automated, like
+drums: pure arithmetic over the static priors (`generate_into`, in place;
+only `sqrt` and rounding, no `ln`/`exp`, so a seed grows the same patches on
+every machine). Levels are measured by `tonal::Leveler`, a second synth that
+renders the patch's home note (attack shortened; 360 ms, or 1.2 s for pads,
+textures and FX; at 24 kHz) **1440 frames per audio block**, the selected
+patch first; the loudest 50 ms window is brought to the kind's RMS target
+unless its peak would pass a ceiling (chord kinds sit lower). A loaded
+state or a new device measures everything at once. A measurement restarts
+the synth's random streams (`WavetableSynth::restart`), so it gives the
+same gain on the audio thread and off it. The embedded synth runs over the
+whole block (Bloom's parameter changes reach it at the block start, notes
+at their sample): two renders with the same blocks are identical; renders
+with other block sizes differ only by the synth's control-rate grid.
+
+### API for the editor
+
+- `patch::Kind`, `KIND_NAMES`, `Kind::TONAL`; `p::KIND` (17) and the
+  performance ids 18–26 (table above).
+- `tonal::generate(seed, kind)`, `generate_into`, `roll(prev, seed, kind,
+  deviance)`, `mutate(scene, seed, amount)`, `regrow(scene, i, distance)`,
+  `replace(scene, i, patch)`, `PatchScene::set_locked`.
+- `tonal::patch_name(patch)`, `tonal::scene_names(scene)`.
+- `Patch::to_preset(name, gain)` and `bloom::patch_preset(patch, knobs,
+  name)`: an `instrument.wavetable` preset (knobs baked in, Bloom's level in
+  its Volume) to open the sound in the full Wavetable Synth.
+- `bloom::render_patch(patch, knobs, tune, sr)`: the kind's demo note
+  (`demo_note`) through a device (`Bloom::with_patch`), for export and drag.
+- `bloom::patch_timbre(patch, knobs, tune)`: the `Timbre` of the first
+  750 ms of that render (the patch's modulation as the wobble), for the
+  visual's sound → look mapping.
+- `tonal::Knobs` (the device's knobs as one struct), `tonal::shape_knobs`.
+- State: `state_json_full(params, scene, corners, visual, patches)`,
+  `parse_patches(data)`, `effective_patches(stored, seed, kind)`;
+  `Bloom::kind()`, `patches()`, `patch_gains()`. The editor's existing
+  `state_json_with` writes no `extra.patches` (the device then regrows the
+  same scene from Seed and Kind; only edits and locks would be lost).
+
+Audition offline (no window):
+`cargo run -p aitrack-stock --release --example bloom_kinds -- <out_dir> [seed]`
+writes `<kind>.wav` and `<kind>.png` (spectrogram, 30 Hz–16 kHz log, patch
+boundaries marked) per kind and prints each patch's stats.
 
 ## Sound → colour and shape
 

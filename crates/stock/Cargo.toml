@@ -18,6 +18,8 @@ realfft = "3"
 [dev-dependencies]
 # Only to check that the scale tables of the MIDI devices match the model's.
 aitrack-model.workspace = true
+# MIT OR Apache-2.0. Spectrogram PNGs of the `bloom_kinds` audition tool.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints]
 workspace = true

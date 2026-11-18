@@ -162,3 +162,67 @@ fn vault_switches_engines_and_presets_without_rt_heap_traffic() {
         }
     }
 }
+
+#[test]
+fn bloom_grows_and_plays_tonal_scenes_without_rt_heap_traffic() {
+    use aitrack_dsp::{Event, EventKind, Processor};
+    use aitrack_stock::instrument::bloom::{Bloom, p};
+    let mut b = Bloom::new();
+    b.prepare(SR, BLOCK);
+    let norm = |b: &Bloom, id: u32, plain: f32| b.info().params.iter().find(|i| i.id == id).unwrap().to_normalized(plain);
+    let mut d = Driver::new();
+    // Every tonal kind (a new scene grows and is measured on the audio
+    // thread), a seed automation, selections, the macros and every
+    // performance knob automated, in parameter events and between blocks.
+    let knobs: [(u32, f32, f32); 13] = [
+        (p::DECAY, -60.0, 70.0),
+        (p::BODY, -50.0, 80.0),
+        (p::TONE, -70.0, 60.0),
+        (p::GRIT, -40.0, 90.0),
+        (p::SPACE, 0.0, 90.0),
+        (p::ATTACK, -80.0, 90.0),
+        (p::DROP, -90.0, 100.0),
+        (p::MOTION, 0.0, 200.0),
+        (p::WIDTH, 0.0, 200.0),
+        (p::DRIVE, 0.0, 100.0),
+        (p::FILTER, -100.0, 100.0),
+        (p::VARY, 0.0, 100.0),
+        (p::GLIDE, 0.0, 800.0),
+    ];
+    for (round, kind) in (1..=7).chain([0, 3]).enumerate() {
+        let n = counted(|| {
+            b.set_param(p::KIND, norm(&b, p::KIND, kind as f32));
+            for k in 0..140 {
+                if k % 20 == 7 {
+                    b.set_param(p::SEED, norm(&b, p::SEED, (round * 1000 + k) as f32));
+                }
+                if k % 9 == 4 {
+                    b.set_param(p::SELECTED, norm(&b, p::SELECTED, (k % 16) as f32));
+                }
+                if k % 11 == 2 {
+                    b.set_param(p::MODE, norm(&b, p::MODE, (k % 3) as f32));
+                }
+                let (id, lo, hi) = knobs[k % knobs.len()];
+                b.set_param(id, norm(&b, id, if k % 2 == 0 { lo } else { hi }));
+                d.block(&mut b, 0);
+            }
+        });
+        assert_eq!(n, 0, "kind {kind}: {n} heap operations on the audio side");
+    }
+    // A Kind change inside a block's events, with notes after it.
+    let mut buf = aitrack_dsp::AudioBuffer::new(2, BLOCK);
+    let events = vec![
+        Event { offset: 0, kind: EventKind::Param { id: p::KIND, value: norm(&b, p::KIND, 2.0) } },
+        Event { offset: 3, kind: EventKind::NoteOn { channel: 0, key: 60, velocity: 0.9, note_id: 1 } },
+        Event { offset: 40, kind: EventKind::Param { id: p::SEED, value: norm(&b, p::SEED, 777.0) } },
+        Event { offset: 90, kind: EventKind::NoteOff { channel: 0, key: 60, velocity: 0.0, note_id: 1 } },
+    ];
+    let tr = aitrack_dsp::Transport { playing: true, ..Default::default() };
+    let n = counted(|| {
+        for _ in 0..30 {
+            let mut ctx = aitrack_dsp::ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &events, transport: &tr };
+            b.process(&mut ctx);
+        }
+    });
+    assert_eq!(n, 0, "kind change in the events: {n} heap operations");
+}

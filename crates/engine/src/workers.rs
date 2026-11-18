@@ -325,8 +325,12 @@ fn work(sh: &Shared, seq: u32) {
 }
 
 fn worker_main(sh: &Shared, me: usize, kind: PoolKind) {
-    if let PoolKind::Live(period) = kind {
-        crate::thread_priority::promote_worker_thread(period);
+    // Before the first job: logging here is off the real-time path.
+    if let PoolKind::Live(period) = kind
+        && !crate::thread_priority::promote_worker_thread(period)
+        && cfg!(any(windows, target_os = "macos"))
+    {
+        log::warn!("DSP worker {me} runs at normal priority (the real-time promotion failed, period {period:?})");
     }
     crate::rt::mark_in_audio();
     aitrack_dsp::mark_audio_thread();

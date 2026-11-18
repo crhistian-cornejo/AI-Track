@@ -76,8 +76,12 @@ pub(crate) fn audio_aware_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
             return;
         }
         let n = &LAST_AUDIO_PANIC;
+        // Several DSP workers can panic at once: only the one that turns the
+        // sequence odd writes the note; the others leave it to it.
         let s = n.seq.load(Ordering::Relaxed);
-        n.seq.store(s.wrapping_add(1) | 1, Ordering::Release);
+        if s & 1 == 1 || n.seq.compare_exchange(s, s.wrapping_add(1) | 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
         if let Some(loc) = info.location() {
             let f = loc.file().as_bytes();
             let f = &f[f.len().saturating_sub(NOTE_BYTES)..];

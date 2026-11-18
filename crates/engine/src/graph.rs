@@ -1991,8 +1991,11 @@ impl CompiledGraph {
         };
         if pool.is_parallel() && schedule.parallel {
             if !crate::multicore::process_levels(schedule, tracks, inputs, side, out_bus, &env, pool) {
-                // As on one thread, where it would have unwound from here.
-                panic!("a track's processing panicked on a DSP worker");
+                // As on one thread, where it would have unwound from here. Not
+                // `panic!`: that would run the hook again and overwrite the
+                // device's panic location with this line (a boxed `()` does
+                // not allocate).
+                std::panic::resume_unwind(Box::new(()));
             }
         } else {
             for (i, t) in tracks.iter().enumerate() {

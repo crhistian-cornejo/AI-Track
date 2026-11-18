@@ -76,7 +76,10 @@ mod imp {
         // Nanoseconds → Mach absolute time units.
         let abs = |ns: u128| (ns * tb.denom as u128 / tb.numer as u128).min(u32::MAX as u128) as u32;
         let p = period.as_nanos().clamp(500_000, 200_000_000);
-        let mut policy = libc::thread_time_constraint_policy { period: abs(p), computation: abs(p / 2), constraint: abs(p), preemptible: 1 };
+        // xnu refuses a computation above its real-time quantum (50 ms) with
+        // KERN_INVALID_ARGUMENT, which left workers at normal priority with
+        // buffers over 100 ms: half the period, at most 50 ms.
+        let mut policy = libc::thread_time_constraint_policy { period: abs(p), computation: abs((p / 2).min(50_000_000)), constraint: abs(p), preemptible: 1 };
         // SAFETY: `pthread_mach_thread_np(pthread_self())` is the calling
         // thread's port (no new port right is created); the policy struct is
         // the one this flavour expects and outlives the call.

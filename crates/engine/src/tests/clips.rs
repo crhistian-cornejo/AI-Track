@@ -296,6 +296,34 @@ fn split_clip_renders_like_the_unsplit_one() {
     check(b, samples, t, 1100, "looping clip");
 }
 
+// ───────────────────────────── Take lanes ─────────────────────────────
+
+#[test]
+fn take_lanes_are_silent_and_the_comp_plays_the_promoted_stretch() {
+    let mut b = P::new(120.0);
+    let samples = SampleCache::blocking();
+    let t = b.track(TrackKind::Audio, "vox");
+    // The main lane holds a quiet file; the take is loud.
+    let quiet = source(&mut b, &samples, "quiet", vec![0.1; 4 * BEAT], Warp::default());
+    let loud = source(&mut b, &samples, "loud", vec![0.8; 4 * BEAT], Warp::default());
+    let (cq, cl) = (add_clip(&mut b, Clip::new("quiet", Color(0), quiet, 4 * PPQ)), add_clip(&mut b, Clip::new("loud", Color(0), loud, 4 * PPQ)));
+    b.place(t, cq, 0);
+    edit(&mut b.p, Command::AddTakeLane { track: t, index: 0, name: "Take 1".into() });
+    let id = b.p.alloc_placement_id();
+    edit(&mut b.p, Command::PlaceClip { track: t, placement: Placement { id, clip: cl, start: 0, lane: 1 } });
+    // A take lane is silent: only the quiet main lane is heard.
+    let before = render_with(&b.p, &samples, (0, 4 * PPQ));
+    assert!(peak(before.channel(0)) < 0.2 && peak(before.channel(0)) > 0.05, "peak {}", peak(before.channel(0)));
+    // Comping beat 1 to 3 of the take makes that stretch loud, and only it.
+    let cmds = takes::comp_range(&mut b.p, t, 0, PPQ, 3 * PPQ).expect("comp");
+    edit(&mut b.p, Command::Batch { commands: cmds });
+    let after = render_with(&b.p, &samples, (0, 4 * PPQ));
+    let ch = after.channel(0);
+    assert!(peak(&ch[..BEAT - 64]) < 0.2 && peak(&ch[3 * BEAT + 64..]) < 0.2, "outside the comp stays quiet");
+    assert!(peak(&ch[BEAT + 64..3 * BEAT - 64]) > 0.7, "the comp plays the take");
+    assert!(ch[BEAT - 1].abs() < 0.2 && ch[BEAT + 1] < 0.8, "the seam is faded, not a step");
+}
+
 // ───────────────────────────── Session View ─────────────────────────────
 
 /// A processor fed by hand, as the export does, but with the command queue

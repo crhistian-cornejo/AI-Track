@@ -225,6 +225,21 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
                 cx,
             ));
     }
+    if t.kind.has_clips() {
+        let shown = ws.s.take_lanes_shown(track);
+        card = card.child(widgets::divider_h()).child(
+            item("track-takes", Icon::Layers, "Show Take Lanes", keys::hint(Cmd::ShowTakeLanes), shown).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.menu = None;
+                this.s.toggle_take_lanes(track);
+                cx.notify();
+            })),
+        );
+        if shown {
+            card = card.child(action("track-insert-take", Icon::Add, "Insert Take Lane", None, false, cx, move |this, _, _| {
+                this.s.insert_take_lane(track);
+            }));
+        }
+    }
     card.child(widgets::divider_h())
         .child(
             item(
@@ -293,6 +308,40 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
                 this.s.add_track(TrackKind::Instrument);
             },
         ))
+        .into_any_element()
+}
+
+/// Right-click on a take lane's header: rename, reorder, insert and delete lanes.
+pub fn take_lane_menu(ws: &mut Workspace, track: TrackId, lane: usize, cx: &mut Context<Workspace>) -> AnyElement {
+    let n = ws.s.project.track(track).map_or(0, |t| t.take_lanes.len());
+    let mut card = widgets::menu_card("take-lane-menu", 232.);
+    card = card
+        .child(item("take-rename", Icon::Pencil, "Rename Take Lane", None, false).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.menu = None;
+            crate::commands::open_rename_for(this, Some(crate::commands::RenameTarget::TakeLane(track, lane)), window, cx);
+        })))
+        .child(action("take-insert", Icon::Add, "Insert Take Lane", None, false, cx, move |this, _, _| {
+            this.s.insert_take_lane(track);
+        }));
+    if lane > 0 {
+        card = card.child(action("take-up", Icon::ChevronUp, "Move Up", None, false, cx, move |this, _, _| {
+            this.s.shift_take_lane(track, lane, -1);
+        }));
+    }
+    if lane + 1 < n {
+        card = card.child(action("take-down", Icon::ChevronDown, "Move Down", None, false, cx, move |this, _, _| {
+            this.s.shift_take_lane(track, lane, 1);
+        }));
+    }
+    card.child(widgets::divider_h())
+        .child(action("take-hide", Icon::Minus, "Hide Take Lanes", keys::hint(Cmd::ShowTakeLanes), false, cx, move |this, _, _| {
+            if this.s.take_lanes_shown(track) {
+                this.s.toggle_take_lanes(track);
+            }
+        }))
+        .child(action("take-delete", Icon::Trash, "Delete Take Lane", None, false, cx, move |this, _, _| {
+            this.s.delete_take_lane(track, lane);
+        }))
         .into_any_element()
 }
 

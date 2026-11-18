@@ -57,7 +57,7 @@ impl Plan {
         }
         let gives_way = |pl: &Placement| pl.lane == lane && !keep.contains(&pl.id);
         for edge in [a, b] {
-            for pl in self.placements(track, |x, y| x < edge && edge < y) {
+            for pl in self.placements_in(track, lane, |x, y| x < edge && edge < y) {
                 if gives_way(&pl)
                     && let Some(cmds) = ops::split_at(&mut self.p, track, pl.id, edge)
                 {
@@ -65,7 +65,7 @@ impl Plan {
                 }
             }
         }
-        for pl in self.placements(track, |x, y| x >= a && y <= b) {
+        for pl in self.placements_in(track, lane, |x, y| x >= a && y <= b) {
             if gives_way(&pl) {
                 self.remove(track, &pl);
             }

@@ -28,6 +28,7 @@ mod mixer_routing;
 mod real;
 mod session_edit;
 mod state;
+mod take_lanes;
 mod theme;
 mod usage;
 mod views;

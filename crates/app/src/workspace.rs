@@ -185,6 +185,9 @@ pub enum Drag {
     /// Dragging the line inside the selected automation range raises or
     /// lowers just that part (`original` is the lane when the drag began).
     AutoShift { range: crate::state::AutoRange, original: Vec<AutomationPoint>, start_y: f32 },
+    /// Dragging on a take lane picks a range of it; releasing promotes it into
+    /// the main lane (with `hold`, from Shift, it waits for Enter).
+    TakeRange { track: TrackId, lane: usize, anchor: Tick, hold: bool },
     LoopBrace { anchor: Tick },
     Scrub,
     /// Colour picker: the hue strip or the saturation/value square.
@@ -209,6 +212,8 @@ pub enum MenuKind {
     LaneContext,
     /// Right-click on a track header (acts on the selected tracks).
     TrackContext(TrackId),
+    /// Right-click on a take lane's header (track, index among its take lanes).
+    TakeLaneContext(TrackId, usize),
     /// Right-click on a device's title bar (acts on the picked devices).
     DeviceContext(DeviceId),
     /// Right-click on a device row in the Cmd+K palette (favorite / reassign group).
@@ -648,6 +653,13 @@ impl Workspace {
                     ))
                 }
                 "play" => self.b.engine.play(),
+                // A MIDI track with three take lanes and a comp made of parts of them.
+                "takes" => {
+                    if let Some(track) = self.s.seed_demo_takes() {
+                        self.s.selected_track = Some(track);
+                        self.s.view = MainView::Arrangement;
+                    }
+                }
                 // The Content Hub open on its Plugins tab (`hubplugins`), with a mix of states to look at (`hubplugins=demo`).
                 "hubplugins" | "hubplugins=demo" | "hubplugins=confirm" => {
                     self.modal = Some(views::prefs::Modal::ContentHub);
@@ -1225,7 +1237,7 @@ impl Workspace {
             && let Some(k) = r.autos.iter().position(|t| *t == target)
         {
             let view_h = f32::from(self.regions.arrange.get().size.height).max(200.);
-            let (top, bottom) = (r.top, r.top + r.h + (k + 1) as f32 * views::arrangement::auto_h());
+            let (top, bottom) = (r.top, r.top + r.auto_top() + (k + 1) as f32 * views::arrangement::auto_h());
             let v = &mut self.s.arrange;
             if top < v.scroll_y {
                 v.scroll_y = top;
@@ -1938,6 +1950,15 @@ impl Workspace {
                 let at = self.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
                 self.s.set_auto_range(*track, *target, *anchor, at);
             }
+            Drag::TakeRange { track, lane, anchor, .. } => {
+                let (tick, _) = self.arrange_pos(e.position);
+                let at = self.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+                // Still at the press: the whole take under it (a click promotes a clip).
+                match self.s.take_clip_span(*track, *lane, *anchor).filter(|_| at == *anchor) {
+                    Some((a, b)) => self.s.select_take_range(*track, *lane, a, b),
+                    None => self.s.select_take_range(*track, *lane, *anchor, at),
+                }
+            }
             Drag::AutoShift { range, original, start_y } => {
                 let delta = (*start_y - f32::from(e.position.y)) / views::arrangement::auto_value_px() * fine;
                 self.s.shift_auto_range(*range, original, delta);
@@ -1977,6 +1998,9 @@ impl Workspace {
                 Drag::SoundsResize { .. } | Drag::SoundsVolume { .. } => self.sounds.prefs.save(),
                 Drag::Notes { .. } => {
                     self.audition.release(crate::audition::NOTE, |t, k, v| self.b.engine.audition_note(t, k, v));
+                }
+                Drag::TakeRange { hold: false, .. } => {
+                    self.s.promote_take_selection();
                 }
                 Drag::ClipCopy(d) => views::arrange_clips::copy_end(self, d),
                 Drag::ClipShape(d) => views::arrange_clips::shape_end(self, &d, cx),

@@ -31,6 +31,10 @@ pub fn auto_h() -> f32 {
 pub fn auto_value_px() -> f32 {
     auto_h() - 12.
 }
+/// Height of one take lane.
+pub fn take_h() -> f32 {
+    m().take_h
+}
 const CLIP_HEAD: f32 = 14.;
 
 #[derive(Clone, Debug)]
@@ -39,6 +43,8 @@ pub struct LaneRow {
     pub kind: TrackKind,
     pub top: f32,
     pub h: f32,
+    /// The take lanes shown under the track (0 when hidden), under the clips.
+    pub takes: usize,
     /// The automation lanes shown under the track, top to bottom.
     pub autos: Vec<AutomationTarget>,
     /// How many groups the track sits inside: the header indents by it.
@@ -47,17 +53,28 @@ pub struct LaneRow {
 
 impl LaneRow {
     pub fn total(&self) -> f32 {
-        self.h + auto_h() * self.autos.len() as f32
+        self.auto_top() + auto_h() * self.autos.len() as f32
+    }
+
+    /// Where the automation lanes start, below the clips and the take lanes.
+    pub fn auto_top(&self) -> f32 {
+        self.h + take_h() * self.takes as f32
+    }
+
+    /// The take lane `ly` px below the row's top, and `ly` inside it.
+    pub fn take_at(&self, ly: f32) -> Option<(usize, f32)> {
+        let k = ((ly - self.h) / take_h()).floor();
+        (k >= 0. && (k as usize) < self.takes).then(|| (k as usize, ly - self.h - k * take_h()))
     }
 
     /// The automation lane `ly` px below the row's top, and `ly` inside it.
     pub fn lane_at(&self, ly: f32) -> Option<(usize, AutomationTarget, f32)> {
-        let k = ((ly - self.h) / auto_h()).floor();
+        let k = ((ly - self.auto_top()) / auto_h()).floor();
         if k < 0. {
             return None;
         }
         let k = k as usize;
-        self.autos.get(k).map(|t| (k, *t, ly - self.h - k as f32 * auto_h()))
+        self.autos.get(k).map(|t| (k, *t, ly - self.auto_top() - k as f32 * auto_h()))
     }
 }
 
@@ -76,7 +93,8 @@ pub fn rows(s: &AppState) -> Vec<LaneRow> {
         }
         let autos = s.shown_lanes(t.id);
         let h = m().track_h(t.height);
-        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, autos, depth: groups::depth(&s.project, t.id) });
+        let takes = s.shown_takes(t.id);
+        out.push(LaneRow { track: t.id, kind: t.kind, top: y, h, takes, autos, depth: groups::depth(&s.project, t.id) });
         y += out.last().map_or(0., LaneRow::total);
     }
     out
@@ -111,7 +129,7 @@ pub fn automation_value_at(ws: &Workspace, track: TrackId, target: AutomationTar
     let row = rows(&ws.s).into_iter().find(|r| r.track == track)?;
     let k = row.autos.iter().position(|t| *t == target)?;
     let b = ws.regions.arrange.get();
-    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.h - k as f32 * auto_h();
+    let y = f32::from(pos.y - b.origin.y) + ws.s.arrange.scroll_y - row.top - row.auto_top() - k as f32 * auto_h();
     Some((1. - (y - 6.) / (auto_h() - 12.)).clamp(0., 1.))
 }
 
@@ -251,6 +269,16 @@ struct GroupPaint {
     members: Vec<(Color, Vec<(f32, f32)>)>,
 }
 
+/// One take lane as painted: its band, and the stretches of it the comp plays.
+struct TakePaint {
+    y: f32,
+    color: Color,
+    /// The stretches the main lane plays from this take, in pixels (left, right).
+    used: Vec<(f32, f32)>,
+    /// The range being picked on it, in pixels.
+    sel: Option<(f32, f32)>,
+}
+
 struct AutoPaint {
     y: f32,
     points: Vec<(f32, f32)>,
@@ -289,13 +317,15 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
 
     // ── Gather what the lane canvas paints ──
     let mut clips = Vec::new();
+    let mut take_clips = Vec::new();
+    let mut take_rows = Vec::new();
     let mut autos = Vec::new();
     let mut lanes = Vec::new();
     let mut group_lanes = Vec::new();
     for r in &rows {
         let Some(t) = ws.s.project.track(r.track) else { continue };
         let ry = r.top - view.scroll_y;
-        lanes.push((ry, r.h, t.color, r.autos.len(), ws.s.is_track_selected(t.id)));
+        lanes.push((ry, r.h, t.color, r.takes, r.autos.len(), ws.s.is_track_selected(t.id)));
         if ry > lane_h || ry + r.total() < 0. {
             continue;
         }
@@ -318,6 +348,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             if pl.start + c.length < t0 || pl.start > t1 {
                 continue;
             }
+            // The main lane plays; take lane `i` is the row `i` under the clips.
+            let (cy, ch) = match usize::from(pl.lane) {
+                0 => (ry, r.h),
+                lane if lane <= r.takes => (ry + r.h + (lane - 1) as f32 * take_h(), take_h()),
+                _ => continue,
+            };
             let body = match ws.s.project.sources.get(&c.source) {
                 Some(Source::Notes(n)) => {
                     let visible: Vec<(u8, Tick, Tick)> = n.notes.iter().filter(|n| n.start >= c.offset).map(|n| (n.key, n.start, n.length)).collect();
@@ -348,14 +384,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let audio = matches!(body, Body::Audio { .. });
             // Notes draw their own repeats; audio gets a notch at each one.
             let repeats = if matches!(body, Body::Audio { .. }) { crate::editing::overlay::loop_repeats(c, px_per_tick) } else { Vec::new() };
-            clips.push(ClipPaint {
+            let paint = ClipPaint {
                 id: pl.id,
-                bx: ClipBox::of(c, audio, pl.start, ry, r.h, px_per_tick, view.scroll_x),
+                bx: ClipBox::of(c, audio, pl.start, cy, ch, px_per_tick, view.scroll_x),
                 looping: c.looping.is_some_and(|l| l.end > l.start),
                 x: pl.start as f32 * px_per_tick - view.scroll_x,
                 w: c.length as f32 * px_per_tick,
-                y: ry + 2.,
-                h: r.h - 4.,
+                y: cy + 2.,
+                h: ch - 4.,
                 color: c.color,
                 name: c.name.clone(),
                 selected: selection.contains(&pl.id),
@@ -364,12 +400,19 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 offset: c.offset,
                 muted: c.muted,
                 repeats,
-            });
+            };
+            if pl.lane == 0 { clips.push(paint) } else { take_clips.push(paint) }
+        }
+        let px = |tick: Tick| tick as f32 * px_per_tick - view.scroll_x;
+        for i in 0..r.takes.min(t.take_lanes.len()) {
+            let sel = ws.s.takes.sel.filter(|s| s.track == t.id && s.lane == i && !s.is_empty()).map(|s| (px(s.start), px(s.end)));
+            let used = takes::comp_used(&ws.s.project, t.id, i).into_iter().map(|(a, b)| (px(a), px(b))).collect();
+            take_rows.push(TakePaint { y: ry + r.h + i as f32 * take_h(), color: t.color, used, sel });
         }
         for (k, &target) in r.autos.iter().enumerate() {
             let lane = t.automation.iter().find(|l| l.target == target && !l.points.is_empty());
             autos.push(AutoPaint {
-                y: ry + r.h + k as f32 * auto_h(),
+                y: ry + r.auto_top() + k as f32 * auto_h(),
                 points: lane.map(|l| l.points.iter().map(|p| (p.tick as f32 * px_per_tick - view.scroll_x, p.value)).collect()).unwrap_or_default(),
                 line: lane.map(|l| automation_line(l, px_per_tick, view.scroll_x)).unwrap_or_default(),
                 color: crate::theme::mix(track_color(t.color), p().automation, 0.35),
@@ -433,11 +476,16 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             let h = f32::from(b.size.height);
             window.paint_quad(paint::fill_rect(b, p().well));
             // Lane backgrounds.
-            for (y, lh, _, autos, sel) in &lanes {
+            for (y, lh, _, takes, autos, sel) in &lanes {
                 window.paint_quad(paint::fill_rect(at(o, 0., *y, w, *lh), if *sel { content(0.025) } else { gpui::transparent_black() }));
                 window.paint_quad(paint::fill_rect(at(o, 0., *y + *lh - 1., w, 1.), border()));
+                for k in 0..*takes {
+                    let ty = *y + *lh + k as f32 * take_h();
+                    window.paint_quad(paint::fill_rect(at(o, 0., ty, w, take_h()), content(0.035)));
+                    window.paint_quad(paint::fill_rect(at(o, 0., ty + take_h() - 1., w, 1.), border()));
+                }
                 for k in 0..*autos {
-                    let ay = *y + *lh + k as f32 * auto_h();
+                    let ay = *y + *lh + *takes as f32 * take_h() + k as f32 * auto_h();
                     window.paint_quad(paint::fill_rect(at(o, 0., ay, w, auto_h()), content(0.015)));
                     window.paint_quad(paint::fill_rect(at(o, 0., ay + auto_h() - 1., w, 1.), border()));
                 }
@@ -468,6 +516,12 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             }
             for c in &rec_clips {
                 paint_clip(window, cx, o, c, w, None);
+            }
+            for c in &take_clips {
+                paint_clip(window, cx, o, c, w, None);
+            }
+            for t in &take_rows {
+                paint_take_row(window, o, t, w);
             }
             window.set_cursor_style(arrange_clips::cursor_for(hot.map(|h| h.1), copying), &hitbox);
             if idle {
@@ -809,6 +863,43 @@ fn paint_group_lane(window: &mut Window, o: Point<Pixels>, canvas_w: f32, g: &Gr
 
 /// One clip. `canvas_w` bounds what is worth drawing; `hot` is what the
 /// pointer is over (or a drag holds) when it is this clip.
+/// A take lane over its clips: what the comp plays stays bright with an
+/// accent rule on top, the rest is dimmed, and the range being picked is tinted.
+fn paint_take_row(window: &mut Window, o: Point<Pixels>, t: &TakePaint, w: f32) {
+    let h = take_h() - 1.;
+    // Dim everything the comp does not play.
+    let mut x = 0.;
+    let dim = |window: &mut Window, from: f32, to: f32| {
+        let (a, b) = (from.max(0.), to.min(w));
+        if b > a {
+            window.paint_quad(paint::fill_rect(at(o, a, t.y, b - a, h), with_alpha(p().well, 0.55)));
+        }
+    };
+    for &(a, b) in &t.used {
+        dim(window, x, a);
+        x = x.max(b);
+    }
+    dim(window, x, w);
+    for &(a, b) in &t.used {
+        let (a, b) = (a.max(0.), b.min(w));
+        if b > a {
+            window.paint_quad(paint::fill_rect(at(o, a, t.y, b - a, 2.), accent()));
+            window.paint_quad(paint::fill_rect(at(o, a, t.y, 1., h), accent_alpha(0.8)));
+            window.paint_quad(paint::fill_rect(at(o, b - 1., t.y, 1., h), accent_alpha(0.8)));
+        }
+    }
+    if let Some((a, b)) = t.sel {
+        let (a, b) = (a.max(0.), b.min(w));
+        if b > a {
+            window.paint_quad(paint::fill_rect(at(o, a, t.y, b - a, h), accent_alpha(0.28)));
+            window.paint_quad(paint::fill_rect(at(o, a, t.y, 1., h), accent()));
+            window.paint_quad(paint::fill_rect(at(o, b - 1., t.y, 1., h), accent()));
+        }
+    }
+    // The lane's name is on its header; the colour keeps the two together.
+    window.paint_quad(paint::fill_rect(at(o, 0., t.y, 3., h), track_color(t.color)));
+}
+
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint, canvas_w: f32, hot: Option<Zone>) {
     let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
     let fill = if c.muted { mix(clip_fill(c.color), p().well, 0.7) } else { clip_fill(c.color) };
@@ -1098,11 +1189,55 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                 })),
         );
     let mut col = div().flex().flex_col().child(main);
+    for k in 0..r.takes.min(t.take_lanes.len()) {
+        col = col.child(take_header(ws, &t, k, indent, cx));
+    }
     let lanes = r.autos.clone();
     for (k, target) in lanes.into_iter().enumerate() {
         col = col.child(lane_header(ws, &t, k, target, indent, cx));
     }
     col.into_any_element()
+}
+
+/// The header of one take lane: its name (right-click for the lane's menu),
+/// and a button to delete it.
+fn take_header(ws: &Workspace, t: &Track, k: usize, indent: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let id = t.id;
+    let key = (id.0 as usize) << 8 | k.min(255);
+    let name = t.take_lanes.get(k).map_or_else(String::new, |l| l.name.clone());
+    let used = !takes::comp_used(&ws.s.project, id, k).is_empty();
+    div()
+        .id(("take-head", key))
+        .h(px(take_h()))
+        .pl(px(SP2 + 4. + indent))
+        .pr(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .bg(content(0.02))
+        .border_b_1()
+        .border_color(border())
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.menu = None;
+                this.open_menu(MenuKind::TakeLaneContext(id, k), e.position, cx);
+            }),
+        )
+        .child(div().w(px(SP1)).h(px(SP3)).rounded(px(r_sm())).bg(if used { accent() } else { pal.faint }))
+        .child(label(paint::fit(&name, m().track_header_w - 72. - indent, TEXT_SM), TEXT_SM, if used { pal.text } else { pal.muted }).flex_1())
+        .child(
+            widgets::sized_icon_button(("take-del", key), Icon::Trash, false, 20., 12.)
+                .tooltip(widgets::tip("Delete this take lane", None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.s.delete_take_lane(id, k);
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
 }
 
 /// The header of one automation lane (Live): the chooser of what it
@@ -1450,6 +1585,21 @@ fn lane_mouse_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, 
     };
     let track = row.track;
     ws.s.selected_track = Some(track);
+    ws.s.takes.sel = None;
+    // A take lane: a click promotes the take under it, a drag a range of it
+    // (Shift: pick, then Enter promotes).
+    if ly >= row.h
+        && let Some((lane, _)) = row.take_at(ly)
+    {
+        ws.s.ed.area = crate::editing::Area::Arrange;
+        let at = ws.s.snap_tick(crate::editing::GridView::Arrange, tick.max(0), e.modifiers.alt);
+        match ws.s.take_clip_span(track, lane, at.max(tick)) {
+            Some((a, b)) => ws.s.select_take_range(track, lane, a, b),
+            None => ws.s.select_take_range(track, lane, at, at),
+        }
+        ws.begin_drag(Drag::TakeRange { track, lane, anchor: at, hold: e.modifiers.shift }, cx);
+        return;
+    }
     // Automation lane.
     if ly >= row.h {
         if let Some((_, target, y)) = row.lane_at(ly) {
@@ -1541,6 +1691,14 @@ fn auto_lane_down(ws: &mut Workspace, track: TrackId, target: AutomationTarget, 
 
 fn lane_right_click(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
     let Some((row, tick, x, ly)) = lane_hit(ws, e.position) else { return };
+    if ly >= row.h
+        && let Some((lane, _)) = row.take_at(ly)
+    {
+        ws.s.selected_track = Some(row.track);
+        ws.menu = None;
+        ws.open_menu(MenuKind::TakeLaneContext(row.track, lane), e.position, cx);
+        return;
+    }
     if ly >= row.h {
         // Right-click a breakpoint to delete it.
         if let Some((_, target, y)) = row.lane_at(ly) {

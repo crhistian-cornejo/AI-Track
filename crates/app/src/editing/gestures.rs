@@ -64,7 +64,7 @@ pub fn scrub_to(s: &mut AppState, engine: &mut dyn EngineBridge, at: Tick) {
 /// The placement on `track` under `tick`, topmost first.
 pub fn clip_at(ws: &Workspace, track: TrackId, tick: Tick) -> Option<PlacementId> {
     let p = &ws.s.project;
-    p.track(track)?.arrangement.iter().rev().find(|pl| p.clips.get(&pl.clip).is_some_and(|c| tick >= pl.start && tick < pl.start + c.length)).map(|pl| pl.id)
+    p.track(track)?.arrangement.iter().rev().filter(|pl| pl.lane == 0).find(|pl| p.clips.get(&pl.clip).is_some_and(|c| tick >= pl.start && tick < pl.start + c.length)).map(|pl| pl.id)
 }
 
 /// Left button down in a lane. Returns `true` when the click is dealt with.

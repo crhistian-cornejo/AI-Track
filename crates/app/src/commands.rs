@@ -18,6 +18,8 @@ pub enum RenameTarget {
     Clip(ClipId),
     Track(TrackId),
     Scene(SceneId),
+    /// A take lane: the track and its index among the take lanes.
+    TakeLane(TrackId, usize),
 }
 
 /// View state of the shortcuts sheet and the Rename field.
@@ -79,6 +81,11 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             // Enter launches in the Session View and does nothing elsewhere.
             if ws.s.view == MainView::Session {
                 ws.launch_session_cursor(cx);
+            } else if ws.s.takes.sel.is_some() {
+                // A range picked on a take lane (Shift + drag) is promoted by Enter.
+                if !ws.s.promote_take_selection() {
+                    ws.toast("That take has nothing in the range", cx);
+                }
             } else {
                 cx.propagate();
             }
@@ -162,6 +169,19 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             Some(_) => {}
             None => ws.toast("Only groups fold: select a group or a track inside one", cx),
         },
+        Cmd::ShowTakeLanes => {
+            let tracks: Vec<TrackId> = ws.s.project.content_tracks().filter(|t| t.kind.has_clips()).map(|t| t.id).filter(|t| ws.s.is_track_selected(*t)).collect();
+            if tracks.is_empty() {
+                ws.toast("Select an audio or MIDI track to show its take lanes", cx);
+            }
+            // All shown when any is hidden, as the automation toggle does.
+            let show = tracks.iter().any(|t| !ws.s.take_lanes_shown(*t));
+            for t in tracks {
+                if ws.s.take_lanes_shown(t) != show {
+                    ws.s.toggle_take_lanes(t);
+                }
+            }
+        }
         Cmd::ArmTrack => {
             if ws.s.toggle_arm().is_none() {
                 ws.toast("Select an audio or MIDI track to arm", cx);
@@ -237,6 +257,7 @@ pub fn open_rename_for(
         Some(RenameTarget::Clip(c)) => ws.s.project.clips.get(&c).map(|c| c.name.clone()),
         Some(RenameTarget::Track(t)) => ws.s.project.track(t).map(|t| t.name.clone()),
         Some(RenameTarget::Scene(s)) => ws.s.project.scenes.iter().find(|x| x.id == s).map(|x| x.name.clone()),
+        Some(RenameTarget::TakeLane(t, i)) => ws.s.project.track(t).and_then(|t| t.take_lanes.get(i)).map(|l| l.name.clone()),
         None => None,
     };
     let (Some(target), Some(name)) = (target, name) else {
@@ -257,6 +278,7 @@ pub fn apply_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
         Some(RenameTarget::Clip(c)) => ws.s.rename_clip(c, &name),
         Some(RenameTarget::Track(t)) => ws.s.rename_track(t, &name),
         Some(RenameTarget::Scene(s)) => ws.s.rename_scene(s, &name),
+        Some(RenameTarget::TakeLane(t, i)) => ws.s.rename_take_lane(t, i, name.trim().to_owned()),
         None => false,
     };
     ws.modal = None;

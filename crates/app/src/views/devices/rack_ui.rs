@@ -657,7 +657,23 @@ fn pads_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: O
                             }
                             cx.notify();
                         }))
-                        .child(label(crate::paint::fit(&c.name, PAD - 8., TEXT_XS), TEXT_XS, if c.mute { pal.muted } else { pal.text }))
+                        // The name, and the headphones that play the pad's sample file.
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(label(crate::paint::fit(&c.name, PAD - 8. - if sample.is_some() { 16. } else { 0. }, TEXT_XS), TEXT_XS, if c.mute { pal.muted } else { pal.text }))
+                                .when_some(sample.clone(), |row, path| {
+                                    let on = ws.rack_ui.previewing.is_some_and(|(d, n, _)| d == id && n == note);
+                                    row.child(
+                                        widgets::sized_icon_button(("ppreview", key), Icon::Headphones, on, 16., 10.)
+                                            .tooltip(widgets::tip(if on { "Stop the sample" } else { "Play the sample file" }, None))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| preview_pad(this, id, note, &path, cx))),
+                                    )
+                                }),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -679,15 +695,6 @@ fn pads_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: O
                                             cx.notify();
                                         }))),
                                 )
-                                .when_some(sample.clone(), |row, path| {
-                                    let on = ws.rack_ui.previewing.is_some_and(|(d, n, _)| d == id && n == note);
-                                    row.child(div().flex_1()).child(
-                                        widgets::sized_icon_button(("ppreview", key), Icon::Headphones, on, 16., 10.)
-                                            .tooltip(widgets::tip(if on { "Stop the sample" } else { "Play the sample file" }, None))
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                            .on_click(cx.listener(move |this, _, _, cx| preview_pad(this, id, note, &path, cx))),
-                                    )
-                                }),
                         )
                         .tooltip(widgets::tip_owned(match &sample {
                             Some(path) => format!("{}\n{}\nClick plays the pad · the headphones play the sample", c.name, path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned())),

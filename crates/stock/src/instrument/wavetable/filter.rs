@@ -6,15 +6,18 @@
 //!   (the `Type` parameter) at 12 or 24 dB/oct (`Slope`).
 //! * **Ladder** — 4-pole zero-delay-feedback ladder low-pass with a `tanh`
 //!   input stage; resonance reaches self-oscillation.
+//! * **Moog 24 / OTA 24 / OTA 12 / Diode 18** — the `aitrack_dsp::ladder`
+//!   filters: non-linearity inside the feedback loop, 2× oversampled.
 //! * **Notch** — SVF band-reject (`Slope` 24 dB cascades two).
 //! * **Comb +/−** — feedback comb tuned to the cutoff (positive feedback:
 //!   harmonic peaks; negative: odd harmonics, hollow).
 //! * **Formant** — three band-passes on vowel formants; the cutoff knob
 //!   sweeps A → E → I → O → U.
 
+use aitrack_dsp::ladder::Ladder;
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
 
-pub const MODELS: &[&str] = &["SVF", "Ladder", "Notch", "Comb +", "Comb −", "Formant"];
+pub const MODELS: &[&str] = &["SVF", "Ladder", "Notch", "Comb +", "Comb −", "Formant", "Moog 24", "OTA 24", "OTA 12", "Diode 18"];
 pub const TYPES: &[&str] = &["Low-pass", "High-pass", "Band-pass"];
 
 pub mod model {
@@ -24,6 +27,23 @@ pub mod model {
     pub const COMB_POS: usize = 3;
     pub const COMB_NEG: usize = 4;
     pub const FORMANT: usize = 5;
+    /// Zero-delay-feedback ladders from `aitrack_dsp::ladder` (2× oversampled).
+    pub const MOOG24: usize = 6;
+    pub const OTA24: usize = 7;
+    pub const OTA12: usize = 8;
+    pub const DIODE18: usize = 9;
+
+    /// The ladder topology a model index stands for.
+    pub fn ladder_kind(model: usize) -> Option<aitrack_dsp::ladder::LadderKind> {
+        use aitrack_dsp::ladder::LadderKind;
+        match model {
+            MOOG24 => Some(LadderKind::Transistor),
+            OTA24 => Some(LadderKind::Ota),
+            OTA12 => Some(LadderKind::Ota12),
+            DIODE18 => Some(LadderKind::Diode),
+            _ => None,
+        }
+    }
 }
 
 /// Lowest comb frequency (sets the delay buffer).
@@ -89,6 +109,7 @@ pub struct VoiceFilter {
     ladder: [[f32; 4]; 2],
     ladder_g: f32,
     ladder_k: f32,
+    lad: [Ladder; 2],
     comb: [Vec<f32>; 2],
     comb_pos: usize,
     comb_delay: f32,
@@ -109,6 +130,7 @@ impl VoiceFilter {
             ladder: [[0.0; 4]; 2],
             ladder_g: 0.5,
             ladder_k: 0.0,
+            lad: [Ladder::default(); 2],
             comb: [Vec::new(), Vec::new()],
             comb_pos: 0,
             comb_delay: 100.0,
@@ -123,6 +145,9 @@ impl VoiceFilter {
     /// Allocate for a sample rate (control thread).
     pub fn prepare(&mut self, sample_rate: f64) {
         self.sr = sample_rate;
+        for l in &mut self.lad {
+            l.set_sample_rate(sample_rate as f32);
+        }
         let len = (sample_rate / COMB_MIN_HZ) as usize + 4;
         for c in &mut self.comb {
             c.clear();
@@ -134,6 +159,9 @@ impl VoiceFilter {
     pub fn reset(&mut self) {
         self.svf = [[SvfState::default(); 2]; 3];
         self.ladder = [[0.0; 4]; 2];
+        for l in &mut self.lad {
+            l.reset();
+        }
         for c in &mut self.comb {
             c.iter_mut().for_each(|v| *v = 0.0);
         }
@@ -151,6 +179,13 @@ impl VoiceFilter {
                 let g = (std::f32::consts::PI * cutoff / sr as f32).tan();
                 self.ladder_g = g / (1.0 + g);
                 self.ladder_k = 4.2 * r;
+            }
+            m if model::ladder_kind(m).is_some() => {
+                let kind = model::ladder_kind(m).unwrap_or_default();
+                for l in &mut self.lad {
+                    l.set_kind(kind);
+                    l.set_params(cutoff, r);
+                }
             }
             model::NOTCH => {
                 let q = 0.5 + 6.0 * r * r;
@@ -203,6 +238,7 @@ impl VoiceFilter {
         }
         match self.s.model {
             model::LADDER => (self.ladder_tick(0, l), self.ladder_tick(1, r)),
+            m if model::ladder_kind(m).is_some() => (self.lad[0].process(l), self.lad[1].process(r)),
             model::COMB_POS | model::COMB_NEG => self.comb_tick(l, r),
             model::FORMANT => {
                 let mut out = [0.0f32; 2];
@@ -271,7 +307,11 @@ impl VoiceFilter {
     /// Guard against blow-ups (NaN after extreme modulation).
     pub fn sanitize(&mut self) {
         let ok = self.svf.iter().flatten().all(|s| s.is_finite()) && self.ladder.iter().flatten().all(|v| v.is_finite());
+        let ok = ok && self.lad.iter().all(|l| l.is_finite());
         if !ok {
+            for l in &mut self.lad {
+                l.reset();
+            }
             self.svf = [[SvfState::default(); 2]; 3];
             self.ladder = [[0.0; 4]; 2];
         }
@@ -314,6 +354,26 @@ mod tests {
         assert!(gain_at(&mut f, 800.0) > 3.0 * gain_at(&mut f, 5000.0));
         f.configure(FilterSettings { model: model::SVF, kind: 1, slope24: true, cutoff: 2000.0, ..Default::default() });
         assert!(gain_at(&mut f, 100.0) < 0.01 && gain_at(&mut f, 10_000.0) > 0.8);
+    }
+
+    #[test]
+    fn dsp_ladder_models_filter_and_self_oscillate() {
+        for m in [model::MOOG24, model::OTA24, model::OTA12, model::DIODE18] {
+            let mut f = VoiceFilter::new(48_000.0);
+            f.configure(FilterSettings { model: m, cutoff: 800.0, resonance: 0.2, ..Default::default() });
+            assert!(gain_at(&mut f, 100.0) > 0.4 && gain_at(&mut f, 8000.0) < 0.02, "model {m}");
+            f.configure(FilterSettings { model: m, cutoff: 1000.0, resonance: 1.0, drive: 1.0, ..Default::default() });
+            f.reset();
+            let (y, _) = f.process(1.0, 1.0);
+            assert!(y.is_finite());
+            let mut peak = 0.0f32;
+            for _ in 0..48_000 {
+                let (y, _) = f.process(0.0, 0.0);
+                assert!(y.is_finite());
+                peak = peak.max(y.abs());
+            }
+            assert!(peak > 0.01, "model {m}: {peak}");
+        }
     }
 
     #[test]

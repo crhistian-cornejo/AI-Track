@@ -82,6 +82,10 @@ impl FilterView {
         use aitrack_stock::instrument::wavetable::filter::model;
         let (fc, r) = (self.cutoff.max(10.), self.resonance.clamp(0., 1.));
         match self.model {
+            m if model::ladder_kind(m).is_some() => {
+                let kind = model::ladder_kind(m).unwrap_or_default();
+                aitrack_dsp::ladder::response_db(kind, f, fc, r, kind.default_comp())
+            }
             model::LADDER => {
                 // Four poles; resonance trades low end for a peak at the cutoff.
                 let x = f / fc;

@@ -1,12 +1,16 @@
-//! `fx.filter` — multimode TPT state-variable filter (12/24 dB) with drive,
+//! `fx.filter` — multimode TPT state-variable filter (12/24 dB) or, with the
+//! `Ladder` parameter, a zero-delay-feedback VA ladder (Moog 24, OTA 24,
+//! OTA 12, Diode 18 from `aitrack_dsp::ladder`) with drive,
 //! an LFO (free or tempo-synced) and an envelope follower modulating the
 //! cutoff in octaves. Coefficients update every 8 samples from a smoothed
-//! log-frequency, so sweeps are zipper-free. Zero latency.
+//! log-frequency, so sweeps are zipper-free. Zero latency in the SVF modes; the ladders run 2× oversampled and
+//! delay by about two samples.
 //!
 //! Meter layout: `[cutoff L (Hz), cutoff R (Hz), envelope (0..1)]`.
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower};
+use aitrack_dsp::ladder::{Ladder, LadderKind};
 use aitrack_dsp::lfo::{Lfo, LfoShape, SYNC_DIVISIONS, division_beats, division_hz};
 use aitrack_dsp::shaper::{Adaa1, ShaperKind};
 use aitrack_dsp::smooth::Smoother;
@@ -32,9 +36,12 @@ pub mod p {
     pub const ENV_RELEASE: u32 = 13;
     pub const MIX: u32 = 14;
     pub const OUTPUT: u32 = 15;
+    /// 0 = the SVF modes above; 1..=4 = a ladder filter (replaces Type/Slope).
+    pub const LADDER: u32 = 16;
 }
 
 const TYPES: &[&str] = &["Low-pass", "High-pass", "Band-pass", "Notch", "Peak"];
+pub const LADDERS: &[&str] = &["Off", "Moog 24", "OTA 24", "OTA 12", "Diode 18"];
 const SLOPES: &[&str] = &["12 dB/oct", "24 dB/oct"];
 const OFF_ON: &[&str] = &["Off", "On"];
 const UPDATE: usize = 8;
@@ -58,6 +65,7 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::ENV_RELEASE, "Envelope Release", 5.0, 2000.0, 150.0).unit("ms").log().short("Rel"),
         ParamInfo::new(p::MIX, "Mix", 0.0, 100.0, 100.0).unit("%"),
         ParamInfo::new(p::OUTPUT, "Output", -24.0, 12.0, 0.0).unit("dB").short("Out"),
+        ParamInfo::new(p::LADDER, "Ladder", 0.0, 4.0, 0.0).choices(LADDERS).short("Ladder"),
     ]
 }
 
@@ -72,6 +80,18 @@ struct Channel {
     c: [SvfCoeffs; 2],
     shaper: Option<Adaa1>,
     cutoff: f32,
+    ladder: Ladder,
+}
+
+/// The ladder topology a `Ladder` parameter value stands for.
+pub fn ladder_kind(choice: usize) -> Option<LadderKind> {
+    match choice {
+        1 => Some(LadderKind::Transistor),
+        2 => Some(LadderKind::Ota),
+        3 => Some(LadderKind::Ota12),
+        4 => Some(LadderKind::Diode),
+        _ => None,
+    }
 }
 
 pub struct Filter {
@@ -154,6 +174,13 @@ impl Filter {
     }
 
     fn design(&mut self, ch: usize, cutoff: f32) {
+        if let Some(kind) = ladder_kind(self.params.choice(p::LADDER)) {
+            let c = &mut self.ch[ch];
+            c.cutoff = cutoff;
+            c.ladder.set_kind(kind);
+            c.ladder.set_params(cutoff, self.params.plain(p::RESONANCE) / 100.0);
+            return;
+        }
         let mode = match self.params.choice(p::TYPE) {
             1 => SvfMode::Highpass,
             2 => SvfMode::Bandpass,
@@ -211,6 +238,7 @@ impl Segmented for Filter {
         let lfo_depth = self.params.plain(p::LFO_DEPTH);
         let env_amt = self.params.plain(p::ENV_AMOUNT);
         let two = self.params.choice(p::SLOPE) == 1;
+        let use_ladder = ladder_kind(self.params.choice(p::LADDER)).is_some();
         let nyq_oct = ((self.sr as f32 * 0.45) / 20.0).log2();
         if dirty {
             // Make the next sample recompute coefficients.
@@ -247,9 +275,13 @@ impl Segmented for Filter {
                     {
                         y = s.process(y * g) / g.sqrt();
                     }
-                    y = c.st[0].process(&c.c[0], y);
-                    if two {
-                        y = c.st[1].process(&c.c[1], y);
+                    if use_ladder {
+                        y = c.ladder.process(y);
+                    } else {
+                        y = c.st[0].process(&c.c[0], y);
+                        if two {
+                            y = c.st[1].process(&c.c[1], y);
+                        }
                     }
                     *x = sanitize(*x * d + y * w);
                 }
@@ -268,6 +300,9 @@ impl Processor for Filter {
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
         self.sr = sample_rate;
+        for c in &mut self.ch {
+            c.ladder.set_sample_rate(sample_rate as f32);
+        }
         self.base_oct.set_time(15.0, sample_rate);
         for s in [&mut self.wet, &mut self.dry, &mut self.drive] {
             s.set_time(15.0, sample_rate);
@@ -285,6 +320,7 @@ impl Processor for Filter {
             if let Some(s) = c.shaper.as_mut() {
                 s.reset();
             }
+            c.ladder.reset();
         }
         self.env.reset();
         self.env_level = 0.0;
@@ -347,6 +383,37 @@ mod tests {
         set_plain(&mut f, p::SLOPE, 1.0);
         let a24 = gain_db(&mut f, 4000.0);
         assert!(a24 < -66.0 && a24 > -80.0, "{a24}");
+    }
+
+    #[test]
+    fn ladder_modes_replace_the_svf() {
+        for (choice, slope) in [(1.0, 24.0), (2.0, 24.0), (3.0, 12.0), (4.0, 18.0)] {
+            let mut f = Filter::new();
+            set_plain(&mut f, p::LADDER, choice);
+            set_plain(&mut f, p::CUTOFF, 800.0);
+            set_plain(&mut f, p::RESONANCE, 0.0);
+            let pass = gain_db(&mut f, 50.0);
+            assert!(pass.abs() < 1.5, "ladder {choice}: {pass}");
+            let a = gain_db(&mut f, 4000.0);
+            let b = gain_db(&mut f, 8000.0);
+            assert!((a - b - slope).abs() < 3.5, "ladder {choice}: {} dB/oct, want {slope}", a - b);
+        }
+    }
+
+    #[test]
+    fn ladder_resonance_self_oscillates_at_the_cutoff() {
+        let mut f = Filter::new();
+        set_plain(&mut f, p::LADDER, 1.0);
+        set_plain(&mut f, p::CUTOFF, 1000.0);
+        set_plain(&mut f, p::RESONANCE, 100.0);
+        let mut impulse = vec![0.0; 24_000];
+        impulse[0] = 0.5;
+        let (l, _) = process_stereo(&mut f, move |i| (impulse[i], impulse[i]), 24_000);
+        let tail = &l[12_000..];
+        assert!(rms(tail) > 0.01, "keeps ringing: {}", rms(tail));
+        let crossings = tail.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        let hz = crossings as f32 * SR as f32 / tail.len() as f32;
+        assert!((hz / 1000.0 - 1.0).abs() < 0.05, "{hz}");
     }
 
     #[test]

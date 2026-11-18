@@ -29,6 +29,7 @@ struct Settings {
     vel_cutoff: f32,
     vel_amp: f32,
     release_ms: f32,
+    filter_type: usize,
 }
 
 fn shape(i: usize) -> (VaShape, bool) {
@@ -164,6 +165,8 @@ impl Engine for Ladder {
         s.release_ms = p.plain(lp::A_RELEASE).max(p.plain(lp::F_RELEASE));
         self.fenv.set(p.plain(lp::F_ATTACK), p.plain(lp::F_DECAY), p.plain(lp::F_SUSTAIN) / 100.0, p.plain(lp::F_RELEASE));
         self.aenv.set(p.plain(lp::A_ATTACK), p.plain(lp::A_DECAY), p.plain(lp::A_SUSTAIN) / 100.0, p.plain(lp::A_RELEASE));
+        s.filter_type = p.choice(lp::FILTER_TYPE);
+        self.filter.set_variant(s.filter_type);
         self.filter.drive = s.drive;
         self.countdown = 0;
     }

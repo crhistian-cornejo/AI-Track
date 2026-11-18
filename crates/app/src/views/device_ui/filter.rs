@@ -9,7 +9,8 @@ use crate::theme::*;
 use crate::workspace::Workspace;
 use aitrack_dsp::response::svf_cascade_db;
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, butterworth_q};
-use aitrack_stock::fx::filter::{p, resonance_q};
+use aitrack_dsp::ladder::{LadderKind, response_db};
+use aitrack_stock::fx::filter::{ladder_kind, p, resonance_q};
 use gpui::{AnyElement, App, Context, Hsla, IntoElement, ParentElement, Pixels, Point, Styled, TextAlign, Window, div, px};
 
 /// Top and bottom of the filter plots, dB.
@@ -57,6 +58,21 @@ pub fn paint_response(window: &mut Window, cx: &mut App, r: Rect, sections: &[Sv
     kit::line(window, &pts, 2., color);
 }
 
+/// Response of a ladder filter at `hz` as a plot fraction.
+fn ladder_frac(kind: LadderKind, hz: f32, cutoff: f32, resonance: f32) -> f32 {
+    db_frac(response_db(kind, hz, cutoff, resonance / 100., kind.default_comp()))
+}
+
+/// Grid, filled curve and outline of a ladder filter's response.
+pub fn paint_ladder_response(window: &mut Window, cx: &mut App, r: Rect, (kind, cutoff, resonance): (LadderKind, f32, f32), color: Hsla, labels: bool) {
+    kit::db_grid(window, cx, r, DB_BOTTOM, DB_TOP, 12., labels);
+    kit::freq_grid(window, cx, r, labels);
+    let n = ((r.w / 3.) as usize).clamp(32, 300);
+    let pts = kit::sample_curve(r, n, |fx| ladder_frac(kind, frac_freq(fx), cutoff, resonance));
+    kit::fill_to(window, &pts, r.bottom(), with_alpha(color, 0.16));
+    kit::line(window, &pts, 2., color);
+}
+
 /// Where the cutoff node sits: on the curve at the cutoff frequency.
 pub fn node(sections: &[SvfCoeffs], cutoff: f32, sample_rate: f64) -> (f32, f32) {
     (freq_frac(cutoff), db_frac(svf_cascade_db(sections, cutoff as f64, sample_rate) as f32).clamp(0.04, 0.96))
@@ -65,7 +81,11 @@ pub fn node(sections: &[SvfCoeffs], cutoff: f32, sample_rate: f64) -> (f32, f32)
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let (cutoff, resonance) = (dev.plain(p::CUTOFF), dev.plain(p::RESONANCE));
     let secs = sections(dev.choice(p::TYPE), dev.choice(p::SLOPE) == 1, cutoff, resonance, dev.sample_rate);
-    let (fx, fy) = node(&secs, cutoff, dev.sample_rate);
+    let lad = ladder_kind(dev.choice(p::LADDER));
+    let (fx, fy) = match lad {
+        Some(k) => (freq_frac(cutoff), ladder_frac(k, cutoff, cutoff, resonance).clamp(0.04, 0.96)),
+        None => node(&secs, cutoff, dev.sample_rate),
+    };
     let reset = [p::CUTOFF, p::RESONANCE].map(|id| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()))).to_vec();
     let handles = vec![Handle { fx, fy, x: ax(p::CUTOFF, 1.), y: ax(p::RESONANCE, -1.1), alt: ax(p::RESONANCE, -1.5), index: 0, reset }];
     let (lfo, env) = (dev.plain(p::LFO_DEPTH), dev.plain(p::ENV_AMOUNT));
@@ -84,7 +104,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::bar(window, a.min(b), r.y + r.h * 0.55, (a - b).abs(), r.h * 0.45, 0., with_alpha(series(3), 0.16));
             kit::txt(window, cx, "Env", a.min(b) + 4., r.bottom() - 28., TEXT_XS, with_alpha(series(3), 0.9), TextAlign::Left);
         }
-        paint_response(window, cx, r, &secs, sr, if enabled { pal.accent } else { pal.muted }, true);
+        let color = if enabled { pal.accent } else { pal.muted };
+        match lad {
+            Some(k) => paint_ladder_response(window, cx, r, (k, cutoff, resonance), color, true),
+            None => paint_response(window, cx, r, &secs, sr, color, true),
+        }
         // Where the modulated cutoff is right now (left and right channel).
         for hz in live {
             if hz > 10. && (hz / cutoff - 1.).abs() > 0.01 {
@@ -96,7 +120,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let rate = if dev.on(p::LFO_SYNC) { p::LFO_DIV } else { p::LFO_RATE };
     kit::panel(if dev.big { 640. } else { 440. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
-        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))
+        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LADDER, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))
         .child(kit::strip(
             ws,
             dev,

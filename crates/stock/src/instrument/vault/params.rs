@@ -110,7 +110,9 @@ pub mod ladder {
     pub const LFO_CUTOFF: u32 = BASE + 30;
     pub const VEL_CUTOFF: u32 = BASE + 31;
     pub const VEL_AMP: u32 = BASE + 32;
-    pub const END: u32 = BASE + 33;
+    /// Filter variant (0 = classic cascade; see `kit::FILTER_VARIANTS`).
+    pub const FILTER_TYPE: u32 = BASE + 33;
+    pub const END: u32 = BASE + 34;
 }
 
 /// Poly analog synth (200..).
@@ -159,7 +161,9 @@ pub mod poly {
     pub const VEL_FILTER: u32 = BASE + 34;
     /// Stereo spread of the voices, 0..100 %.
     pub const SPREAD: u32 = BASE + 35;
-    pub const END: u32 = BASE + 36;
+    /// Filter variant (0 = classic OTA cascade; see `kit::FILTER_VARIANTS`).
+    pub const FILTER_TYPE: u32 = BASE + 36;
+    pub const END: u32 = BASE + 37;
 }
 
 /// 6-operator FM (300..).
@@ -397,6 +401,7 @@ fn build() -> Vec<ParamInfo> {
         v.push(pct(LFO_CUTOFF, "LFO → Cutoff", 0.0));
         v.push(pct(VEL_CUTOFF, "Velocity → Cutoff", 30.0).short("Vel F"));
         v.push(pct(VEL_AMP, "Velocity → Amp", 30.0).short("Vel A"));
+        v.push(choice(FILTER_TYPE, "Filter Type", super::kit::FILTER_VARIANTS, 0.0).short("Filter"));
     }
 
     // Poly analog.
@@ -438,6 +443,7 @@ fn build() -> Vec<ParamInfo> {
         v.push(pct(poly::VEL_AMP, "Velocity → Amp", 40.0).short("Vel A"));
         v.push(pct(VEL_FILTER, "Velocity → Filter", 20.0).short("Vel F"));
         v.push(pct(SPREAD, "Spread", 40.0));
+        v.push(choice(poly::FILTER_TYPE, "Filter Type", super::kit::FILTER_VARIANTS, 0.0).short("Filter"));
     }
 
     // FM.

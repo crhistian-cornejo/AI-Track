@@ -40,6 +40,7 @@ pub struct Settings {
     vel_amp: f32,
     vel_filter: f32,
     spread: f32,
+    filter_type: usize,
     fenv: [f32; 4],
     aenv: [f32; 4],
 }
@@ -167,6 +168,7 @@ impl Voice for PolyVoice {
         let vel = 1.0 - s.vel_filter + s.vel_filter * self.vel;
         let oct = s.env * 5.0 * fe * vel + s.key_track * (self.key - 60.0) / 12.0 + s.lfo_cutoff * 2.0 * lfo + self.drift_f.next() * s.drift * 0.15;
         self.cut_base = s.cutoff * 2f32.powf(oct);
+        self.filter.set_variant(s.filter_type);
         self.filter.set(self.cut_base, s.reso, s.sr);
     }
 
@@ -267,6 +269,7 @@ impl Engine for Poly {
         s.pm_freq = p.on(pp::PM_FREQ);
         s.pm_pw = p.on(pp::PM_PW);
         s.pm_filter = p.on(pp::PM_FILTER);
+        s.filter_type = p.choice(pp::FILTER_TYPE);
         s.lfo_rate = p.plain(pp::LFO_RATE);
         s.vibrato = p.plain(pp::LFO_PITCH);
         s.lfo_pw = p.plain(pp::LFO_PW) / 100.0;

@@ -25,6 +25,7 @@ pub mod crossover;
 pub mod delay;
 pub mod dynamics;
 pub mod envelope;
+pub mod ladder;
 pub mod lfo;
 pub mod loudness;
 pub mod osc;

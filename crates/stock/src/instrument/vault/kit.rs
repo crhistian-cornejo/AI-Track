@@ -247,11 +247,21 @@ pub struct Cascade4 {
     k: f32,
     pub model: FilterModel,
     pub drive: f32,
+    /// Zero-delay-feedback replacement for the classic cascade (see
+    /// [`Cascade4::set_variant`]); `None` runs the classic one.
+    zdf: Option<aitrack_dsp::ladder::Ladder>,
+    variant: usize,
+    sr: f32,
 }
+
+/// Names of the filter variants every Vault engine offers: the classic
+/// cascade of the engine (stable first entry) and the `aitrack_dsp::ladder`
+/// filters. Padded to 8 so entries can be appended without remapping.
+pub const FILTER_VARIANTS: &[&str] = &["Classic", "Moog 24", "OTA 24", "OTA 12", "Diode 18", "—", "—", "—"];
 
 impl Default for Cascade4 {
     fn default() -> Self {
-        Self { s: [0.0; 4], last: 0.0, g: 0.0, k: 0.0, model: FilterModel::Ladder, drive: 1.0 }
+        Self { s: [0.0; 4], last: 0.0, g: 0.0, k: 0.0, model: FilterModel::Ladder, drive: 1.0, zdf: None, variant: 0, sr: 0.0 }
     }
 }
 
@@ -260,9 +270,36 @@ impl Cascade4 {
         Self { model, ..Default::default() }
     }
 
+    /// Pick the filter: 0 = the classic cascade, 1..=4 = the ZDF ladders
+    /// (Moog 24, OTA 24, OTA 12, Diode 18) of `aitrack_dsp::ladder`.
+    pub fn set_variant(&mut self, variant: usize) {
+        use aitrack_dsp::ladder::{Ladder, LadderKind};
+        if variant == self.variant {
+            return;
+        }
+        self.variant = variant;
+        self.zdf = match variant {
+            1 => Some(Ladder::new(LadderKind::Transistor)),
+            2 => Some(Ladder::new(LadderKind::Ota)),
+            3 => Some(Ladder::new(LadderKind::Ota12)),
+            4 => Some(Ladder::new(LadderKind::Diode)),
+            _ => None,
+        };
+        self.sr = 0.0;
+        self.reset();
+    }
+
     /// `cutoff` Hz, `reso` 0..1 (≈1 self-oscillates), at sample rate `sr`.
     #[inline]
     pub fn set(&mut self, cutoff: f32, reso: f32, sr: f32) {
+        if let Some(l) = self.zdf.as_mut() {
+            if self.sr != sr {
+                self.sr = sr;
+                l.set_sample_rate(sr);
+            }
+            l.set_params(cutoff, reso);
+            return;
+        }
         let fs = 2.0 * sr;
         let fc = cutoff.clamp(10.0, 0.45 * sr);
         let wd = (std::f32::consts::PI * fc / fs).tan();
@@ -275,6 +312,9 @@ impl Cascade4 {
     pub fn reset(&mut self) {
         self.s = [0.0; 4];
         self.last = 0.0;
+        if let Some(l) = self.zdf.as_mut() {
+            l.reset();
+        }
     }
 
     #[inline]
@@ -298,6 +338,10 @@ impl Cascade4 {
     /// One input sample (two internal steps).
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
+        if let Some(l) = self.zdf.as_mut() {
+            let y = l.process(self.drive * x);
+            return if self.drive > 1.0 { y / self.drive.sqrt() } else { y };
+        }
         let a = self.step(x);
         let b = self.step(x);
         let mut y = 0.5 * (a + b);

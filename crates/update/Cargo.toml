@@ -1,0 +1,27 @@
+[package]
+name = "aitrack-update"
+description = "Auto-update logic: manifest, versions, resumable verified download and install steps. No UI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+# HTTP client (MIT OR Apache-2.0); the same one the library and the splice crate use.
+ureq = { version = "3", features = ["platform-verifier"] }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+# Minisign signature verification, streaming (MIT).
+minisign-verify = "0.2"
+
+[dev-dependencies]
+# A throwaway key pair to sign test archives (MIT).
+minisign = "0.10"
+
+[lints]
+workspace = true

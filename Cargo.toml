@@ -9,6 +9,7 @@ members = [
   "crates/library",
   "crates/ai",
   "crates/splice",
+  "crates/update",
   "crates/app",
   "xtask",
 ]
@@ -38,6 +39,7 @@ aitrack-host = { path = "crates/host" }
 aitrack-library = { path = "crates/library" }
 aitrack-ai = { path = "crates/ai" }
 aitrack-splice = { path = "crates/splice" }
+aitrack-update = { path = "crates/update" }
 
 # Shared third-party crates (pin here, use `.workspace = true` in members)
 serde = { version = "1", features = ["derive"] }

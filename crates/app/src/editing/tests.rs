@@ -524,6 +524,36 @@ fn insert_silence_and_duplicate_time_move_every_track() {
 }
 
 #[test]
+fn insert_silence_moves_take_lanes_and_comp_with_the_main_lane() {
+    let Song { mut s, midi, .. } = song();
+    midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT)]);
+    assert!(s.edit("Add take lane", vec![Command::AddTakeLane { track: midi, index: 0, name: "Take 1".into() }]));
+    let (source, clip, id) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
+    assert!(s.edit("Add take", vec![
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new() })) },
+        Command::AddClip { id: clip, clip: Box::new(Clip::new("Take", Color::palette(1), source, 4 * BEAT)) },
+        Command::PlaceClip { track: midi, placement: Placement { id, clip, start: 0, lane: 1 } },
+        Command::SetComp { track: midi, spans: vec![CompSpan { lane: 1, start: BEAT / 2, end: 3 * BEAT }] },
+    ]));
+    s.set_time_selection((BEAT, midi), (3 * BEAT, midi));
+    let before = steps(&s);
+    assert!(s.insert_silence());
+    assert_eq!(steps(&s), before + 1, "one undo step");
+    let t = s.project.track(midi).unwrap();
+    let mut main: Vec<_> = t.arrangement.iter().filter(|p| p.lane == 0).map(|p| p.start).collect();
+    let mut take: Vec<_> = t.arrangement.iter().filter(|p| p.lane == 1).map(|p| p.start).collect();
+    main.sort();
+    take.sort();
+    assert_eq!(main, [0, 3 * BEAT]);
+    assert_eq!(take, main, "the take lane moved with the main lane");
+    assert_eq!(t.comp, [CompSpan { lane: 1, start: BEAT / 2, end: BEAT }, CompSpan { lane: 1, start: 3 * BEAT, end: 5 * BEAT }]);
+    assert!(s.undo());
+    let t = s.project.track(midi).unwrap();
+    assert_eq!(t.comp, [CompSpan { lane: 1, start: BEAT / 2, end: 3 * BEAT }]);
+    assert_eq!(t.arrangement.iter().filter(|p| p.lane == 1).count(), 1);
+}
+
+#[test]
 fn loop_selection_select_all_and_the_arrow_keys() {
     let Song { mut s, midi, midi2, audio } = song();
     let riff = midi_clip(&mut s, midi, BEAT, 2 * BEAT, &[]);

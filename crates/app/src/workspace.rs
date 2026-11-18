@@ -2884,6 +2884,7 @@ impl Workspace {
         self.chat_log.retain(|e| !matches!(e, ChatEntry::Proposal { .. } | ChatEntry::Part(_)));
         self.synced_revision = None;
         self.fx = views::device_ui::UiState::default();
+        views::device_ui::modulator::set_map_mode(None);
         cx.notify();
     }
 
@@ -3349,6 +3350,8 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::fps::begin(window, || "main".to_owned());
+        // The knobs' modulation rings, once a frame, for the devices panel and the device windows alike.
+        views::device_ui::modulator::refresh(&self.s.project);
         if !self.recovery.is_empty() {
             self.offer_recovery(window, cx);
         } else if !self.pending_missing.is_empty() {
@@ -3576,6 +3579,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 if this.palette.open {
                     views::palette::close(this, window, cx);
+                    return;
+                }
+                // Map mode ends with Escape.
+                if views::device_ui::modulator::map_mode().is_some() {
+                    views::device_ui::modulator::set_map_mode(None);
+                    cx.notify();
                     return;
                 }
                 // A fade, trim or copy drag in the lanes is given up first.

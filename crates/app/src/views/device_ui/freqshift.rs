@@ -69,13 +69,19 @@ fn track_frac(shift: f32) -> f32 {
     (0.5 + shift / (2. * SHIFT_MAX)).clamp(0., 1.)
 }
 
+/// The (left, right) shifts the card shows: the meter's, while an LFO moves
+/// them, else the ones the parameters set.
+pub fn shown_shifts(static_shift: f32, spread: f32, moving: Option<(f32, f32)>) -> (f32, f32) {
+    moving.unwrap_or((static_shift, right_shift(static_shift, spread)))
+}
+
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let ring = dev.choice(p::MODE) == 1;
     let static_shift = dev.plain(p::SHIFT) + dev.plain(p::FINE);
     let spread = dev.plain(p::SPREAD) / 100.;
-    let live = dev.meter.len() >= 5;
-    // With the LFO running, the meter has the shift as it is right now.
-    let (left, right) = if live { (dev.m(0), dev.m(1)) } else { (static_shift, right_shift(static_shift, spread)) };
+    // Only an LFO moves the shift: with it off, the set shift is the shift.
+    let live = dev.meter.len() >= 5 && dev.plain(p::LFO_DEPTH) > 0.;
+    let (left, right) = shown_shifts(static_shift, spread, live.then(|| (dev.m(0), dev.m(1))));
     let enabled = dev.enabled;
     let norm = dev.norm(p::SHIFT);
     let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
@@ -167,6 +173,13 @@ mod tests {
         assert_eq!(right_shift(100., 0.), 100.);
         assert_eq!(right_shift(100., 0.5), 0.);
         assert_eq!(right_shift(100., 1.), -100.);
+    }
+
+    #[test]
+    fn without_an_lfo_the_label_shows_the_set_shift_not_stale_meter_values() {
+        assert_eq!(shown_shifts(0., 0., None), (0., 0.));
+        assert_eq!(hz_text(shown_shifts(0., 0., None).0), "+0 Hz");
+        assert_eq!(shown_shifts(0., 0., Some((133., -133.))), (133., -133.));
     }
 
     #[test]

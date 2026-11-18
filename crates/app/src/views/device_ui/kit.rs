@@ -711,6 +711,13 @@ pub const WINDOW_PANEL_MIN_H: f32 = 280.;
 /// dock, a column. In a window (see [`WindowScope`]) `width` is the least it
 /// needs: it takes the room the window gives and the plots inside grow with
 /// it; below that width the window scrolls instead of cutting it off.
+/// A line of text above a plot (a summary, and optionally a second one at the
+/// right): outside the plot, so it never sits under a handle or an axis label.
+pub fn plot_header(left: impl Into<gpui::SharedString>, right: Option<String>) -> Div {
+    let pal = p();
+    div().flex_none().flex().justify_between().gap(px(SP2)).px(px(SP1)).child(label(left, TEXT_XS, pal.faint)).children(right.map(|r| label(r, TEXT_XS, pal.muted)))
+}
+
 pub fn panel(width: f32) -> Div {
     if in_window() {
         need(width, WINDOW_PANEL_MIN_H);

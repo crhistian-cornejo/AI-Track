@@ -155,8 +155,34 @@ impl Plan {
         let tracks: Vec<TrackId> = self.p.tracks.iter().filter(|t| t.kind.has_clips()).map(|t| t.id).collect();
         for track in tracks {
             self.split_edge(track, at);
-            for pl in self.placements(track, |x, _| x >= at) {
-                self.run(Command::MovePlacement { track, id: pl.id, to_track: track, start: pl.start + len, lane: pl.lane });
+            // The take lanes keep their time with the main lane they were recorded against.
+            let lanes = self.p.track(track).map_or(0, |t| t.take_lanes.len() as u16);
+            for lane in 1..=lanes {
+                for pl in self.placements_in(track, lane, |a, b| a < at && at < b) {
+                    if let Some(cmds) = aitrack_model::ops::split_at(&mut self.p, track, pl.id, at) {
+                        self.run_all(cmds);
+                    }
+                }
+            }
+            for lane in 0..=lanes {
+                for pl in self.placements_in(track, lane, |x, _| x >= at) {
+                    self.run(Command::MovePlacement { track, id: pl.id, to_track: track, start: pl.start + len, lane: pl.lane });
+                }
+            }
+            let spans = self.p.track(track).map(|t| t.comp.clone()).unwrap_or_default();
+            if spans.iter().any(|c| c.end > at) {
+                let mut moved = Vec::with_capacity(spans.len() + 1);
+                for c in spans {
+                    if c.end <= at {
+                        moved.push(c);
+                    } else if c.start >= at {
+                        moved.push(CompSpan { start: c.start + len, end: c.end + len, ..c });
+                    } else {
+                        moved.push(CompSpan { end: at, ..c });
+                        moved.push(CompSpan { start: at + len, end: c.end + len, ..c });
+                    }
+                }
+                self.run(Command::SetComp { track, spans: moved });
             }
         }
         let lanes: Vec<(TrackId, AutomationLane)> = self

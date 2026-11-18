@@ -175,13 +175,8 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             if tracks.is_empty() {
                 ws.toast("Select an audio or MIDI track to show its take lanes", cx);
             }
-            // All shown when any is hidden, as the automation toggle does.
-            let show = tracks.iter().any(|t| !ws.s.take_lanes_shown(*t));
-            for t in tracks {
-                if ws.s.take_lanes_shown(t) != show {
-                    ws.s.toggle_take_lanes(t);
-                }
-            }
+            // All shown when any is hidden, as the automation toggle does: one undo step.
+            ws.s.toggle_take_lanes_of(&tracks);
         }
         Cmd::ArmTrack => {
             if ws.s.toggle_arm().is_none() {

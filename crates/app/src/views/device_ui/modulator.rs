@@ -54,6 +54,17 @@ pub fn set_map_mode(device: Option<DeviceId>) {
     MAP.with(|m| m.set(device));
 }
 
+/// The modulator in Map mode, if it still exists as a modulator; the mode
+/// ends otherwise (the device was deleted, undone away, or the project changed).
+pub fn live_map_mode(project: &Project) -> Option<DeviceId> {
+    let m = map_mode()?;
+    if project.device(m).is_some_and(|d| d.is_modulator()) {
+        return Some(m);
+    }
+    set_map_mode(None);
+    None
+}
+
 /// Collect the mapped parameters of the project (once a frame, before the
 /// knobs are built). A parameter wears the ring of the first modulator that
 /// drives it, as the engine gives it to that one.
@@ -84,7 +95,7 @@ pub fn ring(device: DeviceId, param: u32) -> Option<(f32, f32)> {
 /// modulator's track: the target is mapped and the mode ends. `true` when it
 /// took the press.
 pub fn pick_drag(ws: &mut Workspace, drag: &Drag, cx: &mut Context<Workspace>) -> bool {
-    let Some(m) = map_mode() else { return false };
+    let Some(m) = live_map_mode(&ws.s.project) else { return false };
     let target = match drag {
         Drag::Knob { target: KnobTarget::Param { device, param, .. }, .. } => ModTarget::Param { device: *device, param: *param },
         Drag::Knob { target: KnobTarget::Pan { track }, .. } if ws.s.project.device_track(m) == Some(*track) => ModTarget::Pan,
@@ -107,7 +118,11 @@ fn bind(ws: &mut Workspace, m: DeviceId, target: ModTarget, cx: &mut Context<Wor
             set_map_mode(None);
             ws.toast(format!("Mapped to {name}: set its range with the handles"), cx);
         }
-        Err(why) => ws.toast(why, cx),
+        Err(why) => {
+            // A refused bind ends the mode: it must not swallow every press from now on.
+            set_map_mode(None);
+            ws.toast(why, cx);
+        }
     }
     cx.notify();
 }
@@ -412,7 +427,6 @@ pub fn render_lfo(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Wo
             }
         }
         kit::dot(window, r.pt(mark.0, mark.1), 6., color, Some(pal.text));
-        kit::txt(window, cx, &title, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
         kit::txt(window, cx, "1", r.x + 6., r.py(out_frac(1.)) - 12., TEXT_XS, pal.faint, TextAlign::Left);
         kit::txt(window, cx, "0", r.x + 6., r.py(out_frac(0.)) - 12., TEXT_XS, pal.faint, TextAlign::Left);
     });
@@ -424,6 +438,7 @@ pub fn render_lfo(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Wo
         .flex()
         .flex_col()
         .gap(px(SP2))
+        .child(kit::plot_header(title, None))
         .child(div().flex_1().min_h(px(0.)).child(plot))
         .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::WAVE, cx)).child(kit::pick(dev, p::TIME_MODE, cx)).child(kit::pick(dev, p::RETRIG, cx)))
         .child(kit::strip(ws, dev, &[rate_id, p::DEPTH, p::OFFSET, p::PHASE], &[p::JITTER, p::SMOOTH], cx));
@@ -551,7 +566,19 @@ mod tests {
         assert_eq!(ring(eq, 2), None, "unmapped by undo");
         set_map_mode(Some(m));
         assert_eq!(map_mode(), Some(m));
+        assert_eq!(live_map_mode(&s.project), Some(m));
         set_map_mode(None);
+        assert_eq!(map_mode(), None);
+        // A deleted modulator ends the mode instead of swallowing presses.
+        set_map_mode(Some(m));
+        for _ in 0..8 {
+            s.undo();
+        }
+        assert!(s.project.device(m).is_none());
+        assert_eq!(live_map_mode(&s.project), None);
+        assert_eq!(map_mode(), None, "the stale mode was cleared");
+        set_map_mode(Some(DeviceId(987_654)));
+        assert_eq!(live_map_mode(&s.project), None);
         assert_eq!(map_mode(), None);
     }
 }

@@ -41,7 +41,6 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         return empty("Select a track to see its devices.");
     };
     let tid = track.id;
-    crate::views::device_ui::modulator::refresh(&ws.s.project);
     let ids: Vec<DeviceId> = track.devices.iter().map(|d| d.id).collect();
     // Live's chain: devices left to right in signal order, an insertion
     // point between each pair (it lights up while a device is dragged over).

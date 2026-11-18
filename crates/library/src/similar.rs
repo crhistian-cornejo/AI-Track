@@ -218,7 +218,6 @@ impl Library {
         let next = AtomicUsize::new(0);
         let (tx, rx) = unbounded::<(usize, Result<Vec<f32>>)>();
         let (candidates, todo_ref) = (&candidates, &todo);
-        cache.conn.execute_batch("BEGIN")?;
         let result = std::thread::scope(|s| -> Result<()> {
             for _ in 0..threads {
                 let tx = tx.clone();
@@ -238,41 +237,53 @@ impl Library {
                 });
             }
             drop(tx);
-            let mut since_commit = 0;
-            let mut last_commit = Instant::now();
-            for (n, r) in rx {
-                let (i, hash) = todo_ref[n];
-                let Some(hash) = hash else { continue };
-                let r = r.and_then(|v| {
-                    if v.len() == embedder.dim() { Ok(v) } else { Err(LibraryError::Audio(format!("embedding of {} values, expected {}", v.len(), embedder.dim()))) }
-                });
-                match &r {
-                    Ok(v) => {
-                        cache.store_embedding(&hash, &id, version, Ok(v.clone()))?;
-                        stats.embedded += 1;
-                        pr.embedded += 1;
+            // Results are written in short transactions that are opened and closed
+            // between two waits on the channel: waiting on a slow decode never
+            // holds the database's write lock (the UI writes to it too).
+            while let Ok(first) = rx.recv() {
+                let mut batch = vec![first];
+                while batch.len() < 50 {
+                    match rx.try_recv() {
+                        Ok(x) => batch.push(x),
+                        Err(_) => break,
                     }
+                }
+                cache.conn.execute_batch("BEGIN")?;
+                let written = (|| -> Result<()> {
+                    for (n, r) in batch {
+                        let (i, hash) = todo_ref[n];
+                        let Some(hash) = hash else { continue };
+                        let r = r.and_then(|v| {
+                            if v.len() == embedder.dim() { Ok(v) } else { Err(LibraryError::Audio(format!("embedding of {} values, expected {}", v.len(), embedder.dim()))) }
+                        });
+                        match &r {
+                            Ok(v) => {
+                                cache.store_embedding(&hash, &id, version, Ok(v.clone()))?;
+                                stats.embedded += 1;
+                                pr.embedded += 1;
+                            }
+                            Err(e) => {
+                                log::debug!("embedding failed for {}: {e}", candidates[i].path.display());
+                                cache.store_embedding(&hash, &id, version, Err(&e.to_string()))?;
+                                stats.errors += 1;
+                            }
+                        }
+                        pr.done += 1;
+                        pr.current = Some(candidates[i].path.clone());
+                    }
+                    Ok(())
+                })();
+                match written {
+                    Ok(()) => cache.conn.execute_batch("COMMIT")?,
                     Err(e) => {
-                        log::debug!("embedding failed for {}: {e}", candidates[i].path.display());
-                        cache.store_embedding(&hash, &id, version, Err(&e.to_string()))?;
-                        stats.errors += 1;
+                        let _ = cache.conn.execute_batch("ROLLBACK");
+                        return Err(e);
                     }
                 }
-                pr.done += 1;
-                pr.current = Some(candidates[i].path.clone());
                 progress(&pr);
-                since_commit += 1;
-                // Short transactions: the watcher and the scanner write to this database too.
-                if since_commit >= 50 || last_commit.elapsed() >= Duration::from_millis(500) {
-                    cache.conn.execute_batch("COMMIT; BEGIN")?;
-                    since_commit = 0;
-                    last_commit = Instant::now();
-                }
             }
             Ok(())
         });
-        // Whatever happened, keep the work done so far.
-        cache.conn.execute_batch("COMMIT")?;
         result?;
         stats.cancelled = cancel.load(Ordering::Relaxed) && pr.done < pr.total;
         pr.current = None;
@@ -922,6 +933,63 @@ mod tests {
         let root = lib.add_root(&samples, RootKind::User).unwrap();
         lib.scan(&BasicAnalyzer, &ScanOptions { roots: Some(vec![root]), ..Default::default() }, &mut |_| {}, &AtomicBool::new(false)).unwrap();
         (dir, db, samples)
+    }
+
+    /// Embeds the first two files at once, then blocks on the third until released.
+    struct Gate {
+        inner: Fake,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Embedder for Gate {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn embed(&self, path: &Path) -> Result<Vec<f32>> {
+            if self.inner.calls.load(Ordering::Relaxed) >= 2 {
+                self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                while !self.release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return self.inner.embed(path);
+            }
+            self.inner.embed(path)
+        }
+    }
+
+    #[test]
+    fn waiting_on_a_slow_decode_does_not_hold_the_write_lock() {
+        let (_dir, db, _) = library_with_sounds();
+        let other = Library::open(&db).unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Gate { inner: Fake::new(1), release: release.clone() };
+        let cancel = AtomicBool::new(false);
+        let fav = other.connection().query_row("SELECT id FROM samples WHERE name LIKE 'Tone 900%'", [], |r| r.get::<_, i64>(0)).unwrap();
+        std::thread::scope(|s| {
+            let job = s.spawn(|| {
+                let lib = Library::open(&db).unwrap();
+                lib.embed_missing(&lib, &gate, &EmbedOptions { threads: 1, limit: None }, &mut |_| {}, &cancel)
+            });
+            // Two files are embedded and stored; the third decode is stuck.
+            let t0 = Instant::now();
+            while gate.inner.calls.load(Ordering::Relaxed) < 3 && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            // Another connection (the UI) writes while the job waits.
+            other.connection().busy_timeout(Duration::from_millis(500)).unwrap();
+            let wrote = other.set_favorite(SampleId(fav), true);
+            release.store(true, Ordering::Relaxed);
+            job.join().unwrap().unwrap();
+            assert!(wrote.is_ok(), "the write blocked behind the embed job: {wrote:?}");
+        });
+        assert_eq!(other.embedding_count("fake", 1).unwrap(), 3);
     }
 
     #[test]

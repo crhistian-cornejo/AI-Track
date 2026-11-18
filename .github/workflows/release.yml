@@ -54,7 +54,7 @@ jobs:
 
   macos:
     needs: meta
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 120
     env:
       APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -112,6 +112,12 @@ jobs:
           $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
           "WINDOWS_PFX_FILE=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # NSIS is no longer on the runner image.
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Package
         run: cargo xtask package --target win --sign
       - uses: actions/upload-artifact@v4

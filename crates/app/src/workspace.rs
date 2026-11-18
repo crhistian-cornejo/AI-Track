@@ -608,6 +608,15 @@ impl Workspace {
                 "ai" => self.ai_open = true,
                 // Open the palette, optionally on a tab: `palette=devices`.
                 "palette" => self.palette_pending = true,
+                // The palette's "Similar to <sound>" list for the first sound of the library.
+                "similar" => {
+                    self.palette_pending = true;
+                    self.palette.tab = views::palette::Tab::Samples;
+                    let items = self.b.library.search("", None);
+                    if let Some(it) = items.iter().find(|i| i.id == 1).or(items.first()) {
+                        self.palette.similar = Some(views::palette::SimilarTo { id: it.id, name: it.name.clone() });
+                    }
+                }
                 "prefs=sounds" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
                         views::prefs::PrefsPage::Sounds,

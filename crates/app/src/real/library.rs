@@ -13,7 +13,7 @@
 
 use crate::bridge::*;
 use aitrack_library::{
-    AiDetector,
+    AiDetector, DspEmbedder, EmbedEvent, EmbedJob, EmbedOptions, SimilarFinder,
     Analysis, Analyzer, BasicAnalyzer, Category, KeyFilter, KeyHint, KeyMatch, Library, NameHints, OrganizeLayout,
     OrganizeMode, OrganizePlan, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, RecommendQuery, RootKind, Sample, SampleId, ScanEvent, ScanJob, ScanOptions, SearchQuery, Source,
 };
@@ -126,6 +126,9 @@ enum Scan {
     /// Listening to samples without a key (factory bank read-only, results
     /// cached in the user library).
     Keys(ReanalyseJob),
+    /// Listening to every sound to learn which ones sound alike (quiet, and
+    /// stopped as soon as the user asks for anything else).
+    Embed(EmbedJob),
 }
 
 impl Scan {
@@ -133,6 +136,7 @@ impl Scan {
         match self {
             Scan::Folders(j) => j.cancel(),
             Scan::Keys(j) => j.cancel(),
+            Scan::Embed(j) => j.cancel(),
         }
     }
 }
@@ -162,6 +166,10 @@ pub struct RealLibrary {
     plugins: Option<aitrack_library::plugins::PluginInstaller>,
     plugin_cards: Vec<aitrack_library::plugins::PluginCard>,
     plugin_cards_at: Option<std::time::Instant>,
+    /// The index of "sounds like this one", kept between questions.
+    similar: RefCell<SimilarFinder>,
+    /// The sounds should be listened to again (at start-up, after a scan or a key detection).
+    embed_wanted: bool,
 }
 
 /// Where the plugin installer keeps its receipts and work folders: next to the user library.
@@ -209,6 +217,8 @@ impl RealLibrary {
             }),
             plugin_cards: Vec::new(),
             plugin_cards_at: None,
+            similar: RefCell::default(),
+            embed_wanted: true,
         };
         this.restart_watcher();
         this.refresh();
@@ -252,7 +262,7 @@ impl RealLibrary {
         if let Ok(root) = lib.add_root(&folder, RootKind::Splice) {
             self.refresh();
             self.restart_watcher();
-            if self.scan.is_none() {
+            if !self.scan_busy() {
                 self.start_scan(ScanOptions { roots: Some(vec![root]), ..Default::default() });
             }
         }
@@ -295,8 +305,30 @@ impl RealLibrary {
         self.libs[i].as_ref().and_then(|l| l.count().ok()).unwrap_or(0)
     }
 
+    /// A scan, key detection or organize that must not be interrupted is running. The
+    /// background listening for similar sounds gives way to everything else.
+    fn scan_busy(&mut self) -> bool {
+        if matches!(self.scan, Some(Scan::Embed(_))) {
+            if let Some(s) = self.scan.take() {
+                s.cancel();
+            }
+            self.embed_wanted = true;
+        }
+        self.scan.is_some()
+    }
+
+    /// Learn which sounds sound alike, in the background, when nothing else is running.
+    fn start_embed(&mut self) {
+        self.embed_wanted = false;
+        if self.scan.is_some() || self.libs[USER].is_none() {
+            return;
+        }
+        let opts = EmbedOptions { threads: std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 3)), limit: None };
+        self.scan = Some(Scan::Embed(EmbedJob::spawn_library(self.factory_path.clone(), self.user_path.clone(), Arc::new(DspEmbedder), opts)));
+    }
+
     fn start_scan(&mut self, opts: ScanOptions) {
-        if self.scan.is_some() {
+        if self.scan_busy() {
             return;
         }
         let job = ScanJob::spawn(self.user_path.clone(), self.analyzer.clone(), opts);
@@ -546,6 +578,18 @@ impl LibraryBridge for RealLibrary {
         self.view().search(q)
     }
 
+    fn similar_sounds(&self, id: u64, limit: usize) -> Vec<SimilarSound> {
+        let (lib, sample) = split_id(id);
+        let libs = [self.libs[FACTORY].as_ref(), self.libs[USER].as_ref()];
+        match self.similar.borrow_mut().find(libs, lib as u8, sample, &DspEmbedder, limit) {
+            Ok(hits) => hits.iter().map(|h| SimilarSound { item: item(h.lib as usize, &h.sample), similarity: h.similarity }).collect(),
+            Err(e) => {
+                log::warn!("similar sounds: {e}");
+                Vec::new()
+            }
+        }
+    }
+
     fn sound_searcher(&self) -> Option<SoundSearchFn> {
         let (factory, user) = (self.factory_path.clone(), self.user_path.clone());
         let mut libs: Option<[Option<Library>; 2]> = None;
@@ -643,7 +687,7 @@ impl LibraryBridge for RealLibrary {
     }
 
     fn detect_keys(&mut self) -> Result<(), String> {
-        if self.scan.is_some() {
+        if self.scan_busy() {
             return Err("A scan is already running".into());
         }
         if self.libs[USER].is_none() {
@@ -664,7 +708,7 @@ impl LibraryBridge for RealLibrary {
         let root = lib.add_root(path, kind).map_err(|e| e.to_string())?;
         self.refresh();
         self.restart_watcher();
-        if self.scan.is_some() {
+        if self.scan_busy() {
             return Ok(()); // picked up by the next rescan
         }
         self.start_scan(ScanOptions { roots: Some(vec![root]), ..Default::default() });
@@ -676,7 +720,9 @@ impl LibraryBridge for RealLibrary {
     }
 
     fn cancel_scan(&mut self) {
-        if let Some(s) = &self.scan {
+        if let Some(s) = &self.scan
+            && !matches!(s, Scan::Embed(_))
+        {
             s.cancel();
             self.status.message = "Cancelling…".into();
         }
@@ -722,9 +768,28 @@ impl LibraryBridge for RealLibrary {
             self.refresh();
             changed = true;
         }
+        if self.scan.is_none() && self.embed_wanted && self.organize_rx.is_none() {
+            self.start_embed();
+        }
         let Some(scan) = &self.scan else { return changed };
         let mut finished = false;
+        let after_listening = matches!(scan, Scan::Embed(_));
         match scan {
+            Scan::Embed(job) => {
+                while let Ok(ev) = job.events.try_recv() {
+                    match ev {
+                        EmbedEvent::Progress(_) => {}
+                        EmbedEvent::Finished(s) => {
+                            log::info!("library: listened to {} sounds for similarity ({} already known, {} errors)", s.embedded, s.cached, s.errors);
+                            finished = true;
+                        }
+                        EmbedEvent::Failed(e) => {
+                            log::warn!("library: similar-sound analysis failed: {e}");
+                            finished = true;
+                        }
+                    }
+                }
+            }
             Scan::Folders(job) => {
                 while let Ok(ev) = job.events.try_recv() {
                     changed = true;
@@ -770,6 +835,8 @@ impl LibraryBridge for RealLibrary {
         if finished {
             self.scan = None;
             self.refresh();
+            // New sounds in the library, or new keys: they may need listening to.
+            self.embed_wanted = !after_listening;
         }
         changed
     }
@@ -888,6 +955,36 @@ mod tests {
             lib.poll();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn similar_sounds_come_from_the_background_listening_and_stay_in_the_kind_of_sound() {
+        let dir = std::env::temp_dir().join(format!("aitrack-test-similar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_wav(&dir.join("Kick Alpha.wav"), 0.3);
+        write_wav(&dir.join("Kick Beta.wav"), 0.35);
+        write_wav(&dir.join("Pad Gamma.wav"), 0.4);
+        let mut lib = RealLibrary::open(None, dir.join("user.db"));
+        lib.add_folder(&dir).unwrap();
+        // The scan, then the listening that follows it.
+        let start = std::time::Instant::now();
+        // `embed_wanted` is raised when the scan ends and lowered when the listening starts.
+        while start.elapsed() < std::time::Duration::from_secs(60) {
+            lib.poll();
+            if lib.scan.is_none() && !lib.embed_wanted {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let alpha = lib.search("alpha", None).remove(0);
+        let similar = lib.similar_sounds(alpha.id, 10);
+        assert_eq!(similar.iter().map(|s| s.item.name.as_str()).collect::<Vec<_>>(), vec!["Kick Beta"], "only kicks, and not itself");
+        assert!(similar[0].similarity > 0.5, "{}", similar[0].similarity);
+        // Asking for a sound that is not there answers nothing.
+        assert!(lib.similar_sounds(u64::MAX >> 20, 5).is_empty());
+        drop(lib);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

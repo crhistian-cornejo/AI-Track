@@ -22,6 +22,7 @@ pub mod libraries;
 pub mod packs;
 pub mod peaks;
 pub mod search;
+pub mod semantic;
 pub mod settings;
 pub mod splice;
 pub mod thumbs;
@@ -231,6 +232,10 @@ pub struct PaletteState {
     pub tags: Vec<String>,
     /// Samples tab only: list the sounds that sound like this one instead of a text search.
     pub similar: Option<SimilarTo>,
+    /// The CLAP model (Preferences › Sounds downloads it): what "Semantic" search needs.
+    pub model: Option<semantic::SemanticUi>,
+    /// The last answer was ranked by meaning (its rows carry a match score).
+    pub semantic_active: bool,
     pub sort: SortCol,
     pub ascending: bool,
     pub shuffle: Option<u64>,
@@ -299,6 +304,16 @@ impl PaletteState {
                 self.tab = Tab::All;
             }
         }
+    }
+
+    /// The CLAP model state, created on first use.
+    pub fn model(&mut self) -> &mut semantic::SemanticUi {
+        self.model.get_or_insert_with(semantic::SemanticUi::new)
+    }
+
+    /// Rank by meaning: on by default, in effect once the model is installed.
+    pub fn semantic_wanted(&self) -> bool {
+        !self.settings.semantic_off && self.model.as_ref().is_some_and(semantic::SemanticUi::ready)
     }
 
     pub fn splice_ui(&mut self) -> Option<&mut splice::SpliceUi> {
@@ -404,6 +419,7 @@ fn ensure(ws: &mut Workspace) {
         pal.worker = Some(if stubs { search::Worker::spawn(None, std::path::PathBuf::new()) } else { search::Worker::spawn(factory, user) });
     }
     let user_db = pal.user_db.clone();
+    pal.model();
     pal.cloud.load(user_db.clone());
     pal.libraries.load(user_db);
     pal.peaks.get_or_insert_with(Default::default);
@@ -474,6 +490,7 @@ pub fn refresh(ws: &mut Workspace) {
     let pal = &mut ws.palette;
     let text = pal.query.trim().to_owned();
     let in_key = pal.tab == Tab::InKey;
+    let semantic_on = pal.semantic_wanted();
     if wants_local_samples(pal.tab)
         && let Some(w) = &pal.worker
     {
@@ -487,6 +504,7 @@ pub fn refresh(ws: &mut Workspace) {
             key: if in_key { key } else { None },
             tags: if all { Vec::new() } else { pal.tags.clone() },
             similar: pal.similar.as_ref().filter(|_| pal.tab == Tab::Samples).map(|s| s.id),
+            semantic: semantic_on && matches!(pal.tab, Tab::All | Tab::Samples),
         });
     }
     let (kind, bpm, tags, shuffle, tab) = (pal.kind, pal.bpm, pal.tags.clone(), pal.shuffle, pal.tab);
@@ -733,6 +751,16 @@ fn bridge_search(ws: &mut Workspace) {
     }
     let key = if ws.palette.tab == Tab::InKey { ws.s.project.scale } else { None };
     let q = ws.palette.query.trim().to_owned();
+    ws.palette.semantic_active = false;
+    if ws.palette.semantic_wanted() && !q.is_empty() && key.is_none() && matches!(ws.palette.tab, Tab::All | Tab::Samples) {
+        let rows: Vec<SampleRow> = ws.b.library.semantic_search(&q, search::SHOWN).iter().map(|h| SampleRow { similarity: Some(h.similarity), score: h.similarity, ..SampleRow::from_item(&h.item) }).collect();
+        if !rows.is_empty() {
+            ws.palette.semantic_active = true;
+            ws.palette.sample_tags = search::tag_counts(&rows);
+            ws.palette.samples = rows;
+            return;
+        }
+    }
     let mut items = if key.is_some() && q.is_empty() { ws.b.library.recommend(key, ws.s.project.tempo.initial_bpm()) } else { ws.b.library.search(&q, key) };
     if let Some(k) = key {
         items.retain(|it| it.key.is_some_and(|x| keys_match(x, k)));
@@ -767,14 +795,26 @@ pub fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
         for reply in w.poll() {
             match reply {
                 search::Reply::NoIndex => ws.palette.no_index = true,
-                search::Reply::Samples { generation, rows, tags } => {
+                search::Reply::Samples { generation, rows, tags, semantic } => {
                     if generation >= ws.palette.answered {
                         ws.palette.answered = generation;
+                        ws.palette.semantic_active = semantic;
                         ws.palette.samples = rows;
                         ws.palette.sample_tags = tags;
                         rebuild_rows = true;
                     }
                 }
+            }
+        }
+    }
+    if let Some(m) = &mut ws.palette.model {
+        let (c, installed) = m.poll();
+        changed |= c;
+        if installed {
+            // The sounds get listened to by meaning from now on, and searches may use it.
+            ws.b.library.listen_semantic();
+            if ws.palette.open {
+                refresh(ws);
             }
         }
     }
@@ -1808,7 +1848,7 @@ fn sort_header(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
     };
     let splice = ws.palette.tab == Tab::Splice;
     // The similarity column of a "similar sounds" list has a header of its own, aligned with the percentages.
-    let match_header = (ws.palette.similar.is_some() && ws.palette.tab == Tab::Samples).then(|| column(SIM_W, label("MATCH", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD)));
+    let match_header = ((ws.palette.similar.is_some() && ws.palette.tab == Tab::Samples) || ws.palette.semantic_active).then(|| column(SIM_W, label("MATCH", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD)));
     div()
         .h(px(HEADER_H))
         .flex_none()
@@ -1865,6 +1905,27 @@ fn bpm_control(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
     d
 }
 
+/// "Semantic": rank by what the words mean. Dim until the model is installed; then a click opens
+/// Preferences › Sounds, where it is downloaded.
+fn semantic_chip(ws: &Workspace, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    let ready = ws.palette.model.as_ref().is_some_and(semantic::SemanticUi::ready);
+    let on = ready && !ws.palette.settings.semantic_off;
+    let tip = if !ready { "Search by meaning (\"dark punchy kick\"): download the model in Preferences › Sounds" } else if on { "Ranking by meaning. Click to search by name only" } else { "Search by meaning" };
+    chip("semantic-chip", "Semantic", on)
+        .when(!ready, |d| d.opacity(0.6))
+        .tooltip(widgets::tip(tip, None))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if ready {
+                this.palette.settings.semantic_off = !this.palette.settings.semantic_off;
+                this.palette.settings.save();
+                refresh(this);
+            } else {
+                this.open_modal(crate::views::prefs::Modal::Preferences(crate::views::prefs::PrefsPage::Sounds), cx);
+            }
+            cx.notify();
+        }))
+}
+
 fn filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let mut kinds = div().flex().items_center().gap(px(SP1));
@@ -1891,6 +1952,8 @@ fn filter_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
         .gap(px(SP3))
         .children(similar)
         .child(kinds)
+        .child(widgets::divider_v(16.))
+        .child(semantic_chip(ws, cx))
         .child(widgets::divider_v(16.))
         .child(bpm_control(ws, cx))
         .child(widgets::divider_v(16.))

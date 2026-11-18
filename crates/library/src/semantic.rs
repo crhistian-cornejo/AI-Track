@@ -232,7 +232,7 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             write_wav(&samples.join(format!("{n}.wav")), 44_100, 1, 0.2, 0.1 + i as f32 * 0.01);
         }
-        let lib = Library::open(&dir.path().join("lib.db")).unwrap();
+        let lib = Library::open(dir.path().join("lib.db")).unwrap();
         let root = lib.add_root(&samples, RootKind::User).unwrap();
         lib.scan(&BasicAnalyzer, &ScanOptions { roots: Some(vec![root]), ..Default::default() }, &mut |_| {}, &AtomicBool::new(false)).unwrap();
         lib.embed_missing(&lib, &Fake, &EmbedOptions { threads: 1, limit: None }, &mut |_| {}, &AtomicBool::new(false)).unwrap();

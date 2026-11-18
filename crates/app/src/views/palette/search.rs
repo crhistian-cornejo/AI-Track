@@ -3,11 +3,12 @@
 //! SQLite. Only the newest query is answered; each is capped.
 
 use crate::bridge::LibraryItem;
-use aitrack_library::{BpmFilter, DspEmbedder, Filters, KeyFilter, KeyMatch, Library, Sample, SampleId, SearchQuery, SimilarFinder, SortBy};
+use aitrack_library::{BpmFilter, ClapEmbedder, DspEmbedder, Filters, KeyFilter, KeyMatch, Library, Sample, SampleId, SearchQuery, SemanticSearcher, SimilarFinder, SortBy};
 use aitrack_model::Scale;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Rows fetched per index for one query.
 const FETCH: usize = 400;
@@ -34,6 +35,8 @@ pub struct SampleQuery {
     pub tags: Vec<String>,
     /// Instead of a text search: the sounds that sound like this sample (bridge id), most alike first.
     pub similar: Option<u64>,
+    /// Rank by meaning (CLAP) when the model is installed: "dark punchy kick".
+    pub semantic: bool,
 }
 
 /// One local sample as the palette lists it.
@@ -177,10 +180,10 @@ pub fn tag_counts(rows: &[SampleRow]) -> Vec<(String, usize)> {
 }
 
 /// The rows of a "Similar to…" list, most alike first and one per file.
-fn similar_rows(libs: &[Option<Library>; 2], finder: &mut SimilarFinder, id: u64) -> Vec<SampleRow> {
+fn similar_rows(libs: &[Option<Library>; 2], finder: &mut SimilarFinder, id: u64, learned: Option<&ClapEmbedder>) -> Vec<SampleRow> {
     let (lib, sample) = ((id >> 48) as u8, SampleId((id & ((1 << 48) - 1)) as i64));
     let refs = [libs[FACTORY].as_ref(), libs[USER].as_ref()];
-    let hits = match finder.find(refs, lib, sample, &DspEmbedder, SHOWN) {
+    let hits = match finder.find_blended(refs, lib, sample, &DspEmbedder, learned.map(|c| c as &dyn aitrack_library::Embedder), SHOWN) {
         Ok(h) => h,
         Err(e) => {
             log::warn!("palette: similar sounds: {e}");
@@ -193,6 +196,52 @@ fn similar_rows(libs: &[Option<Library>; 2], finder: &mut SimilarFinder, id: u64
         .filter(|h| seen.insert(h.sample.path.clone()))
         .map(|h| SampleRow { splice: h.lib as usize == USER && splice_roots.contains(&h.sample.root_id.0), similarity: Some(h.similarity), ..SampleRow::from_sample(h.lib as usize, &h.sample) })
         .collect()
+}
+
+/// Samples ranked by meaning, then by name: the rows of a semantic query. The order is the search's own
+/// (not [`finish`]'s), one row per file, and `similarity` carries the score for the MATCH column.
+fn semantic_rows(libs: &[Option<Library>; 2], searcher: &mut SemanticSearcher, clap: &ClapEmbedder, q: &SampleQuery) -> Result<Vec<SampleRow>, String> {
+    let refs = [libs[FACTORY].as_ref(), libs[USER].as_ref()];
+    let filters = search_query(q).filters;
+    let hits = searcher.search(refs, clap, q.text.trim(), SHOWN * 2, &filters).map_err(|e| e.to_string())?;
+    let splice_roots = splice_roots(libs[USER].as_ref());
+    let mut samples: Vec<Sample> = hits.iter().map(|h| h.sample.clone()).collect();
+    fill_keys(libs[USER].as_ref(), &mut samples);
+    let mut seen = HashSet::new();
+    let mut rows: Vec<SampleRow> = hits
+        .iter()
+        .zip(samples)
+        .filter(|(h, _)| seen.insert(h.sample.path.clone()))
+        .map(|(h, s)| SampleRow {
+            splice: h.lib as usize == USER && splice_roots.contains(&s.root_id.0),
+            score: h.score,
+            similarity: Some(h.score.min(1.0)),
+            ..SampleRow::from_sample(h.lib as usize, &s)
+        })
+        .filter(|r| q.tags.iter().all(|t| r.tags.contains(t)))
+        .collect();
+    rows.truncate(SHOWN);
+    Ok(rows)
+}
+
+/// The CLAP model, opened when it is installed. The disk is looked at again every few seconds
+/// while it is not (it may have been downloaded since).
+#[derive(Default)]
+struct Clap {
+    embedder: Option<ClapEmbedder>,
+    checked: Option<Instant>,
+}
+
+impl Clap {
+    fn get(&mut self) -> Option<&ClapEmbedder> {
+        if self.embedder.is_none() && self.checked.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            self.checked = Some(Instant::now());
+            if ClapEmbedder::is_ready() {
+                self.embedder = Some(ClapEmbedder::new());
+            }
+        }
+        self.embedder.as_ref()
+    }
 }
 
 /// Which of the user's folders is Splice's.
@@ -245,7 +294,8 @@ fn fill_keys(user: Option<&Library>, samples: &mut [Sample]) {
 pub enum Reply {
     /// The worker opened no index (stub bridges, or no library yet).
     NoIndex,
-    Samples { generation: u64, rows: Vec<SampleRow>, tags: Vec<(String, usize)> },
+    /// `semantic`: the order is by meaning (the rows carry a match score).
+    Samples { generation: u64, rows: Vec<SampleRow>, tags: Vec<(String, usize)>, semantic: bool },
 }
 
 pub struct Worker {
@@ -267,6 +317,8 @@ impl Worker {
                 return;
             }
             let mut finder = SimilarFinder::new();
+            let mut searcher = SemanticSearcher::new();
+            let mut clap = Clap::default();
             while let Ok(mut q) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     q = newer;
@@ -276,12 +328,29 @@ impl Worker {
                     libs[USER] = open(&user);
                 }
                 if let Some(id) = q.similar {
-                    let rows = similar_rows(&libs, &mut finder, id);
+                    let rows = similar_rows(&libs, &mut finder, id, clap.get());
                     let tags = tag_counts(&rows);
-                    if out.send(Reply::Samples { generation: q.generation, rows, tags }).is_err() {
+                    if out.send(Reply::Samples { generation: q.generation, rows, tags, semantic: false }).is_err() {
                         break;
                     }
                     continue;
+                }
+                if q.semantic
+                    && !q.text.trim().is_empty()
+                    && q.key.is_none()
+                    && let Some(model) = clap.get()
+                {
+                    match semantic_rows(&libs, &mut searcher, model, &q) {
+                        Ok(rows) => {
+                            let tags = tag_counts(&rows);
+                            if out.send(Reply::Samples { generation: q.generation, rows, tags, semantic: true }).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // The words still search the names below.
+                        Err(e) => log::warn!("palette: semantic search: {e}"),
+                    }
                 }
                 let sq = search_query(&q);
                 let mut rows = Vec::new();
@@ -310,7 +379,7 @@ impl Worker {
                     }
                 }
                 let (rows, tags) = finish(rows, &q);
-                if out.send(Reply::Samples { generation: q.generation, rows, tags }).is_err() {
+                if out.send(Reply::Samples { generation: q.generation, rows, tags, semantic: false }).is_err() {
                     break;
                 }
             }

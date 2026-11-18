@@ -451,6 +451,8 @@ fn sounds_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             None,
             text_button("open-hub", "Open Content Hub", Some(Icon::Package), false).on_click(cx.listener(|this, _, _, cx| this.open_modal(Modal::ContentHub, cx))),
         ))
+        .child(section_title("SEARCH BY MEANING"))
+        .child(semantic_section(ws, cx))
         .child(section_title("SPLICE FOLDER"))
         .child(para("The sounds you license with the Splice desktop app are files in a folder on this computer. AI-Track finds that folder by itself, indexes it as its own collection (“Splice” in the Sounds panel and the search palette, filterable on its own), and picks up new downloads without a restart. Nothing is sent to Splice.", pal.muted))
         .child(splice_folder_row(ws, cx))
@@ -901,6 +903,73 @@ fn plugin_format_name(f: aitrack_model::PluginFormat) -> &'static str {
         aitrack_model::PluginFormat::Vst3 => "VST3",
         aitrack_model::PluginFormat::Clap => "CLAP",
     }
+}
+
+/// Search by meaning (CLAP): what it does, its license and size before the download, then the
+/// download with progress. Everything runs on this computer.
+fn semantic_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Div {
+    use crate::views::palette::semantic::{ModelState, mb};
+    let pal = p();
+    ws.palette.load();
+    let model = ws.palette.model().clone_view();
+    let (hint, control): (String, AnyElement) = match &model.state {
+        ModelState::Checking => ("Looking for the model…".into(), div().into_any_element()),
+        ModelState::Ready => (
+            "Installed. Type what you want to hear in the palette (⌘K → Samples): “dark punchy kick”, “warm analog pad”.".into(),
+            switch("semantic-on", !ws.palette.settings.semantic_off)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.settings.semantic_off = !this.palette.settings.semantic_off;
+                    this.palette.settings.save();
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ),
+        ModelState::Missing | ModelState::Failed(_) => (
+            match &model.state {
+                ModelState::Failed(e) => format!("The download failed: {e}"),
+                _ => format!("Not installed. One download of {}.", mb(model.info.size)),
+            },
+            text_button("semantic-download", format!("Download ({})", mb(model.info.size)), Some(Icon::Download), true)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.model().download();
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ),
+        ModelState::Downloading { fraction, message } => (
+            format!("Downloading {:.0}%  ·  {message}", fraction * 100.),
+            text_button("semantic-cancel", "Cancel", None, false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette.model().cancel();
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ),
+    };
+    let progress = match &model.state {
+        ModelState::Downloading { fraction, .. } => Some(*fraction),
+        _ => None,
+    };
+    let i = &model.info;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .child(para("Describe a sound instead of remembering its file name. A small AI model (CLAP) turns every sample and your words into numbers in the same space, so “dark punchy kick” finds kicks that sound that way. It runs on this computer: no audio or text is sent anywhere. The search palette gets a Semantic switch; names still count and rank first.", pal.muted))
+        .child(
+            div()
+                .p(px(SP3))
+                .rounded(px(r_md()))
+                .bg(content(0.04))
+                .border_1()
+                .border_color(border())
+                .child(para_wrapped(format!("{}  ·  License: {}  ·  {}  ·  Source: {}", i.name, i.license, mb(i.size), i.source), pal.muted))
+                .child(div().pt(px(SP1)).child(para_wrapped(i.notice.clone(), pal.faint))),
+        )
+        .child(setting_row("Semantic search", Some(hint.into()), control))
+        .children(progress.map(|f| {
+            div().h(px(4.)).w_full().rounded(px(r_sm())).bg(pal.well).child(div().h_full().w(gpui::relative(f.clamp(0., 1.))).rounded(px(r_sm())).bg(pal.accent))
+        }))
 }
 
 /// The plugins found, one line per plugin whatever its formats: name, maker, formats.

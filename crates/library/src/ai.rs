@@ -210,7 +210,7 @@ mod tests {
         fn embed_features(&self, f: &[f32]) -> aitrack_ai::Result<Vec<f32>> {
             assert_eq!(f.len(), MEL_FRAMES * MEL_BANDS);
             let mut v = vec![0f32; self.dim()];
-            for frame in f.chunks_exact(MEL_BANDS) {
+            for frame in f.as_chunks::<MEL_BANDS>().0 {
                 for (b, x) in frame.iter().enumerate() {
                     v[b / 8] += (x + 100.0) / MEL_FRAMES as f32;
                 }

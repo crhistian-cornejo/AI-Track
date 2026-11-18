@@ -132,8 +132,17 @@ pre-trained weights as provided for research purposes (they were trained on MUSD
 license of the weights has not been clarified. AI-Track does not distribute these weights: they are downloaded from \
 the original source on your request. You are responsible for checking that your use complies with their terms.";
 
-fn gh_release(file: &str) -> String {
-    format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{file}")
+/// The official Microsoft.ML.OnnxRuntime package on NuGet: one archive holds the
+/// native runtime for every platform. (Microsoft's GitHub releases of ONNX Runtime
+/// are gone, which broke the old per-platform downloads.)
+fn nuget_ort(extract: Vec<(String, String)>) -> ModelFile {
+    ModelFile {
+        url: format!("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/{ORT_VERSION}/microsoft.ml.onnxruntime.{ORT_VERSION}.nupkg"),
+        sha256: "6871ccbc97f3d5bdb4095a1dcec33aa78d56f6ed8de5980ef5fa1d9f2e7c679a".into(),
+        size: Some(159_626_394),
+        file_name: format!("microsoft.ml.onnxruntime.{ORT_VERSION}.nupkg"),
+        extract,
+    }
 }
 
 /// Every model and runtime known to this build, for the current platform.
@@ -222,9 +231,8 @@ fn ort_entry(
         version: version.into(),
         files,
         license: "MIT".into(),
-        license_url: "https://github.com/microsoft/onnxruntime/blob/main/LICENSE".into(),
-        source: "https://github.com/microsoft/onnxruntime/releases (official Microsoft builds)"
-            .into(),
+        license_url: "https://licenses.nuget.org/MIT".into(),
+        source: "https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime (official Microsoft builds)".into(),
         notice: None,
         requires_acceptance: false,
         stems: vec![],
@@ -237,25 +245,15 @@ fn runtime_entries() -> Vec<ModelEntry> {
     let mut v = Vec::new();
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
-        let zip = format!("onnxruntime-win-x64-{ORT_VERSION}.zip");
         v.push(ort_entry(
             ids::ONNXRUNTIME,
             "ONNX Runtime (CPU)",
             "Official Microsoft ONNX Runtime CPU build for Windows x64.",
             ORT_VERSION,
-            vec![ModelFile {
-                url: gh_release(&zip),
-                sha256: "5869e26bb25314375f2d5ef1877e3ea06b1543d6c710e6e4a1ec2f7177ab4b2c".into(),
-                size: Some(82_929_944),
-                file_name: zip,
-                extract: vec![
-                    ("lib/onnxruntime.dll".into(), "onnxruntime.dll".into()),
-                    (
-                        "lib/onnxruntime_providers_shared.dll".into(),
-                        "onnxruntime_providers_shared.dll".into(),
-                    ),
-                ],
-            }],
+            vec![nuget_ort(vec![
+                ("runtimes/win-x64/native/onnxruntime.dll".into(), "onnxruntime.dll".into()),
+                ("runtimes/win-x64/native/onnxruntime_providers_shared.dll".into(), "onnxruntime_providers_shared.dll".into()),
+            ])],
         ));
         // DirectML builds stopped at 1.24.x on NuGet (DirectML is in sustained engineering).
         v.push(ort_entry(
@@ -286,45 +284,28 @@ fn runtime_entries() -> Vec<ModelEntry> {
     }
     #[cfg(all(windows, target_arch = "aarch64"))]
     {
-        let zip = format!("onnxruntime-win-arm64-{ORT_VERSION}.zip");
         v.push(ort_entry(
             ids::ONNXRUNTIME,
             "ONNX Runtime (CPU)",
             "Official Microsoft ONNX Runtime CPU build for Windows on Arm.",
             ORT_VERSION,
-            vec![ModelFile {
-                url: gh_release(&zip),
-                sha256: "817f4129073f84f81cde3ff92b1a4e06d007691e7208deed08a8b6d6df143f7f".into(),
-                size: Some(85_851_069),
-                file_name: zip,
-                extract: vec![
-                    ("lib/onnxruntime.dll".into(), "onnxruntime.dll".into()),
-                    (
-                        "lib/onnxruntime_providers_shared.dll".into(),
-                        "onnxruntime_providers_shared.dll".into(),
-                    ),
-                ],
-            }],
+            vec![nuget_ort(vec![
+                ("runtimes/win-arm64/native/onnxruntime.dll".into(), "onnxruntime.dll".into()),
+                ("runtimes/win-arm64/native/onnxruntime_providers_shared.dll".into(), "onnxruntime_providers_shared.dll".into()),
+            ])],
         ));
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let tgz = format!("onnxruntime-osx-arm64-{ORT_VERSION}.tgz");
         v.push(ort_entry(
             ids::ONNXRUNTIME,
             "ONNX Runtime (CPU + CoreML)",
             "Official Microsoft ONNX Runtime build for Apple silicon, with the CoreML execution provider.",
             ORT_VERSION,
-            vec![ModelFile {
-                url: gh_release(&tgz),
-                sha256: "2e1344a1926ee50eb25b38153cb6992c3567515aef0e677a1a520a1798896d6f".into(),
-                size: Some(36_936_435),
-                file_name: tgz,
-                extract: vec![(format!("lib/libonnxruntime.{ORT_VERSION}.dylib"), "libonnxruntime.dylib".into())],
-            }],
+            vec![nuget_ort(vec![("runtimes/osx-arm64/native/libonnxruntime.dylib".into(), "libonnxruntime.dylib".into())])],
         ));
     }
-    let _ = gh_release;
+    let _ = nuget_ort;
     let _ = ort_entry;
     v
 }

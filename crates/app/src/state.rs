@@ -1720,11 +1720,11 @@ impl AppState {
         // The engine runs MIDI effects before everything else, in the order they
         // were put in: a new one goes after the last MIDI effect of the chain, so
         // the chain reads as it runs.
-        if plugin_id.starts_with("midi.")
+        if (plugin_id.starts_with("midi.") || plugin_id == "rack.midi")
             && into.is_none()
             && let DeviceSlot::Track { index, .. } = &mut slot
         {
-            let is_midi = |d: &Device| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi."));
+            let is_midi = |d: &Device| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi.")) || matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Midi);
             *index = self.project.track(track)?.devices.iter().rposition(is_midi).map_or(0, |i| i + 1);
         }
         let id = self.project.alloc_device_id();
@@ -1733,6 +1733,7 @@ impl AppState {
             "rack.drum" => Some(RackKind::Drum),
             "rack.instrument" => Some(RackKind::Instrument),
             "rack.audio" => Some(RackKind::Audio),
+            "rack.midi" => Some(RackKind::Midi),
             _ => None,
         } {
             device.kind = DeviceKind::Rack(Rack::new(kind));

@@ -5,7 +5,7 @@
 //!
 //! A rack built by grouping has one chain holding the grouped devices in
 //! their order. It is an instrument rack when one of them is an instrument,
-//! an audio rack otherwise.
+//! a MIDI Effect Rack when all of them are MIDI effects, an audio rack otherwise.
 
 use crate::command::{Command, DeviceSlot};
 use crate::ids::DeviceId;
@@ -107,13 +107,23 @@ pub fn group_commands(p: &Project, ids: &[DeviceId], rack: DeviceId) -> Option<V
     picked.sort();
     let devices: Vec<Device> = picked.iter().map(|&(_, id)| p.device(id).cloned()).collect::<Option<_>>()?;
     let first = devices.first()?;
-    let kind = if devices.iter().any(Device::is_instrument) { RackKind::Instrument } else { RackKind::Audio };
+    let all_midi = devices.iter().all(|d| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi.")));
+    let kind = if devices.iter().any(Device::is_instrument) {
+        RackKind::Instrument
+    } else if all_midi {
+        RackKind::Midi
+    } else {
+        RackKind::Audio
+    };
     let mut r = Rack::new(kind);
     let mut chain = Chain::new(first.name.clone(), Color::palette(0));
     chain.devices = devices;
     r.chains.push(chain);
-    let name = if kind == RackKind::Instrument { "Instrument Rack" } else { "Audio Effect Rack" };
-    let plugin_id = if kind == RackKind::Instrument { "rack.instrument" } else { "rack.audio" };
+    let (name, plugin_id) = match kind {
+        RackKind::Instrument => ("Instrument Rack", "rack.instrument"),
+        RackKind::Midi => ("MIDI Effect Rack", "rack.midi"),
+        _ => ("Audio Effect Rack", "rack.audio"),
+    };
     let device = Device { kind: DeviceKind::Rack(r), ..Device::stock(rack, plugin_id, name) };
     // Removed from the back so the indices before them hold.
     let mut cmds: Vec<Command> = picked.iter().rev().map(|&(_, id)| Command::RemoveDevice { id }).collect();
@@ -215,6 +225,21 @@ mod tests {
         let cmds = group_commands(&p, &[ids[0]], inner).unwrap();
         run(&mut p, cmds);
         assert_eq!(device_slot(&p, inner), Some(DeviceSlot::Rack { rack, chain: 0, index: 0 }));
+    }
+
+    #[test]
+    fn midi_effects_make_a_midi_effect_rack() {
+        let (mut p, t, _) = project();
+        let (a, b) = (p.alloc_device_id(), p.alloc_device_id());
+        for (i, (id, pid)) in [(a, "midi.arp"), (b, "midi.chord")].into_iter().enumerate() {
+            Command::AddDevice { slot: DeviceSlot::Track { track: t, index: i }, device: Box::new(Device::stock(id, pid, pid)) }.apply(&mut p).unwrap();
+        }
+        let rack = p.alloc_device_id();
+        let cmds = group_commands(&p, &[a, b], rack).unwrap();
+        run(&mut p, cmds);
+        let d = p.device(rack).unwrap();
+        assert_eq!(d.name, "MIDI Effect Rack");
+        assert!(matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Midi) && !d.is_instrument());
     }
 
     #[test]

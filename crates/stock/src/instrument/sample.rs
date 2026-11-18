@@ -28,7 +28,8 @@ const STREAM_SLOTS: usize = 6;
 pub struct SampleData {
     channels: usize,
     frames: usize,
-    data: Vec<f32>,
+    /// Shared: the pads of a sliced loop all play one decode of the file.
+    data: Arc<[f32]>,
     pub sample_rate: f64,
     /// Where it came from, for state saving.
     pub path: Option<String>,
@@ -47,7 +48,7 @@ impl SampleData {
                 planar[c * frames + f] = if v.is_finite() { v } else { 0.0 };
             }
         }
-        Self { channels: ch, frames, data: planar, sample_rate: sample_rate.max(1.0), path: None }
+        Self { channels: ch, frames, data: planar.into(), sample_rate: sample_rate.max(1.0), path: None }
     }
 
     pub fn frames(&self) -> usize {
@@ -88,8 +89,38 @@ impl SampleData {
     }
 }
 
-/// Decode a WAV file (PCM 8/16/24/32-bit or 32-bit float).
+/// What `load_wav` decoded, by path: a file loaded by many devices (the pads
+/// of a loop sliced into a Drum Rack) is held in memory once while any of
+/// them lives. Keyed with the file's size and modification time.
+struct Decoded {
+    path: String,
+    stamp: (u64, Option<std::time::SystemTime>),
+    data: std::sync::Weak<[f32]>,
+    channels: usize,
+    frames: usize,
+    sample_rate: f64,
+}
+
+static DECODED: std::sync::Mutex<Vec<Decoded>> = std::sync::Mutex::new(Vec::new());
+
+/// Decode a WAV file (PCM 8/16/24/32-bit or 32-bit float). Control thread.
 pub fn load_wav(path: &str) -> Result<SampleData, String> {
+    let stamp = std::fs::metadata(path).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None));
+    if let Ok(cache) = DECODED.lock()
+        && let Some(hit) = cache.iter().find(|d| d.path == path && d.stamp == stamp)
+        && let Some(data) = hit.data.upgrade()
+    {
+        return Ok(SampleData { channels: hit.channels, frames: hit.frames, data, sample_rate: hit.sample_rate, path: Some(path.to_string()) });
+    }
+    let s = decode_wav_file(path)?;
+    if let Ok(mut cache) = DECODED.lock() {
+        cache.retain(|d| d.data.strong_count() > 0 && d.path != path);
+        cache.push(Decoded { path: path.to_string(), stamp, data: Arc::downgrade(&s.data), channels: s.channels, frames: s.frames, sample_rate: s.sample_rate });
+    }
+    Ok(s)
+}
+
+fn decode_wav_file(path: &str) -> Result<SampleData, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| format!("{path}: {e}"))?;
     let spec = reader.spec();
     let data: Vec<f32> = match spec.sample_format {
@@ -145,7 +176,7 @@ fn read_wav_range(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File
         }
     }
     if read_frames == 0 {
-        return SampleData { channels: out_ch, frames: 0, data: Vec::new(), sample_rate: spec.sample_rate as f64, path: None };
+        return SampleData { channels: out_ch, frames: 0, data: Arc::from(Vec::new()), sample_rate: spec.sample_rate as f64, path: None };
     }
     // Trim planar buffers if fewer frames than max_frames were at EOF.
     if read_frames < max_frames {
@@ -155,7 +186,7 @@ fn read_wav_range(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File
         }
         planar = tight;
     }
-    SampleData { channels: out_ch, frames: read_frames, data: planar, sample_rate: spec.sample_rate.max(1) as f64, path: None }
+    SampleData { channels: out_ch, frames: read_frames, data: planar.into(), sample_rate: spec.sample_rate.max(1) as f64, path: None }
 }
 
 /// Pre-allocated page slot shared between the background disk reader and audio thread.

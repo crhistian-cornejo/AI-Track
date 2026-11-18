@@ -35,6 +35,7 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::ClipQuantize(clip) => quantize_menu(ws, *clip, cx),
         MenuKind::StutterStep { device, step } => crate::views::device_ui::stutter::step_menu(ws, *device, *step, cx),
         MenuKind::File => file_menu(ws, window, cx),
+        MenuKind::SliceToDrumRack(track, placement) => crate::editing::slice::slice_menu(ws, *track, *placement, cx),
     })
 }
 

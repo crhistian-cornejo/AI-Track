@@ -74,6 +74,15 @@ fn periodic_hann(size: usize) -> Vec<f32> {
 
 /// Detect percussive/note onset transient frame indices across all channels.
 pub fn detect_transients(channels: &[&[f32]], sample_rate: u32) -> Vec<usize> {
+    detect_transients_with(channels, sample_rate, 0.5)
+}
+
+/// [`detect_transients`] with a sensitivity 0..=1: 0.5 is the default
+/// threshold, higher finds softer onsets (more of them), lower only the
+/// clear hits. The first transient is always frame 0.
+pub fn detect_transients_with(channels: &[&[f32]], sample_rate: u32, sensitivity: f32) -> Vec<usize> {
+    // Threshold scale: 2 at sensitivity 0, 1 at 0.5, 0.5 at 1.
+    let k = 2f32.powf(1.0 - 2.0 * sensitivity.clamp(0.0, 1.0));
     let len = channels.first().map_or(0, |c| c.len());
     if len == 0 || sample_rate == 0 {
         return Vec::new();
@@ -118,7 +127,7 @@ pub fn detect_transients(channels: &[&[f32]], sample_rate: u32) -> Vec<usize> {
     let back_snap = sr / 500; // snap 2 ms earlier to preserve attack crispness
     let mut transients = vec![0usize];
     let mut last_idx = 0usize;
-    let floor = 0.008f32;
+    let floor = 0.008f32 * k;
 
     for i in 1..flux.len() {
         let cur = flux[i];
@@ -131,7 +140,7 @@ pub fn detect_transients(channels: &[&[f32]], sample_rate: u32) -> Vec<usize> {
         let mut window_vals: Vec<f32> = flux[lo..hi].to_vec();
         window_vals.sort_by(f32::total_cmp);
         let median = window_vals[window_vals.len() / 2];
-        if cur > median * 2.2 + floor && i.saturating_sub(last_idx) >= refractory.max(1) {
+        if cur > median * 2.2 * k + floor && i.saturating_sub(last_idx) >= refractory.max(1) {
             let frame = (i * hop).saturating_sub(back_snap);
             if frame > *transients.last().unwrap_or(&0) + back_snap {
                 transients.push(frame);
@@ -852,6 +861,23 @@ mod tests {
         for hit in [2_400usize, 14_400, 28_800, 40_000] {
             assert!(found.iter().any(|&t| t.abs_diff(hit) < 512), "missed transient near {hit}: {found:?}");
         }
+    }
+
+    #[test]
+    fn higher_sensitivity_finds_softer_onsets() {
+        let sr = 48_000;
+        let mut x = vec![0.0f32; sr as usize];
+        // A loud hit and a quiet one a bit later.
+        for (hit, level) in [(2_400usize, 0.9f32), (24_000, 0.04)] {
+            for j in 0..400 {
+                x[hit + j] = level * (-(j as f32) / 100.0).exp() * ((j as f32) * 0.25).sin();
+            }
+        }
+        let low = detect_transients_with(&[&x], sr, 0.0);
+        let high = detect_transients_with(&[&x], sr, 1.0);
+        assert!(low.iter().any(|&t| t.abs_diff(2_400) < 512), "{low:?}");
+        assert!(high.iter().any(|&t| t.abs_diff(24_000) < 512), "the soft one shows at high sensitivity: {high:?}");
+        assert!(high.len() >= low.len());
     }
 
     #[test]

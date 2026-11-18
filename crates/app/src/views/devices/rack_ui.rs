@@ -464,8 +464,11 @@ fn chain_strip(ws: &mut Workspace, id: DeviceId, rack: &Rack, ci: usize, cx: &mu
         .flex_wrap()
         .items_end()
         .gap(px(SP2))
-        .child(knob("cvol", db_to_fader(c.volume_db), false, KnobTarget::Chain { rack: id, index: ci, knob: ChainKnob::Volume }, "Vol", db_text(c.volume_db), cx))
-        .child(knob("cpan", (c.pan + 1.) / 2., true, KnobTarget::Chain { rack: id, index: ci, knob: ChainKnob::Pan }, "Pan", pan_text(c.pan), cx))
+        // (A MIDI Effect Rack's chains carry notes, not audio: no level to set.)
+        .when(rack.kind != RackKind::Midi, |r| {
+            r.child(knob("cvol", db_to_fader(c.volume_db), false, KnobTarget::Chain { rack: id, index: ci, knob: ChainKnob::Volume }, "Vol", db_text(c.volume_db), cx))
+                .child(knob("cpan", (c.pan + 1.) / 2., true, KnobTarget::Chain { rack: id, index: ci, knob: ChainKnob::Pan }, "Pan", pan_text(c.pan), cx))
+        })
         .child(
             div()
                 .flex()

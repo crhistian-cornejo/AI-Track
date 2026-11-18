@@ -20,6 +20,7 @@ mod groups;
 mod modulators;
 mod racks;
 pub mod menus;
+pub mod slice;
 pub mod overlay;
 mod overwrite;
 mod timeline;

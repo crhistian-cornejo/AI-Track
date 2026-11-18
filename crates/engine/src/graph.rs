@@ -333,6 +333,8 @@ pub(crate) struct RackNode {
     /// its reverb line up.
     pub dry_delay: DelayLine,
     pub input: AudioBuffer,
+    /// MIDI Effect Rack: the merged output of its chains for the current block.
+    pub out: EventList,
 }
 
 pub(crate) struct ChainNode {
@@ -525,13 +527,49 @@ fn process_devices<'a>(devs: &'a mut [DeviceNode], buf: &mut AudioBuffer, events
                 }
             }
             DeviceNode::Rack(r) => {
-                if r.enabled.load(Ordering::Relaxed) {
+                if !r.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if r.kind == RackKind::Midi {
+                    // A MIDI Effect Rack never touches the audio: its chains'
+                    // merged output is what the devices after it get.
+                    r.run_midi(cur, tr, sr, buf.frames());
+                    let r: &'a RackNode = r;
+                    cur = &r.out.events;
+                } else {
                     r.process(buf, cur, tr, sr, side, win, allow_sleep);
                 }
             }
             DeviceNode::Missing(_) => {}
         }
     }
+}
+
+/// The events a chain of MIDI effects hands on: every MIDI effect (and MIDI
+/// Effect Rack) of `devs` in order, each fed the output of the one before.
+/// Audio devices are not run.
+fn midi_chain<'a>(devs: &'a mut [DeviceNode], events: &'a [Event], tr: &Transport, sr: f64, frames: usize) -> &'a [Event] {
+    let mut cur: &'a [Event] = events;
+    for d in devs {
+        match d {
+            DeviceNode::Proc(p) if p.is_midi => {
+                let enabled = p.enabled.load(Ordering::Relaxed);
+                if p.run_midi(cur, tr, sr, frames, enabled) {
+                    let p: &'a ProcNode = p;
+                    if let Some(m) = p.midi.as_deref() {
+                        cur = &m.out.events;
+                    }
+                }
+            }
+            DeviceNode::Rack(r) if r.kind == RackKind::Midi && r.enabled.load(Ordering::Relaxed) => {
+                r.run_midi(cur, tr, sr, frames);
+                let r: &'a RackNode = r;
+                cur = &r.out.events;
+            }
+            _ => {}
+        }
+    }
+    cur
 }
 
 /// `out` = `events` (window offsets) and the part of `timed` (block offsets)
@@ -578,6 +616,38 @@ fn in_range(v: u8, r: (u8, u8)) -> bool {
 const CHOKE_SECONDS: f64 = 0.005;
 
 impl RackNode {
+    /// MIDI Effect Rack: route `cur` to the chains by their key / velocity /
+    /// chain-select zones, run each chain's MIDI effects and merge what they
+    /// hand on into `self.out`. A muted (or solo-silenced) chain, or one
+    /// whose selector zone is closed, takes no new notes; it still gets the
+    /// note-offs of the notes it has, so nothing hangs.
+    fn run_midi(&mut self, cur: &[Event], tr: &Transport, sr: f64, frames: usize) {
+        self.out.clear();
+        let selector = self.selector as f32;
+        for c in &mut self.chains {
+            c.events.clear();
+            if std::mem::take(&mut c.all_off) {
+                c.held = [0; 2];
+                c.events.push(0, EventKind::AllNotesOff);
+            }
+        }
+        for e in cur {
+            for c in &mut self.chains {
+                if matches!(e.kind, EventKind::NoteOn { .. }) && (c.gain == (0.0, 0.0) || fade_gain(selector, c.selector_range, c.sel_fade) <= 0.0) {
+                    continue;
+                }
+                Self::route(RackKind::Midi, c, e);
+            }
+        }
+        for c in &mut self.chains {
+            let out = midi_chain(&mut c.devices, &c.events.events, tr, sr, frames);
+            for e in out {
+                self.out.push(e.offset, e.kind);
+            }
+        }
+        self.out.sort();
+    }
+
     /// Route one event to a chain: the events it gets are appended to its
     /// list. Returns the chain's choke group when the event was a note-on it
     /// took.
@@ -2290,3 +2360,7 @@ mod stock_midi;
 #[cfg(test)]
 #[path = "tests/groove.rs"]
 mod groove;
+
+#[cfg(test)]
+#[path = "tests/slice.rs"]
+mod slice;

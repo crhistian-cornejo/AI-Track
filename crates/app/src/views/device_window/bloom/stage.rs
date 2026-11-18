@@ -93,6 +93,7 @@ pub struct StageState {
     pub menu: bool,
     /// The species menu is open.
     pub species_menu: bool,
+    pub kind_menu: bool,
     /// Gene groups folded in the gene editor (bit per group).
     pub folded: u16,
     /// The tab under the stage (DNA, Morph, Play, Tools).

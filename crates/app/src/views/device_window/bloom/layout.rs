@@ -13,13 +13,14 @@
 //! Every hint lives in a tooltip; the frame timings only show with `AITRACK_FPS`.
 
 use super::matter::{self, Material};
-use super::{TIP_BACK, TIP_EXPORT, TIP_FWD, TIP_MATERIAL, TIP_MORPH, TIP_MUTATE, TIP_ROLL, TIP_SPECIES, TIP_STAGE, dial, dial_w, dna, icon_action, knobs, morph, pads, stage, tools, view};
+use super::{TIP_KIND, TIP_SAVE_WT, TIP_BACK, TIP_EXPORT, TIP_FWD, TIP_MATERIAL, TIP_MORPH, TIP_MUTATE, TIP_ROLL, TIP_SPECIES, TIP_STAGE, dial, dial_w, dna, icon_action, knobs, morph, pads, stage, tools, view};
 use crate::icons::{Icon, icon};
 use crate::theme::*;
 use crate::views::device_ui::{Dev, instr, kit};
 use crate::widgets::{self, label, mono};
 use crate::workspace::{DraggedSample, Workspace};
 use aitrack_stock::instrument::bloom::genome::{SOUNDS, Scene, Species, g};
+use aitrack_stock::instrument::bloom::patch::Kind;
 use aitrack_stock::instrument::bloom::{VOICES, p};
 use gpui::{
     AnyElement, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, canvas, div,
@@ -201,6 +202,22 @@ fn species_picker(ws: &mut Workspace, dev: &Dev, scene: &Scene, cx: &mut Context
     dropdown(("bloom-species", dev.key(0x608)), "SPECIES", scene.species.label(), 172., TIP_SPECIES, open, items, move |ws, o| ws.fx.bloom.view(device).stage.species_menu = o, cx)
 }
 
+/// The kind of sound as a dropdown: Drums or a tonal kind.
+fn kind_picker(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+    let open = ws.fx.bloom.view(dev.id).stage.kind_menu;
+    let device = dev.id;
+    let now = view::kind(dev);
+    let items = Kind::ALL
+        .into_iter()
+        .map(|k| {
+            let d = dev.clone();
+            let pick: Pick = Box::new(move |ws, _| view::set_kind(ws, &d, k));
+            (k.label(), k == now, pick)
+        })
+        .collect();
+    dropdown(("bloom-kind", dev.key(0x60C)), "KIND", now.label(), 140., TIP_KIND, open, items, move |ws, o| ws.fx.bloom.view(device).stage.kind_menu = o, cx)
+}
+
 /// The voices in use as a small meter.
 fn voices_meter(dev: &Dev) -> AnyElement {
     let pal = p();
@@ -246,8 +263,8 @@ fn header(ws: &mut Workspace, dev: &Dev, scene: &Scene, cx: &mut Context<Workspa
         .gap(px(SP3))
         .child(label("Bloom", TEXT_LG, pal.text).font_weight(FontWeight::BOLD))
         .child(seed)
-        .child(species_picker(ws, dev, scene, cx))
-        // The Kind selector (parameter 17) goes here once the engine has it.
+        .child(kind_picker(ws, dev, cx))
+        .when(!view::kind(dev).is_tonal(), |d| d.child(species_picker(ws, dev, scene, cx)))
         .child(div().flex_1())
         .child(voices_meter(dev))
         .child(material_picker(ws, dev, cx))
@@ -352,7 +369,7 @@ pub fn envelope_points(attack: f32, hold: f32, decay: f32, total: f32, n: usize)
 
 /// The selected sound: its colour and name, its lock, its amplitude envelope
 /// (the resonator's ring counts when it outlasts the body) filled in its colour.
-fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, color: Hsla, cx: &mut Context<Workspace>) -> Div {
+fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, name: String, locked: bool, color: Hsla, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let genome = &scene.sounds[cell.min(SOUNDS - 1)];
     let gn = genome.folded();
@@ -379,7 +396,6 @@ fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, color: Hsla, cx: &mut C
         },
     )
     .size_full();
-    let locked = scene.locked(cell);
     let d = dev.clone();
     let lock = widgets::icon_chip(("bloom-sel-lock", dev.key(0x641)), Icon::Lock, locked, pal.accent)
         .tooltip(widgets::tip("Lock — Roll and Mutate leave it alone", None))
@@ -398,7 +414,7 @@ fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, color: Hsla, cx: &mut C
                 .items_center()
                 .gap(px(SP2))
                 .child(div().size(px(12.)).rounded_full().bg(color))
-                .child(label(format!("{:02} {}", cell + 1, genome.role.label()), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .child(label(format!("{:02} {}", cell + 1, name), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
                 .child(div().flex_1())
                 .child(lock),
         )
@@ -519,6 +535,37 @@ pub fn narrow(width: f32) -> bool {
     width > 0. && width < NARROW_W
 }
 
+/// The Genes tab of a tonal kind: the patch's name and kind, and saving it
+/// as a Wavetable Synth preset (its genes are that synth's parameters).
+fn tonal_panel(dev: &Dev, cell: usize, name: String, color: Hsla, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let d = dev.clone();
+    let save = big_button(("bloom-save-wt", dev.key(0x6A0)), "Save as Wavetable preset", Icon::Download, false, TIP_SAVE_WT)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            match view::save_patch_preset(this, &d, cell) {
+                Ok(n) => this.toast(format!("Saved {n} in Wavetable Synth presets"), cx),
+                Err(e) => this.toast(e, cx),
+            }
+            cx.notify();
+        }));
+    card()
+        .child(section("PATCH", None))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SP3))
+                .child(div().size(px(12.)).rounded_full().bg(color))
+                .child(label(format!("{:02} {}", cell + 1, name), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .child(label(view::kind(dev).label(), TEXT_SM, pal.muted))
+                .child(div().flex_1())
+                .child(div().w(px(260.)).child(save)),
+        )
+        .child(label("Played by Bloom's built-in Wavetable Synth. Save it to open and edit every parameter there.", TEXT_SM, pal.muted))
+        .into_any_element()
+}
+
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let t0 = std::time::Instant::now();
     let pal = p();
@@ -528,6 +575,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let cell_color = stage::colour(&looks[cell]);
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let sel_color = stage::colour(&looks[selected]);
+    let names = view::names(ws, dev, &scene);
+    let tonal = view::kind(dev).is_tonal();
     let root_region = ws.fx.region(dev.id, 20);
     let width = f32::from(root_region.get().size.width);
     let narrow = narrow(width);
@@ -539,7 +588,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(section("GENERATE", None))
         .child(generator(ws, dev, cx))
         .child(section("SELECTED SOUND", None))
-        .child(selected_sound(dev, &scene, selected, sel_color, cx))
+        .child(selected_sound(dev, &scene, selected, names[selected].clone(), view::locked(ws, dev, &scene, selected), sel_color, cx))
         .child(section("MORPH", Some(TIP_MORPH)))
         .child(morph(ws, dev, 92., cx))
         .child(div().flex_1())
@@ -572,12 +621,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     if narrow {
         below = Some(div().flex_none().flex().flex_wrap().gap(px(SP3)).children(groups.into_iter().map(|g| card().child(g))));
     } else {
-        main = main.child(card().flex_none().w(px(SIDE_W)).children(groups));
+        main = main.child(card().id(("bloom-knob-column", dev.key(0x6A1))).flex_none().w(px(SIDE_W)).overflow_y_scroll().children(groups));
     }
 
     // Tabs: the genes of the selected sound, the morph, the play settings, the tools.
     let tab = ws.fx.bloom.view(dev.id).stage.tab.min(TABS.len() - 1);
     let body = match tab {
+        0 if tonal => tonal_panel(dev, cell, names[cell].clone(), cell_color, cx),
         0 => dna::panel(ws, dev, &scene, cell, cell_color, cx),
         1 => card()
             .child(section("PLAY", None))

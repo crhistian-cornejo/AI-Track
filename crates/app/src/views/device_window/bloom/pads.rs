@@ -29,6 +29,8 @@ pub fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[Look; SOUND
     let pal = p();
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let matching = ws.fx.bloom.view(dev.id).matching.as_ref().map(|m| (m.cell, m.fraction));
+    let names = view::names(ws, dev, scene);
+    let locks: [bool; SOUNDS] = std::array::from_fn(|i| view::locked(ws, dev, scene, i));
     let mut grid = div().w_full().flex().flex_col().gap(px(SP1));
     let cols = cols.clamp(1, SOUNDS);
     for row in 0..SOUNDS.div_ceil(cols) {
@@ -38,12 +40,12 @@ pub fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[Look; SOUND
             let surface = pal.surface;
             let on = i == selected;
             let lit = dev.m(i).clamp(0.0, 1.0);
-            let locked = scene.locked(i);
-            let role = scene.sounds[i].role;
+            let locked = locks[i];
+            let name = names[i].clone();
             let d = dev.clone();
             let caption = match matching {
                 Some((cell, f)) if cell == i => mono(format!("{:.0}%", f * 100.), TEXT_XS, pal.accent2),
-                _ => label(role.label(), TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }),
+                _ => label(name.clone(), TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }),
             };
             let mut pad = div()
                 .id(("bloom-pad", dev.key(0x500 | i)))
@@ -75,7 +77,7 @@ pub fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[Look; SOUND
                         .when_locked(locked, pal.accent),
                 )
                 .child(div().pb(px(SP1)).overflow_hidden().child(caption))
-                .tooltip(widgets::tip_owned(format!("{:02} {} — click: hear · Alt-click: lock", i + 1, role.label())))
+                .tooltip(widgets::tip_owned(format!("{:02} {} — click: hear · Alt-click: lock", i + 1, name)))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     if e.modifiers.alt {

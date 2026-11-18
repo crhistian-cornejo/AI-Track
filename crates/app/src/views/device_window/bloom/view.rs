@@ -16,6 +16,8 @@ use aitrack_model::{Command, DeviceId};
 use aitrack_stock::instrument::bloom::genome::{Genome, SOUNDS, Scene, Species};
 use aitrack_stock::instrument::bloom::timbre::{self, Timbre};
 use aitrack_stock::instrument::bloom::voice::Macros;
+use aitrack_stock::instrument::bloom::patch::{Kind, PatchScene};
+use aitrack_stock::instrument::bloom::tonal;
 use aitrack_stock::instrument::bloom::{self as bloom, MAX_SEED, p};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::RenderImage;
@@ -34,6 +36,8 @@ pub struct Parsed {
     pub corners: Corners,
     /// The visual's material (Obsidian when the state names none).
     pub material: Material,
+    /// The tonal patches the state stores (tonal kinds only).
+    pub patches: Option<PatchScene>,
 }
 
 /// How the device plays its sounds: its Tune and macro knobs, rounded so a
@@ -344,7 +348,8 @@ pub fn parsed(ws: &mut Workspace, device: DeviceId) -> Rc<Parsed> {
     let state = ws.s.project.device(device).and_then(|d| d.state.clone());
     let (stored, corners) = bloom::parse_state(state.as_deref());
     let material = bloom::visual_of(state.as_deref()).and_then(|k| Material::from_key(&k)).unwrap_or_default();
-    let p = Rc::new(Parsed { stored, corners, material });
+    let patches = bloom::parse_patches(state.as_deref());
+    let p = Rc::new(Parsed { stored, corners, material, patches });
     v.parsed = Some((h, p.clone()));
     p
 }
@@ -415,6 +420,89 @@ pub fn commit(ws: &mut Workspace, dev: &Dev, scene: &Scene, corners: Option<Corn
     v.at = v.history.len() - 1;
 }
 
+/// The kind of sound the device grows (Drums or a tonal kind).
+pub fn kind(dev: &Dev) -> Kind {
+    Kind::from_index(dev.choice(p::KIND))
+}
+
+/// The tonal patches the device plays now (meaningful for tonal kinds).
+pub fn patches(ws: &mut Workspace, dev: &Dev) -> PatchScene {
+    let parsed = parsed(ws, dev.id);
+    let seed = bloom::seed_of(dev.plain(p::SEED));
+    let k = kind(dev);
+    let kind = if k.is_tonal() { k } else { Kind::Bass };
+    bloom::effective_patches(parsed.patches.as_ref(), seed, kind)
+}
+
+/// The sixteen names the editor shows: each drum's role, or each tonal
+/// patch's grown name.
+pub fn names(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> [String; SOUNDS] {
+    if kind(dev).is_tonal() {
+        tonal::scene_names(&patches(ws, dev))
+    } else {
+        std::array::from_fn(|i| scene.sounds[i].role.label().to_string())
+    }
+}
+
+/// Whether cell `i` is locked (in the drum scene or the tonal patches).
+pub fn locked(ws: &mut Workspace, dev: &Dev, scene: &Scene, i: usize) -> bool {
+    if kind(dev).is_tonal() { patches(ws, dev).locked(i) } else { scene.locked(i) }
+}
+
+/// Store tonal `patches` on the device as one undo step, with the Seed they
+/// were grown from (the drum scene and corners kept as they are).
+fn commit_patches(ws: &mut Workspace, dev: &Dev, patches: &PatchScene, label: &str) {
+    let drums = scene(ws, dev);
+    let Some(d) = ws.s.project.device(dev.id) else { return };
+    let corners = bloom::parse_state(d.state.as_deref()).1;
+    let visual = bloom::visual_of(d.state.as_deref());
+    let seed = dev.to_norm(p::SEED, patches.seed.min(MAX_SEED) as f32);
+    let mut params: BTreeMap<u32, f32> = d.params.clone();
+    params.insert(p::SEED, seed);
+    params.insert(p::SPECIES, dev.to_norm(p::SPECIES, drums.species.index() as f32));
+    let state = bloom::state_json_full(&params, &drums, &corners, visual.as_deref(), Some(patches));
+    let device = dev.id;
+    let cmds = vec![Command::SetDeviceState { device, state: Some(state), preset: d.preset.clone() }, Command::SetParam { device, param: p::SEED, value: Some(seed) }];
+    ws.s.seal();
+    ws.s.edit(label, cmds);
+    ws.s.seal();
+}
+
+/// The device's knobs as a tonal patch feels them (for saving or rendering).
+pub fn tonal_knobs(dev: &Dev) -> tonal::Knobs {
+    let pc = |id: u32| dev.plain(id) / 100.0;
+    tonal::Knobs {
+        macros: Macros { decay: pc(p::DECAY), body: pc(p::BODY), tone: pc(p::TONE), grit: pc(p::GRIT) },
+        space: pc(p::SPACE),
+        velocity: pc(p::VELOCITY),
+        attack: pc(p::ATTACK),
+        drop: pc(p::DROP),
+        motion: pc(p::MOTION),
+        glide: dev.plain(p::GLIDE),
+    }
+}
+
+/// Save tonal patch `cell` (with the knobs baked in) as a user preset of
+/// the Wavetable Synth; returns its name.
+pub fn save_patch_preset(ws: &mut Workspace, dev: &Dev, cell: usize) -> Result<String, String> {
+    let ps = patches(ws, dev);
+    let patch = &ps.patches[cell.min(SOUNDS - 1)];
+    let name = format!("{} {:06}", tonal::patch_name(patch), ps.seed);
+    let preset = bloom::patch_preset(patch, &tonal_knobs(dev), &name);
+    let params: BTreeMap<u32, f32> = preset.params.iter().filter_map(|(k, v)| Some((k.parse().ok()?, *v))).collect();
+    let root = crate::views::device_window::chrome::user_root();
+    crate::views::device_window::presets::save_user(&root, aitrack_stock::instrument::wavetable::ID, &name, &params).map(|(e, _)| e.name)
+}
+
+/// Switch the kind of sound the device grows (one undo step). The patches
+/// of a tonal kind grow from the current seed.
+pub fn set_kind(ws: &mut Workspace, dev: &Dev, kind: Kind) {
+    let value = dev.to_norm(p::KIND, kind.index() as f32);
+    ws.s.seal();
+    ws.s.edit("Bloom kind", vec![Command::SetParam { device: dev.id, param: p::KIND, value: Some(value) }]);
+    ws.s.seal();
+}
+
 /// The seed of the next roll: from the current one and the roll count, so a
 /// session's rolls are repeatable (never from the clock).
 pub fn next_seed(current: u64, rolls: u64) -> u64 {
@@ -428,6 +516,16 @@ pub fn deviance(dev: &Dev) -> f32 {
 
 /// A new scene from the next seed, `species` (else the current one).
 pub fn roll(ws: &mut Workspace, dev: &Dev, species: Option<Species>) {
+    let k = kind(dev);
+    if k.is_tonal() && species.is_none() {
+        let now = patches(ws, dev);
+        let v = ws.fx.bloom.view(dev.id);
+        v.rolls += 1;
+        let seed = next_seed(now.seed, v.rolls);
+        let new = tonal::roll(&now, seed, k, deviance(dev));
+        commit_patches(ws, dev, &new, "Roll sounds");
+        return;
+    }
     let now = scene(ws, dev);
     let v = ws.fx.bloom.view(dev.id);
     v.rolls += 1;
@@ -439,6 +537,15 @@ pub fn roll(ws: &mut Workspace, dev: &Dev, species: Option<Species>) {
 
 /// Nudge the unlocked sounds by the deviance.
 pub fn mutate(ws: &mut Workspace, dev: &Dev) {
+    if kind(dev).is_tonal() {
+        let now = patches(ws, dev);
+        let v = ws.fx.bloom.view(dev.id);
+        v.rolls += 1;
+        let seed = next_seed(now.seed ^ 0x5EED, v.rolls);
+        let new = tonal::mutate(&now, seed, deviance(dev).max(0.05) * 0.6);
+        commit_patches(ws, dev, &new, "Mutate sounds");
+        return;
+    }
     let now = scene(ws, dev);
     let v = ws.fx.bloom.view(dev.id);
     v.rolls += 1;
@@ -449,6 +556,10 @@ pub fn mutate(ws: &mut Workspace, dev: &Dev) {
 
 /// Step through the roll history (`dir` = -1 back, +1 forward).
 pub fn step_history(ws: &mut Workspace, dev: &Dev, dir: i32) {
+    // The history holds drum scenes; tonal kinds step with undo.
+    if kind(dev).is_tonal() {
+        return;
+    }
     let _ = scene(ws, dev);
     let v = ws.fx.bloom.view(dev.id);
     let at = v.at as i32 + dir;
@@ -465,6 +576,13 @@ pub fn step_history(ws: &mut Workspace, dev: &Dev, dir: i32) {
 }
 
 pub fn toggle_lock(ws: &mut Workspace, dev: &Dev, cell: usize) {
+    if kind(dev).is_tonal() {
+        let mut ps = patches(ws, dev);
+        let on = !ps.locked(cell);
+        ps.set_locked(cell, on);
+        commit_patches(ws, dev, &ps, if on { "Lock sound" } else { "Unlock sound" });
+        return;
+    }
     let mut s = scene(ws, dev);
     let on = !s.locked(cell);
     s.set_locked(cell, on);

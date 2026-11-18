@@ -32,7 +32,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
     // bezel its corners take the colour of.
     let bezel = pal.surface;
     let field = stage::stage(ws, dev, &scene, stage::Opts { swatches: false, outer: bezel, slot: 1, zoom: 1.2 }, cx);
-    let sound = format!("{:02} {}", selected + 1, scene.sounds[selected].role.label());
+    let sound = format!("{:02} {}", selected + 1, view::names(ws, dev, &scene)[selected]);
+    let family = if view::kind(dev).is_tonal() { view::kind(dev).label() } else { scene.species.label() };
     let overlay = |text: String, color: gpui::Hsla| div().px(px(SP1)).h(px(16.)).flex().items_center().rounded(px(r_sm())).bg(with_alpha(pal.surface, 0.72)).child(mono(text, TEXT_XS, color));
     let well = div()
         .id(("bloom-card-stage", dev.key(0x700)))
@@ -47,7 +48,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
         .border_color(border())
         .tooltip(widgets::tip(window::TIP_STAGE, None))
         .child(field)
-        .child(div().absolute().top(px(SP2)).left(px(SP2)).child(overlay(format!("{} · {:06}", scene.species.label(), scene.seed), pal.muted)))
+        .child(div().absolute().top(px(SP2)).left(px(SP2)).child(overlay(format!("{} · {:06}", family, bloom::seed_of(dev.plain(p::SEED))), pal.muted)))
         .child(
             div()
                 .absolute()
@@ -152,12 +153,12 @@ mod tests {
         let small = card_layout(false);
         assert!(small.knobs >= 10, "{small:?}");
         let shown: Vec<u32> = window::knobs::first(small.knobs, |_| true).map(|k| k.id).collect();
-        for id in [p::DECAY, p::BODY, p::TONE, p::GRIT, p::SPACE, p::VOLUME, p::TUNE, p::VELOCITY] {
+        for id in [p::DECAY, p::BODY, p::TONE, p::GRIT, p::ATTACK, p::MOTION, p::FILTER, p::SPACE] {
             assert!(shown.contains(&id), "{id}");
         }
-        // The expanded card has room for the table and ten more rows.
+        // The expanded card has room for the whole table.
         let big = card_layout(true);
-        assert!(big.knobs >= window::knobs::KNOBS.len() + 10, "{big:?}");
+        assert!(big.knobs >= window::knobs::KNOBS.len(), "{big:?}");
         for v in [small.width, small.stage_w, big.width, big.stage_w, KNOB] {
             assert_eq!(v % 4., 0., "{v}");
         }

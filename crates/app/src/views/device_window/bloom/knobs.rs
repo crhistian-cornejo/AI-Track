@@ -63,13 +63,22 @@ pub const KNOBS: &[Knob] = &[
     k(p::BODY, Group::Sound, "Body — more resonant ring"),
     k(p::TONE, Group::Sound, "Tone — darker or brighter"),
     k(p::GRIT, Group::Sound, "Grit — drive and noise"),
+    k(p::ATTACK, Group::Sound, "Attack — softer or snappier starts"),
+    k(p::DROP, Group::Sound, "Drop — pitch falls (+) or rises (−) at start"),
+    k(p::MOTION, Group::Sound, "Motion — how much the sounds move"),
+    k(p::FILTER, Group::Space, "Filter — low-pass left, high-pass right"),
+    k(p::DRIVE, Group::Space, "Drive — saturate the output"),
     k(p::SPACE, Group::Space, "Space — shared room"),
+    k(p::WIDTH, Group::Space, "Width — mono to extra wide"),
     k(p::VOLUME, Group::Space, "Volume — output level"),
+    k(p::VARY, Group::Play, "Vary — every hit a little different"),
+    k(p::GLIDE, Group::Play, "Glide — slide between notes (tonal)"),
     k(p::TUNE, Group::Play, "Tune — transpose every sound"),
     k(p::VELOCITY, Group::Play, "Velocity — how much hits follow velocity"),
     k(p::DEVIANCE, Group::Shape, "Deviance — how far Roll/Mutate wander"),
     k(p::MORPH_X, Group::Shape, "Morph X — blend corners A↔B, C↔D"),
     k(p::MORPH_Y, Group::Shape, "Morph Y — blend corners A/B↔C/D"),
+    k(p::REACT, Group::Shape, "React — how hard the visual moves"),
 ];
 
 /// The table's row of parameter `id`.
@@ -112,7 +121,7 @@ mod tests {
         let unique: BTreeSet<u32> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "no parameter twice");
         // The scene's identity, the selection and the play switches are not knobs.
-        let not_knobs = [p::SEED, p::SPECIES, p::SELECTED, p::MODE, p::BASE, p::CHOKE];
+        let not_knobs = [p::SEED, p::SPECIES, p::KIND, p::SELECTED, p::MODE, p::BASE, p::CHOKE];
         for info in aitrack_stock::instrument::bloom::params() {
             if !not_knobs.contains(&info.id) {
                 assert!(unique.contains(&info.id), "{} has a knob", info.name);
@@ -143,9 +152,9 @@ mod tests {
         let four: Vec<u32> = first(4, |_| true).map(|k| k.id).collect();
         assert_eq!(four, vec![p::DECAY, p::BODY, p::TONE, p::GRIT]);
         let no_body: Vec<u32> = first(4, |id| id != p::BODY).map(|k| k.id).collect();
-        assert_eq!(no_body, vec![p::DECAY, p::TONE, p::GRIT, p::SPACE]);
+        assert_eq!(no_body, vec![p::DECAY, p::TONE, p::GRIT, p::ATTACK]);
         assert!(of(Group::Shape, |_| true).all(|k| k.group == Group::Shape));
-        assert_eq!(of(Group::Sound, |_| true).count(), 4);
+        assert_eq!(of(Group::Sound, |_| true).count(), 7);
     }
 
     #[test]

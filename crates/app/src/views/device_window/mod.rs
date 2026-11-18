@@ -71,7 +71,8 @@ fn screens(cx: &App) -> Vec<Placement> {
 /// Open the window of `device`, or bring it to the front.
 pub fn open(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>) {
     if let Some(handle) = ws.device_windows.get(&device).copied() {
-        if handle.update(cx, |_, window, _| window.activate_window()).is_ok() {
+        // A background visual check (`AITRACK_DEV_HIDDEN`) never brings a window forward.
+        if handle.update(cx, |_, window, _| if !crate::dev_hidden::enabled() { window.activate_window() }).is_ok() {
             return;
         }
         ws.device_windows.remove(&device);
@@ -378,6 +379,11 @@ fn dev_words(ws: &mut Workspace, device: DeviceId, wid: WindowId, words: &[Strin
 
 impl Render for DeviceWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Placement and drawer growth can move the window: a hidden run puts it
+        // back out of sight on every frame (one cheap AppKit call).
+        if crate::dev_hidden::enabled() {
+            crate::dev_hidden::hide(window);
+        }
         let pal = p();
         let Some(ws) = self.ws.upgrade() else { return div().into_any_element() };
         let device = self.device;

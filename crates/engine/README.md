@@ -169,8 +169,11 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 * **Thread priority**: MMCSS "Pro Audio" (critical) on the first callback
   and in every DSP worker on Windows. macOS: CoreAudio's IO thread is
   already real-time; workers ask for a time-constraint policy matching the
-  buffer period. They do not join the device's audio workgroup: cpal does
-  not expose the `AudioObjectID` it opened (see `thread_priority.rs`).
+  buffer period and then join the output device's IO workgroup
+  (`kAudioDevicePropertyIOThreadOSWorkgroup`, found from the UID cpal gives
+  through `kAudioHardwarePropertyTranslateUIDToDevice`; `workgroup.rs`).
+  Each worker joins once when it starts and leaves before it exits; the pool
+  is rebuilt with the new workgroup on every device change.
 
 ### Export
 
@@ -201,7 +204,6 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 
 ## Not done yet
 
-* Joining the CoreAudio device's `os_workgroup` from the DSP workers.
 * Clip envelopes other than volume, fades on MIDI clips, MIDI racks, launch
   modes Gate/Repeat (behave as Trigger),
   scene tempo, recording to disk, disk streaming (`creek`), pitch-preserving

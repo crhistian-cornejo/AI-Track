@@ -29,6 +29,7 @@ pub mod status;
 pub mod tap;
 pub mod thread_priority;
 pub mod workers;
+pub mod workgroup;
 
 #[cfg(test)]
 mod alloc_counter;

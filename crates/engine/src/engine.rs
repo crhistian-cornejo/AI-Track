@@ -245,6 +245,7 @@ impl Engine {
             pool_tx: None,
             pool_retire_rx: None,
             pending_pool: None,
+            workgroup: None,
         };
         let manual = match &config.audio {
             // `check_device` opens it on the control thread's first tick.
@@ -1018,6 +1019,8 @@ struct Control {
     /// A pool built while the queue was full (the audio thread is not
     /// running blocks); queued as soon as there is room.
     pending_pool: Option<WorkerPool>,
+    /// The output device's IO workgroup the live pool's workers join (macOS).
+    workgroup: Option<Arc<crate::workgroup::AudioWorkgroup>>,
 }
 
 impl Control {
@@ -1281,7 +1284,7 @@ impl Control {
 
     /// A worker pool for the current setting and device.
     fn make_pool(&self) -> WorkerPool {
-        WorkerPool::new(resolve_threads(self.audio_threads), PoolKind::Live(self.period))
+        WorkerPool::with_workgroup(resolve_threads(self.audio_threads), PoolKind::Live(self.period), self.workgroup.clone())
     }
 
     /// The setting changed: build the new pool here and queue it for the
@@ -1460,6 +1463,7 @@ impl Control {
 
     /// A runner with no device: a stereo input queue the caller feeds by hand.
     fn headless_runner(&mut self, rate: f64) -> AudioProcessor {
+        self.workgroup = None;
         self.period = Duration::from_secs_f64(self.max_frames as f64 / rate.max(1.0));
         let (sink, rx, stamps) = input_ring(rate as usize, 2);
         *lock(&self.shared.virtual_input) = Some(sink);
@@ -1509,6 +1513,11 @@ impl Control {
         };
         let buffer = prepared.active.buffer_size.map_or(self.max_frames, |b| b as usize).clamp(16, 8192);
         self.period = Duration::from_secs_f64(buffer as f64 / sr.max(1.0));
+        // Before the pool is built: its workers join the new device's group.
+        self.workgroup = prepared.workgroup();
+        if let Some(wg) = &self.workgroup {
+            log::info!("audio: DSP workers join the device's IO workgroup (suggested parallel threads: {:?})", wg.max_parallel_threads());
+        }
         let runner = self.new_runner(sr, input_rx);
         let stream = audio_io::start(prepared, runner, input_tx, self.status.clone())?;
         let active = stream.active.clone();

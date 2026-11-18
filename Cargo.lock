@@ -170,6 +170,8 @@ dependencies = [
  "log",
  "midir",
  "num_cpus",
+ "objc2-core-audio",
+ "objc2-core-foundation",
  "rtrb",
  "rubato",
  "serde",

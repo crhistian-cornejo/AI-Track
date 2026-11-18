@@ -18,6 +18,7 @@
 use super::sample::{SampleData, load_wav};
 use crate::common::{ParamStore, Segmented, drive, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::osc::Noise;
+use aitrack_dsp::resample::{Kernel, Quality};
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
 use serde_json::{Value, json};
@@ -31,6 +32,8 @@ pub mod p {
     pub const VOLUME: u32 = 0;
     pub const VEL_CURVE: u32 = 1;
     pub const VEL_SENS: u32 = 2;
+    /// Interpolation quality (added later: a new id, old projects get the default).
+    pub const QUALITY: u32 = 3;
     pub const PAD0: u32 = 16;
     pub const PAD_STRIDE: u32 = 8;
     pub const TUNE: u32 = 0;
@@ -49,6 +52,8 @@ pub mod p {
 }
 
 pub const VEL_CURVES: &[&str] = &["Linear", "Soft", "Hard", "Fixed"];
+/// Band-limited interpolation length (see [`aitrack_dsp::resample::Quality`]).
+pub const QUALITIES: &[&str] = &["Normal", "High"];
 const CHOKES: &[&str] = &["Off", "1", "2", "3", "4", "5", "6", "7", "8"];
 const OFF_ON: &[&str] = &["Off", "On"];
 
@@ -86,6 +91,7 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::VOLUME, "Volume", -48.0, 6.0, 0.0).unit("dB"),
         ParamInfo::new(p::VEL_CURVE, "Velocity Curve", 0.0, 3.0, 0.0).choices(VEL_CURVES).short("Curve"),
         ParamInfo::new(p::VEL_SENS, "Velocity Sensitivity", 0.0, 100.0, 80.0).unit("%").short("Vel"),
+        ParamInfo::new(p::QUALITY, "Interpolation", 0.0, 1.0, 1.0).choices(QUALITIES).short("Interp"),
     ];
     for (i, n) in PAD_NAMES.iter().enumerate() {
         let b = i as u32;
@@ -147,6 +153,7 @@ pub struct Drum {
     volume: f32,
     curve: usize,
     vel_sens: f32,
+    kernel: &'static Kernel,
     fade_step: f32,
     attack_step: f32,
     age: u64,
@@ -188,6 +195,7 @@ impl Drum {
             volume: 1.0,
             curve: 0,
             vel_sens: 0.8,
+            kernel: Kernel::get(Quality::High),
             fade_step: 0.01,
             attack_step: 1.0,
             age: 0,
@@ -230,6 +238,7 @@ impl Drum {
     fn update(&mut self) {
         let pr = &self.params;
         self.volume = db_to_gain(pr.plain(p::VOLUME));
+        self.kernel = Kernel::get(if pr.choice(p::QUALITY) == 0 { Quality::Normal } else { Quality::High });
         self.curve = pr.choice(p::VEL_CURVE);
         self.vel_sens = pr.plain(p::VEL_SENS) / 100.0;
         for i in 0..PADS {
@@ -346,6 +355,9 @@ impl Segmented for Drum {
             let src = self.samples[v.pad].as_deref().unwrap_or(&self.kit[v.pad]);
             let frames = src.frames() as f64;
             let two = src.channels() >= 2;
+            // Band-limited reads whose cutoff follows the pad's speed.
+            let kernel = self.kernel;
+            let fc = kernel.cutoff(pad.rate_mul);
             let mut peak = 0.0f32;
             for i in start..end {
                 if v.pos >= frames {
@@ -363,8 +375,8 @@ impl Segmented for Drum {
                     }
                 }
                 let g = v.amp * v.vel * v.fade * v.attack;
-                let mut l = src.read(0, v.pos);
-                let mut r = if two { src.read(1, v.pos) } else { l };
+                let mut l = src.read_bl(kernel, 0, v.pos, fc);
+                let mut r = if two { src.read_bl(kernel, 1, v.pos, fc) } else { l };
                 if pad.filter_on {
                     l = v.filt[0].process(&pad.coeffs, l);
                     r = v.filt[1].process(&pad.coeffs, r);
@@ -402,6 +414,7 @@ impl Processor for Drum {
     }
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
+        aitrack_dsp::resample::init();
         if (sample_rate - self.sr).abs() > 0.5 {
             self.kit = build_kit(sample_rate);
         }
@@ -677,4 +690,23 @@ mod tests {
         assert!(e.pad_sample(0).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Report 24.02 §7.1: a pad tuned an octave up must not fold a 13 kHz
+    /// sample back into the band.
+    #[test]
+    fn tuning_a_pad_up_does_not_alias() {
+        let play = |freq: f64| {
+            let mut d = Drum::new();
+            let x: Vec<f32> = (0..48_000).map(|i| 0.5 * (std::f64::consts::TAU * freq * i as f64 / 48_000.0).sin() as f32).collect();
+            d.set_pad_sample(0, Some(SampleData::from_interleaved(&x, 1, 48_000.0)));
+            set_plain(&mut d, p::pad(0, p::TUNE), 12.0);
+            let (l, _) = render_notes(&mut d, &[(0, FIRST_KEY, 1.0, true)], 20_000);
+            l[2_000..18_000].to_vec()
+        };
+        let reference = play(4_000.0);
+        let alias = crate::test_util::rel_db(&play(13_000.0), &reference);
+        eprintln!("drum +12 st: 13 kHz residual {alias:.1} dB");
+        assert!(alias < -60.0, "13 kHz an octave up leaves {alias:.1} dB");
+    }
+
 }

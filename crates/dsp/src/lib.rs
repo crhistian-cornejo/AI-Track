@@ -30,6 +30,7 @@ pub mod lfo;
 pub mod loudness;
 pub mod osc;
 pub mod oversample;
+pub mod resample;
 pub mod shaper;
 pub mod smooth;
 pub mod spectrum;

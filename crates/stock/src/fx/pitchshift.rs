@@ -17,6 +17,12 @@
 //! that of the longest grain whatever the Grain knob says (a shorter grain
 //! reads further back), so automating Grain never moves the delay.
 //!
+//! The heads read the line through the band-limited kernel of
+//! [`aitrack_dsp::resample`]: a head moving `ratio` samples per sample is
+//! low-passed at the new Nyquist (cutoff `≈ 1/ratio`), so shifting up does
+//! not fold the top of the band back (Hermite left a 13 kHz sine at 22 kHz
+//! an octave up at −1.1 dB).
+//!
 //! Formants are not preserved: material is resampled, as in any
 //! delay-line shifter, so large shifts of voices sound like a different singer.
 //!
@@ -24,6 +30,7 @@
 
 use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
 use aitrack_dsp::delay::DelayLine;
+use aitrack_dsp::resample::{Kernel, Quality};
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
 
@@ -216,7 +223,7 @@ impl Segmented for PitchShifter {
         }
         let align = self.params.on(p::ALIGN);
         let ms = 0.001 * self.sr as f32;
-        let max_d = self.lines[0].max_delay() as f32 - 3.0;
+        let kernel = Kernel::get(Quality::High);
         let span = self.search as f32;
         // The delay of the longest grain: the one the plugin reports.
         let lat = self.latency_for(MAX_GRAIN_MS);
@@ -230,6 +237,7 @@ impl Segmented for PitchShifter {
             let fb = self.feedback.next();
             self.cur_semi = semi;
             let ratio = (semi * (1.0 / 12.0)).exp2();
+            let fc = kernel.cutoff(ratio as f64);
             let input = [l, r];
             self.in_peak = (self.in_peak * 0.9995).max(l.abs().max(r.abs()));
             // Feed the lines: input plus the shifted signal coming back.
@@ -263,9 +271,11 @@ impl Segmented for PitchShifter {
             for k in 0..2 {
                 let w = 0.5 - 0.5 * (std::f32::consts::TAU * ph[k]).cos();
                 self.win[k] = w;
-                let d = (self.base + pad + self.off[k] + ph[k] * grain).clamp(2.0, max_d);
+                // `read_delay` keeps the kernel inside the line; only a head
+                // at the very end of its (closed) window ever reaches that.
+                let d = self.base + pad + self.off[k] + ph[k] * grain;
                 for c in 0..2 {
-                    wet[c] += w * self.lines[c].read_cubic(d);
+                    wet[c] += w * kernel.read_delay(&self.lines[c], d, fc);
                 }
             }
             let (w, dg) = (self.wet.next(), self.dry_gain.next());
@@ -288,6 +298,7 @@ impl Processor for PitchShifter {
     }
 
     fn prepare(&mut self, sample_rate: f64, _max_frames: usize) {
+        aitrack_dsp::resample::init();
         if self.sr != sample_rate {
             self.sr = sample_rate;
             let ms = 0.001 * sample_rate as f32;
@@ -498,4 +509,24 @@ mod tests {
         assert!(rms(&l[8000..]) > 0.05);
         assert!(rms(&r) < 1e-6);
     }
+
+    /// Report 24.01 §5.1: +12 st on a 13 kHz sine left 22 kHz at −1.1 dB.
+    /// Reading the line faster than the rate now goes through a kernel whose
+    /// cutoff follows the ratio, so the octave above Nyquist vanishes.
+    #[test]
+    fn octave_up_does_not_fold_back() {
+        let run = |freq: f32| {
+            let mut s = PitchShifter::new();
+            set_plain(&mut s, p::SEMITONES, 12.0);
+            let (l, _) = process_stereo(&mut s, sine(freq, 0.5), 96_000);
+            l[48_000..80_000].to_vec()
+        };
+        let reference = run(4_000.0);
+        let alias = crate::test_util::rel_db(&run(13_000.0), &reference);
+        let pass = 20.0 * (rms(&reference) / (0.5 / 2f32.sqrt())).log10();
+        eprintln!("pitchshift +12 st: 13 kHz residual {alias:.1} dB, 4 kHz -> 8 kHz gain {pass:+.2} dB");
+        assert!(alias < -60.0, "13 kHz an octave up leaves {alias:.1} dB");
+        assert!(pass.abs() < 0.5, "passband gain {pass:+.2} dB");
+    }
+
 }

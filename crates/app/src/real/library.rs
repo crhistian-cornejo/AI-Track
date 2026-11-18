@@ -13,7 +13,7 @@
 
 use crate::bridge::*;
 use aitrack_library::{
-    AiDetector, DspEmbedder, EmbedEvent, EmbedJob, EmbedOptions, SimilarFinder,
+    AiDetector, ClapEmbedder, DspEmbedder, EmbedEvent, EmbedJob, EmbedOptions, SimilarFinder,
     Analysis, Analyzer, BasicAnalyzer, Category, KeyFilter, KeyHint, KeyMatch, Library, NameHints, OrganizeLayout,
     OrganizeMode, OrganizePlan, ReanalyseEvent, ReanalyseJob, ReanalyseOptions, RecommendQuery, RootKind, Sample, SampleId, ScanEvent, ScanJob, ScanOptions, SearchQuery, Source,
 };
@@ -176,6 +176,12 @@ pub struct RealLibrary {
     similar: RefCell<SimilarFinder>,
     /// The sounds should be listened to again (at start-up, after a scan or a key detection).
     embed_wanted: bool,
+    /// After the timbre pass, listen with CLAP too (the model may have been installed meanwhile).
+    clap_wanted: bool,
+    /// The running pass is the CLAP one.
+    clap_running: bool,
+    /// Whether the CLAP model is installed: asked of a short thread, since it reads the disk.
+    clap_probe: Option<crossbeam_channel::Receiver<bool>>,
 }
 
 /// Where the plugin installer keeps its receipts and work folders: next to the user library.
@@ -225,6 +231,9 @@ impl RealLibrary {
             plugin_cards_at: None,
             similar: RefCell::default(),
             embed_wanted: true,
+            clap_wanted: false,
+            clap_running: false,
+            clap_probe: None,
         };
         this.restart_watcher();
         this.refresh();
@@ -326,11 +335,24 @@ impl RealLibrary {
     /// Learn which sounds sound alike, in the background, when nothing else is running.
     fn start_embed(&mut self) {
         self.embed_wanted = false;
+        self.clap_running = false;
         if self.scan.is_some() || self.libs[USER].is_none() {
             return;
         }
         let opts = EmbedOptions { threads: std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 3)), limit: None };
         self.scan = Some(Scan::Embed(EmbedJob::spawn_library(self.factory_path.clone(), self.user_path.clone(), Arc::new(DspEmbedder), opts)));
+    }
+
+    /// The learned (CLAP) pass over the library, once the model is known to be installed.
+    fn start_clap_embed(&mut self) {
+        self.clap_wanted = false;
+        if self.scan.is_some() || self.libs[USER].is_none() {
+            return;
+        }
+        // Decoding and the mel front end run on two threads; the model itself serialises its calls.
+        let opts = EmbedOptions { threads: 2, limit: None };
+        self.clap_running = true;
+        self.scan = Some(Scan::Embed(EmbedJob::spawn_library(self.factory_path.clone(), self.user_path.clone(), Arc::new(ClapEmbedder::new()), opts)));
     }
 
     fn start_scan(&mut self, opts: ScanOptions) {
@@ -584,6 +606,10 @@ impl LibraryBridge for RealLibrary {
         self.view().search(q)
     }
 
+    fn listen_semantic(&mut self) {
+        self.clap_wanted = true;
+    }
+
     fn similar_sounds(&self, id: u64, limit: usize) -> Vec<SimilarSound> {
         let (lib, sample) = split_id(id);
         let libs = [self.libs[FACTORY].as_ref(), self.libs[USER].as_ref()];
@@ -777,6 +803,23 @@ impl LibraryBridge for RealLibrary {
         if self.scan.is_none() && self.embed_wanted && self.organize_rx.is_none() {
             self.start_embed();
         }
+        if self.scan.is_none() && self.clap_wanted && self.organize_rx.is_none() && self.clap_probe.is_none() {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            self.clap_probe = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(ClapEmbedder::is_ready());
+            });
+        }
+        if let Some(rx) = &self.clap_probe
+            && let Ok(ready) = rx.try_recv()
+        {
+            self.clap_probe = None;
+            if self.scan.is_none() && ready {
+                self.start_clap_embed();
+            } else if !ready {
+                self.clap_wanted = false;
+            }
+        }
         let Some(scan) = &self.scan else { return changed };
         let mut finished = false;
         let after_listening = matches!(scan, Scan::Embed(_));
@@ -786,7 +829,8 @@ impl LibraryBridge for RealLibrary {
                     match ev {
                         EmbedEvent::Progress(_) => {}
                         EmbedEvent::Finished(s) => {
-                            log::info!("library: listened to {} sounds for similarity ({} already known, {} errors)", s.embedded, s.cached, s.errors);
+                            let what = if self.clap_running { "by meaning" } else { "for similarity" };
+                            log::info!("library: listened to {} sounds {what} ({} already known, {} errors)", s.embedded, s.cached, s.errors);
                             finished = true;
                         }
                         EmbedEvent::Failed(e) => {
@@ -843,6 +887,11 @@ impl LibraryBridge for RealLibrary {
             self.refresh();
             // New sounds in the library, or new keys: they may need listening to.
             self.embed_wanted = !after_listening;
+            // The timbre pass is done: the learned one follows when its model is installed.
+            if after_listening && !self.clap_running {
+                self.clap_wanted = true;
+            }
+            self.clap_running = false;
         }
         changed
     }

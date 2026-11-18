@@ -12,6 +12,8 @@ pub struct PaletteSettings {
     /// into the library. `None` = look for it (`~/Splice/sounds`, `~/Splice`,
     /// Ableton's `User Library/Samples/Splice`).
     pub splice_folder: Option<PathBuf>,
+    /// Ranking by meaning (CLAP) is on once the model is installed, unless this is set.
+    pub semantic_off: bool,
 }
 
 fn path() -> PathBuf {
@@ -45,6 +47,7 @@ mod tests {
     #[test]
     fn splice_is_off_by_default_and_old_files_load() {
         assert!(!PaletteSettings::default().splice);
+        assert!(!PaletteSettings::default().semantic_off, "meaning is on once the model is installed");
         let s: PaletteSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, PaletteSettings::default());
         let s: PaletteSettings = serde_json::from_str(r#"{"splice":true}"#).unwrap();

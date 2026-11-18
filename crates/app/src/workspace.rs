@@ -671,6 +671,16 @@ impl Workspace {
                         self.palette.similar = Some(views::palette::SimilarTo { id: it.id, name: it.name.clone() });
                     }
                 }
+                // The palette's semantic search: "dark punchy kick" ranked by meaning (stub bridges fake the model).
+                "semantic" => {
+                    self.palette_pending = true;
+                    self.palette.tab = views::palette::Tab::Samples;
+                    let q = "dark punchy kick";
+                    self.palette.query = q.into();
+                    self.search.update(cx, |i, cx| i.set_text(q, cx));
+                }
+                // Preferences › Sounds with the model download half way.
+                "semantic-download" => self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Sounds)),
                 // The updater in a state, without the network: `update=available|ready|failed`.
                 "update=available" | "update=ready" | "update=failed" => views::updates::seed_dev(self, word),
                 // Preferences > MCP server with the server on, a made-up client and calls (nothing is started).

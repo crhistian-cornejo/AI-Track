@@ -70,6 +70,13 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, path: &Path) -> Result<Vec<f32>>;
 }
 
+/// An [`Embedder`] whose vectors also describe *words*: a phrase maps into the same space as
+/// the sounds, so "dark punchy kick" can be ranked against them by cosine (CLAP).
+pub trait TextEmbedder: Embedder {
+    /// The vector of a phrase, of length [`Embedder::dim`].
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+}
+
 fn encode(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -666,6 +673,16 @@ impl SimilarIndex {
         })
     }
 
+    /// Cosine similarity between a raw vector (a phrase's) and one indexed sample.
+    pub fn similarity_to(&self, raw: &[f32], lib: u8, id: SampleId) -> Option<f32> {
+        if raw.len() != self.dim {
+            return None;
+        }
+        let i = *self.by_id.get(&(lib, id.0))?;
+        let q = prepare(raw, &self.mean, &self.inv_std);
+        Some(self.rows[i * self.dim..(i + 1) * self.dim].iter().zip(&q).map(|(a, b)| a * b).sum())
+    }
+
     /// The samples that sound most like the one at (`lib`, `id`), without itself.
     pub fn nearest_to(&self, lib: u8, id: SampleId, opts: &SimilarOptions) -> Vec<Neighbour> {
         let Some(&i) = self.by_id.get(&(lib, id.0)) else { return Vec::new() };
@@ -738,8 +755,13 @@ pub struct SimilarHit {
 /// the samples changed. The user library holds the vectors (see [`EmbedJob::spawn_library`]).
 #[derive(Default)]
 pub struct SimilarFinder {
-    index: Option<((u64, u64, u64), SimilarIndex)>,
+    /// One index per embedder id, with the counts it was built at.
+    indexes: HashMap<String, ((u64, u64, u64), SimilarIndex)>,
 }
+
+/// How much the learned (CLAP) similarity counts in a blended "similar" list; the DSP timbre vector
+/// makes up the rest. Sounds with no learned vector yet are ranked by the DSP vector alone.
+pub const LEARNED_WEIGHT: f32 = 0.65;
 
 impl SimilarFinder {
     pub fn new() -> Self {
@@ -748,7 +770,7 @@ impl SimilarFinder {
 
     /// Forget the index (the libraries changed in a way the cheap check cannot see).
     pub fn invalidate(&mut self) {
-        self.index = None;
+        self.indexes.clear();
     }
 
     /// The index as it is now (built when missing or out of date).
@@ -759,11 +781,12 @@ impl SimilarFinder {
             libs[0].map_or(0, |l| l.count().unwrap_or(0)),
             cache.count().unwrap_or(0),
         );
-        if self.index.as_ref().is_none_or(|(s, _)| *s != stamp) {
+        let key = format!("{}@{}", embedder.id(), embedder.version());
+        if self.indexes.get(&key).is_none_or(|(s, _)| *s != stamp) {
             let tagged: Vec<(u8, &Library)> = libs.iter().enumerate().filter_map(|(i, l)| l.map(|l| (i as u8, l))).collect();
-            self.index = Some((stamp, SimilarIndex::load(&tagged, cache, embedder)?));
+            self.indexes.insert(key.clone(), (stamp, SimilarIndex::load(&tagged, cache, embedder)?));
         }
-        Ok(&self.index.as_ref().expect("just built").1)
+        Ok(&self.indexes.get(&key).expect("just built").1)
     }
 
     /// The `limit` samples that sound most like sample `id` of library `lib`: the same
@@ -786,6 +809,60 @@ impl SimilarFinder {
         let neighbours = self.index(libs, embedder)?.nearest(&raw, Some((lib, id)), &opts);
         let mut out = Vec::with_capacity(neighbours.len());
         for n in neighbours {
+            if let Some(l) = libs.get(n.lib as usize).copied().flatten()
+                && let Ok(sample) = l.get(n.id)
+            {
+                out.push(SimilarHit { lib: n.lib, sample, similarity: n.similarity });
+            }
+        }
+        let mut samples: Vec<_> = out.iter().map(|h| h.sample.clone()).collect();
+        let _ = cache.fill_from_cache(&mut samples);
+        for (h, s) in out.iter_mut().zip(samples) {
+            h.sample = s;
+        }
+        Ok(out)
+    }
+}
+
+impl SimilarFinder {
+    /// Like [`SimilarFinder::find`], with the learned embedder's opinion mixed in: for a sound both
+    /// embedders know, the similarity is [`LEARNED_WEIGHT`] learned and the rest DSP timbre; a sound
+    /// the learned one has not reached yet keeps its DSP similarity. Without a learned embedder, or
+    /// when the reference has no learned vector, this is `find`.
+    pub fn find_blended(&mut self, libs: [Option<&Library>; 2], lib: u8, id: SampleId, dsp: &dyn Embedder, learned: Option<&dyn Embedder>, limit: usize) -> Result<Vec<SimilarHit>> {
+        let Some(learned) = learned else { return self.find(libs, lib, id, dsp, limit) };
+        let (Some(source), Some(cache)) = (libs.get(lib as usize).copied().flatten(), libs[1]) else { return Ok(Vec::new()) };
+        let Some(raw_learned) = source.embedding_of(id, cache, learned).ok().flatten() else { return self.find(libs, lib, id, dsp, limit) };
+        let mut reference = vec![source.get(id)?];
+        let _ = cache.fill_from_cache(&mut reference);
+        let reference = reference.remove(0);
+        let Some(raw_dsp) = source.embedding_of(id, cache, dsp)? else { return Ok(Vec::new()) };
+        let opts = SimilarOptions {
+            limit: usize::MAX,
+            same_category: reference.category.map(|c| (c, reference.subcategory.clone())),
+            key: reference.scale(),
+            bpm: reference.bpm.filter(|_| reference.is_loop()),
+            ..Default::default()
+        };
+        let by_dsp = self.index(libs, dsp)?.nearest(&raw_dsp, Some((lib, id)), &opts);
+        let by_learned: HashMap<(u8, i64), f32> = self
+            .index(libs, learned)?
+            .nearest(&raw_learned, Some((lib, id)), &SimilarOptions { limit: usize::MAX, ..Default::default() })
+            .into_iter()
+            .map(|n| ((n.lib, n.id.0), n.similarity))
+            .collect();
+        let mut blended: Vec<Neighbour> = by_dsp
+            .into_iter()
+            .map(|n| {
+                let similarity = by_learned.get(&(n.lib, n.id.0)).map_or(n.similarity, |l| LEARNED_WEIGHT * l + (1.0 - LEARNED_WEIGHT) * n.similarity);
+                // The key and tempo nudges stay what they were.
+                Neighbour { similarity, score: similarity + (n.score - n.similarity), ..n }
+            })
+            .collect();
+        blended.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.0.cmp(&b.id.0)));
+        blended.truncate(limit);
+        let mut out = Vec::with_capacity(blended.len());
+        for n in blended {
             if let Some(l) = libs.get(n.lib as usize).copied().flatten()
                 && let Ok(sample) = l.get(n.id)
             {

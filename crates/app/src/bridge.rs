@@ -1924,6 +1924,14 @@ pub trait LibraryBridge {
     fn similar_sounds(&self, _id: u64, _limit: usize) -> Vec<SimilarSound> {
         Vec::new()
     }
+    /// The sounds that best match a described sound ("dark punchy kick") by meaning, best first;
+    /// `similarity` is the match, 0..1. Only stub bridges answer here: the real library is searched
+    /// by the palette's own worker (which holds the CLAP model off the UI thread).
+    fn semantic_search(&self, _query: &str, _limit: usize) -> Vec<SimilarSound> {
+        Vec::new()
+    }
+    /// The CLAP model was just installed: listen to the library with it in the background.
+    fn listen_semantic(&mut self) {}
     /// Samples ranked for the project's key and tempo.
     fn recommend(&self, scale: Option<Scale>, _bpm: f64) -> Vec<LibraryItem> {
         self.search("", scale)
@@ -2069,6 +2077,36 @@ impl LibraryBridge for StubLibrary {
                 let kind = if i.is_loop == me.is_loop { 0.15 } else { 0. };
                 let key = if i.key.is_some() && i.key == me.key { 0.1 } else { 0. };
                 SimilarSound { item: i.clone(), similarity: (0.55 + 0.1 * shared + 0.2 * length + kind + key).min(0.99) }
+            })
+            .collect();
+        out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity).then_with(|| a.item.name.cmp(&b.item.name)));
+        out.truncate(limit);
+        out
+    }
+
+    fn semantic_search(&self, query: &str, limit: usize) -> Vec<SimilarSound> {
+        // A pretend model: each word leans towards a kind of sound, the way a trained one would.
+        const MEANING: [(&str, &[&str]); 5] = [
+            ("Kick", &["dark", "punchy", "boom", "sub", "thump", "kick", "deep", "808"]),
+            ("Pad", &["warm", "analog", "soft", "lush", "pad", "wide"]),
+            ("Hat", &["bright", "tick", "sizzle", "hat", "metallic", "crisp"]),
+            ("Vocal", &["vocal", "chop", "voice", "choir", "vox"]),
+            ("Snare", &["snare", "crack", "snappy", "clap"]),
+        ];
+        let words = aitrack_library::text::words(query);
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<SimilarSound> = self
+            .items
+            .iter()
+            .filter_map(|i| {
+                let name = aitrack_library::text::words(&i.name);
+                let kind = i.category.split_whitespace().next().unwrap_or("");
+                let leaning = MEANING.iter().find(|(k, _)| *k == kind).map_or(0, |(_, ws)| words.iter().filter(|w| ws.contains(&w.as_str())).count());
+                let named = words.iter().filter(|w| name.contains(w)).count();
+                let score = 0.2 + 0.2 * leaning.min(3) as f32 + 0.1 * named.min(3) as f32;
+                (leaning > 0 || named > 0).then(|| SimilarSound { item: i.clone(), similarity: score.min(0.97) })
             })
             .collect();
         out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity).then_with(|| a.item.name.cmp(&b.item.name)));
@@ -2737,6 +2775,18 @@ mod tests {
         let found = lib.search("", Some(am));
         assert!(found.iter().all(|i| i.key.is_none_or(|k| k.mask() == am.mask())));
         assert!(lib.search("kick", None).iter().all(|i| i.name.to_lowercase().contains("kick") || i.category == "Kick"));
+    }
+
+    #[test]
+    fn the_stub_ranks_described_sounds_by_a_pretend_meaning() {
+        let lib = StubLibrary::default();
+        let found = lib.semantic_search("dark punchy kick", 5);
+        assert_eq!(found.len(), 5);
+        assert!(found.iter().all(|s| s.item.category == "Kick"), "{found:?}");
+        assert!(found.windows(2).all(|w| w[0].similarity >= w[1].similarity));
+        let pad = lib.semantic_search("warm analog pad", 3);
+        assert_eq!(pad[0].item.name, "Pad Warm Analog Am");
+        assert!(lib.semantic_search("   ", 3).is_empty());
     }
 
     #[test]

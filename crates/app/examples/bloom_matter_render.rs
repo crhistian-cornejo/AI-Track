@@ -10,7 +10,12 @@
 //! * `sound-<n>-<role>-{light,dark}.png`: six sounds' own looks on Obsidian;
 //! * `strip-{light,dark}.png`: 30 frames (1/20 s apart) of a hit and its settling;
 //! * `sheet-{light,dark}.png`: every material side by side;
-//! * `timing.txt`: GPU time per frame at 512 × 512.
+//! * `ensemble-{window,card}-{light,dark}.png`: four sounds playing a beat,
+//!   12 frames at the window's and the card's stage sizes, and
+//!   `ensemble-materials-*.png`: every material mid-beat (second argument
+//!   `ensemble`: only these);
+//! * `timing.txt`: GPU time per frame at 512 × 512, and at the window's
+//!   stage size on a Retina display (1800 × 920) down to 640 × 328.
 //! * with a second argument `knobs`, only `knobs-{light,dark}.png`: one sound
 //!   under each knob turned (timbre re-analysed under the knobs, then the
 //!   direct mapping), at rest and a moment after a hit.
@@ -75,7 +80,7 @@ fn animate(s: &Shot) -> Animator {
     let steps = (s.rest / dt) as usize;
     let quiet = [0.0; SOUNDS];
     for _ in 0..steps {
-        a.step(dt, &Live { env: &quiet, pulse: &quiet, looks: s.looks, selected: s.selected }, s.cursor, false);
+        a.step(dt, &Live { env: &quiet, pulse: &quiet, looks: s.looks, selected: s.selected, hits: &NO_HITS, level: 0.0 }, s.cursor, false);
     }
     if let Some(after) = s.hit {
         let n = (after / dt) as usize;
@@ -84,10 +89,39 @@ fn animate(s: &Shot) -> Animator {
             let (mut env, mut pulse) = ([0.0; SOUNDS], [0.0; SOUNDS]);
             env[s.selected] = (-t / 0.25).exp();
             pulse[s.selected] = (-t / 0.06).exp();
-            a.step(dt, &Live { env: &env, pulse: &pulse, looks: s.looks, selected: s.selected }, s.cursor, false);
+            let mut hits = NO_HITS;
+            hits[s.selected] = 1.0;
+            a.step(dt, &Live { env: &env, pulse: &pulse, looks: s.looks, selected: s.selected, hits: &hits, level: 0.3 * env[s.selected] }, s.cursor, false);
         }
     }
     a
+}
+
+const NO_HITS: [f32; SOUNDS] = [0.0; SOUNDS];
+
+/// A beat on four sounds (kick, hat, snare, perc) for `secs` seconds at
+/// 120 BPM, stepped at 120 Hz; calls `shot` with the animator every `every` steps.
+fn ensemble(looks: &[SoundLook; SOUNDS], secs: f32, every: usize, mut shot: impl FnMut(usize, &Animator)) {
+    let mut a = Animator::default();
+    let dt = 1.0 / 120.0;
+    let steps = (secs / dt) as usize;
+    let sounds: [(usize, f32, f32, f32); 4] = [(0, 1.0, 0.0, 4.0), (6, 0.5, 0.0, 9.0), (10, 2.0, 1.0, 5.0), (13, 1.0, 0.5, 6.0)];
+    let mut hits = NO_HITS;
+    for k in 0..steps {
+        let beat = k as f32 * dt * 2.0;
+        let (mut env, mut pulse) = ([0.0; SOUNDS], [0.0; SOUNDS]);
+        for &(i, period, offset, decay) in &sounds {
+            let ph = ((beat - offset) / period).rem_euclid(1.0) * period;
+            env[i] = (-ph * decay).exp();
+            pulse[i] = (-ph * 16.0).exp();
+            hits[i] = ((beat - offset) / period).floor();
+        }
+        let level = (0.18 * env.iter().sum::<f32>()).min(0.9);
+        a.step(dt, &Live { env: &env, pulse: &pulse, looks, selected: 0, hits: &hits, level }, None, false);
+        if k % every == every - 1 {
+            shot(k / every, &a);
+        }
+    }
 }
 
 fn render(gpu: &Gpu, target: &matter::gpu::Target, s: &Shot, w: u32, h: u32) -> Vec<u8> {
@@ -148,6 +182,12 @@ fn main() {
         knobs(&gpu, &target, &scene, &dir);
         return;
     }
+    if only == "ensemble" || only.is_empty() {
+        ensemble_shots(&gpu, &looks_l, &looks_d, &dir);
+        if !only.is_empty() {
+            return;
+        }
+    }
 
     // Every material at rest and during a hit.
     for light in [true, false] {
@@ -199,17 +239,18 @@ fn main() {
         let mut frames = Vec::new();
         let quiet = [0.0; SOUNDS];
         for _ in 0..120 {
-            a.step(dt, &Live { env: &quiet, pulse: &quiet, looks, selected: 0 }, None, false);
+            a.step(dt, &Live { env: &quiet, pulse: &quiet, looks, selected: 0, hits: &NO_HITS, level: 0.0 }, None, false);
         }
         for f in 0..30 {
             for k in 0..6 {
                 let t = (f as f32 * 6.0 + k as f32) * dt - 6.0 * 6.0 * dt;
-                let (mut env, mut pulse) = ([0.0; SOUNDS], [0.0; SOUNDS]);
+                let (mut env, mut pulse, mut hits) = ([0.0; SOUNDS], [0.0; SOUNDS], NO_HITS);
                 if t >= 0.0 {
                     env[0] = (-t / 0.25).exp();
                     pulse[0] = (-t / 0.06).exp();
+                    hits[0] = 1.0;
                 }
-                a.step(dt, &Live { env: &env, pulse: &pulse, looks, selected: 0 }, Some((0.75, 0.35 - f as f32 * 0.02)), false);
+                a.step(dt, &Live { env: &env, pulse: &pulse, looks, selected: 0, hits: &hits, level: 0.0 }, Some((0.75, 0.35 - f as f32 * 0.02)), false);
             }
             let u = a.uniforms(Material::Obsidian, &panel(light, sw, sh), 0.0);
             let mut px = gpu.render_bgra(&small, &u).expect("render");
@@ -221,6 +262,38 @@ fn main() {
     }
 
     timing(&gpu, &looks_d, &dir);
+}
+
+/// Several sounds playing a beat: a 12-frame strip at the window's size and
+/// one at the card's (a small, wide stage), every material mid-beat, light and dark.
+fn ensemble_shots(gpu: &Gpu, looks_l: &[SoundLook; SOUNDS], looks_d: &[SoundLook; SOUNDS], dir: &Path) {
+    for light in [true, false] {
+        let looks = if light { looks_l } else { looks_d };
+        let theme = if light { "light" } else { "dark" };
+        for (name, w, h, zoom) in [("window", 480u32, 360u32, 1.0f32), ("card", 280, 160, 1.3)] {
+            let t = gpu.target(w, h);
+            let mut frames = Vec::new();
+            ensemble(looks, 3.0, 30, |_, a| {
+                let pl = panel(light, w, h).zoomed(zoom);
+                let mut px = gpu.render_bgra(&t, &a.uniforms(Material::Obsidian, &pl, 0.0)).expect("render");
+                bgra_to_rgba(&mut px);
+                frames.push(px);
+            });
+            let (g, gw, gh) = grid(&frames, w, h, 4);
+            save(dir, &format!("ensemble-{name}-{theme}.png"), &g, gw, gh);
+        }
+        let mut sheet = Vec::new();
+        let t = gpu.target(W, H);
+        ensemble(looks, 2.2, 252, |_, a| {
+            for m in Material::ALL {
+                let mut px = gpu.render_bgra(&t, &a.uniforms(m, &panel(light, W, H), 0.0)).expect("render");
+                bgra_to_rgba(&mut px);
+                sheet.push(px);
+            }
+        });
+        let (g, gw, gh) = grid(&sheet, W, H, 4);
+        save(dir, &format!("ensemble-materials-{theme}.png"), &g, gw, gh);
+    }
 }
 
 /// One sound under each knob: a row at rest and a row after a hit.
@@ -295,6 +368,31 @@ fn timing(gpu: &Gpu, looks: &[SoundLook; SOUNDS], dir: &Path) {
                 times[30]
             ));
             a.time += 0.01;
+        }
+    }
+    // The window's stage on a Retina display (about 900 × 460 points) at a few
+    // scales, mid-beat with four sounds: what the adaptive resolution chooses from.
+    for (w, h) in [(1800u32, 920u32), (1350, 690), (900, 460), (640, 328)] {
+        let t = gpu.target(w, h);
+        let mut frames = Vec::new();
+        ensemble(looks, 1.3, 156, |_, a| frames.push(*a));
+        let a = frames.last().copied().unwrap_or_default();
+        for m in [Material::Obsidian, Material::Glass] {
+            let u = a.uniforms(m, &panel(false, w, h), 0.0);
+            let _ = gpu.render_bgra(&t, &u);
+            let through = (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..60 {
+                        let mut enc = gpu.device.create_command_encoder(&Default::default());
+                        gpu.encode(&mut enc, &t, &u);
+                        gpu.queue.submit([enc.finish()]);
+                    }
+                    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+                    t0.elapsed().as_secs_f64() * 1000.0 / 60.0
+                })
+                .fold(f64::INFINITY, f64::min);
+            report.push_str(&format!("{:<10} GPU {through:.3} ms/frame back to back · {w}x{h} ({:.2} MP, four sounds playing)\n", m.name(), (w * h) as f64 / 1e6));
         }
     }
     print!("{report}");

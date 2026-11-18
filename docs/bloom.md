@@ -268,13 +268,35 @@ its colour and shape driven by the sound playing.
 | `matter/frame.rs` | The motion: the playing sound takes the stage (its look blends in on a hit and decays back to the selected sound), spikes rise at once and sink in 0.3 s, a hit shakes and puffs the vapour, the pointer attracts from outside the mass and pushes in over it. A few µs a frame. |
 | `matter/gpu.rs`, `service.rs` | One wgpu device (Metal / DX12) for every Bloom, created lazily on the `bloom-matter` thread. The UI posts the frame's uniforms and paints the newest finished frame (one frame behind, never waiting). |
 | `matter/surface.rs` | macOS: frames are NV12 IOSurface `CVPixelBuffer`s that wgpu renders into through Metal textures made from the IOSurface planes, shown with `Window::paint_surface` (zero-copy; three rotate). Elsewhere frames are read back as BGRA and uploaded with `paint_image`. |
-| `stage.rs` | The GPUI element: the frame, the sixteen swatches, the gestures. |
+| `stage.rs` | The GPUI element: the frame, its pacing and resolution, the gestures. |
+| `pads.rs` | The sixteen sounds as pads under the window's stage (colour, number, role, lit while playing). |
+| `knobs.rs` | Every knob in one table (parameter, window group, one-line tooltip); the card shows a prefix. |
 
-Frames are at most 512 device pixels on their long side (scaled up by the
-GPU). The stage draws at full rate while it moves (hits, the pointer, a
-drag) and breathes at about 12 frames a second when idle, only while shown;
-with reduced motion it is one still frame, redrawn when the look changes.
-Without a GPU adapter the CPU field below is drawn instead.
+Several sounds show at once: up to four playing sounds (`frame::Voice`)
+each tint a patch of the film and the rim around their own place on the mass
+(a golden-angle spiral over the side facing the viewer) while they sound; a
+hit sends a ripple ring across its patch and throws a droplet in the sound's
+colour that spins, falls back and melts in. Behind the mass a glow in the
+playing sounds' colours (the selected sound's, faintly, at rest) swells with
+the output level: added light on dark panels, a dyed wash on pale ones. The
+vapour takes their colours and fades out before the panel's edges.
+
+Pacing (`stage::pace`, tested as a pure function): every display frame
+while the device sounds (an envelope or the output above 1 %, or a hit
+counter moving), while the transport plays with hits up to 4 s apart, for
+1.5 s after the sound stops, and while the pointer or a drag moves it; about
+12 frames a second (the idle breathing) otherwise. A stage that is clipped
+away, scrolled off or in an occluded window draws nothing. Reduced motion is
+one still frame; low power draws at the breathing rate while it sounds and
+not at all when silent.
+
+Resolution: a moving frame gets as many device pixels as the GPU affords,
+native when it can: the budget (start 0.9 MP, never under 0.3 MP, more
+than twice the old 512 px cap) shrinks while the render thread's frame
+costs more than 4 ms and grows back while it costs less, in steps of 1/8 of
+the scale so buffers rarely change size; the idle breathing and a still
+frame are native. Without a GPU adapter
+the CPU field below is drawn instead.
 
 | Measure | Becomes (per sound, on top of the material) |
 |---|---|

@@ -27,6 +27,11 @@ struct U {
     smoke_b: vec4f,
     smoke_c: vec4f,
     tint: vec4f,    // the sound's own colour (linear), how much it tints the light
+    glow: vec4f,    // output level (smoothed), the voices' summed level, the droplets' reach, 1 while a ripple or droplet lives
+    voice: array<vec4f, 4>, // each playing sound: colour (linear), level (0 = none)
+    vdir: array<vec4f, 4>,  // its place on the mass (unit direction), seconds since its hit (< 0: none)
+    drop: array<vec4f, 4>,  // its droplet: centre (units), radius (0 = none)
+    kick: vec4f,    // how hard each one's last hit was
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -198,14 +203,32 @@ fn detail_reach() -> f32 {
 // The distance, and a bound that ignores the spikes' steep cones (the body
 // and folds less the tallest spike): far from the spikes the march may step
 // by the bound, near them by the careful distance.
+// The droplets hits throw off the mass (one per playing sound, while it flies).
+fn droplets(p: vec3f) -> f32 {
+    var d = 1e3;
+    for (var i = 0; i < 4; i++) {
+        let r = u.drop[i].w;
+        if (r > 0.0) {
+            d = min(d, length(p - u.drop[i].xyz) - r);
+        }
+    }
+    return d;
+}
+
 fn map2(p: vec3f) -> vec2f {
     let t = u.res.z;
     let s = u.shape0.x;
     var d = body(p);
+    // Droplets and ripples only while a hit's live (a uniform branch).
+    let moving = u.glow.w > 0.0;
+    var dr = 1e3;
+    if (moving) {
+        dr = droplets(p);
+    }
     // Far from the surface the details cannot matter: skip them.
     let reach = detail_reach();
     if (d > reach + 0.1 * s) {
-        let b = d - reach;
+        let b = min(d - reach, dr);
         return vec2f(b, b);
     }
     let churn = u.shape0.w;
@@ -245,7 +268,11 @@ fn map2(p: vec3f) -> vec2f {
         let sway = 0.85 + 0.15 * sin(t * 3.0 + f.x);
         d -= pow(x, u.spikes.y) * h * sway * tallest;
     }
-    return vec2f(d, bound);
+    // Droplets pinch off and melt back in.
+    if (!moving) {
+        return vec2f(d, bound);
+    }
+    return vec2f(smin(d, dr, 0.14 * s), min(bound, dr));
 }
 
 fn normal_at(p: vec3f, e: f32) -> vec3f {
@@ -419,7 +446,9 @@ fn march(ro: vec3f, rd: vec3f, pixel: f32) -> Hit {
     h.near_ratio = 1e9;
     h.near_t = 0.0;
     let s = u.shape0.x;
-    let reach = s * (1.25 + 0.15 * u.shape0.y) + u.shape1.x * s * 0.9 + u.spikes.x * 0.45 * s + 0.3 * s * max(u.cursor.z * u.cursor.w, 0.0) + u.shape1.w * s;
+    let mass = s * (1.25 + 0.15 * u.shape0.y) + u.shape1.x * s * 0.9 + u.spikes.x * 0.45 * s + 0.3 * s * max(u.cursor.z * u.cursor.w, 0.0) + u.shape1.w * s;
+    // Droplets that fly beyond it are drawn as spheres (see `fs_matter`).
+    let reach = mass;
     // Bounding sphere.
     let b = dot(ro, rd);
     let c = dot(ro, ro) - reach * reach;
@@ -453,8 +482,86 @@ fn march(ro: vec3f, rd: vec3f, pixel: f32) -> Hit {
     return h;
 }
 
-fn shade(p: vec3f, rd: vec3f, n: vec3f) -> vec3f {
+// A colour pushed away from its grey (the sounds' colours are soft pastels;
+// on the mass and in the glow they need more chroma to read).
+fn vivid(c: vec3f, k: f32) -> vec3f {
+    let g = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+    return max(mix(vec3f(g), c, k), vec3f(0.0));
+}
+
+// The playing sounds over the surface: each colours a patch around its place
+// on the mass while it sounds, and its hit's ripple ring. Returns the mixed
+// colour (linear, weighted) and the total weight.
+fn voice_field(dir: vec3f) -> vec4f {
+    var c = vec3f(0.0);
+    var w = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let lv = u.voice[i].w;
+        if (lv > 0.0) {
+            let k = max(dot(dir, u.vdir[i].xyz), 0.0);
+            let k2 = k * k;
+            var wi = k2 * k2 * k * (0.25 + 0.75 * sqrt(lv)) * min(lv * 4.0, 1.0);
+            let age = u.vdir[i].w;
+            if (age >= 0.0) {
+                let a = sqrt(max(2.0 - 2.0 * dot(dir, u.vdir[i].xyz), 0.0));
+                let x = a - (0.12 + age * 1.5);
+                wi += exp(-x * x * 60.0) * exp(-age * 2.2) * u.kick[i] * 1.4;
+            }
+            c += u.voice[i].rgb * wi;
+            w += wi;
+        }
+    }
+    return vec4f(c, w);
+}
+
+// The colour and the weight of the playing sounds, all over (the glow, the vapour).
+fn voices_mix() -> vec4f {
+    var c = vec3f(0.0);
+    var w = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let lv = u.voice[i].w;
+        c += u.voice[i].rgb * lv;
+        w += lv;
+    }
+    return vec4f(c, w);
+}
+
+// Which droplet `p` sits on (index) and how much (0..1).
+fn droplet_at(p: vec3f) -> vec2f {
+    var best = 0.0;
+    var at = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let r = u.drop[i].w;
+        if (r > 0.0) {
+            let k = 1.0 - smoothstep(0.0, r * 0.9, length(p - u.drop[i].xyz) - r * 0.6);
+            if (k > best) {
+                best = k;
+                at = f32(i);
+            }
+        }
+    }
+    return vec2f(at, best);
+}
+
+fn shade(p: vec3f, rd: vec3f, n0: vec3f) -> vec3f {
     let t = u.res.z;
+    // A hit's ripple: a ring running out over its sound's patch, bending the
+    // reflections (in the shading only: the march stays as cheap as at rest).
+    var n = n0;
+    if (u.glow.w > 0.0) {
+        let pd = normalize(p - vec3f(0.0, -0.06, 0.0));
+        for (var i = 0; i < 4; i++) {
+            let age = u.vdir[i].w;
+            if (age >= 0.0) {
+                let c = u.vdir[i].xyz;
+                let a = sqrt(max(2.0 - 2.0 * dot(pd, c), 0.0));
+                let x = a - (0.12 + age * 1.5);
+                let w = cos(x * 22.0) * exp(-x * x * 40.0) * exp(-age * 2.6) * u.kick[i];
+                let away = pd - c * dot(pd, c);
+                n = normalize(n + away * (w * 0.6 / max(length(away), 1e-3)));
+            }
+        }
+    }
     let v = -rd;
     let ndv = clamp(dot(n, v), 0.0, 1.0);
     let rough = clamp(u.mat1.x, 0.0, 1.0);
@@ -464,7 +571,15 @@ fn shade(p: vec3f, rd: vec3f, n: vec3f) -> vec3f {
     let r = reflect(rd, n);
     // The film: thickness wanders over the surface; the sound shifts it.
     let film = u.mat1.w + u.mat2.y + u.mat2.x * (0.5 + 0.5 * vnoise(p * 2.2 + vec3f(0.0, t * 0.05, 0.0)));
-    let irid = thin_film(ndv, film);
+    var irid = thin_film(ndv, film);
+    // The playing sounds tint the film over their patches.
+    var vf = vec4f(0.0);
+    if (u.glow.y > 0.0) {
+        vf = voice_field(normalize(p - vec3f(0.0, -0.06, 0.0)));
+    }
+    let vw = clamp(vf.w, 0.0, 1.0);
+    let vc = vivid(vf.rgb / max(vf.w, 1e-4), 1.8);
+    irid = mix(irid, irid * vc * 1.6 + vc * 0.3, vw * 0.8);
     let grazing = pow(1.0 - ndv, 1.5);
     let iw = u.mat1.z * (0.22 + 0.78 * grazing);
     let f0 = mix(vec3f(0.04), albedo, metal);
@@ -496,7 +611,9 @@ fn shade(p: vec3f, rd: vec3f, n: vec3f) -> vec3f {
 
     // The rim: a bright edge on the silhouette, tinted by the film.
     let rim = pow(1.0 - ndv, 4.0) * u.mat2.z;
-    col += rim * mix(vec3f(0.9, 0.92, 1.0), irid * 1.6, 0.55 * u.mat1.z) * mix(1.0, 0.7, u.bg.w);
+    col += rim * mix(mix(vec3f(0.9, 0.92, 1.0), irid * 1.6, 0.55 * u.mat1.z), vc * 1.5, vw * 0.7) * mix(1.0, 0.7, u.bg.w);
+    // The sounds glow through the film: strongest at grazing angles and in the creases.
+    col += vc * vw * (0.04 + 0.4 * grazing + 0.2 * (1.0 - ao)) * mix(1.0, 0.75, u.bg.w);
 
     // Glass: what lies behind, bent and tinted, plus the reflections.
     if (u.mat2.w > 0.0) {
@@ -518,6 +635,17 @@ fn shade(p: vec3f, rd: vec3f, n: vec3f) -> vec3f {
         let flicker = 0.75 + 0.25 * vnoise(p * 3.5 + vec3f(0.0, t * 0.6, 0.0));
         let glow = (vein * (0.9 + 1.5 * u.spikes.w) + pow(crease, 1.5) * 1.6 + pow(1.0 - ndv, 3.0) * 0.12) * flicker;
         col += u.mat3.rgb * u.mat3.w * glow;
+    }
+
+    // A droplet is a glossy bead of its sound's colour.
+    var dp = vec2f(0.0);
+    if (u.glow.w > 0.0) {
+        dp = droplet_at(p);
+    }
+    if (dp.y > 0.0) {
+        let dc = vivid(u.voice[i32(dp.x)].rgb, 1.9);
+        let bead = dc * (0.2 + 0.8 * diff) + environment(r, 0.04) * fres * 0.8 + dc * pow(1.0 - ndv, 2.0) * 0.9;
+        col = mix(col, bead, dp.y);
     }
     return col * u.mat4.y;
 }
@@ -542,18 +670,36 @@ fn fs_matter(in: VsOut) -> @location(0) vec4f {
     let light = u.bg.w;
     let s = u.shape0.x;
 
-    // The panel: the theme's colour with a soft lift behind the mass.
+    // The panel: the theme's colour with a soft lift behind the mass and a
+    // vignette, and a glow in the colours of what plays (the selected
+    // sound's, faintly, at rest) that swells with the output.
+    let vm = voices_mix();
+    let playing = clamp(vm.w * 2.0, 0.0, 1.0);
+    let gcol = vivid(mix(u.tint.rgb, vm.rgb / max(vm.w, 1e-4), playing), 1.7);
+    let energy = clamp(0.18 + 1.1 * u.glow.x + 0.45 * min(u.glow.y, 1.0), 0.0, 1.3);
     var col = u.bg.rgb;
     let lift = exp(-dot(p * vec2f(0.55, 0.75), p * vec2f(0.55, 0.75)) * 1.4);
-    col *= 1.0 + lift * mix(0.10, 0.045, light);
-    // The shadow it casts on the panel below.
+    let vignette = 1.0 - mix(0.22, 0.10, light) * smoothstep(0.5, 2.4, length(p * vec2f(0.62, 0.85)));
+    col *= vignette * (1.0 + lift * mix(0.10, 0.06, light));
+    let halo = exp(-dot(p * vec2f(0.6, 0.68), p * vec2f(0.6, 0.68)) * 1.3);
+    // Dark panels take the colour as light; pale ones as a dyed wash, so they stay pale.
+    let lit = col + gcol * halo * energy * 0.12;
+    let wash = exp(-dot(p * vec2f(0.5, 0.6), p * vec2f(0.5, 0.6)) * 0.8);
+    let dyed = mix(col, col * (0.45 + gcol * 0.8), clamp(wash * energy * 0.85, 0.0, 0.7));
+    col = mix(lit, dyed, light);
+    // The shadow it casts on the panel below, with the glow's bounce in it.
     let sy = -0.70 * s;
     let sd = (p - vec2f(0.0, sy)) / vec2f(0.62 * s, 0.10 * s);
     let shadow = exp(-dot(sd, sd)) * 0.7 + exp(-dot(sd * 0.45, sd * 0.45)) * 0.25;
     col *= 1.0 - shadow * mix(0.55, 0.32, light);
+    col += gcol * exp(-dot(sd * 0.5, sd * 0.5)) * energy * playing * mix(0.10, 0.05, light);
 
-    // The vapour behind the mass.
-    let vap = vapour(p);
+    // The vapour behind the mass, tinted by what plays.
+    var vap = vapour(p);
+    // It fades out before the panel's edges instead of being cut by them.
+    let edge = min(min(px.y, u.res.y - px.y), min(px.x, u.res.x - px.x));
+    let fade = smoothstep(0.0, 0.18 * min(u.res.x, u.res.y), edge);
+    vap = vec4f(mix(vap.rgb, mix(vap.rgb, gcol, 0.75), playing * 0.8), vap.a * fade);
     col = mix(col, vap.rgb, vap.a);
 
     // The mass.
@@ -578,6 +724,33 @@ fn fs_matter(in: VsOut) -> @location(0) vec4f {
         col = mix(col, decode(m), cover);
         // A little vapour in front where it leaves the surface.
         col = mix(col, vap.rgb, vap.a * 0.35 * smoothstep(0.0, 0.25, p.y - 0.15 * s));
+    }
+    // A droplet out beyond the mass: an exact sphere (cheap, and crisp at any size).
+    if (u.glow.w > 0.0 && cover < 1.0) {
+        var best = 1e9;
+        var at = vec4f(0.0);
+        for (var i = 0; i < 4; i++) {
+            let r = u.drop[i].w;
+            if (r > 0.0) {
+                let oc = ro - u.drop[i].xyz;
+                let b = dot(oc, rd);
+                let miss = sqrt(max(dot(oc, oc) - b * b, 0.0));
+                let t = -b - sqrt(max(r * r - miss * miss, 0.0));
+                // Coverage from how far the ray passes from the rim, in pixels.
+                let k = clamp((r - miss) / (pixel * max(t, 1.0)) + 0.5, 0.0, 1.0);
+                if (k > 0.0 && t < best) {
+                    best = t;
+                    at = vec4f(f32(i), t, k, 0.0);
+                }
+            }
+        }
+        if (best < 1e8) {
+            let i = i32(at.x);
+            let pos = ro + rd * at.y;
+            let n = normalize(pos - u.drop[i].xyz);
+            let m = tonemap(shade(pos, rd, n));
+            col = mix(col, decode(m), at.z * (1.0 - cover));
+        }
     }
     let a = corner_mask(px);
     return vec4f(encode(col) * a, a);

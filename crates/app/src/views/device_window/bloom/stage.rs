@@ -20,17 +20,16 @@ use super::matter::service::{self, Image, Status};
 use super::matter::uniforms::Uniforms;
 use super::view::{self, CellDrag};
 use super::visual::audition;
-use crate::icons::{Icon, icon};
 use crate::theme::*;
 use crate::views::device_ui::Dev;
-use crate::widgets::{self, label, mono};
+use crate::widgets::mono;
 use crate::workspace::{DraggedSample, Workspace};
 use aitrack_stock::instrument::bloom::genome::{SOUNDS, Scene};
 use aitrack_stock::instrument::bloom::p;
 use aitrack_stock::instrument::bloom::timbre::Timbre;
 use gpui::{
-    AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    StatefulInteractiveElement, Styled, canvas, div, point, px,
+    AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    StatefulInteractiveElement, Styled, canvas, div, px,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -38,8 +37,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// The longest side of a frame, device pixels (frames are scaled up by the GPU).
-pub const MAX_SIDE: f32 = 512.0;
 /// Height of the swatch row at the bottom of the stage.
 pub const SWATCHES_H: f32 = 56.0;
 
@@ -52,6 +49,8 @@ pub struct Opts {
     pub outer: gpui::Hsla,
     /// Which stage of the device this is (several can show in one window).
     pub slot: u8,
+    /// How much bigger the mass is than the window's fit (small stages fill up).
+    pub zoom: f32,
 }
 
 /// The newest frame a window shows.
@@ -92,10 +91,23 @@ pub struct StageState {
     pub moving: bool,
     /// The material menu is open.
     pub menu: bool,
+    /// The species menu is open.
+    pub species_menu: bool,
+    /// Gene groups folded in the gene editor (bit per group).
+    pub folded: u16,
     /// The tab under the stage (DNA, Morph, Play, Tools).
     pub tab: usize,
-    /// UI-side cost of the last frame, ms.
+    /// UI-side cost of the last frame, ms (the stage's own work only).
     pub cost: Rc<Cell<f32>>,
+    /// What building the window's editor cost the UI thread last frame, ms.
+    pub build_ms: f32,
+    /// How often the stage draws now (see [`pace`]).
+    pub pace: Pace,
+    /// When the device last sounded (a hit, an envelope, output).
+    sounded: Option<Instant>,
+    seen_hits: Option<[f32; SOUNDS]>,
+    /// Device pixels a frame may have while it moves (adapts to the GPU's cost).
+    pub budget: Rc<Cell<f32>>,
 }
 
 impl StageState {
@@ -105,11 +117,94 @@ impl StageState {
     }
 
     /// Whether the idle breathing wants a frame now (about 12 a second while
-    /// the stage was painted in the last two seconds).
+    /// the stage was painted, on screen, in the last two seconds).
     pub fn wants_tick(&self) -> bool {
-        !self.reduced && self.painted.get().is_some_and(|t| (0.08..2.0).contains(&t.elapsed().as_secs_f32()))
+        self.pace == Pace::Breathe && self.painted.get().is_some_and(|t| (0.08..2.0).contains(&t.elapsed().as_secs_f32()))
     }
 }
+
+/// How often a stage draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pace {
+    /// Every display frame: the device sounds, or the matter still moves.
+    Full,
+    /// About 12 frames a second (the idle breathing; low power while it sounds).
+    #[default]
+    Breathe,
+    /// No frames (reduced motion, or the stage is not on screen).
+    Still,
+}
+
+/// What a device's sound is doing this frame (from its meter and the transport).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Activity {
+    /// The loudest sound's envelope, 0..1.
+    pub loudest: f32,
+    /// Output RMS, linear.
+    pub level: f32,
+    /// A hit counter moved since the last frame.
+    pub hit: bool,
+    pub playing: bool,
+}
+
+/// An envelope or output level above this is sound.
+pub const SOUNDING: f32 = 0.01;
+/// Seconds the full rate holds after the sound stops (the matter settles).
+pub const SETTLE_S: f32 = 1.5;
+/// While the transport plays, the full rate holds this long between hits.
+pub const BETWEEN_HITS_S: f32 = 4.0;
+
+impl Activity {
+    pub fn sounding(&self) -> bool {
+        self.hit || self.loudest > SOUNDING || self.level > SOUNDING
+    }
+}
+
+/// How often a stage draws: every frame while its device sounds (and while
+/// the transport plays with hits a few seconds apart, and for a moment after,
+/// while the matter settles), the idle breathing otherwise. A stage that is
+/// not on screen draws nothing; reduced motion is one still frame; low power
+/// draws at the breathing rate at most and not at all when silent.
+/// `quiet_for`: seconds since the device last sounded.
+pub fn pace(a: Activity, quiet_for: f32, moving: bool, shown: bool, reduced: bool, low_power: bool) -> Pace {
+    if !shown || reduced {
+        return Pace::Still;
+    }
+    let live = a.sounding() || moving || quiet_for < SETTLE_S || (a.playing && quiet_for < BETWEEN_HITS_S);
+    match (live, low_power) {
+        (true, false) => Pace::Full,
+        (true, true) | (false, false) => Pace::Breathe,
+        (false, true) => Pace::Still,
+    }
+}
+
+/// The scale (device pixels per logical pixel) of a frame for a stage of
+/// `w` × `h` logical px on a display of `native` device px per px, with at
+/// most `budget` device pixels: native when it fits, else as much as fits,
+/// never under a quarter.
+pub fn frame_scale(w: f32, h: f32, native: f32, budget: f32) -> f32 {
+    let area = (w * h).max(1.0);
+    native.min((budget / area).sqrt()).max(0.25)
+}
+
+/// The next pixel budget from the render thread's cost of the last frame:
+/// shrinks while frames cost more than `target` ms, grows back while they
+/// cost less (bounded, and gently, so it never oscillates frame to frame).
+pub fn adapt_budget(budget: f32, cost_ms: f32, target_ms: f32) -> f32 {
+    if cost_ms <= 0.0 {
+        return budget;
+    }
+    let k = (target_ms / cost_ms).clamp(0.8, 1.06);
+    (budget * k).clamp(MIN_BUDGET, MAX_BUDGET)
+}
+
+/// Device pixels a moving frame starts with and its bounds.
+pub const START_BUDGET: f32 = 900_000.0;
+pub const MIN_BUDGET: f32 = 300_000.0;
+pub const MAX_BUDGET: f32 = 4_000_000.0;
+/// What a frame may cost the render thread, ms (the raymarch and the NV12
+/// conversion; a quarter of a 60 Hz frame).
+pub const TARGET_MS: f32 = 4.0;
 
 fn timbre_key(t: &Timbre, light: bool) -> u64 {
     let mut h: u64 = if light { 0x9E37_79B9 } else { 0x85EB_CA6B };
@@ -158,16 +253,38 @@ fn area(b: Bounds<Pixels>, swatches: bool) -> (f32, f32, f32, f32) {
 }
 
 /// The panel of a stage at `k` device pixels per logical pixel.
-fn panel(b: Bounds<Pixels>, swatches: bool, k: f32, corner: f32, bg: [f32; 3], light: bool, outer: [f32; 3]) -> Panel {
+#[allow(clippy::too_many_arguments)]
+fn panel(b: Bounds<Pixels>, swatches: bool, zoom: f32, k: f32, corner: f32, bg: [f32; 3], light: bool, outer: [f32; 3]) -> Panel {
     let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
     let (x, y, aw, ah) = area(b, swatches);
-    Panel::fit((w * k).round(), (h * k).round(), (x * k, y * k, aw * k, ah * k), corner * k, bg, light, outer)
+    Panel::fit((w * k).round(), (h * k).round(), (x * k, y * k, aw * k, ah * k), corner * k, bg, light, outer).zoomed(zoom)
 }
 
 /// The pointer at `pos` in the mass's units, for a stage of bounds `b`.
-fn units(b: Bounds<Pixels>, swatches: bool, pos: Point<Pixels>) -> (f32, f32) {
-    let pl = panel(b, swatches, 1.0, 0.0, [0.0; 3], false, [0.0; 3]);
+fn units(b: Bounds<Pixels>, swatches: bool, zoom: f32, pos: Point<Pixels>) -> (f32, f32) {
+    let pl = panel(b, swatches, zoom, 1.0, 0.0, [0.0; 3], false, [0.0; 3]);
     pl.units(f32::from(pos.x - b.origin.x), f32::from(pos.y - b.origin.y))
+}
+
+/// What the device is doing, and its meter as the matter reads it: the
+/// envelopes, pulses and hit counters (or the `bloomplay` dev view's
+/// synthetic beat, which plays its lit cells in turn).
+fn live_meter(dev: &Dev, fake: Option<[f32; SOUNDS]>, time: f32) -> ([f32; SOUNDS], [f32; SOUNDS], [f32; SOUNDS], f32) {
+    let mut env: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(i));
+    let mut pulse: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(16 + i));
+    let mut hits: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(32 + i));
+    let mut level = dev.m(80);
+    if let Some(fake) = fake {
+        for i in 0..SOUNDS {
+            let at = time * 2.0 + i as f32 * 0.37;
+            let beat = (at % 2.0) / 2.0;
+            env[i] = fake[i] * (-beat * 4.0).exp();
+            pulse[i] = fake[i] * (-beat * 14.0).exp();
+            hits[i] = if fake[i] > 0.0 { (at / 2.0).floor() } else { 0.0 };
+        }
+        level = (0.2 * env.iter().sum::<f32>()).min(0.9);
+    }
+    (env, pulse, hits, level)
 }
 
 /// Whether the GPU stage can draw (starts the render thread on first ask).
@@ -221,68 +338,92 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
     }
     let device = dev.id;
     let changed = view::poll(ws, dev, cx);
-    let reduced = ws.look.app.reduced_motion || ws.look.app.low_power;
+    let reduced = ws.look.app.reduced_motion;
+    let low_power = ws.look.app.low_power;
+    let playing = ws.b.engine.transport().playing;
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
-    let mut shown = view::played(ws, dev, scene);
     let matching = ws.fx.bloom.view(device).matching.as_ref().map(|m| (m.cell, m.fraction, m.best));
-    if let Some((cell, _, Some(best))) = matching {
-        shown.sounds[cell] = best;
-    }
-    let looks = sound_looks(ws, dev, &shown);
-    let colours = view::looks(ws, &shown, view::Shape::of(dev));
+    let looks = match matching {
+        Some((cell, _, Some(best))) => {
+            let mut shown = view::played(ws, dev, scene);
+            shown.sounds[cell] = best;
+            sound_looks(ws, dev, &shown)
+        }
+        _ => {
+            let shown = view::played(ws, dev, scene);
+            sound_looks(ws, dev, &shown)
+        }
+    };
     let material = view::parsed(ws, device).material;
     let busy = ws.fx.bloom.busy();
     let v = ws.fx.bloom.view(device);
-    // The meter, or the synthetic activity of the `bloomplay` dev view.
-    let mut env: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(i));
-    let mut pulse: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(16 + i));
-    if let Some(fake) = v.fake {
-        let phase = v.stage.anim.time;
-        for i in 0..SOUNDS {
-            let beat = ((phase * 2.0 + i as f32 * 0.37) % 2.0) / 2.0;
-            env[i] = fake[i] * (-beat * 4.0).exp();
-            pulse[i] = fake[i] * (-beat * 14.0).exp();
-        }
-    }
+    let (env, pulse, hits, level) = live_meter(dev, v.fake, v.stage.anim.time);
     let now = Instant::now();
     let st = &mut v.stage;
     let dt = st.last.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32());
     st.last = Some(now);
     st.reduced = reduced;
+    let hit = st.seen_hits.is_some_and(|h| h != hits);
+    st.seen_hits = Some(hits);
+    let activity = Activity { loudest: env.iter().copied().fold(0.0, f32::max), level, hit, playing };
+    if activity.sounding() {
+        st.sounded = Some(now);
+    }
+    let quiet_for = st.sounded.map_or(f32::INFINITY, |t| now.duration_since(t).as_secs_f32());
     let cursor = st.cursor;
-    let moving = st.anim.step(dt, &Live { env: &env, pulse: &pulse, looks: &looks, selected }, cursor, reduced);
+    let moving = st.anim.step(dt, &Live { env: &env, pulse: &pulse, looks: &looks, selected, hits: &hits, level }, cursor, reduced);
     st.moving = moving;
+    let dragging = v.drag.is_some();
+    let st = &mut v.stage;
+    st.pace = pace(activity, quiet_for, moving || changed || busy || dragging, true, reduced, low_power);
+    let rate = st.pace;
     let anim = st.anim;
     let frames = st.frames.clone();
     let painted = st.painted.clone();
     let cost = st.cost.clone();
-    let dragging = v.drag.is_some();
-    let animate = !reduced && (moving || changed || busy || dragging);
+    let budget = st.budget.clone();
+    if budget.get() <= 0.0 {
+        budget.set(START_BUDGET);
+    }
     let pal = p();
     let light = !pal.dark;
     let bg = linear(pal.well);
     let outer = encoded(opts.outer);
     let seed = scene.seed as f32 % 997.0 + selected as f32 * 0.37;
     let corner = r_md();
-    let swatches = opts.swatches;
+    let (swatches, zoom) = (opts.swatches, opts.zoom);
     let key_base = device.0 << 24 | u64::from(opts.slot) << 16;
     let region = ws.fx.region(device, 9 + opts.slot);
     let store = region.clone();
     let well = pal.well;
+    let ui_ms = t0.elapsed().as_secs_f32() * 1000.0;
     let surface = canvas(
         move |b, _, _| store.set(b),
         move |b, _, window, _| {
             let p0 = Instant::now();
             let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
-            if w < 8.0 || h < 8.0 {
+            // Clipped away or scrolled off: no work, no frames (an occluded
+            // window gets no frames from GPUI in the first place).
+            if w < 8.0 || h < 8.0 || !window.content_mask().bounds.intersects(&b) {
                 return;
             }
-            let k = window.scale_factor().min(MAX_SIDE / w.max(h)).max(0.25);
-            let pl = panel(b, swatches, k, corner, bg, light, outer);
+            let svc = service::service();
+            // Moving frames get as many pixels as the GPU affords (native when
+            // it can); the slow breathing and a still frame are native.
+            let native = window.scale_factor();
+            let k = match rate {
+                Pace::Full => {
+                    budget.set(adapt_budget(budget.get(), svc.cost_ms(), TARGET_MS));
+                    frame_scale(w, h, native, budget.get())
+                }
+                Pace::Breathe | Pace::Still => native,
+            };
+            // In steps of 1/8, so the render thread's buffers rarely change size.
+            let k = ((k * 8.0).floor() / 8.0).max(0.25);
+            let pl = panel(b, swatches, zoom, k, corner, bg, light, outer);
             let u = anim.uniforms(material, &pl, seed);
             let wid = window.window_handle().window_id().as_u64();
             let key = key_base ^ wid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let svc = service::service();
             let mut frames = frames.borrow_mut();
             let slot = frames.slots.entry(key).or_default();
             if slot.last != Some(u) {
@@ -317,11 +458,11 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
                 Some(Shown::Surface(s)) => window.paint_surface(b, s.0.clone()),
                 None => window.paint_quad(gpui::fill(b, well).corner_radii(px(corner))),
             }
-            if animate || slot.seen < slot.sent {
+            if rate == Pace::Full || slot.seen < slot.sent {
                 window.request_animation_frame();
             }
             painted.set(Some(Instant::now()));
-            let ms = (p0.elapsed() + t0.elapsed()).as_secs_f32() * 1000.0;
+            let ms = ui_ms + p0.elapsed().as_secs_f32() * 1000.0;
             cost.set(if cost.get() == 0.0 { ms } else { cost.get() * 0.9 + ms * 0.1 });
         },
     )
@@ -345,7 +486,7 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
     });
     let (d, r) = (dev.clone(), region.clone());
     let hover = cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
-        let at = units(r.get(), swatches, e.position);
+        let at = units(r.get(), swatches, zoom, e.position);
         this.fx.bloom.view(d.id).stage.cursor = Some(at);
         cx.notify();
     });
@@ -400,9 +541,6 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
                 .child(mono(format!("Matching {name} into {:02} · {:.0}%", cell + 1, f * 100.), TEXT_XS, pal.accent2)),
         );
     }
-    if swatches {
-        root = root.child(swatch_row(ws, dev, scene, &colours, &env, cx));
-    }
     if ws.fx.bloom.view(device).drag.is_some() {
         root = root.child(capture(dev, cx));
     }
@@ -413,76 +551,6 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
 pub fn colour(look: &super::look::Look) -> gpui::Hsla {
     let e = super::look::encode;
     gpui::Rgba { r: e(look.rgb[0]), g: e(look.rgb[1]), b: e(look.rgb[2]), a: 1. }.into()
-}
-
-/// The sixteen sounds as glossy swatches in their own colours: click to
-/// select and hear one, Alt-click to lock it.
-fn swatch_row(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[super::look::Look; SOUNDS], env: &[f32; SOUNDS], cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
-    let matching = ws.fx.bloom.view(dev.id).matching.as_ref().map(|m| (m.cell, m.fraction));
-    let mut row = div().flex().items_start().justify_center().gap(px(SP1));
-    for i in 0..SOUNDS {
-        let c = colour(&colours[i]);
-        let on = i == selected;
-        let lit = env[i].clamp(0.0, 1.0);
-        let locked = scene.locked(i);
-        let deep = gpui::Hsla { l: (c.l * 0.45).max(0.08), ..c };
-        let shine = gpui::Hsla { l: (c.l + 0.3).min(0.95), s: c.s * 0.6, ..c };
-        let d = dev.clone();
-        let mut pebble = div()
-            .relative()
-            .size(px(20.))
-            .rounded_full()
-            .bg(gpui::linear_gradient(150., gpui::linear_color_stop(c, 0.), gpui::linear_color_stop(deep, 1.)))
-            .border_1()
-            .border_color(if on { pal.text } else { with_alpha(c, 0.4) })
-            .child(div().absolute().top(px(3.)).left(px(4.)).w(px(6.)).h(px(4.)).rounded_full().bg(with_alpha(shine, 0.85)));
-        if lit > 0.02 {
-            pebble = pebble.shadow(vec![gpui::BoxShadow { color: with_alpha(c, 0.7 * lit), offset: point(px(0.), px(0.)), blur_radius: px(4. + 8. * lit), spread_radius: px(1.), inset: false }]);
-        }
-        if locked {
-            pebble = pebble.child(div().absolute().top(px(-4.)).right(px(-4.)).child(icon(Icon::Lock, 8., pal.accent)));
-        }
-        let caption = match matching {
-            Some((cell, f)) if cell == i => mono(format!("{:.0}%", f * 100.), TEXT_XS, pal.accent2),
-            _ => label(scene.sounds[i].role.short(), TEXT_XS, if on { pal.text } else { pal.faint }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }),
-        };
-        row = row.child(
-            div()
-                .id(("bloom-swatch", dev.key(0x500 | i)))
-                .w(px(28.))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(SP1))
-                .cursor_pointer()
-                .child(pebble)
-                .child(caption)
-                .tooltip(widgets::tip_owned(format!("{:02} {}\nClick to hear · Alt-click locks", i + 1, scene.sounds[i].role.label())))
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    if e.modifiers.alt {
-                        view::toggle_lock(this, &d, i);
-                        cx.notify();
-                        return;
-                    }
-                    this.fx.bloom.view(d.id).dna_cell = Some(i);
-                    audition(this, &d, i, cx);
-                }))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.release_audition(cx))),
-        );
-    }
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .bottom(px(SP2))
-        .h(px(SWATCHES_H - SP2))
-        .flex()
-        .justify_center()
-        .child(div().px(px(SP2)).py(px(SP1)).rounded(px(r_lg())).bg(with_alpha(pal.surface, 0.55)).child(row))
-        .into_any_element()
 }
 
 /// Window-wide listeners while the mass is dragged (regrowing the selected sound).
@@ -544,17 +612,98 @@ fn capture(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::point;
 
     #[test]
     fn the_pointer_maps_into_the_mass_units() {
         let b = Bounds { origin: point(px(100.), px(50.)), size: gpui::size(px(400.), px(300. + SWATCHES_H)) };
-        let pl = panel(b, true, 1.0, 0.0, [0.0; 3], false, [0.0; 3]);
+        let pl = panel(b, true, 1.0, 1.0, 0.0, [0.0; 3], false, [0.0; 3]);
         assert_eq!(pl.scale, 300.0 * 0.54, "fitted into the area above the swatches");
-        let (x, y) = units(b, true, point(px(100. + pl.cx + pl.scale * 0.5), px(50. + pl.cy)));
+        let (x, y) = units(b, true, 1.0, point(px(100. + pl.cx + pl.scale * 0.5), px(50. + pl.cy)));
         assert!((x - 0.5).abs() < 1e-5 && y.abs() < 1e-5);
         // Two device pixels per point double every length.
-        let hi = panel(b, true, 2.0, 6.0, [0.0; 3], false, [0.0; 3]);
+        let hi = panel(b, true, 1.0, 2.0, 6.0, [0.0; 3], false, [0.0; 3]);
         assert_eq!((hi.width, hi.scale, hi.corner), (800.0, 2.0 * pl.scale, 12.0));
+        // A zoomed stage maps the pointer onto the bigger mass.
+        let z = panel(b, true, 1.25, 1.0, 0.0, [0.0; 3], false, [0.0; 3]);
+        let (x, _) = units(b, true, 1.25, point(px(100. + z.cx + z.scale * 0.5), px(50. + z.cy)));
+        assert!((x - 0.5).abs() < 1e-5 && z.scale == pl.scale * 1.25);
+    }
+
+    #[test]
+    fn a_sounding_device_animates_at_full_rate_then_settles() {
+        let quiet = Activity::default();
+        let hit = Activity { hit: true, ..quiet };
+        let ringing = Activity { loudest: 0.3, ..quiet };
+        let output = Activity { level: 0.05, ..quiet };
+        let playing = Activity { playing: true, ..quiet };
+        // Playing sound animates everywhere it is shown, hovered or not.
+        for a in [hit, ringing, output] {
+            assert_eq!(pace(a, 0.0, false, true, false, false), Pace::Full, "{a:?}");
+        }
+        // It settles for a moment after the sound stops, then breathes.
+        assert_eq!(pace(quiet, 1.0, false, true, false, false), Pace::Full);
+        assert_eq!(pace(quiet, SETTLE_S + 0.1, false, true, false, false), Pace::Breathe);
+        // The transport rolling between sparse hits keeps the full rate a while.
+        assert_eq!(pace(playing, 3.0, false, true, false, false), Pace::Full);
+        assert_eq!(pace(playing, BETWEEN_HITS_S + 1.0, false, true, false, false), Pace::Breathe);
+        assert_eq!(pace(playing, f32::INFINITY, false, true, false, false), Pace::Breathe, "a silent track does not burn frames");
+        // Motion of its own (a hover, a drag) is full rate too.
+        assert_eq!(pace(quiet, f32::INFINITY, true, true, false, false), Pace::Full);
+        // Hidden or scrolled away: nothing.
+        assert_eq!(pace(hit, 0.0, true, false, false, false), Pace::Still);
+        // Reduced motion: one still frame. Low power: the breathing rate while it sounds, nothing when silent.
+        assert_eq!(pace(hit, 0.0, true, true, true, false), Pace::Still);
+        assert_eq!(pace(hit, 0.0, false, true, false, true), Pace::Breathe);
+        assert_eq!(pace(quiet, f32::INFINITY, false, true, false, true), Pace::Still);
+        // A quiet meter is not sound.
+        assert!(!Activity { loudest: SOUNDING * 0.5, level: SOUNDING * 0.5, ..quiet }.sounding());
+    }
+
+    #[test]
+    fn a_stage_frame_costs_the_ui_thread_well_under_a_millisecond() {
+        // What `stage` does each frame besides the cached lookups: every
+        // sound's live look under the knobs, the motion, the uniforms.
+        use super::super::matter::Material;
+        let base: [SoundLook; SOUNDS] = std::array::from_fn(|i| sound_look(&Timbre { centroid: 100.0 + 400.0 * i as f32, noisiness: 0.3, ..Default::default() }, false));
+        let knobs = Controls { decay: 0.3, grit: -0.2, ..Controls::default() };
+        let mut anim = super::super::matter::Animator::default();
+        let pl = Panel::fit(1800.0, 920.0, (0.0, 0.0, 1800.0, 920.0), 8.0, [0.2; 3], false, [0.0; 3]);
+        let n = 2_000;
+        let t0 = Instant::now();
+        let mut sink = 0.0;
+        for k in 0..n {
+            let env: [f32; SOUNDS] = std::array::from_fn(|i| ((k + i) % 7) as f32 / 7.0);
+            let hits: [f32; SOUNDS] = std::array::from_fn(|i| ((k + i) / 9) as f32);
+            let looks: [SoundLook; SOUNDS] = std::array::from_fn(|i| {
+                let live = Timbre { centroid: live_centroid(env[i]), noisiness: 0.4, ..Default::default() };
+                with_controls(&blend(&base[i], &sound_look(&live, false), 0.5 * env[i]), &knobs)
+            });
+            anim.step(1.0 / 60.0, &Live { env: &env, pulse: &env, looks: &looks, selected: k % SOUNDS, hits: &hits, level: 0.3 }, None, false);
+            let a = Activity { loudest: env[0], level: 0.3, hit: k % 9 == 0, playing: true };
+            sink += anim.uniforms(Material::Obsidian, &pl, 0.0).floats()[20] + pace(a, 0.1, false, true, false, false) as u8 as f32;
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        assert!(sink.is_finite());
+        assert!(per < 0.25, "{per} ms per frame");
+    }
+
+    #[test]
+    fn frames_are_native_when_they_fit_and_adapt_to_the_gpu() {
+        // A 900 × 460 stage on a Retina display: 1.66 M device pixels.
+        assert_eq!(frame_scale(900., 460., 2.0, 4_000_000.), 2.0, "native when it fits");
+        let k = frame_scale(900., 460., 2.0, 700_000.);
+        assert!(k < 2.0 && (900. * k * 460. * k - 700_000.).abs() < 1_000.);
+        // Even the least budget has twice the pixels the old 512 px cap gave.
+        const { assert!(MIN_BUDGET >= 2.0 * 512. * 262.) };
+        assert_eq!(frame_scale(10_000., 10_000., 2.0, 1_000.), 0.25, "never under a quarter");
+        // Too slow: fewer pixels; fast: more, gently, within bounds.
+        assert!(adapt_budget(700_000., 5.0, TARGET_MS) < 700_000.);
+        assert!(adapt_budget(700_000., 1.0, TARGET_MS) > 700_000.);
+        assert!(adapt_budget(700_000., 1.0, TARGET_MS) <= 700_000. * 1.06 + 1.);
+        assert_eq!(adapt_budget(MIN_BUDGET, 50.0, TARGET_MS), MIN_BUDGET);
+        assert_eq!(adapt_budget(MAX_BUDGET, 0.1, TARGET_MS), MAX_BUDGET);
+        assert_eq!(adapt_budget(700_000., 0.0, TARGET_MS), 700_000., "no measure yet");
     }
 
     #[test]

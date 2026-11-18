@@ -4,14 +4,15 @@
 //! species, the morph pad and the tools; the device window has everything,
 //! the material picker and the DNA panel included ([`window`]).
 
-use super::{Dev, caption, kit};
+use super::{Dev, kit};
+use crate::icons::Icon;
 use crate::theme::*;
-use crate::widgets::{label, mono};
+use crate::widgets::{self, mono};
 use crate::workspace::Workspace;
 use aitrack_model::{Color, Command, Device, DeviceId, Track, TrackKind};
 use aitrack_stock::instrument::bloom::genome::Species;
 use aitrack_stock::instrument::bloom::{self as bloom, p};
-use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, px};
+use gpui::{AnyElement, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px};
 
 /// The device window's editor and everything the visual is made of.
 #[path = "../device_window/bloom/mod.rs"]
@@ -25,44 +26,77 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
     }
     let pal = p();
     let scene = view::shown(ws, dev);
-    let w = if dev.big { 720. } else { 460. };
+    let layout = card_layout(dev.big);
     let selected = dev.choice(p::SELECTED).min(15);
-    // The same matter as the window, smaller, in a bezel its corners take the colour of.
+    // The same matter as the window, smaller and filling its square, in a
+    // bezel its corners take the colour of.
     let bezel = pal.surface;
-    let field = stage::stage(ws, dev, &scene, stage::Opts { swatches: false, outer: bezel, slot: 1 }, cx);
-    let mut side = div().flex_none().w(px(112.)).flex().flex_col().gap(px(SP1));
-    let buttons = window::grow_buttons(ws, dev, cx);
-    let mut it = buttons.into_iter();
-    let (roll, mutate) = (it.next(), it.next());
-    side = side.children(roll).children(mutate).child(div().flex().gap(px(SP1)).children(it)).child(kit::num_w(ws, dev, p::DEVIANCE, 112., cx));
-    let header = div()
+    let field = stage::stage(ws, dev, &scene, stage::Opts { swatches: false, outer: bezel, slot: 1, zoom: 1.2 }, cx);
+    let sound = format!("{:02} {}", selected + 1, scene.sounds[selected].role.label());
+    let overlay = |text: String, color: gpui::Hsla| div().px(px(SP1)).h(px(16.)).flex().items_center().rounded(px(r_sm())).bg(with_alpha(pal.surface, 0.72)).child(mono(text, TEXT_XS, color));
+    let well = div()
+        .id(("bloom-card-stage", dev.key(0x700)))
+        .relative()
         .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(SP2))
-        .child(caption("BLOOM"))
-        .child(label(scene.species.label(), TEXT_XS, pal.muted))
-        .child(div().flex_1())
-        .child(mono(format!("{} · {:02} {}", if scene.locked(selected) { "locked" } else { "sound" }, selected + 1, scene.sounds[selected].role.label()), TEXT_XS, pal.muted))
-        .child(kit::readout("SEED", format!("{:06}", scene.seed), pal.accent));
-    let mut macros = div().flex_none().flex().items_end().gap(px(SP1));
-    for id in [p::DECAY, p::BODY, p::TONE, p::GRIT] {
-        macros = macros.child(dial(dev, id, 26., cx));
+        .w(px(layout.stage_w))
+        .h_full()
+        .p(px(SP1))
+        .rounded(px(r_lg()))
+        .bg(bezel)
+        .border_1()
+        .border_color(border())
+        .tooltip(widgets::tip(window::TIP_STAGE, None))
+        .child(field)
+        .child(div().absolute().top(px(SP2)).left(px(SP2)).child(overlay(format!("{} · {:06}", scene.species.label(), scene.seed), pal.muted)))
+        .child(
+            div()
+                .absolute()
+                .bottom(px(SP2))
+                .left(px(SP2))
+                .flex()
+                .gap(px(SP1))
+                .child(overlay(sound, pal.text))
+                .when(scene.locked(selected), |d| d.child(overlay("locked".into(), pal.accent))),
+        );
+    // Roll and Mutate, the history, and the way into the window.
+    let d = dev.clone();
+    let open = widgets::sized_icon_button(("bloom-open", dev.key(0x701)), Icon::OpenWindow, false, 24., 14.)
+        .tooltip(widgets::tip(window::TIP_OPEN, None))
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            crate::views::device_window::open(this, d.id, cx);
+            cx.notify();
+        }));
+    let actions = div().flex_none().flex().items_center().gap(px(SP1)).children(window::grow_buttons(ws, dev, cx)).child(div().flex_1()).child(open);
+    // As many knobs of the table as the rows hold, in its order.
+    let has = |id: u32| dev.info(id).is_some();
+    let mut grid = div().flex().flex_wrap().gap(px(SP1)).content_start();
+    for k in window::knobs::first(layout.knobs, has) {
+        grid = grid.child(dial(dev, k.id, KNOB, cx));
     }
-    let mut panel = kit::panel(w)
-        .child(header)
-        .child(div().flex_1().min_h(px(96.)).flex().gap(px(SP2)).child(div().flex_1().min_w(px(0.)).h_full().p(px(SP1)).rounded(px(r_lg())).bg(bezel).border_1().border_color(border()).child(field)).child(side));
-    if dev.big {
-        macros = macros.child(dial(dev, p::SPACE, 26., cx)).child(dial(dev, p::VOLUME, 26., cx));
-        let morph = window::morph(ws, dev, 64., cx);
-        let tools = window::tools(ws, dev, cx);
-        panel = panel
-            .child(div().flex_none().flex().items_end().gap(px(SP3)).child(macros).child(morph).child(div().flex_1()).child(tools))
-            .child(window::species_chips(dev, &scene, cx));
-    } else {
-        panel = panel.child(macros);
-    }
-    panel.into_any_element()
+    let side = div().flex_1().min_w(px(0.)).flex().flex_col().gap(px(SP2)).child(actions).child(grid);
+    kit::panel(layout.width).child(div().flex_1().min_h(px(0.)).flex().gap(px(SP2)).child(well).child(side)).into_any_element()
+}
+
+/// The card's knob size.
+const KNOB: f32 = 24.;
+
+/// How the card is laid out at its two widths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardLayout {
+    pub width: f32,
+    pub stage_w: f32,
+    /// How many knobs of the table it shows.
+    pub knobs: usize,
+}
+
+/// The compact card (460 px) and the expanded one (720 px): the stage a
+/// square-ish well on the left, the knobs in two rows (three expanded) beside it.
+pub fn card_layout(big: bool) -> CardLayout {
+    let (width, stage_w, rows) = if big { (720., 232., 3) } else { (460., 168., 2) };
+    // The panel's padding, the gap to the stage.
+    let side = width - 2. * SP2 - stage_w - SP2;
+    CardLayout { width, stage_w, knobs: window::knobs::fit(side, window::dial_w(KNOB), SP1, rows) }
 }
 
 /// The dev-view words: `bloom` adds a Bloom on a new track with a seeded
@@ -107,4 +141,25 @@ pub fn dev_word(ws: &mut Workspace, word: &str) -> Option<DeviceId> {
         v.rings = vec![view::RingAnim { cell: 0, age: 0.12 }, view::RingAnim { cell: 6, age: 0.3 }, view::RingAnim { cell: 10, age: 0.05 }];
     }
     Some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_card_holds_the_macros_and_room_to_grow() {
+        let small = card_layout(false);
+        assert!(small.knobs >= 10, "{small:?}");
+        let shown: Vec<u32> = window::knobs::first(small.knobs, |_| true).map(|k| k.id).collect();
+        for id in [p::DECAY, p::BODY, p::TONE, p::GRIT, p::SPACE, p::VOLUME, p::TUNE, p::VELOCITY] {
+            assert!(shown.contains(&id), "{id}");
+        }
+        // The expanded card has room for the table and ten more rows.
+        let big = card_layout(true);
+        assert!(big.knobs >= window::knobs::KNOBS.len() + 10, "{big:?}");
+        for v in [small.width, small.stage_w, big.width, big.stage_w, KNOB] {
+            assert_eq!(v % 4., 0., "{v}");
+        }
+    }
 }

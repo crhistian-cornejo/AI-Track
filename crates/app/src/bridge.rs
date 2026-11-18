@@ -545,6 +545,33 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
             if playing { 6.4 } else { 0.0 },
             if playing { -8.0 + 3.0 * env } else { -120.0 },
         ]),
+        "instrument.bloom" => {
+            // A beat played on four sounds: a kick each beat, a hat each eighth,
+            // a snare on two and four, a perc on the off-beats (Bloom's layout:
+            // envelope, pulse, hit count, centroid, noisiness, then RMS and peak).
+            let mut v = [0.0f32; aitrack_stock::instrument::bloom::METER_LEN];
+            if playing {
+                let hit = |period: f32, offset: f32, i: usize, decay: f32, v: &mut [f32]| {
+                    let ph = ((beat - offset) / period).rem_euclid(1.0) * period;
+                    v[i] = (-ph * decay).exp();
+                    v[16 + i] = (-ph * 16.0).exp();
+                    v[32 + i] = ((beat - offset) / period).floor().rem_euclid(4096.0);
+                };
+                hit(1.0, 0.0, 0, 4.0, &mut v);
+                hit(0.5, 0.0, 6, 9.0, &mut v);
+                hit(2.0, 1.0, 10, 5.0, &mut v);
+                hit(1.0, 0.5, 13, 6.0, &mut v);
+                for (i, c, n) in [(0, 0.15, 0.05), (6, 0.85, 0.8), (10, 0.5, 0.6), (13, 0.62, 0.2)] {
+                    v[48 + i] = c;
+                    v[64 + i] = n;
+                }
+                let sum = v[..16].iter().sum::<f32>();
+                v[80] = (0.18 * sum).min(0.9);
+                v[81] = (0.3 * sum).min(1.0);
+                v[82] = 4.0 / aitrack_stock::instrument::bloom::VOICES as f32;
+            }
+            put(&v)
+        }
         "fx.saturator" => put(&[0.7 * env, 0.6 * env, 0.6 * env, 0.3 * hat * env.max(0.2), 0.25 * hat]),
         // Tape, amp and console publish their peaks (linear) and one activity value.
         "fx.tape" | "fx.amp" => put(&[0.7 * env, 0.6 * env, 0.5 * env + 0.1 * hat]),

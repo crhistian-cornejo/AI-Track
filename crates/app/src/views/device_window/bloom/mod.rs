@@ -1,15 +1,16 @@
-//! The Bloom window, laid out like a plugin: a top bar (title, seed, the
-//! species, the material picker), the generator on the left (Roll and
-//! Mutate, the history, Deviance, the selected sound's envelope, the macros,
-//! the export chip), the stage on the right (the matter and the sixteen
-//! swatches), and tabs under them (the DNA, Morph, Play, Tools). Rendered
-//! through the Workspace with the same commands as the Device View card.
+//! The Bloom window, laid out like a standalone instrument (`layout.rs`):
+//! a header, the generator, the stage with the sixteen pads, every knob
+//! grouped (`knobs.rs`), and tabs for the genes, the morph, the play settings
+//! and the tools. Rendered through the Workspace with the same commands as
+//! the Device View card.
 
 pub mod dna;
 pub mod field;
+pub mod knobs;
 pub mod layout;
 pub mod look;
 pub mod matter;
+pub mod pads;
 pub mod stage;
 pub mod view;
 pub mod visual;
@@ -23,21 +24,47 @@ use crate::views::device_ui::Dev;
 use crate::views::devices::knob_control_sized;
 use crate::widgets::{self, knob_cell, label, mono, text_button};
 use crate::workspace::{KnobTarget, Workspace};
-use aitrack_stock::instrument::bloom::genome::{SOUNDS, Scene, Species};
+use aitrack_stock::instrument::bloom::genome::SOUNDS;
 use aitrack_stock::instrument::bloom::p;
 use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
-/// A knob of `side` px with its name and value (cards use small ones).
+/// What every knob's tooltip says under its line.
+pub const KNOB_HINT: &str = "Drag · double-click resets · right-click: automate";
+
+/// A knob of `side` px with its name and value, in a cell `side + 24` px
+/// wide (cards use small ones). Drags are the usual parameter edits (they
+/// record and automate); right-click offers the knob's automation lane.
 pub fn dial(dev: &Dev, id: u32, side: f32, cx: &mut Context<Workspace>) -> AnyElement {
     let Some(info) = dev.info(id).cloned() else { return div().into_any_element() };
     let value = dev.norm(id);
     let target = KnobTarget::Param { device: dev.id, param: id, default: info.default_normalized() };
-    let k = knob_control_sized(("bloom-knob", dev.key(id as usize)), value, info.min < 0. && info.max > 0., dev.enabled, side, target, cx)
-        .tooltip(widgets::tip(info.name, Some("Drag · Shift fine · double-click resets")));
+    let tip = knobs::tip(id).unwrap_or(info.name);
+    let k = knob_control_sized(("bloom-knob", dev.key(id as usize)), value, info.min < 0. && info.max > 0., dev.enabled, side, target, cx).tooltip(widgets::tip(tip, Some(KNOB_HINT)));
     knob_cell(k, info.short, info.format(value), side + 24.).into_any_element()
 }
+
+/// The width of a [`dial`]'s cell.
+pub fn dial_w(side: f32) -> f32 {
+    side + 24.
+}
+
+// The tooltips of the controls the card and the window share: one short line each.
+pub const TIP_ROLL: &str = "Roll — grow 16 new sounds";
+pub const TIP_MUTATE: &str = "Mutate — nudge every unlocked sound";
+pub const TIP_BACK: &str = "Back — the previous scene";
+pub const TIP_FWD: &str = "Forward — the next scene";
+pub const TIP_SPECIES: &str = "Species — the family Roll grows from";
+pub const TIP_MATERIAL: &str = "Matter — the look only, not the sound";
+pub const TIP_STAGE: &str = "Click: hear · drag: regrow · Alt-click: lock · drop a sample: match";
+pub const TIP_OPEN: &str = "Open — the full Bloom window";
+pub const TIP_MATCH: &str = "Match — grow the selected sound towards a sample";
+pub const TIP_RACK: &str = "To Drum Rack — 16 pads, one Bloom sound each";
+pub const TIP_RENDER: &str = "Render — 16 WAVs into the library";
+pub const TIP_EXPORT: &str = "Export — the selected sound as a WAV to drag";
+pub const TIP_CORNER: &str = "Store the scene here · Alt-click clears";
+pub const TIP_MORPH: &str = "Morph — blend the four stored scenes";
 
 /// A button that runs `f` on the workspace.
 pub fn action(id: (&'static str, usize), text: &'static str, i: Icon, primary: bool, tip: &'static str, cx: &mut Context<Workspace>, f: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static) -> AnyElement {
@@ -72,43 +99,11 @@ pub fn grow_buttons(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
     let (back, fwd) = (v.at > 0, v.at + 1 < v.history.len());
     let (d1, d2, d3, d4) = (dev.clone(), dev.clone(), dev.clone(), dev.clone());
     vec![
-        action(("bloom-roll", dev.key(1)), "Roll", Icon::Dice, true, "Grow a new scene from the next seed (Deviance: how far it moves)", cx, move |ws, _| view::roll(ws, &d1, None)),
-        action(("bloom-mutate", dev.key(2)), "Mutate", Icon::Shuffle, false, "Nudge every unlocked sound", cx, move |ws, _| view::mutate(ws, &d2)),
-        icon_action(("bloom-back", dev.key(3)), Icon::ChevronLeft, back, "Previous scene", cx, move |ws, _| view::step_history(ws, &d3, -1)),
-        icon_action(("bloom-fwd", dev.key(4)), Icon::ChevronRight, fwd, "Next scene", cx, move |ws, _| view::step_history(ws, &d4, 1)),
+        action(("bloom-roll", dev.key(1)), "Roll", Icon::Dice, true, TIP_ROLL, cx, move |ws, _| view::roll(ws, &d1, None)),
+        action(("bloom-mutate", dev.key(2)), "Mutate", Icon::Shuffle, false, TIP_MUTATE, cx, move |ws, _| view::mutate(ws, &d2)),
+        icon_action(("bloom-back", dev.key(3)), Icon::ChevronLeft, back, TIP_BACK, cx, move |ws, _| view::step_history(ws, &d3, -1)),
+        icon_action(("bloom-fwd", dev.key(4)), Icon::ChevronRight, fwd, TIP_FWD, cx, move |ws, _| view::step_history(ws, &d4, 1)),
     ]
-}
-
-/// The species as chips: picking one rolls a scene of that species.
-pub fn species_chips(dev: &Dev, scene: &Scene, cx: &mut Context<Workspace>) -> Div {
-    let pal = p();
-    let mut row = div().flex().flex_wrap().items_center().gap(px(SP1));
-    for s in Species::ALL {
-        let on = s == scene.species;
-        let d = dev.clone();
-        row = row.child(
-            div()
-                .id(("bloom-species", dev.key(s.index())))
-                .h(px(24.))
-                .px(px(SP2))
-                .flex()
-                .items_center()
-                .rounded(px(r_sm()))
-                .cursor_pointer()
-                .bg(if on { accent_alpha(0.22) } else { content(0.05) })
-                .border_1()
-                .border_color(if on { accent_alpha(0.6) } else { border() })
-                .hover(|st| st.bg(content(0.1)))
-                .child(label(s.label(), TEXT_SM, if on { pal.accent } else { pal.text }))
-                .tooltip(widgets::tip("Roll a scene of this species", None))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    view::roll(this, &d, Some(s));
-                    cx.notify();
-                })),
-        );
-    }
-    row
 }
 
 /// The morph corners and the X/Y pad.
@@ -133,7 +128,7 @@ pub fn morph(ws: &mut Workspace, dev: &Dev, pad: f32, cx: &mut Context<Workspace
                 .border_1()
                 .border_color(if set { accent_alpha(0.6) } else { border() })
                 .child(label(name, TEXT_XS, if set { pal.accent } else { pal.muted }).font_weight(FontWeight::SEMIBOLD))
-                .tooltip(widgets::tip("Store the scene in this corner · Alt-click clears it", None))
+                .tooltip(widgets::tip(TIP_CORNER, None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                     view::set_corner(this, &d, k, e.modifiers().alt);
@@ -155,7 +150,8 @@ pub fn morph(ws: &mut Workspace, dev: &Dev, pad: f32, cx: &mut Context<Workspace
         }
         kit::dot(window, r.pt(x, y), 6., if any { pal.accent } else { pal.faint }, Some(pal.text));
     });
-    div().flex().gap(px(SP2)).child(slots).child(div().size(px(pad)).flex_none().child(plot))
+    let pad_el = div().id(("bloom-morph-pad", dev.key(0x310))).size(px(pad)).flex_none().child(plot).tooltip(widgets::tip(TIP_MORPH, Some("Drag the dot · stored corners light up")));
+    div().flex().gap(px(SP2)).child(slots).child(pad_el)
 }
 
 /// Match, the next-best matches, the Drum Rack and the sample export.
@@ -169,10 +165,10 @@ pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
     let mut col = div().flex().flex_col().gap(px(SP2));
     let mut row = div().flex().flex_wrap().gap(px(SP1));
     row = row.child(match &matching {
-        Some(_) => action(("bloom-match", dev.key(5)), "Stop", Icon::X, false, "Stop matching", cx, move |ws, _| view::cancel_match(ws, d1.id)),
-        None => action(("bloom-match", dev.key(5)), "Match sample…", Icon::Waveform, false, "Grow the selected sound towards an audio file (or drop one on the field)", cx, move |ws, cx| pick_and_match(ws, &d1, cx)),
+        Some(_) => action(("bloom-match", dev.key(5)), "Stop", Icon::X, false, "Stop — cancel the match", cx, move |ws, _| view::cancel_match(ws, d1.id)),
+        None => action(("bloom-match", dev.key(5)), "Match sample…", Icon::Waveform, false, TIP_MATCH, cx, move |ws, cx| pick_and_match(ws, &d1, cx)),
     });
-    row = row.child(action(("bloom-rack", dev.key(6)), "To Drum Rack", Icon::Drum, false, "A new track with a Drum Rack: sixteen pads, each a Bloom playing one sound", cx, move |ws, cx| {
+    row = row.child(action(("bloom-rack", dev.key(6)), "To Drum Rack", Icon::Drum, false, TIP_RACK, cx, move |ws, cx| {
         let scene = view::scene(ws, &d2);
         if let Some((cmds, track)) = view::drum_rack_commands(&mut ws.s.project, d2.id, &scene) {
             ws.s.seal();
@@ -185,7 +181,7 @@ pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
     }));
     row = row.child(match rendering {
         Some(n) => div().h(px(m().control_h)).px(px(SP2)).flex().items_center().child(mono(format!("Rendering {n}/16…"), TEXT_XS, pal.muted)).into_any_element(),
-        None => action(("bloom-render", dev.key(7)), "Render samples", Icon::Download, false, "Write the sixteen sounds as WAV files and add them to the library", cx, move |ws, _| view::start_render(ws, &d3)),
+        None => action(("bloom-render", dev.key(7)), "Render samples", Icon::Download, false, TIP_RENDER, cx, move |ws, _| view::start_render(ws, &d3)),
     });
     col = col.child(row);
     if let Some((f, name, dist, secs)) = matching {
@@ -207,7 +203,7 @@ pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
                     .bg(content(0.06))
                     .hover(|st| st.bg(content(0.12)))
                     .child(label(format!("{} {}", g.role.short(), k + 2), TEXT_XS, pal.text))
-                    .tooltip(widgets::tip("Put this near match in the cell instead", None))
+                    .tooltip(widgets::tip("Neighbour — use this near match instead", None))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let s = view::scene(this, &d);
                         let new = aitrack_stock::instrument::bloom::grow::replace(&s, cell, &g);

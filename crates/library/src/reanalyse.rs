@@ -265,6 +265,7 @@ impl Library {
     /// Rows still missing a key or a tempo (or with a length-based tempo
     /// estimate). Drum hits (808s aside) and very
     /// short files are not asked for a key, files under a second not for a tempo.
+    /// Online-only cloud files are skipped: reading one would download it.
     fn reanalyse_candidates(&self, limit: Option<usize>) -> Result<Vec<Candidate>> {
         let mut st = self.conn.prepare(
             "SELECT id, rel_path, root_path, hash, need_key, need_bpm FROM (
@@ -274,7 +275,7 @@ impl Library {
                    AND COALESCE(s.duration, 0) >= ?1) AS need_key,
                  ((s.bpm IS NULL OR s.bpm_source = 'estimate') AND s.kind = 'loop'
                    AND COALESCE(s.duration, 0) >= ?2) AS need_bpm
-               FROM samples s JOIN roots r ON r.id = s.root_id WHERE s.status = 'ok')
+               FROM samples s JOIN roots r ON r.id = s.root_id WHERE s.status = 'ok' AND s.cloud = 0)
              WHERE need_key OR need_bpm ORDER BY id LIMIT ?3",
         )?;
         let limit = limit.map_or(-1, |l| l as i64);
@@ -839,6 +840,18 @@ mod tests {
         assert_eq!(again.analysed, 0, "{again:?}");
         assert_eq!(again.cached, again.candidates);
         assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn online_only_cloud_files_are_not_candidates() {
+        let (dir, root) = fixtures();
+        let lib = scanned(&dir.path().join("lib.db"), &root);
+        let pad = lib.find_by_path(&root.join("Pack/Pad Sine.wav")).unwrap().unwrap();
+        lib.connection().execute("UPDATE samples SET cloud = 1 WHERE id = ?1", [pad.id.0]).unwrap();
+        let fake = Fake { calls: AtomicU32::new(0) };
+        let stats = lib.reanalyse(&lib, &fake, &opts(true), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(stats.candidates, 1, "only the groove: {stats:?}");
+        assert_eq!(fake.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

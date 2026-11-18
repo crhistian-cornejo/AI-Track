@@ -375,10 +375,7 @@ impl Command {
             AddChain { rack, .. } | RemoveChain { rack, .. } | UpdateChain { rack, .. } | SetChainProp { rack, .. } | SetReturnProp { rack, .. } | AddReturn { rack, .. } | RemoveReturn { rack, .. }
             | AddMapping { rack, .. } | RemoveMapping { rack, .. } | SetMappingRange { rack, .. } | SetRackSelector { rack, .. } | SetMacro { rack, .. } | SetMacroDef { rack, .. }
             | SetVariations { rack, .. } => device(*rack),
-            SetAutomation { track, target, .. } => match target {
-                AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. } => frozen(*track),
-                _ => None,
-            },
+            SetAutomation { track, target: AutomationTarget::DeviceParam { .. } | AutomationTarget::DeviceEnabled { .. } | AutomationTarget::Macro { .. }, .. } => frozen(*track),
             SetTrack { id, change: TrackProp::Arm(true) | TrackProp::KeyboardInput(true) } => frozen(*id),
             Batch { commands } => {
                 // A batch that changes the freeze state itself is checked as it applies:

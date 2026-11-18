@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn a_second_promotion_overwrites_part_of_the_first() {
         let mut r = rig(2);
-        for (lane, a, b) in [(0, 1 * PPQ, 5 * PPQ), (1, 3 * PPQ, 7 * PPQ)] {
+        for (lane, a, b) in [(0, PPQ, 5 * PPQ), (1, 3 * PPQ, 7 * PPQ)] {
             let cmds = comp_range(&mut r.p, r.track, lane, a, b).unwrap();
             Command::Batch { commands: cmds }.apply(&mut r.p).unwrap();
         }

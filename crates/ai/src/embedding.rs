@@ -198,8 +198,8 @@ fn describe(x: &[f32], sr: u32, file_seconds: f32) -> Vec<f32> {
         let bw = ((0..bins).map(|k| (hz(k) - cen).powi(2) * p[k]).sum::<f32>() / total).sqrt();
         let mut acc = 0.0;
         let mut roll = hz(bins - 1);
-        for k in 0..bins {
-            acc += p[k];
+        for (k, v) in p.iter().enumerate().take(bins) {
+            acc += v;
             if acc >= 0.85 * total {
                 roll = hz(k);
                 break;
@@ -212,7 +212,7 @@ fn describe(x: &[f32], sr: u32, file_seconds: f32) -> Vec<f32> {
         bandwidth.push(bw / (sr as f32 / 4.0));
         rolloff.push(log_hz(roll));
         flatness.push((log_mean.exp() / (arith + 1e-9)).clamp(0.0, 1.0) * 2.0 - 1.0);
-        for k in 0..bins {
+        for (k, v) in p.iter().enumerate().take(bins) {
             let f = hz(k);
             let b = if f < 100.0 {
                 0
@@ -225,7 +225,7 @@ fn describe(x: &[f32], sr: u32, file_seconds: f32) -> Vec<f32> {
             } else {
                 4
             };
-            bands[b] += p[k];
+            bands[b] += v;
         }
     }
 

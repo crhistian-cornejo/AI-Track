@@ -252,7 +252,7 @@ mod tests {
     use super::*;
 
     fn project() -> (AppState, TrackId, TrackId) {
-        let mut s = AppState::new(crate::demo::project());
+        let s = AppState::new(crate::demo::project());
         let track = s.project.tracks.iter().find(|t| t.can_freeze() && !t.arrangement.is_empty()).map(|t| t.id).expect("a track with clips");
         let empty = s.project.main_track().id;
         (s, track, empty)

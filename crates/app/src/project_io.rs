@@ -877,7 +877,7 @@ mod tests {
         // On disk the file inside the folder is relative, the other one is not.
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"Samples/kick.wav\"") && !text.contains(&inside.display().to_string()));
-        assert!(text.contains(&outside.display().to_string()));
+        assert!(text.contains(&json_path(&outside)));
         // Move the folder and open it from the new place.
         let moved = root.join("moved");
         std::fs::rename(&home, &moved).unwrap();
@@ -888,6 +888,12 @@ mod tests {
         // The project in memory is never touched by saving.
         assert!(audio_paths(&project).contains(&inside));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path as it appears inside the saved JSON (Windows backslashes are escaped there).
+    fn json_path(p: &Path) -> String {
+        let quoted = serde_json::to_string(&p.display().to_string()).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
     }
 
     fn with_sample_again(mut p: Project, path: &Path) -> Project {
@@ -919,8 +925,8 @@ mod tests {
         save(&file, &project).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("\"Samples/kick.wav\"") && text.contains("\"Recordings/take.wav\""), "own folders: relative");
-        assert!(text.contains(&music.join("loose.wav").display().to_string()), "next to the file: absolute");
-        assert!(text.contains(&music.join("Other Song").join("pad.wav").display().to_string()), "another project's folder: absolute");
+        assert!(text.contains(&json_path(&music.join("loose.wav"))), "next to the file: absolute");
+        assert!(text.contains(&json_path(&music.join("Other Song").join("pad.wav"))), "another project's folder: absolute");
         // Only the project file moves: what it did not own still plays.
         let elsewhere = root.join("Desktop");
         std::fs::create_dir_all(&elsewhere).unwrap();

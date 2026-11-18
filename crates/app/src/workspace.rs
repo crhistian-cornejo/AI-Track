@@ -107,7 +107,9 @@ pub(crate) fn workspace_key_context(editing_num: bool) -> &'static str {
 /// and international/numpad layouts) while ignoring shortcut modifiers.
 pub(crate) fn num_edit_char(k: &gpui::Keystroke) -> Option<&str> {
     let m = &k.modifiers;
-    if m.secondary() || m.control || m.alt {
+    // `platform` is Cmd on macOS and the Windows key on Windows, where
+    // `secondary()` is Ctrl: a chord with either never types into the field.
+    if m.secondary() || m.platform || m.control || m.alt {
         return None;
     }
     let raw = k

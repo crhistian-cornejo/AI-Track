@@ -1314,3 +1314,4 @@ mod clips;
 mod device_state;
 mod freeze;
 mod modulation;
+mod multicore;

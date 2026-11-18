@@ -227,6 +227,8 @@ fn rt_loop(
     sample_rate: f64,
 ) -> Option<rtrb::Consumer<ParamEdit>> {
     aitrack_dsp::disable_denormals();
+    // The plugin's thread checks (CLAP `thread-check`) see this as its audio thread.
+    aitrack_dsp::mark_audio_thread();
     let l = region.layout;
     let channels = l.in_channels.max(l.out_channels).max(1);
     let mut buffer = AudioBuffer::new(channels, l.max_frames);

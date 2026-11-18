@@ -373,7 +373,8 @@ impl RealEngine {
         let app_config = from_engine(&settings.audio);
         // The device opens on the engine's control thread: a slow driver
         // must not hold up the first frame. `tick` picks the result up.
-        let config = EngineConfig { audio: Some(settings.audio.clone()), open_in_background: true, ..EngineConfig::default() };
+        let config = EngineConfig { audio: Some(settings.audio.clone()), open_in_background: true, audio_threads: settings.audio_threads, ..EngineConfig::default() };
+        aitrack_engine::set_render_threads(settings.audio_threads);
         let (handle, banner) = match Engine::new(config, live.clone()) {
             Ok((h, _)) => {
                 let banner = h.last_error().map(|e| no_device_banner(&e));
@@ -382,7 +383,8 @@ impl RealEngine {
             Err(e) => {
                 // Could not even start the engine threads with a device:
                 // run headless so editing and export keep working.
-                let (h, _) = Engine::new(EngineConfig::headless(48_000.), live.clone()).expect("start the headless engine");
+                let headless = EngineConfig { audio_threads: settings.audio_threads, ..EngineConfig::headless(48_000.) };
+                let (h, _) = Engine::new(headless, live.clone()).expect("start the headless engine");
                 (h, Some(no_device_banner(&e.to_string())))
             }
         };
@@ -1194,6 +1196,21 @@ impl EngineBridge for RealEngine {
         self.settings.save();
     }
 
+    fn audio_threads(&self) -> usize {
+        self.settings.audio_threads
+    }
+
+    fn set_audio_threads(&mut self, setting: usize) {
+        self.settings.audio_threads = setting;
+        self.settings.save();
+        self.handle.set_audio_threads(setting);
+        aitrack_engine::set_render_threads(setting);
+    }
+
+    fn active_audio_threads(&self) -> usize {
+        self.handle.audio_threads()
+    }
+
     fn take_messages(&mut self) -> Vec<String> {
         let mut m = std::mem::take(&mut self.messages);
         m.extend(self.rt.take_messages());
@@ -1220,6 +1237,7 @@ fn render_options(options: &ExportOptions, project: &Project) -> RenderOptions {
         tail_seconds: options.tail_seconds.max(0.) as f64,
         normalize_db: options.normalize.then_some(-0.3),
         samples: None,
+        threads: None,
     }
 }
 

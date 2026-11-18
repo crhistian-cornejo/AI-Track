@@ -920,6 +920,17 @@ fn para_wrapped(text: String, color: gpui::Hsla) -> Div {
 
 const CACHE_BUDGET_MB: &[usize] = &[128, 256, 512, 1024, 2048];
 
+/// The "Audio threads" choices: Auto (`0`), then fixed counts up to the
+/// machine's logical cores.
+fn audio_thread_choices() -> Vec<usize> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    std::iter::once(0).chain([1, 2, 3, 4, 6, 8, 12, 16].into_iter().filter(|&n| n <= cores.max(1))).collect()
+}
+
+fn audio_threads_text(setting: usize) -> String {
+    if setting == 0 { format!("Auto ({})", aitrack_engine::auto_threads()) } else { setting.to_string() }
+}
+
 // ───────────────────────────── MIDI ─────────────────────────────
 
 /// How long the activity light stays on after a MIDI message.
@@ -1051,6 +1062,10 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
     let cache_text = cache_detail(used_bytes, budget_mb, Some(ws.b.engine.sample_cache_warp_bytes()));
     let low_power = ws.look.app.low_power;
     let sandbox = ws.b.engine.sandbox_plugins();
+    let threads_setting = ws.b.engine.audio_threads();
+    let threads_active = ws.b.engine.active_audio_threads();
+    let thread_choices = audio_thread_choices();
+    let thread_items: Vec<(String, bool, bool)> = thread_choices.iter().map(|&n| (audio_threads_text(n), n == threads_setting, true)).collect();
 
     let tile = |caption: &'static str, value: String, detail: String| {
         let mut lines = div().flex().flex_col();
@@ -1151,6 +1166,17 @@ fn performance_page(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
         .flex_col()
         .child(section_title("TELEMETRY"))
         .child(tiles)
+        .child(section_title("AUDIO THREADS"))
+        .child(setting_row(
+            "Audio threads",
+            Some(format!("Independent tracks run in parallel, exports too; same sound at any setting · now {threads_active}").into()),
+            chip_row("audio-threads", thread_items, cx, move |this, i, cx| {
+                if let Some(&n) = thread_choices.get(i) {
+                    this.b.engine.set_audio_threads(n);
+                }
+                cx.notify();
+            }),
+        ))
         .child(section_title("POWER & UI"))
         .child(setting_row(
             "Low-power / battery mode",

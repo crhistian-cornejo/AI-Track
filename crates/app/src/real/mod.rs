@@ -28,6 +28,9 @@ pub mod settings {
         pub sandbox: bool,
         /// Memory budget (in MB) for decoded audio samples before LRU eviction.
         pub sample_cache_mb: usize,
+        /// Threads the audio graph (live and offline renders) runs on, the
+        /// audio thread included: `0` = Auto, `1` = one thread.
+        pub audio_threads: usize,
         /// Folder holding the factory sound bank (`factory.db` + `packs/`).
         pub content_dir: Option<PathBuf>,
     }
@@ -38,6 +41,7 @@ pub mod settings {
                 audio: aitrack_engine::AudioConfig::default(),
                 sandbox: false,
                 sample_cache_mb: 512,
+                audio_threads: 0,
                 content_dir: None,
             }
         }

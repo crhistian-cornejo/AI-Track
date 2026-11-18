@@ -200,6 +200,46 @@ pub fn gain_to_db(gain: f32) -> f32 {
     if gain <= 1e-8 { -160.0 } else { 20.0 * gain.log10() }
 }
 
+thread_local! {
+    /// Raised on every thread that runs `Processor::process`: the device
+    /// callback, the engine's DSP workers, an offline render while it renders.
+    static AUDIO_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is an audio thread right now (see
+/// [`AudioThreadScope`]). What a hosted plugin's thread check answers (CLAP
+/// `thread-check`). A thread-local read: no allocation, no lock.
+#[inline]
+pub fn is_audio_thread() -> bool {
+    AUDIO_THREAD.with(std::cell::Cell::get)
+}
+
+/// Mark the calling thread as an audio thread for good (a DSP worker).
+#[inline]
+pub fn mark_audio_thread() {
+    AUDIO_THREAD.with(|f| f.set(true));
+}
+
+/// The calling thread counts as an audio thread while this lives; dropping
+/// it (unwinding included) puts back what was there. Real-time safe.
+pub struct AudioThreadScope {
+    was: bool,
+}
+
+impl AudioThreadScope {
+    #[inline]
+    pub fn enter() -> Self {
+        Self { was: AUDIO_THREAD.with(|f| f.replace(true)) }
+    }
+}
+
+impl Drop for AudioThreadScope {
+    #[inline]
+    fn drop(&mut self) {
+        AUDIO_THREAD.with(|f| f.set(self.was));
+    }
+}
+
 /// Flush denormals on the current thread (call once at the top of the audio
 /// callback and in each worker).
 pub fn disable_denormals() {
@@ -222,6 +262,28 @@ pub fn disable_denormals() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audio_thread_scope_nests_and_restores() {
+        assert!(!is_audio_thread());
+        {
+            let _a = AudioThreadScope::enter();
+            assert!(is_audio_thread());
+            {
+                let _b = AudioThreadScope::enter();
+                assert!(is_audio_thread());
+            }
+            assert!(is_audio_thread(), "the inner scope puts back the outer one");
+        }
+        assert!(!is_audio_thread());
+        std::thread::spawn(|| {
+            mark_audio_thread();
+            assert!(is_audio_thread());
+        })
+        .join()
+        .unwrap();
+        assert!(!is_audio_thread(), "per thread");
+    }
 
     #[test]
     fn db_round_trip() {

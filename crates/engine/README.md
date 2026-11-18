@@ -16,6 +16,8 @@ flowchart LR
   RT -- "atomics: meters, position,<br/>clip states, CPU" --> UI
   LOADER["Sample loader thread<br/>sample_cache.rs"] -- "loaded → recompile" --> CTRL
   RT --> DEV["cpal stream<br/>audio_io.rs"]
+  RT -- "one level of tracks (claim counter)" --> WK["DSP workers<br/>workers.rs · multicore.rs"]
+  CTRL -- "WorkerPool (rtrb)" --> RT
   OFF["export.rs<br/>render / WAV / MP3 / stems"] -. "same graph code, no device" .-> RT
 ```
 
@@ -44,7 +46,23 @@ flowchart LR
 * **The audio thread never allocates, locks or does I/O**
   (`tests::audio_thread_never_allocates`, with a counting global allocator,
   covers playback, graph swaps, launches, MIDI, transport changes, the
-  analysis tap and device meters).
+  analysis tap and device meters; `tests::multicore::neither_the_audio_thread_nor_the_workers_allocate`
+  counts the DSP workers too).
+* **Multicore.** Each compiled graph carries a `Schedule` (`multicore.rs`):
+  every audio track gets a level (one above the tracks that feed it or that
+  it sidechains from); tracks of a level are independent. With the "Audio
+  threads" setting above 1 (`EngineConfig::audio_threads`,
+  `EngineHandle::set_audio_threads`; `0` = Auto = physical cores − 1, at
+  most 8) the audio thread hands each level to a fixed `WorkerPool`
+  (`workers.rs`: atomic claim counter, countdown, spin-then-park wake-up,
+  no lock or allocation) and takes part itself. A track's input is gathered
+  from its sources in the single-threaded order, so the output is
+  bit-identical at any thread count (`tests/multicore.rs`). Workers run
+  with a time-constraint policy on macOS and MMCSS "Pro Audio" on Windows,
+  and count as audio threads for the panic hook and for plugins' CLAP
+  `thread-check`. A new pool is built on the control thread and swapped in
+  between blocks. Offline renders use the same pool (normal priority) at
+  `RenderOptions::threads` or `set_render_threads`.
 
 Processing per track and segment (segments split at loop wraps, launches,
 count-in end): clip player → device chain (sub-blocked every 32 samples
@@ -148,9 +166,11 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 * **WASAPI exclusive**: accepted in the config but cpal opens shared streams
   only; the engine falls back to shared and says so. A `wasapi`-crate backend
   is the planned fix.
-* **Thread priority**: MMCSS "Pro Audio" (critical) on the first callback on
-  Windows. macOS: CoreAudio's IO thread is already real-time; joining the
-  device's audio workgroup is a TODO for when worker threads exist.
+* **Thread priority**: MMCSS "Pro Audio" (critical) on the first callback
+  and in every DSP worker on Windows. macOS: CoreAudio's IO thread is
+  already real-time; workers ask for a time-constraint policy matching the
+  buffer period. They do not join the device's audio workgroup: cpal does
+  not expose the `AudioObjectID` it opened (see `thread_priority.rs`).
 
 ### Export
 
@@ -181,13 +201,11 @@ at the device rate; audio files are resampled with rubato's 256-tap sinc.
 
 ## Not done yet
 
-* Parallel worker pool (tracks are processed on the audio thread in
-  topological order; the graph is ready for level-based scheduling).
+* Joining the CoreAudio device's `os_workgroup` from the DSP workers.
 * Clip envelopes other than volume, fades on MIDI clips, MIDI racks, launch
   modes Gate/Repeat (behave as Trigger),
   scene tempo, recording to disk, disk streaming (`creek`), pitch-preserving
-  warp (hook: `AudioClipData::source_frame`), WASAPI exclusive, macOS
-  workgroups, nested VCAs.
+  warp (hook: `AudioClipData::source_frame`), WASAPI exclusive, nested VCAs.
 
 ## Tests
 

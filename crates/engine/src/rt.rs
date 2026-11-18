@@ -6,7 +6,8 @@
 //!    queue has room (the old graph goes back to be dropped elsewhere);
 //! 2. applies transport / launch commands and live MIDI;
 //! 3. splits the block at loop wraps and count-in end, and processes each
-//!    segment through the graph;
+//!    segment through the graph (on the DSP worker pool, when it has more
+//!    than this thread; see [`crate::multicore`]);
 //! 4. adds the metronome and publishes meters, position, clip states, CPU.
 //!
 //! Nothing here allocates, locks or does I/O.
@@ -15,6 +16,7 @@ use crate::clip::TimeCtx;
 use crate::graph::{guarded, CompiledGraph, SegmentIo};
 use crate::record::{RecChunk, RecEvent, RecKind, RecState};
 use crate::status::{PlayheadAnchor, SharedStatus};
+use crate::workers::WorkerPool;
 use aitrack_dsp::{AudioBuffer, EventKind};
 use aitrack_model::{DeviceId, Monitor, Quantize, SceneId, TempoMap, Tick, TrackId, TrackKind, PPQ};
 use rtrb::{Consumer, Producer};
@@ -28,6 +30,12 @@ thread_local! {
     /// Raised while a device callback runs: a panic here is answered with
     /// silence by the guard, and the hook must not print or allocate.
     static IN_AUDIO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread (a DSP worker) as one whose panics are answered
+/// by a guard: the hook stays silent there for good.
+pub(crate) fn mark_in_audio() {
+    IN_AUDIO.with(|f| f.set(true));
 }
 
 type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static;
@@ -68,8 +76,12 @@ pub(crate) fn audio_aware_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
             return;
         }
         let n = &LAST_AUDIO_PANIC;
+        // Several DSP workers can panic at once: only the one that turns the
+        // sequence odd writes the note; the others leave it to it.
         let s = n.seq.load(Ordering::Relaxed);
-        n.seq.store(s.wrapping_add(1) | 1, Ordering::Release);
+        if s & 1 == 1 || n.seq.compare_exchange(s, s.wrapping_add(1) | 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
         if let Some(loc) = info.location() {
             let f = loc.file().as_bytes();
             let f = &f[f.len().saturating_sub(NOTE_BYTES)..];
@@ -375,6 +387,12 @@ pub struct AudioProcessor {
     /// A callback panicked: stay silent, without entering the block again,
     /// until a new graph arrives.
     halted: bool,
+    /// The DSP threads that help this one (none: the single-threaded path).
+    pool: WorkerPool,
+    /// A replacement pool (the "Audio threads" setting changed) and the way
+    /// back for the one it replaces, dropped (joined) off this thread.
+    pool_rx: Option<Consumer<WorkerPool>>,
+    pool_retire: Option<Producer<WorkerPool>>,
 }
 
 /// Continuous-run bookkeeping for the heard playhead, in engine samples:
@@ -458,6 +476,48 @@ impl AudioProcessor {
             midi_pending: Vec::with_capacity(4096),
             midi_base: 0,
             cb_total: 0,
+            pool: WorkerPool::serial(),
+            pool_rx: None,
+            pool_retire: None,
+        }
+    }
+
+    /// Run the graph on `pool` from now on (control thread, before the
+    /// processor goes to the audio thread, or an offline renderer).
+    pub(crate) fn set_pool(&mut self, pool: WorkerPool) {
+        self.pool = pool;
+        self.status.audio_threads.store(self.pool.threads() as u32, Ordering::Relaxed);
+    }
+
+    /// Wire the queues a running processor gets new pools through.
+    pub(crate) fn attach_pools(&mut self, rx: Consumer<WorkerPool>, retire: Producer<WorkerPool>) {
+        self.pool_rx = Some(rx);
+        self.pool_retire = Some(retire);
+    }
+
+    /// Threads the graph runs on (this one included).
+    pub fn audio_threads(&self) -> usize {
+        self.pool.threads()
+    }
+
+    /// The installed pool, for the allocation counter of the tests.
+    #[cfg(test)]
+    pub(crate) fn pool_id(&self) -> usize {
+        self.pool.id()
+    }
+
+    /// Swap in a pool waiting in the queue, when the old one can go back.
+    /// Real-time safe: two queue operations, the old pool is joined elsewhere.
+    fn install_pool(&mut self) {
+        let (Some(rx), Some(retire)) = (self.pool_rx.as_mut(), self.pool_retire.as_mut()) else { return };
+        while retire.slots() > 0 {
+            let Ok(new) = rx.pop() else { break };
+            let old = std::mem::replace(&mut self.pool, new);
+            if let Err(rtrb::PushError::Full(old)) = retire.push(old) {
+                // Cannot happen (slots were checked); never drop here.
+                std::mem::forget(old);
+            }
+            self.status.audio_threads.store(self.pool.threads() as u32, Ordering::Relaxed);
         }
     }
 
@@ -986,6 +1046,9 @@ impl AudioProcessor {
     fn process_block(&mut self, frames: usize) {
         let started = Instant::now();
         aitrack_dsp::disable_denormals();
+        // Plugins asking (CLAP thread-check) see this thread as an audio thread.
+        let _audio = aitrack_dsp::AudioThreadScope::enter();
+        self.install_pool();
         self.install_graphs();
         #[cfg(test)]
         if self.fail_blocks > 0 {
@@ -1058,7 +1121,7 @@ impl AudioProcessor {
                 out_offset: cur,
                 loop_range: self.loop_range,
             };
-            g.process_segment(&mut io);
+            g.process_segment(&mut io, &mut self.pool);
 
             // Metronome (aligned with what is heard: engine time − latency).
             if self.metronome && (playing_seg || counting) {

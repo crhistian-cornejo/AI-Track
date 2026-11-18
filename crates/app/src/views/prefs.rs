@@ -34,6 +34,8 @@ pub enum PrefsPage {
     Updates,
     /// VST3/CLAP plugins: folders searched, what was found and what was left out.
     Plugins,
+    /// The external MCP server: agents outside the app edit the project.
+    Mcp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +294,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
         PrefsPage::Performance => performance_page(ws, cx),
         PrefsPage::Plugins => plugins_page(ws, cx),
         PrefsPage::Updates => super::updates::updates_page(ws, cx),
+        PrefsPage::Mcp => super::mcp::mcp_page(ws, cx),
     };
     let nav = |id: &'static str, i: Icon, text: &'static str, target: PrefsPage| {
         let on = page == target;
@@ -329,6 +332,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                 .child(nav("nav-midi", Icon::Piano, "MIDI", PrefsPage::Midi))
                 .child(nav("nav-plugins", Icon::Plug, "Plugins", PrefsPage::Plugins))
                 .child(nav("nav-perf", Icon::Power, "Performance", PrefsPage::Performance))
+                .child(nav("nav-mcp", Icon::Plug, "MCP server", PrefsPage::Mcp))
                 .child(nav("nav-updates", Icon::Download, "Updates", PrefsPage::Updates)),
         )
         .child(
@@ -341,6 +345,7 @@ fn preferences(ws: &mut Workspace, page: PrefsPage, window: &mut Window, cx: &mu
                     PrefsPage::Performance => "perf-scroll",
                     PrefsPage::Plugins => "plugins-scroll",
                     PrefsPage::Updates => "updates-scroll",
+                    PrefsPage::Mcp => "mcp-scroll",
                 })
                 .flex_1()
                 .min_w(px(0.))

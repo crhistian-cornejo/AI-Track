@@ -646,7 +646,7 @@ fn step_done(ws: &mut Workspace, item: usize, stop_reason: Option<String>, conte
 }
 
 /// `generate_part`: the pattern engine writes the part into the draft.
-fn generate_part(s: &mut Session, input: &Value) -> Result<String, String> {
+pub(crate) fn generate_part(s: &mut Session, input: &Value) -> Result<String, String> {
     let kind_s = input.get("kind").and_then(Value::as_str).unwrap_or("bass").to_lowercase();
     let kind = match kind_s.as_str() {
         "beat" | "drums" => Kind::Drums,

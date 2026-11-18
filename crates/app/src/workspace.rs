@@ -366,6 +366,8 @@ pub struct Workspace {
     pub toast: Option<(String, Instant)>,
     /// Update checks, downloads and installs (`updater.rs`).
     pub updater: crate::updater::Updater,
+    /// The external MCP server: settings, token, the channel from its threads (`mcp_host.rs`).
+    pub mcp: crate::mcp_host::McpHost,
     /// A crash report from the last run, offered once (`logging.rs`).
     pub crash_notice: Option<crate::logging::CrashNotice>,
     pub(crate) crash_rx: crossbeam_channel::Receiver<crate::logging::CrashNotice>,
@@ -542,6 +544,7 @@ impl Workspace {
             chat_log: Vec::new(),
             regions: Rc::new(Regions::default()),
             toast: None,
+            mcp: crate::mcp_host::McpHost::load(),
             updater: crate::updater::Updater::new(Instant::now(), crate::updater::Config::from_env(), crate::updater::UpdatePrefs::load()),
             crash_notice: None,
             crash_rx: crate::logging::spawn_crash_lookup(),
@@ -589,6 +592,7 @@ impl Workspace {
         if let views::ai_panel::state::Backend::Agent(kind) = views::ai_panel::state::Backend::from_pref(&this.look.app.assistant_model) {
             this.b.ai.set_agent(Some(kind));
         }
+        this.mcp_autostart();
         this.apply_dev_view(cx);
         // `slash` opens the assistant with its action menu showing.
         if std::env::var("AITRACK_DEV_VIEW").is_ok_and(|v| v.split(',').any(|w| w.trim() == "slash")) {
@@ -658,6 +662,8 @@ impl Workspace {
                 }
                 // The updater in a state, without the network: `update=available|ready|failed`.
                 "update=available" | "update=ready" | "update=failed" => views::updates::seed_dev(self, word),
+                // Preferences > MCP server with the server on, a made-up client and calls (nothing is started).
+                "mcp" | "prefs=mcp" => views::mcp::seed_dev(self),
                 "prefs=updates" => self.modal = Some(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Updates)),
                 "prefs=sounds" => {
                     self.modal = Some(views::prefs::Modal::Preferences(
@@ -1254,6 +1260,7 @@ impl Workspace {
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         self.autosave_tick();
         self.updater_tick(cx);
+        self.mcp_tick(cx);
         // A take being played, or one that just ended: clips from the notes.
         let rec = self.s.poll_recording(&mut *self.b.engine);
         let clips = rec.committed + rec.audio_clips;
@@ -2798,6 +2805,7 @@ impl Workspace {
             })
             .when_some(health, |d, h| d.child(h))
             .children(views::updates::status_item(self, cx))
+            .children(views::mcp::status_item(self, cx))
             .child(div().flex_1())
             .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
             .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))

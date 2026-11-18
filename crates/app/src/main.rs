@@ -12,6 +12,7 @@ mod freeze;
 mod gesture;
 mod keys;
 mod logging;
+mod mcp_host;
 mod nav;
 mod audition;
 mod autosave;

@@ -161,6 +161,7 @@ pub struct GeneDrag {
     pub cell: usize,
     pub gene: usize,
     pub x0: f32,
+    pub y0: f32,
     pub v0: f32,
 }
 

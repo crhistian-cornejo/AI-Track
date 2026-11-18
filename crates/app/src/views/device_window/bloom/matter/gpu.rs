@@ -301,7 +301,7 @@ mod tests {
         let looks = [SoundLook::default(); SOUNDS];
         let q = [0.0; SOUNDS];
         let mut a = Animator::default();
-        a.step(0.016, &Live { env: &q, pulse: &q, looks: &looks, selected: 0 }, None, false);
+        a.step(0.016, &Live { env: &q, pulse: &q, looks: &looks, selected: 0, hits: &q, level: 0.0 }, None, false);
         let bg = if light { [0.80, 0.81, 0.83] } else { [0.012, 0.012, 0.014] };
         a.uniforms(material, &Panel::fit(256.0, 256.0, (0.0, 0.0, 256.0, 256.0), 0.0, bg, light, [0.0; 3]), 0.0)
     }

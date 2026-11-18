@@ -1,5 +1,8 @@
 //! The shader's uniform block, field for field as `struct U` in
-//! `matter.wgsl` (every field a `vec4f`, so the layout has no padding).
+//! `matter.wgsl` (every field a `vec4f` or an array of them, so the layout
+//! has no padding).
+
+use super::frame::VOICES;
 
 /// What one frame of the matter is drawn from.
 #[repr(C)]
@@ -38,6 +41,18 @@ pub struct Uniforms {
     pub smoke_c: [f32; 4],
     /// The sound's colour (linear), how much it tints the studio.
     pub tint: [f32; 4],
+    /// Output level (smoothed), the voices' summed level, the droplets'
+    /// reach from the centre (units), 1 while a ripple or a droplet lives.
+    pub glow: [f32; 4],
+    /// Each voice's colour (linear) and level (0 = no voice).
+    pub voice: [[f32; 4]; VOICES],
+    /// Each voice's place on the mass (unit direction) and seconds since its
+    /// hit (< 0: no ripple).
+    pub vdir: [[f32; 4]; VOICES],
+    /// Each voice's droplet: centre (units) and radius (0 = none).
+    pub drop: [[f32; 4]; VOICES],
+    /// How hard each voice's last hit was.
+    pub kick: [f32; 4],
 }
 
 /// Size of the block in bytes.
@@ -58,10 +73,11 @@ impl Uniforms {
     pub fn floats(&self) -> [f32; SIZE / 4] {
         let rows = [
             self.res, self.frame, self.bg, self.outer, self.shape0, self.shape1, self.spikes, self.cursor, self.mat0, self.mat1, self.mat2, self.mat3, self.mat4, self.smoke0, self.smoke_a,
-            self.smoke_b, self.smoke_c, self.tint,
+            self.smoke_b, self.smoke_c, self.tint, self.glow,
         ];
         let mut out = [0f32; SIZE / 4];
-        for (i, r) in rows.iter().enumerate() {
+        let all = rows.iter().chain(&self.voice).chain(&self.vdir).chain(&self.drop).chain(std::iter::once(&self.kick));
+        for (i, r) in all.enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(r);
         }
         out
@@ -74,14 +90,17 @@ mod tests {
 
     #[test]
     fn the_block_matches_the_shader() {
-        assert_eq!(SIZE, 18 * 16, "eighteen vec4f");
+        assert_eq!(SIZE, 32 * 16, "thirty-two vec4f");
         let wgsl = include_str!("matter.wgsl");
         let block = &wgsl[wgsl.find("struct U {").unwrap()..];
         let block = &block[..block.find("};").unwrap()];
-        assert_eq!(block.matches("vec4f").count(), SIZE / 16);
+        let arrays = block.matches("array<vec4f, 4>").count();
+        assert_eq!(block.matches("vec4f").count() - arrays + arrays * VOICES, SIZE / 16);
         let mut u = Uniforms::default();
-        u.tint[3] = 2.5;
+        u.kick[3] = 2.5;
+        u.voice[0][3] = 0.75;
         let b = u.bytes();
         assert_eq!(f32::from_ne_bytes(b[SIZE - 4..].try_into().unwrap()), 2.5);
+        assert_eq!(f32::from_ne_bytes(b[19 * 16 + 12..19 * 16 + 16].try_into().unwrap()), 0.75, "the voices follow the glow");
     }
 }

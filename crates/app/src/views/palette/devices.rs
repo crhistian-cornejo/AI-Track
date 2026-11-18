@@ -54,6 +54,7 @@ pub enum DeviceGroup {
     FxMastering,
     FxCreative,
     FxAnalysis,
+    FxModulators,
     // MIDI Effects (they run before the instrument)
     MidiEffects,
 }
@@ -68,7 +69,7 @@ impl DeviceGroup {
         Self::InstMulti,
     ];
 
-    pub const EFFECTS: [Self; 14] = [
+    pub const EFFECTS: [Self; 15] = [
         Self::FxEq,
         Self::FxDynamics,
         Self::FxLimiter,
@@ -82,10 +83,11 @@ impl DeviceGroup {
         Self::FxCreative,
         Self::FxStereoUtility,
         Self::FxAnalysis,
+        Self::FxModulators,
         Self::MidiEffects,
     ];
 
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::InstAnalog,
         Self::InstWavetable,
         Self::InstFm,
@@ -105,6 +107,7 @@ impl DeviceGroup {
         Self::FxCreative,
         Self::FxStereoUtility,
         Self::FxAnalysis,
+        Self::FxModulators,
         Self::MidiEffects,
     ];
 
@@ -141,6 +144,7 @@ impl DeviceGroup {
             Self::FxMastering => "fx.mastering",
             Self::FxCreative => "fx.creative",
             Self::FxAnalysis => "fx.analysis",
+            Self::FxModulators => "fx.modulators",
             Self::MidiEffects => "midi.effects",
         }
     }
@@ -171,6 +175,7 @@ impl DeviceGroup {
             Self::FxMastering => "Multiband & Mastering",
             Self::FxCreative => "Creative",
             Self::FxAnalysis => "Analysis",
+            Self::FxModulators => "Modulators",
             Self::MidiEffects => "MIDI Effects",
         }
     }
@@ -197,6 +202,7 @@ impl DeviceGroup {
             Self::FxMastering => "Audio Effects · Multiband & Mastering",
             Self::FxCreative => "Audio Effects · Creative",
             Self::FxAnalysis => "Audio Effects · Analysis",
+            Self::FxModulators => "Audio Effects · Modulators",
             Self::MidiEffects => "MIDI Effects",
         }
     }
@@ -331,6 +337,7 @@ pub fn classify_stock(plugin_id: &str, prefs: &PluginPrefs) -> DeviceGroup {
         "fx.multiband" => DeviceGroup::FxMastering,
         "fx.analyzer" | "fx.drum_extract" => DeviceGroup::FxAnalysis,
         id if id.starts_with("midi.") => DeviceGroup::MidiEffects,
+        id if id.starts_with("mod.") => DeviceGroup::FxModulators,
         "fx.midside" | "fx.utility" | "rack.audio" => DeviceGroup::FxStereoUtility,
         _ => DeviceGroup::FxStereoUtility,
     }

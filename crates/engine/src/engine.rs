@@ -1170,6 +1170,7 @@ impl Control {
                 Patch::Selector { rack, value } => RtCommand::SetRackSelector(rack, value),
                 Patch::GrooveSettings { id, settings } => RtCommand::SetGrooveSettings(id, settings),
                 Patch::GrooveAmount(amount) => RtCommand::SetGrooveAmount(amount),
+                Patch::ModRange { device, index, min, max } => RtCommand::SetModRange(device, index, min, max),
             };
             let _ = tx.push(cmd);
         }

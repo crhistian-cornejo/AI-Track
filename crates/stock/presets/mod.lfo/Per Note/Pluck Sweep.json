@@ -1,0 +1,23 @@
+{
+  "name": "Pluck Sweep",
+  "plugin": "mod.lfo",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "lfo",
+    "pluck",
+    "retrigger"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.0,
+    "2": 0.6388095,
+    "3": 0.4117647,
+    "4": 1.0,
+    "5": 0.5,
+    "6": 0.0,
+    "7": 0.0,
+    "8": 0.0,
+    "9": 1.0
+  }
+}

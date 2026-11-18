@@ -183,6 +183,12 @@ pub enum Command {
     RemoveMapping { rack: DeviceId, macro_index: usize, index: usize },
     /// Change a mapping's range; `min > max` inverts it.
     SetMappingRange { rack: DeviceId, macro_index: usize, index: usize, min: f32, max: f32 },
+    /// Map a modulator (`mod.*` device) to a target on its own track, at
+    /// `index` in its mappings (at most [`MAX_MOD_MAPPINGS`], one per target).
+    AddModMapping { device: DeviceId, index: usize, mapping: ModMapping },
+    RemoveModMapping { device: DeviceId, index: usize },
+    /// Change the offset range of a modulator mapping (`-1..=1`; `min > max` inverts).
+    SetModRange { device: DeviceId, index: usize, min: f32, max: f32 },
     /// Set a rack's chain selector (0..=127, `Rack::chain_selector`).
     SetRackSelector { rack: DeviceId, value: u8 },
     SetMacro { rack: DeviceId, index: usize, value: f32 },
@@ -276,6 +282,8 @@ impl Command {
             RemoveReturn { .. } => "Delete return",
             AddMapping { .. } | SetMappingRange { .. } => "Map macro",
             RemoveMapping { .. } => "Unmap macro",
+            AddModMapping { .. } | SetModRange { .. } => "Map modulator",
+            RemoveModMapping { .. } => "Unmap modulator",
             SetRackSelector { .. } => "Chain selector",
             SetMacro { .. } => "Change macro",
             SetMacroDef { .. } => "Map macro",
@@ -290,7 +298,7 @@ impl Command {
         use Command::*;
         match self {
             RemoveTrack { .. } | RemoveScene { .. } | RemoveSource { .. } | RemoveClip { .. }
-            | RemovePlacement { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } => true,
+            | RemovePlacement { .. } | RemoveNotes { .. } | RemoveGroove { .. } | RemoveDevice { .. } | RemoveChain { .. } | RemoveReturn { .. } | RemoveMapping { .. } | RemoveModMapping { .. } => true,
             Batch { commands } => commands.iter().any(Command::is_destructive),
             _ => false,
         }
@@ -771,6 +779,50 @@ impl Command {
                 mapping.min = min.clamp(0.0, 1.0);
                 mapping.max = max.clamp(0.0, 1.0);
                 Ok(SetMappingRange { rack, macro_index, index, min: old_min, max: old_max })
+            }
+            AddModMapping { device, index, mapping } => {
+                let track = p.device_track(device).ok_or(CommandError::DeviceNotFound(device))?;
+                if !p.device(device).is_some_and(Device::is_modulator) {
+                    return Err(CommandError::Invalid("only a modulator device can be mapped".into()));
+                }
+                if let ModTarget::Param { device: target, .. } = mapping.target {
+                    if target == device {
+                        return Err(CommandError::Invalid("a modulator cannot drive itself".into()));
+                    }
+                    if p.device(target).is_none() {
+                        return Err(CommandError::DeviceNotFound(target));
+                    }
+                    if p.device_track(target) != Some(track) {
+                        return Err(CommandError::Invalid("a modulator can only drive devices on its own track".into()));
+                    }
+                }
+                let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
+                if d.mods.iter().any(|m| m.target == mapping.target) {
+                    return Err(CommandError::Invalid("that target is already mapped to this modulator".into()));
+                }
+                if d.mods.len() >= MAX_MOD_MAPPINGS {
+                    return Err(CommandError::Invalid(format!("a modulator drives at most {MAX_MOD_MAPPINGS} targets")));
+                }
+                let mapping = ModMapping { min: mapping.min.clamp(-1.0, 1.0), max: mapping.max.clamp(-1.0, 1.0), ..mapping };
+                let index = index.min(d.mods.len());
+                d.mods.insert(index, mapping);
+                Ok(RemoveModMapping { device, index })
+            }
+            RemoveModMapping { device, index } => {
+                let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
+                if index >= d.mods.len() {
+                    return Err(CommandError::OutOfRange(index));
+                }
+                let mapping = d.mods.remove(index);
+                Ok(AddModMapping { device, index, mapping })
+            }
+            SetModRange { device, index, min, max } => {
+                let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
+                let m = d.mods.get_mut(index).ok_or(CommandError::OutOfRange(index))?;
+                let (old_min, old_max) = (m.min, m.max);
+                m.min = min.clamp(-1.0, 1.0);
+                m.max = max.clamp(-1.0, 1.0);
+                Ok(SetModRange { device, index, min: old_min, max: old_max })
             }
             SetRackSelector { rack, value } => {
                 let r = rack_mut(p, rack)?;
@@ -1808,6 +1860,43 @@ mod tests {
         // The macro value and the other macros are left alone.
         assert_eq!(rack_of(&ranged, rack).macros[1..], rack_of(&r.p, rack).macros[1..]);
         assert_eq!(rack_of(&ranged, rack).macros[0].value, rack_of(&r.p, rack).macros[0].value);
+    }
+
+    #[test]
+    fn modulator_mappings_are_commands_with_undo() {
+        let mut r = rack_rig();
+        let m = r.p.alloc_device_id();
+        let (other_track, foreign) = (r.p.alloc_track_id(), r.p.alloc_device_id());
+        Command::AddTrack { track: Box::new(Track::new(other_track, TrackKind::Audio, "B", Color::palette(2))), index: 2 }.apply(&mut r.p).unwrap();
+        Command::AddDevice { slot: DeviceSlot::Track { track: other_track, index: 0 }, device: Box::new(Device::stock(foreign, "fx.eq", "EQ")) }.apply(&mut r.p).unwrap();
+        Command::AddDevice { slot: DeviceSlot::Track { track: r.track, index: 1 }, device: Box::new(Device::stock(m, "mod.lfo", "LFO")) }.apply(&mut r.p).unwrap();
+        let on = |t: ModTarget| ModMapping { target: t, min: -0.25, max: 0.25 };
+        let eq1 = ModTarget::Param { device: r.eq, param: 1 };
+        let q = round_trip(&r.p, Command::AddModMapping { device: m, index: 0, mapping: on(eq1) });
+        assert_eq!(q.device(m).unwrap().mods, vec![on(eq1)]);
+        // Volume and pan are targets too; a device inside a rack on the same track counts.
+        let mut q = q;
+        Command::AddModMapping { device: m, index: 9, mapping: on(ModTarget::Volume) }.apply(&mut q).unwrap();
+        let q2 = round_trip(&q, Command::SetModRange { device: m, index: 1, min: 2.0, max: -0.5 });
+        assert_eq!((q2.device(m).unwrap().mods[1].min, q2.device(m).unwrap().mods[1].max), (1.0, -0.5));
+        let q3 = round_trip(&q, Command::RemoveModMapping { device: m, index: 0 });
+        assert_eq!(q3.device(m).unwrap().mods.len(), 1);
+        assert!(Command::RemoveModMapping { device: m, index: 0 }.is_destructive());
+        let err = |p: &mut Project, c: Command| c.apply(p).unwrap_err();
+        assert!(matches!(err(&mut q, Command::AddModMapping { device: m, index: 0, mapping: on(eq1) }), CommandError::Invalid(_)), "twice");
+        assert!(matches!(err(&mut q, Command::AddModMapping { device: m, index: 0, mapping: on(ModTarget::Param { device: foreign, param: 0 }) }), CommandError::Invalid(_)), "other track");
+        assert!(matches!(err(&mut q, Command::AddModMapping { device: m, index: 0, mapping: on(ModTarget::Param { device: m, param: 0 }) }), CommandError::Invalid(_)), "itself");
+        assert!(matches!(err(&mut q, Command::AddModMapping { device: r.eq, index: 0, mapping: on(ModTarget::Pan) }), CommandError::Invalid(_)), "not a modulator");
+        assert_eq!(err(&mut q, Command::SetModRange { device: m, index: 5, min: 0.0, max: 1.0 }), CommandError::OutOfRange(5));
+        // At most eight targets.
+        let mut full = r.p.clone();
+        for param in 0..MAX_MOD_MAPPINGS as u32 {
+            Command::AddModMapping { device: m, index: 0, mapping: on(ModTarget::Param { device: r.eq, param }) }.apply(&mut full).unwrap();
+        }
+        assert!(matches!(err(&mut full, Command::AddModMapping { device: m, index: 0, mapping: on(ModTarget::Pan) }), CommandError::Invalid(_)));
+        // They survive a save / load.
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(serde_json::from_str::<Project>(&json).unwrap().device(m).unwrap().mods, q.device(m).unwrap().mods);
     }
 
     #[test]

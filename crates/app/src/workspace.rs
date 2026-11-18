@@ -168,6 +168,8 @@ pub enum Drag {
     SoundsVolume { start_x: f32, start: f32 },
     /// A handle of a rack panel: a zone, a macro mapping's range.
     Rack(views::devices::rack_ui::RackDrag),
+    /// An end of a modulator mapping's range bar.
+    Mod(views::device_ui::modulator::ModDrag),
     Marquee { clip: ClipId, from: Point<Pixels>, to: Point<Pixels>, base: BTreeSet<NoteId> },
     Clip { track: TrackId, placement: PlacementId, start: Tick, grab_tick: Tick, applied: (Tick, TrackId) },
     ClipResize { clip: ClipId, length: Tick, grab_tick: Tick },
@@ -648,6 +650,28 @@ impl Workspace {
                     ))
                 }
                 "play" => self.b.engine.play(),
+                // A demo track: a filter with an LFO and an Envelope Follower after it,
+                // the LFO on the cutoff and (by hand, `lfomap`) the follower waiting in Map mode.
+                "lfo" | "lfomap" => {
+                    use aitrack_model::ModTarget;
+                    if let Some(t) = self.s.add_track(TrackKind::Audio) {
+                        self.s.selected_track = Some(t);
+                        self.s.bottom_tab = BottomTab::Devices;
+                        let filter = self.s.add_stock_device(t, "fx.filter", "Filter");
+                        let lfo = self.s.add_stock_device(t, "mod.lfo", "LFO");
+                        let env = self.s.add_stock_device(t, "mod.envfollow", "Envelope Follower");
+                        if let (Some(filter), Some(lfo)) = (filter, lfo) {
+                            self.s.map_modulator(lfo, ModTarget::Param { device: filter, param: aitrack_stock::fx::filter::p::CUTOFF }).ok();
+                            self.s.map_modulator(lfo, ModTarget::Param { device: filter, param: aitrack_stock::fx::filter::p::RESONANCE }).ok();
+                            self.s.set_mod_range(lfo, 0, -0.3, 0.3);
+                            self.s.set_mod_range(lfo, 1, 0.0, 0.2);
+                            self.s.seal();
+                            if word == "lfomap" {
+                                views::device_ui::modulator::set_map_mode(env);
+                            }
+                        }
+                    }
+                }
                 // The Content Hub open on its Plugins tab (`hubplugins`), with a mix of states to look at (`hubplugins=demo`).
                 "hubplugins" | "hubplugins=demo" | "hubplugins=confirm" => {
                     self.modal = Some(views::prefs::Modal::ContentHub);
@@ -1603,6 +1627,10 @@ impl Workspace {
         {
             return;
         }
+        // The same for a modulator's Map mode (a knob, the pan knob or a fader).
+        if views::device_ui::modulator::pick_drag(self, &drag, cx) {
+            return;
+        }
         self.s.seal();
         self.drag = Some(drag);
         cx.notify();
@@ -1807,6 +1835,7 @@ impl Workspace {
                 self.b.engine.set_preview_volume(v);
             }
             Drag::Rack(d) => views::devices::rack_ui::drag_move(self, d, f32::from(e.position.x), fine),
+            Drag::Mod(d) => views::device_ui::modulator::drag_move(self, d, f32::from(e.position.x), fine),
             Drag::Fader { track, last_y, pos, travel } => {
                 let dy = *last_y - y;
                 *last_y = y;

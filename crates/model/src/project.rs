@@ -755,6 +755,9 @@ pub struct Device {
     /// bass from the kick, keying a gate). `None` leaves it unconnected.
     #[serde(default)]
     pub sidechain: Option<TrackId>,
+    /// For a modulator (`mod.*`): the parameters it drives on its track.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mods: Vec<ModMapping>,
 }
 
 impl Device {
@@ -769,7 +772,13 @@ impl Device {
             preset: None,
             collapsed: false,
             sidechain: None,
+            mods: Vec::new(),
         }
+    }
+
+    /// Whether this is a modulator device (LFO, Envelope Follower…).
+    pub fn is_modulator(&self) -> bool {
+        matches!(&self.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("mod."))
     }
 
     pub fn is_instrument(&self) -> bool {
@@ -921,6 +930,45 @@ impl Chain {
             sends: Vec::new(),
             output: ChainOut::Rack,
         }
+    }
+}
+
+/// What a modulator drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ModTarget {
+    /// A parameter of a device on the modulator's track (stock or hosted).
+    Param { device: DeviceId, param: u32 },
+    /// The track's fader.
+    Volume,
+    /// The track's pan.
+    Pan,
+}
+
+/// The most targets one modulator drives.
+pub const MAX_MOD_MAPPINGS: usize = 8;
+
+/// One target of a modulator. The modulator's output `m` (0..=1) moves the
+/// target by `min + (max - min) * m` in normalised units on top of the
+/// knob's (or automation's) value, which stays editable. `min > max`
+/// inverts; `-d..d` is a bipolar depth.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModMapping {
+    pub target: ModTarget,
+    pub min: f32,
+    pub max: f32,
+}
+
+impl ModMapping {
+    /// A bipolar mapping of depth `d` around the base value.
+    pub fn bipolar(target: ModTarget, d: f32) -> Self {
+        Self { target, min: -d, max: d }
+    }
+
+    /// The offset (normalised units) at modulator output `m`.
+    #[inline]
+    pub fn offset(&self, m: f32) -> f32 {
+        self.min + (self.max - self.min) * m
     }
 }
 

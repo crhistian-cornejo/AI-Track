@@ -1,0 +1,19 @@
+{
+  "name": "Gentle Duck",
+  "plugin": "mod.envfollow",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "envelope",
+    "sidechain",
+    "pads"
+  ],
+  "params": {
+    "0": 0.5,
+    "1": 0.45930898,
+    "2": 0.63436335,
+    "3": 0.0,
+    "4": 0.5,
+    "5": 1.0
+  }
+}

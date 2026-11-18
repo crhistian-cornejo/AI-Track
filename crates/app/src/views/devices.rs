@@ -41,6 +41,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         return empty("Select a track to see its devices.");
     };
     let tid = track.id;
+    crate::views::device_ui::modulator::refresh(&ws.s.project);
     let ids: Vec<DeviceId> = track.devices.iter().map(|d| d.id).collect();
     // Live's chain: devices left to right in signal order, an insertion
     // point between each pair (it lights up while a device is dragged over).
@@ -543,7 +544,29 @@ pub fn knob_control_sized(
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
     let color = if enabled { accent() } else { p().faint };
-    knob(id, value, bipolar, side, color).on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+    // A parameter a modulator drives wears a ring over the range it sweeps.
+    let ring = match target {
+        KnobTarget::Param { device, param, .. } => crate::views::device_ui::modulator::ring(device, param),
+        _ => None,
+    };
+    let knob = knob(id, value, bipolar, side, color);
+    let knob = match ring {
+        Some((lo, hi)) => knob.child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let (a, b) = ((value + lo).clamp(0., 1.), (value + hi).clamp(0., 1.));
+                    let c = bounds.center();
+                    let r = side / 2. - 0.5;
+                    crate::paint::arc(window, c, r, crate::widgets::KNOB_A0 + crate::widgets::KNOB_SPAN * a, crate::widgets::KNOB_A0 + crate::widgets::KNOB_SPAN * b, 1.5, p().accent2);
+                },
+            )
+            .absolute()
+            .size_full(),
+        ),
+        None => knob,
+    };
+    knob.on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
         cx.stop_propagation();
         if e.click_count >= 2 {
             match target {

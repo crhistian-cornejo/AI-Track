@@ -17,6 +17,7 @@
 mod clipboard;
 pub mod gestures;
 mod groups;
+mod modulators;
 mod racks;
 pub mod menus;
 pub mod overlay;

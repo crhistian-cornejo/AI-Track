@@ -61,6 +61,26 @@ impl Default for Transport {
     }
 }
 
+/// What a modulator (`mod.*` device) is told to compute the control signal
+/// of one block ahead of its processing: one value per step of `step`
+/// frames. Everything derives from the song position, so a render offline
+/// is the same as live playback.
+pub struct ModBlock<'a> {
+    pub sample_rate: f64,
+    pub playing: bool,
+    pub bpm: f64,
+    /// Frames between two values of the output.
+    pub step: usize,
+    /// Frames of the block.
+    pub frames: usize,
+    /// Song position in samples at the block's first frame.
+    pub start_samples: i64,
+    /// Song position in quarter notes at each step (the tempo map applied).
+    pub beats: &'a [f64],
+    /// The block's events (note-ons retrigger an LFO), sorted by offset.
+    pub events: &'a [Event],
+}
+
 /// Everything a processor sees for one block.
 pub struct ProcessContext<'a> {
     pub sample_rate: f64,
@@ -137,6 +157,13 @@ pub trait Processor: Send {
     /// into a lock-free buffer by the engine. Default: none.
     fn meter(&self, _out: &mut [f32]) -> usize {
         0
+    }
+
+    /// Modulators only: fill `out` (one value in `0..=1` per step of `m`)
+    /// and return true. The default is not a modulator. Called by the
+    /// engine before the track's chain runs the block. No allocation.
+    fn modulate(&mut self, _m: &ModBlock<'_>, _out: &mut [f32]) -> bool {
+        false
     }
 
     /// MIDI effects only (`info().category == Category::MidiEffect`): turn the

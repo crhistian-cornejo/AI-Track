@@ -1,0 +1,19 @@
+{
+  "name": "Inverse Duck",
+  "plugin": "mod.envfollow",
+  "author": "AI-Track",
+  "tags": [
+    "modulator",
+    "envelope",
+    "sidechain",
+    "bass"
+  ],
+  "params": {
+    "0": 0.6111111,
+    "1": 0.35172766,
+    "2": 0.56632334,
+    "3": 0.0,
+    "4": 1.0,
+    "5": 1.0
+  }
+}

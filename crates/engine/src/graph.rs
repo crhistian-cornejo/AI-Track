@@ -12,13 +12,13 @@
 //! pre-fader sends → volume/pan/mute (ramped every 32 samples) →
 //! post-fader sends → meter → PDC delay → destination input.
 
-use crate::automation::{lane_value, pan_from_normalized, pan_gains, volume_db_from_normalized, CONTROL_BLOCK};
+use crate::automation::{lane_value, pan_from_normalized, pan_gains, volume_db_from_normalized, volume_normalized_from_db, CONTROL_BLOCK};
 use crate::clip::{ActiveNotes, CompiledClip, EventList, Rng, TimeCtx};
 use crate::delay::DelayLine;
 use crate::shared::SharedProcessor;
 use crate::status::{MeterBank, SessionStatus, NO_SCENE, STOP_SCENE};
 use crate::tap::{AnalysisTap, DeviceMeter, DEVICE_METER_LEN};
-use aitrack_dsp::{db_to_gain, AudioBuffer, Event, EventKind, EventSink, MidiContext, ProcessContext, Transport};
+use aitrack_dsp::{db_to_gain, AudioBuffer, Event, EventKind, EventSink, MidiContext, ModBlock, ProcessContext, Transport};
 use aitrack_model::{AutomationLane, DeviceId, FollowAction, LaunchMode, Monitor, Quantize, RackKind, SceneId, TempoMap, Tick, TrackId, TrackKind, PPQ};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -276,6 +276,11 @@ impl ProcNode {
     /// The processor panicked: it leaves the signal path for good (shared
     /// with every graph that holds it) and `buf` — what it was to process —
     /// is silenced.
+    fn fall_silently(&mut self) {
+        self.proc.mark_crashed();
+        self.sleeping = false;
+    }
+
     fn fall(&mut self, buf: &mut AudioBuffer) {
         self.proc.mark_crashed();
         self.sleeping = false;
@@ -1006,6 +1011,187 @@ impl ParamAuto {
     }
 }
 
+// ───────────────────────────── Modulation ─────────────────────────────
+
+/// What a modulator moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModDest {
+    /// A device parameter: its base value (knob or automation) plus the
+    /// modulation, written as `Param` events like automation is.
+    Param(DeviceId, u32),
+    /// The track's fader (offset in the normalised volume scale).
+    Volume,
+    /// The track's pan (offset in normalised units: 1 is the whole pan range).
+    Pan,
+}
+
+pub(crate) struct ModTargetNode {
+    pub dest: ModDest,
+    /// Index of the mapping in `Device::mods`.
+    pub index: u16,
+    pub min: f32,
+    pub max: f32,
+    /// The parameter's own value: the knob's, or the automation lane's.
+    pub base: f32,
+    /// The last value sent to the device (NaN: nothing yet).
+    pub last: f32,
+}
+
+/// One modulator device of a track and the targets it drives.
+pub(crate) struct ModNode {
+    pub source: DeviceId,
+    pub targets: Vec<ModTargetNode>,
+    /// The output (0..1) at every [`CONTROL_BLOCK`] step of the block.
+    pub steps: Vec<f32>,
+}
+
+impl TrackNode {
+    /// Compute every modulator's output for this block and deliver it: a
+    /// parameter gets `Param` events in its device's `auto_events` (the base
+    /// value and the automation events of the block folded in, so the knob
+    /// stays editable and automation keeps working underneath), the fader
+    /// gets per-step offsets. `start` is the first sample of the chain's
+    /// block on the song timeline. Real-time safe.
+    fn run_mods(&mut self, ctx: &TimeCtx<'_>, transport: &Transport, playing: bool, start: i64, n: usize) {
+        let nsteps = n.div_ceil(CONTROL_BLOCK);
+        self.beat_steps.clear();
+        for k in 0..nsteps {
+            self.beat_steps.push(ctx.tick_of(start + (k * CONTROL_BLOCK) as i64) / PPQ as f64);
+        }
+        if self.has_fader_mod {
+            self.mod_vol.clear();
+            self.mod_vol.resize(nsteps, 0.0);
+            self.mod_pan.clear();
+            self.mod_pan.resize(nsteps, 0.0);
+        }
+        let Self { mods, devices, events, beat_steps, mod_vol, mod_pan, .. } = self;
+        for m in mods.iter_mut() {
+            m.steps.clear();
+            m.steps.resize(nsteps, 0.0);
+            let mut active = false;
+            if let Some(node) = find_proc_mut(devices, m.source)
+                && node.enabled.load(Ordering::Relaxed)
+                && !node.proc.is_crashed()
+            {
+                // SAFETY: the audio thread owns the installed graph (see `SharedProcessor`).
+                let proc = unsafe { node.proc.get_mut() };
+                let block = ModBlock {
+                    sample_rate: ctx.sr,
+                    playing,
+                    bpm: transport.bpm,
+                    step: CONTROL_BLOCK,
+                    frames: n,
+                    start_samples: start,
+                    beats: beat_steps,
+                    events: &events.events,
+                };
+                match guarded(|| proc.modulate(&block, &mut m.steps)) {
+                    Some(ok) => active = ok,
+                    None => node.fall_silently(),
+                }
+            }
+            if !active {
+                m.steps.fill(0.0);
+            }
+            let steps = &m.steps;
+            for tg in m.targets.iter_mut() {
+                // A modulator that is off (disabled, fallen) adds nothing.
+                let (min, max) = (tg.min, tg.max);
+                let off_at = |k: usize| if active { min + (max - min) * steps[k.min(nsteps - 1)] } else { 0.0 };
+                match tg.dest {
+                    ModDest::Volume => mod_vol.iter_mut().enumerate().for_each(|(k, v)| *v += off_at(k)),
+                    ModDest::Pan => mod_pan.iter_mut().enumerate().for_each(|(k, v)| *v += off_at(k)),
+                    ModDest::Param(device, id) => {
+                        let Some(node) = find_proc_mut(devices, device) else { continue };
+                        let evs = &mut node.auto_events;
+                        let autos = evs.events.len();
+                        // The automation events of the block for this parameter, in order:
+                        // each is rewritten to base + the modulation at its time, and moves `base`.
+                        let mut base = tg.base;
+                        let mut last = tg.last;
+                        let mut ci = 0;
+                        let mut next_auto = |evs: &EventList| -> Option<usize> {
+                            while ci < autos {
+                                let i = ci;
+                                ci += 1;
+                                if matches!(evs.events[i].kind, EventKind::Param { id: pid, .. } if pid == id) {
+                                    return Some(i);
+                                }
+                            }
+                            None
+                        };
+                        let mut pending = next_auto(evs);
+                        for k in 0..=nsteps {
+                            let upto = if k < nsteps { k * CONTROL_BLOCK } else { usize::MAX };
+                            while let Some(i) = pending {
+                                let off = evs.events[i].offset as usize;
+                                if off > upto {
+                                    break;
+                                }
+                                if let EventKind::Param { value, .. } = &mut evs.events[i].kind {
+                                    base = *value;
+                                    *value = (base + off_at(off / CONTROL_BLOCK)).clamp(0.0, 1.0);
+                                    last = *value;
+                                }
+                                pending = next_auto(evs);
+                            }
+                            if k < nsteps {
+                                let want = (base + off_at(k)).clamp(0.0, 1.0);
+                                if last.is_nan() || (want - last).abs() > 1e-5 {
+                                    evs.push(upto as u32, EventKind::Param { id, value: want });
+                                    last = want;
+                                }
+                            }
+                        }
+                        tg.base = base;
+                        tg.last = last;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A knob moved on the running graph: remember it as the base of a
+    /// modulated parameter and return what the device should get.
+    fn modulated_param(&mut self, device: DeviceId, param: u32, v: f32) -> f32 {
+        for m in &mut self.mods {
+            let now = m.steps.last().copied().unwrap_or(0.0);
+            for tg in &mut m.targets {
+                if tg.dest == ModDest::Param(device, param) {
+                    tg.base = v;
+                    let out = (v + tg.min + (tg.max - tg.min) * now).clamp(0.0, 1.0);
+                    tg.last = out;
+                    return out;
+                }
+            }
+        }
+        v
+    }
+
+    /// Fader offsets (volume, pan) of the control step at frame `a`.
+    #[inline]
+    fn fader_mod(&self, a: usize) -> (f32, f32) {
+        if !self.has_fader_mod {
+            return (0.0, 0.0);
+        }
+        let k = a / CONTROL_BLOCK;
+        (self.mod_vol.get(k).copied().unwrap_or(0.0), self.mod_pan.get(k).copied().unwrap_or(0.0))
+    }
+}
+
+/// Keep what the replaced graph's modulators had sent, so a recompile does
+/// not repeat every parameter.
+fn adopt_mods(new: &mut [ModNode], old: &[ModNode]) {
+    for m in new {
+        let Some(o) = old.iter().find(|o| o.source == m.source) else { continue };
+        for tg in &mut m.targets {
+            if let Some(ot) = o.targets.iter().find(|t| t.dest == tg.dest) {
+                tg.last = ot.last;
+            }
+        }
+    }
+}
+
 /// `set_param` from the audio thread: wakes the processor, skips one that
 /// fell, and takes one that panics out of the signal path.
 fn set_param_guarded(p: &SharedProcessor, id: u32, v: f32) {
@@ -1124,6 +1310,14 @@ pub(crate) struct TrackNode {
     pub has_input: bool,
     pub devices: Vec<DeviceNode>,
     pub param_autos: Vec<ParamAuto>,
+    /// Modulators on this track (see [`ModNode`]).
+    pub mods: Vec<ModNode>,
+    /// Song position in quarter notes at each control step of the block.
+    pub beat_steps: Vec<f64>,
+    /// Some modulator drives the fader: the per-step offsets below are live.
+    pub has_fader_mod: bool,
+    pub mod_vol: Vec<f32>,
+    pub mod_pan: Vec<f32>,
     pub buf: AudioBuffer,
     pub chunk_buf: AudioBuffer,
     pub chunk_events: EventList,
@@ -1196,9 +1390,15 @@ impl TrackNode {
     }
 
     /// Fader gains at a tick.
-    fn fader_target(&self, tick: f64, vca_db: f32, vca_mute: bool) -> (f32, f32) {
-        let vol = self.volume_lane.as_ref().and_then(|l| lane_value(l, tick)).map_or(self.volume_db, volume_db_from_normalized);
-        let pan = self.pan_lane.as_ref().and_then(|l| lane_value(l, tick)).map_or(self.pan, pan_from_normalized);
+    fn fader_target(&self, tick: f64, vca_db: f32, vca_mute: bool, modulation: (f32, f32)) -> (f32, f32) {
+        let mut vol = self.volume_lane.as_ref().and_then(|l| lane_value(l, tick)).map_or(self.volume_db, volume_db_from_normalized);
+        let mut pan = self.pan_lane.as_ref().and_then(|l| lane_value(l, tick)).map_or(self.pan, pan_from_normalized);
+        if modulation.0 != 0.0 {
+            vol = volume_db_from_normalized((volume_normalized_from_db(vol) + modulation.0).clamp(0.0, 1.0));
+        }
+        if modulation.1 != 0.0 {
+            pan = (pan + 2.0 * modulation.1).clamp(-1.0, 1.0);
+        }
         let lane_mute = self.mute_lane.as_ref().and_then(|l| lane_value(l, tick)).is_some_and(|v| v >= 0.5);
         if self.mute || lane_mute || vca_mute || self.silenced {
             return (0.0, 0.0);
@@ -1377,6 +1577,7 @@ impl CompiledGraph {
                 }
             }
             adopt_devices(&mut n.devices, &mut o.devices);
+            adopt_mods(&mut n.mods, &o.mods);
             n.panic_notes |= midi_lost(&o.devices, &n.devices);
             let map_scene = |s: usize| old.scenes.get(s).and_then(|sid| {
                 self.scene_lookup.binary_search_by_key(sid, |e| e.0).ok().map(|i| self.scene_lookup[i].1)
@@ -1497,9 +1698,24 @@ impl CompiledGraph {
     /// Fast path: a device parameter (normalised) on the installed graph.
     pub(crate) fn set_device_param(&mut self, device: DeviceId, param: u32, v: f32) {
         for t in &mut self.tracks {
-            if let Some(p) = find_proc_mut(&mut t.devices, device) {
-                set_param_guarded(&p.proc, param, v);
+            if find_proc_mut(&mut t.devices, device).is_some() {
+                let v = t.modulated_param(device, param, v);
+                if let Some(p) = find_proc_mut(&mut t.devices, device) {
+                    set_param_guarded(&p.proc, param, v);
+                }
                 return;
+            }
+        }
+    }
+
+    /// Fast path: the range of mapping `index` of modulator `source`.
+    pub(crate) fn set_mod_range(&mut self, source: DeviceId, index: u16, min: f32, max: f32) {
+        for t in &mut self.tracks {
+            for m in t.mods.iter_mut().filter(|m| m.source == source) {
+                for tg in m.targets.iter_mut().filter(|tg| tg.index == index) {
+                    tg.min = min;
+                    tg.max = max;
+                }
             }
         }
     }
@@ -1808,8 +2024,30 @@ fn process_track(
             }
         });
     }
+    for m in t.mods.iter() {
+        for tg in &m.targets {
+            if let ModDest::Param(device, _) = tg.dest
+                && let Some(node) = find_proc_mut(&mut t.devices, device)
+            {
+                node.auto_events.clear();
+            }
+        }
+    }
     for pa in t.param_autos.iter_mut() {
         pa.emit(&mut t.devices, ctx, auto_start, n);
+    }
+    if !t.mods.is_empty() {
+        // Modulation sits on top of the base value, automation included.
+        t.run_mods(ctx, transport, io.playing, auto_start, n);
+        for m in t.mods.iter() {
+            for tg in &m.targets {
+                if let ModDest::Param(device, _) = tg.dest
+                    && let Some(node) = find_proc_mut(&mut t.devices, device)
+                {
+                    node.auto_events.sort();
+                }
+            }
+        }
     }
     for pa in t.param_autos.iter() {
         pa.for_each_device(|device| {
@@ -1818,7 +2056,7 @@ fn process_track(
             }
         });
     }
-    let allow_sleep = !io.playing || t.param_autos.is_empty();
+    let allow_sleep = !io.playing || (t.param_autos.is_empty() && t.mods.is_empty());
     if t.param_autos.iter().all(ParamAuto::is_timed) {
         let mut si = SideIn { bufs: &*side, scratch: &mut t.side_scratch, offset: 0 };
         process_devices(&mut t.devices, &mut t.buf, &t.events.events, transport, sr, &mut si, (0, n), allow_sleep);
@@ -1902,7 +2140,7 @@ fn process_track(
                 let b = (a + CONTROL_BLOCK).min(n);
                 let tick = ctx.tick_of(lo + b as i64 - fader_shift);
                 let vca_db = if has_vca { vca0 + (vca1 - vca0) * (b as f32 / n as f32) } else { 0.0 };
-                let (tl, tr) = t.fader_target(tick, vca_db, has_vca && vca_mute);
+                let (tl, tr) = t.fader_target(tick, vca_db, has_vca && vca_mute, t.fader_mod(a));
                 if !t.gain_primed {
                     t.cur_gain = [tl, tr];
                     t.gain_primed = true;

@@ -141,15 +141,18 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(caption("16-STEP PATTERN (CLICK GATE · SHIFT ACCENT · ALT SLIDE · SCROLL NOTE)"))
+                .gap(px(SP2))
+                .child(caption(if dev.big { "16-STEP PATTERN (CLICK GATE · SHIFT ACCENT · ALT SLIDE · SCROLL NOTE)" } else { "16-STEP PATTERN" }))
+                .child(div().flex_1())
                 .child(label(
                     if dev.choice(p::SEQ_MODE) == 1 { "Pattern Active" } else { "MIDI Input" },
                     TEXT_XS,
                     if dev.choice(p::SEQ_MODE) == 1 { pal.accent } else { pal.faint },
-                )),
+                ))
+                .when(!dev.big, |row| row.child(acid_gen::compact_actions(ws, dev, cx))),
         )
         .child(seq)
-        .child(acid_gen::strip(ws, dev, cx))
+        .when(dev.big, |card| card.child(acid_gen::strip(ws, dev, true, cx)))
         .child(kit::strip(ws, dev, &primary, &more, cx))
         .into_any_element()
 }
@@ -331,7 +334,7 @@ fn pattern(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
                 .child(div().flex_1())
                 .child(instr::chips(dev, p::SEQ_MODE, cx)),
         )
-        .child(acid_gen::strip(ws, dev, cx))
+        .child(acid_gen::strip(ws, dev, true, cx))
         .child(
             div()
                 .flex_none()

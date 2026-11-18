@@ -301,8 +301,35 @@ fn stepper(dev: &Dev, c: Ctl, value: f32, cx: &mut Context<Workspace>) -> Div {
         .child(arrow(slot, "+", true, cx))
 }
 
-/// The generator strip: the three actions, the dice, and the five controls.
-pub fn strip(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
+/// The three actions as icons, for the compact card's pattern header row
+/// (no extra row, so the synth's knobs keep their room).
+pub fn compact_actions(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
+    let pal = p();
+    let device = dev.id;
+    let g = ws.acid_gen.get(&device).copied().unwrap_or_else(|| AcidGen::new(device));
+    let act = |f: fn(&mut Workspace, DeviceId, &mut Context<Workspace>)| {
+        cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            f(this, device, cx);
+        })
+    };
+    let icon_btn = |slot: usize, glyph: Icon, tip: &'static str, hint: &'static str| {
+        crate::widgets::sized_icon_button(("acid-gen-mini", dev.key(0x300 | slot)), glyph, false, 20., 12.).tooltip(crate::widgets::tip(tip, Some(hint)))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .child(mono(g.seed_tag(), TEXT_XS, pal.faint))
+        .child(icon_btn(0, Icon::Dice, "Generate", "A new acid phrase in the 16 steps (one undo step)").on_mouse_down(MouseButton::Left, act(generate)))
+        .child(icon_btn(1, Icon::Shuffle, "Mutate", "Change a few steps and keep the motif").on_mouse_down(MouseButton::Left, act(mutate)))
+        .child(icon_btn(2, Icon::MusicNote, "To MIDI clip", "Write the phrase as a MIDI clip on this track").on_mouse_down(MouseButton::Left, act(to_clip)))
+}
+
+/// The generator strip: the three actions, the dice, and (with `controls`)
+/// the five controls. The compact card leaves the controls to the expanded
+/// card and the device window, so the synth's own knobs keep their room.
+pub fn strip(ws: &Workspace, dev: &Dev, controls: bool, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let device = dev.id;
     let g = ws.acid_gen.get(&device).copied().unwrap_or_else(|| AcidGen::new(device));
@@ -322,7 +349,7 @@ pub fn strip(ws: &Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
         .flex_col()
         .gap(px(SP1))
         .child(div().flex().items_center().gap(px(SP1)).child(generate_btn).child(mutate_btn).child(clip_btn).child(div().flex_1()).child(mono(g.seed_tag(), TEXT_XS, pal.faint)))
-        .child(div().flex().flex_wrap().gap(px(SP1)).children(steppers))
+        .when(controls, |d| d.child(div().flex().flex_wrap().gap(px(SP1)).children(steppers)))
         .when(!dev.enabled, |d| d.opacity(0.7))
 }
 

@@ -99,6 +99,9 @@ pub fn dev_word(ws: &mut Workspace, word: &str) -> Option<DeviceId> {
             env[i] = e;
         }
         v.fake = Some(env);
+        for (a, e) in v.anim.iter_mut().zip(env) {
+            a.swell = e;
+        }
         v.rings = vec![view::RingAnim { cell: 0, age: 0.12 }, view::RingAnim { cell: 6, age: 0.3 }, view::RingAnim { cell: 10, age: 0.05 }];
     }
     Some(id)

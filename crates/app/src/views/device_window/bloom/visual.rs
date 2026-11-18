@@ -67,10 +67,11 @@ fn to_hsla(rgb: [f32; 3], alpha: f32) -> gpui::Hsla {
     gpui::Rgba { r: e(rgb[0]), g: e(rgb[1]), b: e(rgb[2]), a: alpha }.into()
 }
 
-/// The cell under `pos`, if any.
-fn hit(ws: &mut Workspace, device: aitrack_model::DeviceId, pos: Point<Pixels>) -> Option<usize> {
+/// The cell under `pos` in a visual of bounds `b`, if any.
+fn hit(ws: &mut Workspace, device: aitrack_model::DeviceId, b: Bounds<Pixels>, pos: Point<Pixels>) -> Option<usize> {
     let v = ws.fx.bloom.view(device);
-    let (cx, cy, sx, sy, s) = axes(v.region.get());
+    let (cx, cy, sx, sy, s) = axes(b);
+    let s = s * (90. / s.max(1.)).clamp(1., 1.7);
     let (mx, my) = (f32::from(pos.x), f32::from(pos.y));
     (0..SOUNDS)
         .map(|i| {
@@ -83,9 +84,8 @@ fn hit(ws: &mut Workspace, device: aitrack_model::DeviceId, pos: Point<Pixels>) 
 }
 
 /// Pointer position in visual units.
-fn units(ws: &mut Workspace, device: aitrack_model::DeviceId, pos: Point<Pixels>) -> (f32, f32) {
-    let v = ws.fx.bloom.view(device);
-    let (cx, cy, sx, sy, _) = axes(v.region.get());
+fn units(b: Bounds<Pixels>, pos: Point<Pixels>) -> (f32, f32) {
+    let (cx, cy, sx, sy, _) = axes(b);
     ((f32::from(pos.x) - cx) / sx.max(1.), (f32::from(pos.y) - cy) / sy.max(1.))
 }
 
@@ -113,8 +113,9 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
     let env: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(i));
     let hits: [f32; SOUNDS] = std::array::from_fn(|i| dev.m(32 + i));
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
-    // A cell being matched shows the search's best so far.
-    let mut shown = scene.clone();
+    // The field shows what plays (the morph blend), and a cell being matched
+    // the search's best so far.
+    let mut shown = view::played(ws, dev, scene);
     let matching = ws.fx.bloom.view(device).matching.as_ref().map(|m| (m.cell, m.fraction, m.best));
     if let Some((cell, _, Some(best))) = matching {
         shown.sounds[cell] = best;
@@ -150,7 +151,8 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
         .map(|r| {
             let a = v.anim[r.cell];
             let t = r.age / RING_LIFE;
-            (a.x, a.y, cells[r.cell].r + t * 0.5, (1.0 - t) * (1.0 - t) * 0.85, looks[r.cell].rgb)
+            // Rings rush out and settle (the app's decelerating curve) as they fade.
+            (a.x, a.y, cells[r.cell].r + crate::motion::bezier(t, crate::motion::DECELERATE) * 0.5, (1.0 - t) * (1.0 - t) * 0.85, looks[r.cell].rgb)
         })
         .collect();
     let pal = p();
@@ -165,12 +167,14 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
         light: !pal.dark,
         guide: with_alpha(pal.faint, 0.18),
     });
-    let region = v.region.clone();
     let painter = v.painter.clone();
     let cost = v.cost.clone();
     let enabled = dev.enabled;
+    // Kept per window (the card and the device window may both show it).
+    let region = ws.fx.region(device, 7);
+    let store = region.clone();
     let surface = canvas(
-        move |b, _, _| region.set(b),
+        move |b, _, _| store.set(b),
         move |b, _, window, cx| {
             window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| paint(&snap, &painter, &cost, b, enabled, window, cx));
         },
@@ -178,10 +182,10 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
     .size_full();
 
     // ── Gestures ──
-    let d = dev.clone();
+    let (d, r) = (dev.clone(), region.clone());
     let down = cx.listener(move |this, e: &MouseDownEvent, _, cx| {
         cx.stop_propagation();
-        let Some(i) = hit(this, d.id, e.position) else { return };
+        let Some(i) = hit(this, d.id, r.get(), e.position) else { return };
         if e.modifiers.alt {
             view::toggle_lock(this, &d, i);
             cx.notify();
@@ -192,9 +196,9 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
         this.fx.bloom.view(d.id).dna_cell = Some(i);
         audition(this, &d, i, cx);
     });
-    let d = dev.clone();
+    let (d, r) = (dev.clone(), region.clone());
     let hover = cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
-        let at = units(this, d.id, e.position);
+        let at = units(r.get(), e.position);
         let v = this.fx.bloom.view(d.id);
         v.cursor = Some(at);
         v.cursor_at = Some(std::time::Instant::now());
@@ -233,25 +237,25 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
         .on_drop(drop_file)
         .on_drop(drop_sample);
     if ws.fx.bloom.view(device).drag.is_some() {
-        root = root.child(capture(dev, cx));
+        root = root.child(capture(dev, region, cx));
     }
     root.into_any_element()
 }
 
 /// Window-wide listeners while a cell is dragged.
-fn capture(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
+fn capture(dev: &Dev, region: crate::views::device_ui::Region, cx: &mut Context<Workspace>) -> AnyElement {
     let weak = cx.entity().downgrade();
     let d = dev.clone();
     canvas(
         |_, _, _| {},
         move |_, _, window, _| {
-            let (w, dd) = (weak.clone(), d.clone());
+            let (w, dd, rr) = (weak.clone(), d.clone(), region.clone());
             window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
                 let _ = w.update(cx, |this, cx| {
-                    let (ux, uy) = units(this, dd.id, e.position);
+                    let (ux, uy) = units(rr.get(), e.position);
                     let scene = view::scene(this, &dd);
                     let v = this.fx.bloom.view(dd.id);
                     let Some(mut drag) = v.drag else { return };
@@ -317,7 +321,9 @@ fn paint(snap: &Snapshot, painter: &std::cell::RefCell<view::Painter>, cost: &st
     let scale = window.scale_factor();
     let (gw, gh) = grid_size(w, h, scale);
     let (kx, ky) = (gw as f32 / w, gh as f32 / h);
-    let unit = s * kx;
+    // Small visuals (the card) keep their cells readable.
+    let grow = (90. / s.max(1.)).clamp(1., 1.7);
+    let unit = s * kx * grow;
     let mut blobs: Vec<Blob> = Vec::with_capacity(SOUNDS + 1);
     blobs.push(Blob { x: (cx0 - f32::from(b.origin.x)) * kx, y: (cy0 - f32::from(b.origin.y)) * ky, r: snap.core.0 * unit, rgb: snap.core.1, lobes: 6, spikes: 0.08, sharp: 2.0, wobble: 0.2, phase: snap.time * 0.1, glow: 0.12 });
     for c in &snap.cells {
@@ -363,7 +369,7 @@ fn paint(snap: &Snapshot, painter: &std::cell::RefCell<view::Painter>, cost: &st
     // Overlays: selection, locks, labels, matching progress.
     for c in &snap.cells {
         let center = point(px(cx0 + c.x * sx), px(cy0 + c.y * sy));
-        let r = c.r * s;
+        let r = c.r * s * grow;
         if c.selected {
             crate::paint::arc(window, center, r + 5., 0., std::f32::consts::TAU, 1.5, with_alpha(pal.text, 0.85));
         }

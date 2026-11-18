@@ -8,7 +8,7 @@
 
 use super::field::Field;
 use super::look::{self, Look};
-use crate::views::device_ui::{Dev, Region};
+use crate::views::device_ui::Dev;
 use crate::workspace::Workspace;
 use aitrack_ai::progress::CancelToken;
 use aitrack_model::{Command, DeviceId};
@@ -162,6 +162,8 @@ pub struct Painter {
 /// One device's editor state.
 pub struct BloomView {
     parsed: Option<(u64, Rc<Parsed>)>,
+    /// The scene the parameters and state say, by (parsed state, seed, species).
+    effective: Option<((u64, u64, usize), Scene)>,
     pub history: Vec<Scene>,
     pub at: usize,
     pub anim: [Anim; SOUNDS],
@@ -181,7 +183,6 @@ pub struct BloomView {
     /// Next-best matches for a cell, offered as neighbours.
     pub alternatives: Option<(usize, Vec<Genome>)>,
     pub rendering: Option<RenderJob>,
-    pub region: Region,
     pub painter: Rc<RefCell<Painter>>,
     /// Field cost per frame, ms (moving average).
     pub cost: Rc<Cell<f32>>,
@@ -195,6 +196,7 @@ impl Default for BloomView {
     fn default() -> Self {
         Self {
             parsed: None,
+            effective: None,
             history: Vec::new(),
             at: 0,
             anim: [Anim::default(); SOUNDS],
@@ -211,7 +213,6 @@ impl Default for BloomView {
             matching: None,
             alternatives: None,
             rendering: None,
-            region: Region::default(),
             painter: Rc::default(),
             cost: Rc::default(),
             fake: None,
@@ -262,16 +263,23 @@ fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The device's state, parsed (cached by the bytes).
+/// The device's state, parsed (cached until the project changes: the key is
+/// the edit revision with the size and ends of the bytes, so reading it
+/// every frame costs nothing).
 pub fn parsed(ws: &mut Workspace, device: DeviceId) -> Rc<Parsed> {
-    let state = ws.s.project.device(device).and_then(|d| d.state.clone());
-    let h = state.as_deref().map_or(0, fnv);
+    let revision = ws.s.revision();
+    let state = ws.s.project.device(device).and_then(|d| d.state.as_deref());
+    let h = state.map_or(0, |s| {
+        let ends = [&s[..s.len().min(256)], &s[s.len().saturating_sub(256)..]].concat();
+        fnv(&ends) ^ (s.len() as u64).rotate_left(32) ^ revision.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
     let v = ws.fx.bloom.view(device);
     if let Some((k, p)) = &v.parsed
         && *k == h
     {
         return p.clone();
     }
+    let state = ws.s.project.device(device).and_then(|d| d.state.clone());
     let (stored, corners) = bloom::parse_state(state.as_deref());
     let p = Rc::new(Parsed { stored, corners });
     v.parsed = Some((h, p.clone()));
@@ -283,8 +291,16 @@ pub fn scene(ws: &mut Workspace, dev: &Dev) -> Scene {
     let parsed = parsed(ws, dev.id);
     let seed = bloom::seed_of(dev.plain(p::SEED));
     let species = Species::from_index(dev.choice(p::SPECIES));
-    let s = bloom::effective_scene(parsed.stored.as_ref(), seed, species);
     let v = ws.fx.bloom.view(dev.id);
+    let key = (v.parsed.as_ref().map_or(0, |p| p.0), seed, species.index());
+    let s = match &v.effective {
+        Some((k, s)) if *k == key => s.clone(),
+        _ => {
+            let s = bloom::effective_scene(parsed.stored.as_ref(), seed, species);
+            v.effective = Some((key, s.clone()));
+            s
+        }
+    };
     if v.history.is_empty() || v.history.get(v.at) != Some(&s) {
         // A scene that came from elsewhere (undo, a preset): it joins the history.
         if !v.history.contains(&s) {
@@ -397,6 +413,22 @@ pub fn set_corner(ws: &mut Workspace, dev: &Dev, k: usize, clear: bool) {
     let mut corners = bloom::parse_state(ws.s.project.device(dev.id).and_then(|d| d.state.as_deref())).1;
     corners[k] = if clear { None } else { Some(Box::new(s.sounds)) };
     commit(ws, dev, &s, Some(corners), if clear { "Clear morph corner" } else { "Set morph corner" });
+}
+
+/// The sounds the device plays at the current Morph X/Y: the scene's own,
+/// or the bilinear blend of the corner scenes (a missing corner is the scene).
+pub fn played(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> Scene {
+    let parsed = parsed(ws, dev.id);
+    if parsed.corners.iter().all(Option::is_none) {
+        return scene.clone();
+    }
+    let (x, y) = (dev.plain(p::MORPH_X), dev.plain(p::MORPH_Y));
+    let mut out = scene.clone();
+    for i in 0..SOUNDS {
+        let pick = |k: usize| parsed.corners[k].as_ref().map_or(&scene.sounds[i], |c| &c[i]);
+        out.sounds[i] = bloom::grow::morph4([pick(0), pick(1), pick(2), pick(3)], x, y);
+    }
+    out
 }
 
 /// The look of every sound of `scene` (estimated until analysed).
@@ -613,17 +645,27 @@ pub fn poll(ws: &mut Workspace, dev: &Dev, cx: &mut gpui::Context<Workspace>) ->
     // Matching.
     let mut finished = None;
     if let Some(m) = &mut ws.fx.bloom.view(device).matching {
-        while let Ok(msg) = m.rx.try_recv() {
-            changed = true;
-            match msg {
-                MatchMsg::Progress(p) => {
+        loop {
+            match m.rx.try_recv() {
+                Ok(MatchMsg::Progress(p)) => {
                     m.fraction = p.fraction();
                     m.best = Some(p.best);
                     m.distance = p.distance;
                 }
-                MatchMsg::Done(r) => finished = Some((m.cell, m.name.clone(), r)),
+                Ok(MatchMsg::Done(r)) => {
+                    finished = Some((m.cell, m.name.clone(), r));
+                    break;
+                }
+                // The worker went away without a word (it panicked).
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    finished = Some((m.cell, m.name.clone(), Err("The match stopped unexpectedly".to_owned())));
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
             }
+            changed = true;
         }
+        changed |= finished.is_some();
     }
     if let Some((cell, name, r)) = finished {
         ws.fx.bloom.view(device).matching = None;
@@ -643,13 +685,22 @@ pub fn poll(ws: &mut Workspace, dev: &Dev, cx: &mut gpui::Context<Workspace>) ->
     // Rendering.
     let mut done = None;
     if let Some(r) = &mut ws.fx.bloom.view(device).rendering {
-        while let Ok(msg) = r.rx.try_recv() {
-            changed = true;
-            match msg {
-                RenderMsg::Progress(n) => r.done = n,
-                RenderMsg::Done(res) => done = Some(res),
+        loop {
+            match r.rx.try_recv() {
+                Ok(RenderMsg::Progress(n)) => r.done = n,
+                Ok(RenderMsg::Done(res)) => {
+                    done = Some(res);
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    done = Some(Err("The render stopped unexpectedly".to_owned()));
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
             }
+            changed = true;
         }
+        changed |= done.is_some();
     }
     if let Some(res) = done {
         ws.fx.bloom.view(device).rendering = None;
@@ -667,44 +718,46 @@ pub fn poll(ws: &mut Workspace, dev: &Dev, cx: &mut gpui::Context<Workspace>) ->
     changed
 }
 
-/// The commands that put the scene on a new track as a Drum Rack: sixteen
-/// pads, each a Bloom playing one sound (Single mode), hats sharing a
-/// choke group. One undo step.
-pub fn drum_rack_commands(ws: &mut Workspace, dev: &Dev) -> Option<(Vec<Command>, aitrack_model::TrackId)> {
+/// The commands that put `scene` on a new track as a Drum Rack: sixteen
+/// pads, each a Bloom playing one sound (Single mode, the whole scene in its
+/// state so a pad can be switched later), hats sharing a choke group. The
+/// track goes right after the one holding `device`. One undo step.
+pub fn drum_rack_commands(project: &mut aitrack_model::Project, device: DeviceId, scene: &Scene) -> Option<(Vec<Command>, aitrack_model::TrackId)> {
     use aitrack_model::{Chain, Color, Device, DeviceKind, Rack, RackKind, Track, TrackKind};
-    let s = scene(ws, dev);
-    let source = ws.s.project.device(dev.id)?;
+    let infos = bloom::params();
+    let norm = |id: u32, plain: f32| infos.iter().find(|i| i.id == id).map_or(0., |i| i.to_normalized(plain));
+    let plain = |params: &BTreeMap<u32, f32>, id: u32| infos.iter().find(|i| i.id == id).map_or(0., |i| i.to_plain(params.get(&id).copied().unwrap_or_else(|| i.default_normalized())));
+    let source = project.device(device)?;
     let corners = bloom::parse_state(source.state.as_deref()).1;
     let base_params = source.params.clone();
-    let p_ = &mut ws.s.project;
+    let base = plain(&base_params, p::BASE).round().clamp(0., 112.) as u8;
     let mut rack = Rack::new(RackKind::Drum);
-    let base = dev.plain(p::BASE).round().clamp(0., 112.) as u8;
-    for (i, g) in s.sounds.iter().enumerate() {
+    for (i, g) in scene.sounds.iter().enumerate() {
         let note = base + i as u8;
         let mut chain = Chain::new(g.role.label(), Color::palette(i));
         chain.note = Some(note);
         chain.key_range = (note, note);
         chain.choke = g.folded().index(aitrack_stock::instrument::bloom::genome::g::CHOKE) as u8;
         let mut params = base_params.clone();
-        params.insert(p::MODE, dev.to_norm(p::MODE, 2.));
-        params.insert(p::SELECTED, dev.to_norm(p::SELECTED, i as f32));
-        params.insert(p::CHOKE, dev.to_norm(p::CHOKE, 0.));
-        params.insert(p::SEED, dev.to_norm(p::SEED, s.seed as f32));
-        params.insert(p::SPECIES, dev.to_norm(p::SPECIES, s.species.index() as f32));
-        let mut d = Device::stock(p_.alloc_device_id(), bloom::ID, format!("Bloom {}", g.role.label()));
-        d.state = Some(bloom::state_json(&params, &s, &corners));
+        params.insert(p::MODE, norm(p::MODE, 2.));
+        params.insert(p::SELECTED, norm(p::SELECTED, i as f32));
+        params.insert(p::CHOKE, norm(p::CHOKE, 0.));
+        params.insert(p::SEED, norm(p::SEED, scene.seed.min(MAX_SEED) as f32));
+        params.insert(p::SPECIES, norm(p::SPECIES, scene.species.index() as f32));
+        let mut d = Device::stock(project.alloc_device_id(), bloom::ID, format!("Bloom {}", g.role.label()));
+        d.state = Some(bloom::state_json(&params, scene, &corners));
         d.params = params;
         chain.devices.push(d);
         rack.chains.push(chain);
     }
-    let mut rack_device = Device::stock(p_.alloc_device_id(), "rack.drum", "Drum Rack");
+    let mut rack_device = Device::stock(project.alloc_device_id(), "rack.drum", "Drum Rack");
     rack_device.kind = DeviceKind::Rack(rack);
-    let track = p_.alloc_track_id();
-    let source_track = p_.device_track(dev.id);
-    let color = source_track.and_then(|t| p_.track(t)).map_or(Color::palette(5), |t| t.color);
-    let mut t = Track::new(track, TrackKind::Instrument, format!("Bloom Kit {:06}", s.seed), color);
+    let track = project.alloc_track_id();
+    let source_track = project.device_track(device);
+    let color = source_track.and_then(|t| project.track(t)).map_or(Color::palette(5), |t| t.color);
+    let mut t = Track::new(track, TrackKind::Instrument, format!("Bloom Kit {:06}", scene.seed), color);
     t.devices.push(rack_device);
-    let index = source_track.and_then(|st| p_.tracks.iter().position(|t| t.id == st)).map_or(p_.tracks.len(), |i| i + 1);
+    let index = source_track.and_then(|st| project.tracks.iter().position(|t| t.id == st)).map_or(project.tracks.len(), |i| i + 1);
     Some((vec![Command::AddTrack { track: Box::new(t), index }], track))
 }
 
@@ -753,6 +806,40 @@ mod tests {
         h2[6] = 1.0;
         step(&mut still, &distances, &[0.0; SOUNDS], &h2, true);
         assert!(still.rings.is_empty());
+    }
+
+    #[test]
+    fn a_scene_becomes_a_drum_rack_of_single_sound_blooms() {
+        use aitrack_model::{Command, DeviceKind};
+        let mut s = crate::state::AppState::new(crate::demo::project());
+        let track = s.project.tracks[0].id;
+        let id = s.project.alloc_device_id();
+        let dev = aitrack_model::Device::stock(id, bloom::ID, "Bloom");
+        assert!(s.edit("Add device", vec![Command::AddDevice { slot: aitrack_model::command::DeviceSlot::Track { track, index: 0 }, device: Box::new(dev) }]));
+        let scene = bloom::grow::generate(808, Default::default());
+        let before = s.history.steps().count();
+        let (cmds, new_track) = drum_rack_commands(&mut s.project, id, &scene).unwrap();
+        assert!(s.edit("Bloom to Drum Rack", cmds));
+        assert_eq!(s.history.steps().count(), before + 1, "one undo step");
+        let t = s.project.track(new_track).unwrap();
+        assert_eq!(s.project.tracks.iter().position(|x| x.id == new_track), Some(1), "right after the source track");
+        let DeviceKind::Rack(rack) = &t.devices[0].kind else { panic!("a rack") };
+        assert_eq!(rack.chains.len(), SOUNDS);
+        for (i, c) in rack.chains.iter().enumerate() {
+            assert_eq!(c.note, Some(36 + i as u8));
+            let pad = &c.devices[0];
+            let (stored, _) = bloom::parse_state(pad.state.as_deref());
+            assert_eq!(stored.as_ref(), Some(&scene));
+            let infos = bloom::params();
+            let info = |id: u32| infos.iter().find(|x| x.id == id).unwrap().clone();
+            assert_eq!(info(p::MODE).to_plain(pad.params[&p::MODE]), 2.0, "Single mode");
+            assert_eq!(info(p::SELECTED).to_plain(pad.params[&p::SELECTED]), i as f32);
+            assert_eq!(bloom::seed_of(info(p::SEED).to_plain(pad.params[&p::SEED])), 808);
+        }
+        // The hats share a choke group.
+        assert_eq!(rack.chains[6].choke, 1);
+        assert_eq!(rack.chains[10].choke, 1);
+        assert_eq!(rack.chains[0].choke, 0);
     }
 
     #[test]

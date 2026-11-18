@@ -218,7 +218,8 @@ pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
         None => action(("bloom-match", dev.key(5)), "Match sample…", Icon::Waveform, false, "Grow the selected sound towards an audio file (or drop one on the field)", cx, move |ws, cx| pick_and_match(ws, &d1, cx)),
     });
     row = row.child(action(("bloom-rack", dev.key(6)), "To Drum Rack", Icon::Drum, false, "A new track with a Drum Rack: sixteen pads, each a Bloom playing one sound", cx, move |ws, cx| {
-        if let Some((cmds, track)) = view::drum_rack_commands(ws, &d2) {
+        let scene = view::scene(ws, &d2);
+        if let Some((cmds, track)) = view::drum_rack_commands(&mut ws.s.project, d2.id, &scene) {
             ws.s.seal();
             if ws.s.edit("Bloom to Drum Rack", cmds) {
                 ws.s.selected_track = Some(track);

@@ -467,7 +467,10 @@ impl Segmented for Bloom {
         // Smooth the live levels to avoid zipper steps.
         let k = 1.0 - (-(n as f32) / (0.02 * self.sr)).exp();
         self.space_now += (self.space_amt - self.space_now) * k;
-        self.space.process(bs, bl, br, self.space_now * 1.6);
+        // An idle scene with a silent tail costs nothing (a Drum Rack holds sixteen).
+        if active > 0 || self.space.level > 1e-7 {
+            self.space.process(bs, bl, br, self.space_now * 1.6);
+        }
         let buf = &mut *ctx.buffer;
         let (mut sum, mut peak) = (0.0f32, 0.0f32);
         let vol_from = self.vol_now;
@@ -511,7 +514,6 @@ impl Segmented for Bloom {
         let rms = (sum / (2 * n) as f32).sqrt();
         m.rms = m.rms * 0.7 + rms * 0.3;
         m.peak = peak.max(m.peak * fall);
-        let _ = active;
     }
 }
 
@@ -700,6 +702,28 @@ mod tests {
         let (parsed, corners) = parse_state(Some(&blob));
         assert_eq!(parsed.as_ref(), Some(&edited));
         assert!(corners.iter().all(Option::is_none));
+    }
+
+    /// All sixteen sounds hit every 125 ms (up to 24 voices ringing):
+    /// `cargo test -p aitrack-stock --release --lib bloom_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bloom_cpu() {
+        for species in Species::ALL {
+            let mut b = Bloom::new();
+            set_plain(&mut b, p::SPECIES, species.index() as f32);
+            set_plain(&mut b, p::SEED, 4_000.0 + species.index() as f32);
+            let mut notes = Vec::new();
+            for step in 0..24 {
+                for k in 0..16u8 {
+                    notes.push((step * 6_000 + k as usize * 40, 36 + k, 0.9, true));
+                }
+            }
+            let n = 48_000 * 3;
+            let t = std::time::Instant::now();
+            let _ = render_notes(&mut b, &notes, n);
+            println!("{:<10} {:>6.2} % of a core", species.label(), 100.0 * t.elapsed().as_secs_f64() / 3.0);
+        }
     }
 
     #[test]

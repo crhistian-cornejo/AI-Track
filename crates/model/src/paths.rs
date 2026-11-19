@@ -223,8 +223,15 @@ mod tests {
     use crate::history::{History, Origin};
     use std::collections::BTreeSet;
 
+    /// The absolute path `p` (written the Unix way, `/music/song`) on this
+    /// platform: Windows only takes a path with a drive for absolute.
+    fn abs(p: &str) -> PathBuf {
+        if cfg!(windows) { PathBuf::from(format!("C:{p}")) } else { PathBuf::from(p) }
+    }
+
     fn audio(path: &str, hash: Option<&str>) -> Source {
-        Source::Audio(AudioSource { path: path.into(), hash: hash.map(String::from), sample_rate: 48_000, channels: 2, frames: 48_000, warp: Warp::default(), key: None })
+        let path = if path.starts_with('/') { abs(path) } else { PathBuf::from(path) };
+        Source::Audio(AudioSource { path, hash: hash.map(String::from), sample_rate: 48_000, channels: 2, frames: 48_000, warp: Warp::default(), key: None })
     }
 
     fn project(paths: &[(&str, Option<&str>)]) -> (Project, Vec<SourceId>) {
@@ -252,20 +259,20 @@ mod tests {
         let mut t = Track::new(id, TrackKind::Audio, "a", Color(0));
         t.freeze = Some(Freeze { file: match audio("/music/song/Samples/Frozen/a Frozen.wav", None) { Source::Audio(a) => a, _ => unreachable!() } });
         p.tracks.push(t);
-        let saved = relativize(&p, Path::new("/music/song"));
+        let saved = relativize(&p, &abs("/music/song"));
         assert_eq!(saved.track(id).unwrap().freeze.as_ref().unwrap().file.path, PathBuf::from("Samples/Frozen/a Frozen.wav"));
         let mut opened = saved;
-        resolve(&mut opened, Path::new("/elsewhere/song"));
-        assert_eq!(opened.track(id).unwrap().freeze.as_ref().unwrap().file.path, PathBuf::from("/elsewhere/song/Samples/Frozen/a Frozen.wav"));
+        resolve(&mut opened, &abs("/elsewhere/song"));
+        assert_eq!(opened.track(id).unwrap().freeze.as_ref().unwrap().file.path, abs("/elsewhere/song/Samples/Frozen/a Frozen.wav"));
     }
 
     #[test]
     fn only_paths_inside_the_project_folder_become_relative() {
-        let base = Path::new("/music/song");
-        assert_eq!(relative_path(Path::new("/music/song/Samples/kick.wav"), base), Some(PathBuf::from("Samples/kick.wav")));
-        assert_eq!(relative_path(Path::new("/music/song/a.wav"), base), Some(PathBuf::from("a.wav")));
-        assert_eq!(relative_path(Path::new("/music/other/kick.wav"), base), None, "outside stays absolute");
-        assert_eq!(relative_path(Path::new("/music/song-2/kick.wav"), base), None, "a sibling with the same prefix is outside");
+        let base = &abs("/music/song");
+        assert_eq!(relative_path(&abs("/music/song/Samples/kick.wav"), base), Some(PathBuf::from("Samples/kick.wav")));
+        assert_eq!(relative_path(&abs("/music/song/a.wav"), base), Some(PathBuf::from("a.wav")));
+        assert_eq!(relative_path(&abs("/music/other/kick.wav"), base), None, "outside stays absolute");
+        assert_eq!(relative_path(&abs("/music/song-2/kick.wav"), base), None, "a sibling with the same prefix is outside");
         assert_eq!(relative_path(Path::new("Samples/kick.wav"), base), None, "already relative");
         assert_eq!(relative_path(base, base), None);
     }
@@ -278,33 +285,33 @@ mod tests {
             ("mem://ramp.wav", None),
             ("/music/song/Samples/Deep/snare.wav", None),
         ]);
-        let saved = relativize(&p, Path::new("/music/song"));
+        let saved = relativize(&p, &abs("/music/song"));
         assert_eq!(path_of(&saved, ids[0]), PathBuf::from("Samples/kick.wav"));
-        assert_eq!(path_of(&saved, ids[1]), PathBuf::from("/library/loops/pad.wav"));
+        assert_eq!(path_of(&saved, ids[1]), abs("/library/loops/pad.wav"));
         assert_eq!(path_of(&saved, ids[2]), PathBuf::from("mem://ramp.wav"));
         assert_eq!(path_of(&saved, ids[3]), PathBuf::from("Samples/Deep/snare.wav"));
-        assert_eq!(path_of(&p, ids[0]), PathBuf::from("/music/song/Samples/kick.wav"), "the project in memory is untouched");
+        assert_eq!(path_of(&p, ids[0]), abs("/music/song/Samples/kick.wav"), "the project in memory is untouched");
         // The folder moved: open the saved text and resolve against the new place.
         let mut reopened = Project::open_json(&saved.to_json().unwrap()).unwrap();
-        resolve(&mut reopened, Path::new("/elsewhere/song"));
-        assert_eq!(path_of(&reopened, ids[0]), PathBuf::from("/elsewhere/song/Samples/kick.wav"));
-        assert_eq!(path_of(&reopened, ids[1]), PathBuf::from("/library/loops/pad.wav"));
+        resolve(&mut reopened, &abs("/elsewhere/song"));
+        assert_eq!(path_of(&reopened, ids[0]), abs("/elsewhere/song/Samples/kick.wav"));
+        assert_eq!(path_of(&reopened, ids[1]), abs("/library/loops/pad.wav"));
         assert_eq!(path_of(&reopened, ids[2]), PathBuf::from("mem://ramp.wav"));
-        assert_eq!(path_of(&reopened, ids[3]), PathBuf::from("/elsewhere/song/Samples/Deep/snare.wav"));
+        assert_eq!(path_of(&reopened, ids[3]), abs("/elsewhere/song/Samples/Deep/snare.wav"));
         // Back where it was, the round trip is the identity.
         let mut home = saved.clone();
-        resolve(&mut home, Path::new("/music/song"));
+        resolve(&mut home, &abs("/music/song"));
         assert_eq!(home.sources, p.sources);
     }
 
     #[test]
     fn missing_files_are_found_with_a_caller_supplied_check() {
         let (p, ids) = project(&[("/m/Samples/a.wav", None), ("Samples/b.wav", None), ("mem://x.wav", None), ("/lost/c.wav", Some("h3"))]);
-        let present: BTreeSet<PathBuf> = [PathBuf::from("/m/Samples/a.wav")].into();
-        let missing = missing_sources(&p, Path::new("/m"), |f| present.contains(f));
+        let present: BTreeSet<PathBuf> = [abs("/m/Samples/a.wav")].into();
+        let missing = missing_sources(&p, &abs("/m"), |f| present.contains(f));
         // A relative path is looked for inside the project folder; memory sources are never missing.
         assert_eq!(missing.iter().map(|m| m.source).collect::<Vec<_>>(), vec![ids[1], ids[3]]);
-        assert_eq!(missing[0].path, PathBuf::from("/m/Samples/b.wav"));
+        assert_eq!(missing[0].path, abs("/m/Samples/b.wav"));
         assert_eq!(missing[1].hash.as_deref(), Some("h3"));
         // Candidates for a lost file: same file name, any case.
         let found = candidates_for(&missing[1], &[PathBuf::from("/new/C.WAV"), PathBuf::from("/new/d.wav"), PathBuf::from("/other/c.wav")]);
@@ -361,18 +368,19 @@ mod tests {
             ("Samples/rel.wav", None),          // relative: already in the project
             ("/lib/taken.wav", None),
         ]);
-        let base = Path::new("/music/song");
-        let taken = Path::new("/music/song/Samples/taken.wav");
+        let base = &abs("/music/song");
+        let taken = abs("/music/song/Samples/taken.wav");
         let plan = collect_plan(&p, base, |f| f == taken);
-        let jobs: Vec<(String, String)> = plan.copies.iter().map(|c| (c.from.display().to_string(), c.to.display().to_string())).collect();
+        // Compared as paths: a path reads with the platform's own separator.
+        let jobs: Vec<(PathBuf, PathBuf)> = plan.copies.iter().map(|c| (c.from.clone(), c.to.clone())).collect();
         assert_eq!(
             jobs,
             vec![
-                ("/lib/a/kick.wav".to_string(), "Samples/kick.wav".to_string()),
-                ("/lib/b/kick.wav".to_string(), "Samples/kick 2.wav".to_string()),
-                ("/lib/Hat.wav".to_string(), "Samples/Hat.wav".to_string()),
-                ("/lib/other/hat.WAV".to_string(), "Samples/hat 2.WAV".to_string()),
-                ("/lib/taken.wav".to_string(), "Samples/taken 2.wav".to_string()),
+                (abs("/lib/a/kick.wav"), PathBuf::from("Samples/kick.wav")),
+                (abs("/lib/b/kick.wav"), PathBuf::from("Samples/kick 2.wav")),
+                (abs("/lib/Hat.wav"), PathBuf::from("Samples/Hat.wav")),
+                (abs("/lib/other/hat.WAV"), PathBuf::from("Samples/hat 2.WAV")),
+                (abs("/lib/taken.wav"), PathBuf::from("Samples/taken 2.wav")),
             ]
         );
         assert_eq!(plan.copies[0].sources, vec![ids[0], ids[2]]);
@@ -380,10 +388,10 @@ mod tests {
         let mut q = p.clone();
         let mut h = History::default();
         h.apply(&mut q, "Collect All and Save", Origin::User, plan.commands.clone()).unwrap();
-        assert_eq!(path_of(&q, ids[0]), PathBuf::from("/music/song/Samples/kick.wav"));
-        assert_eq!(path_of(&q, ids[1]), PathBuf::from("/music/song/Samples/kick 2.wav"));
-        assert_eq!(path_of(&q, ids[2]), PathBuf::from("/music/song/Samples/kick.wav"));
-        assert_eq!(path_of(&q, ids[3]), PathBuf::from("/music/song/Samples/own.wav"));
+        assert_eq!(path_of(&q, ids[0]), abs("/music/song/Samples/kick.wav"));
+        assert_eq!(path_of(&q, ids[1]), abs("/music/song/Samples/kick 2.wav"));
+        assert_eq!(path_of(&q, ids[2]), abs("/music/song/Samples/kick.wav"));
+        assert_eq!(path_of(&q, ids[3]), abs("/music/song/Samples/own.wav"));
         assert_eq!(path_of(&q, ids[6]), PathBuf::from("mem://ramp.wav"));
         assert_eq!(path_of(&q, ids[7]), PathBuf::from("Samples/rel.wav"));
         h.undo(&mut q).unwrap();
@@ -398,8 +406,8 @@ mod tests {
     #[test]
     fn a_name_without_an_extension_or_with_dots_gets_its_number_in_the_right_place() {
         let (p, _) = project(&[("/a/take", None), ("/b/take", None), ("/a/v1.2.final.wav", None), ("/b/v1.2.final.wav", None)]);
-        let plan = collect_plan(&p, Path::new("/m"), |_| false);
-        let to: Vec<String> = plan.copies.iter().map(|c| c.to.display().to_string()).collect();
-        assert_eq!(to, ["Samples/take", "Samples/take 2", "Samples/v1.2.final.wav", "Samples/v1.2.final 2.wav"]);
+        let plan = collect_plan(&p, &abs("/m"), |_| false);
+        let to: Vec<PathBuf> = plan.copies.iter().map(|c| c.to.clone()).collect();
+        assert_eq!(to, ["Samples/take", "Samples/take 2", "Samples/v1.2.final.wav", "Samples/v1.2.final 2.wav"].map(PathBuf::from));
     }
 }

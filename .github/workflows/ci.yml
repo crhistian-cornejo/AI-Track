@@ -40,8 +40,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       # Tests that need audio hardware, downloaded models or installed
       # plugins are `#[ignore]`d in the code and stay off here.
+      # Every crate runs even when one fails, so one run lists all that is
+      # broken on a platform instead of stopping at the first crate.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   licenses:
     name: cargo-deny

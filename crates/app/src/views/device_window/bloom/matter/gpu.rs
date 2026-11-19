@@ -14,7 +14,11 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
     matter: wgpu::RenderPipeline,
+    // The NV12 planes go to the macOS surface (`surface.rs`); on Windows the
+    // panel is read back as BGRA and these two pipelines are not drawn with.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     luma: wgpu::RenderPipeline,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     chroma: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     dummy: wgpu::TextureView,
@@ -212,6 +216,8 @@ impl Gpu {
 
     /// Record the NV12 conversion of `t`'s image into the two plane views
     /// (full-size luma, half-size chroma). `t` must have been encoded first.
+    /// Only the macOS surface asks for it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn encode_nv12(&self, enc: &mut wgpu::CommandEncoder, t: &Target, luma: &wgpu::TextureView, chroma: &wgpu::TextureView) {
         let bind = self.bind(&t.ubuf, &t.view);
         Self::pass(enc, luma, &self.luma, &bind);
@@ -248,7 +254,8 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Submit recorded work and wait for it (the render thread's frames).
+    /// Submit recorded work and wait for it (the render thread's frames of the macOS surface).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn submit_and_wait(&self, enc: wgpu::CommandEncoder) -> Result<(), String> {
         self.queue.submit([enc.finish()]);
         self.device.poll(wgpu::PollType::wait_indefinitely()).map(|_| ()).map_err(|e| e.to_string())

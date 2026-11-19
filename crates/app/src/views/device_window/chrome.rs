@@ -273,7 +273,7 @@ pub fn header(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>)
     let (ic, kind) = match &d.kind {
         DeviceKind::Stock { plugin_id } => (
             crate::views::menus::device_icon(plugin_id, ws),
-            crate::views::menus::device_kind_label(plugin_id, ws).to_owned(),
+            crate::views::menus::device_kind_label_of(plugin_id, &d.params, ws).to_owned(),
         ),
         _ => (Icon::Device, String::new()),
     };

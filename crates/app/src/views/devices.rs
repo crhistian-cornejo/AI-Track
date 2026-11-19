@@ -338,7 +338,7 @@ fn card(
     let collapsed = d.collapsed;
     let (kind_label, ic) = match &d.kind {
         DeviceKind::Stock { plugin_id } => (
-            crate::views::menus::device_kind_label(plugin_id, ws).to_owned(),
+            crate::views::menus::device_kind_label_of(plugin_id, &d.params, ws).to_owned(),
             device_icon(plugin_id, ws),
         ),
         DeviceKind::Plugin { format, .. } => ((if *format == PluginFormat::Vst3 { "VST3" } else { "CLAP" }).to_owned(), Icon::Plug),

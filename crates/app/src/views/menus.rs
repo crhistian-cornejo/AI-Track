@@ -489,6 +489,21 @@ pub fn device_kind_label(plugin_id: &str, ws: &Workspace) -> &'static str {
     ws.b.plugins.device(plugin_id).map_or("Device", |_| classify_stock(plugin_id, &ws.palette.plugin_prefs).label())
 }
 
+/// [`device_kind_label`] for one device: a Bloom set to a tonal kind says
+/// that kind (Bass, Pad…) rather than its palette group.
+pub fn device_kind_label_of(plugin_id: &str, params: &std::collections::BTreeMap<u32, f32>, ws: &Workspace) -> &'static str {
+    use aitrack_stock::instrument::bloom::{self, patch::{KIND_NAMES, Kind}};
+    if plugin_id == bloom::ID
+        && let Some(norm) = params.get(&bloom::p::KIND)
+    {
+        let kind = Kind::from_index((norm.clamp(0.0, 1.0) * (KIND_NAMES.len() - 1) as f32).round() as usize);
+        if kind.is_tonal() {
+            return kind.label();
+        }
+    }
+    device_kind_label(plugin_id, ws)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceMenuGroup {
     Favorites,

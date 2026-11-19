@@ -27,6 +27,7 @@ pub mod feel;
 pub mod grid;
 pub mod harmony;
 pub mod lock;
+pub mod pack;
 pub mod patterns;
 pub mod realize;
 pub mod request;

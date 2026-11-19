@@ -387,3 +387,110 @@ fn levels_land_on_the_target() {
 
 
 
+
+/// Saved projects regrow their tonal scenes from Seed + Kind: these seeds
+/// must keep growing exactly what they grew before packs and morphing
+/// existed (pinned on 2026-11-18). A change here is a sound change for
+/// every saved tonal Bloom.
+#[test]
+fn existing_seeds_grow_byte_identical_scenes() {
+    let mut h: u64 = 0;
+    for kind in Kind::TONAL {
+        for seed in [1337u64, 5, 42, 777, 31_337] {
+            for p in &generate(seed, kind).patches {
+                h = h.rotate_left(5) ^ p.hash();
+            }
+        }
+    }
+    assert_eq!(h, 0x8032_b1c1_8ea6_5b54, "a tonal seed grows another scene");
+}
+
+fn corners_of(kind: Kind, seeds: [u64; 4]) -> [PatchScene; 4] {
+    seeds.map(|s| generate(s, kind))
+}
+
+#[test]
+fn morph_is_deterministic_and_each_corner_is_itself() {
+    for kind in Kind::TONAL {
+        let c = corners_of(kind, [11, 22, 33, 44]);
+        for i in [0usize, 7, 15] {
+            let p = [&c[0].patches[i], &c[1].patches[i], &c[2].patches[i], &c[3].patches[i]];
+            for (k, (x, y)) in [(0.0f32, 0.0f32), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].into_iter().enumerate() {
+                assert_eq!(morph4(p, x, y), p[k].folded(), "{kind:?} cell {i}: corner {k} is itself");
+            }
+            let a = morph4(p, 0.37, 0.61);
+            assert_eq!(a, morph4(p, 0.37, 0.61), "deterministic");
+            assert!(a.v.iter().all(|v| quantize(*v) == *v && v.is_finite()));
+            assert_eq!(a.kind, kind);
+            // Between the corners, it is between them.
+            let mid = morph4(p, 0.5, 0.0);
+            assert!(mid.distance(p[0]) > 1e-3 && mid.distance(p[1]) > 1e-3);
+            assert!(mid.distance(p[0]) < p[0].distance(p[1]) && mid.distance(p[1]) < p[0].distance(p[1]));
+        }
+    }
+    // Gains: exact at the corners, in dB between them.
+    let g = [1.0, 4.0, 0.5, 2.0];
+    assert_eq!(morph_gain(g, 1.0, 0.0), 4.0);
+    assert!((morph_gain(g, 0.5, 0.0) - 2.0).abs() < 1e-3, "halfway between 0 and +12 dB is +6 dB");
+    assert!((morph_gain([1.0; 4], 0.3, 0.8) - 1.0).abs() < 1e-5);
+    let w = corner_weights(0.25, 0.75);
+    assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+}
+
+/// Every morphed patch on a grid of X/Y keeps its kind's rules.
+#[test]
+fn morphs_keep_the_kinds_rules_across_the_pad() {
+    type Rules = Vec<(u32, f32, f32)>;
+    let rule_sets: Vec<(Kind, Rules)> = Kind::TONAL.iter().map(|&k| (k, rules(k))).collect();
+    std::thread::scope(|s| {
+        for (kind, rules) in &rule_sets {
+            s.spawn(move || {
+                for (n, seeds) in [[1u64, 2, 3, 4], [500, 9_001, 77, 31_337]].into_iter().enumerate() {
+                    let c = corners_of(*kind, seeds);
+                    for i in (0..SOUNDS).step_by(3) {
+                        let p = [&c[0].patches[i], &c[1].patches[i], &c[2].patches[i], &c[3].patches[i]];
+                        for gx in 0..=6 {
+                            for gy in 0..=6 {
+                                let x = morph4(p, gx as f32 / 6.0, gy as f32 / 6.0);
+                                let at = format!("{kind:?} set {n} cell {i} at {gx}/6, {gy}/6");
+                                for &(id, lo, hi) in rules {
+                                    let v = x.plain(id);
+                                    let tol = 1e-3 * (hi - lo).abs().max(1.0) + 1e-3 * v.abs();
+                                    assert!(v >= lo - tol && v <= hi + tol, "{at}: param {id} = {v} outside {lo}..{hi}");
+                                }
+                                assert!(source_level(&x) >= 44.0, "{at}: nothing sounds");
+                                match kind {
+                                    Kind::Bass => assert!(x.choice(w::VOICE_MODE) >= 1 && x.choice(w::FILTER_TYPE) == 0, "{at}"),
+                                    Kind::Pad => assert!(unison(&x, 0) >= 3 && moves(&x, 6.0, 100.0), "{at}"),
+                                    Kind::Pluck => assert!(x.plain(w::AMP_SUSTAIN) <= 2.1, "{at}"),
+                                    Kind::Texture => assert!(moves(&x, 8.0, 100.0), "{at}"),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn a_morph_scene_follows_its_corners_of_the_same_kind() {
+    let scene = generate(5, Kind::Lead);
+    let mut corners: PatchCorners = Default::default();
+    assert!(!corners_active(&corners, Kind::Lead));
+    assert_eq!(morph_scene(&scene, &corners, 0.7, 0.2), scene, "no corner: the scene");
+    let b = generate(6, Kind::Lead);
+    set_corner(&mut corners, 1, Some(&b));
+    // A corner of another kind does not count.
+    set_corner(&mut corners, 2, Some(&generate(6, Kind::Pad)));
+    assert!(corners_active(&corners, Kind::Lead));
+    let at_b = morph_scene(&scene, &corners, 1.0, 0.0);
+    assert_eq!(at_b.patches, b.patches.map(|p| p.folded()));
+    assert_eq!(at_b.seed, scene.seed);
+    let at_c = morph_scene(&scene, &corners, 0.0, 1.0);
+    assert_eq!(at_c.patches, scene.patches.map(|p| p.folded()), "the Pad corner stands in as the scene");
+    set_corner(&mut corners, 1, None);
+    assert!(corners[1].is_none());
+}

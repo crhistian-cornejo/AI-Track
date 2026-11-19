@@ -10,6 +10,7 @@ pub mod knobs;
 pub mod layout;
 pub mod look;
 pub mod matter;
+pub mod pack;
 pub mod pads;
 pub mod stage;
 pub mod view;

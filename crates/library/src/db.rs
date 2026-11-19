@@ -495,11 +495,13 @@ impl Library {
         &self.conn
     }
 
+    /// The folder of the database, which relative roots are resolved against
+    /// (on Windows without a `\\?\` prefix, like every path roots are compared with).
     fn base_dir(&self) -> PathBuf {
         self.db_path
             .as_deref()
             .and_then(Path::parent)
-            .map(Path::to_path_buf)
+            .map(|dir| strip_verbatim(dir.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."))
     }
 

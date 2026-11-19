@@ -1013,7 +1013,10 @@ mod tests {
     #[test]
     fn index_analyses_missing_key_and_tempo_once() {
         let tmp = tempfile::tempdir().unwrap();
+        // Symlinks resolved (macOS: /var is /private/var), and on Windows without the `\\?\`
+        // prefix `canonicalize` adds: the library looks files up without it.
         let dir = tmp.path().canonicalize().unwrap();
+        let dir = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
         let packs = dir.join("packs").join("Test");
         fs::create_dir_all(&packs).unwrap();
         // An A minor triad pad and a 120 BPM click loop, neither named with a key or tempo.

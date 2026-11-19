@@ -168,13 +168,13 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         let content = if stacked {
             let clip_el = render_clip(ws, window, cx);
             let dev_el = crate::views::devices::render(ws, window, cx);
-            let split = ws.bottom_split.clamp(0.25, 0.75);
-            let total_h = (ws.bottom_h - m().dock_bar_h).max(120.);
+            let total_h = (ws.bottom_h_eff() - m().dock_bar_h).max(120.);
+            let split = crate::workspace::split_fitted(ws.bottom_split, total_h);
             let dev_focused = ws.s.ed.area == crate::editing::Area::Devices;
             let divider = div()
                 .id("bottom-split-resize")
                 .flex_none()
-                .h(px(6.))
+                .h(px(crate::workspace::STACK_DIVIDER_H))
                 .w_full()
                 .cursor_row_resize()
                 .flex()
@@ -201,7 +201,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     div()
                         .flex_grow(split)
                         .flex_basis(px(0.))
-                        .min_h(px(84.))
+                        .min_h(px(crate::workspace::STACK_CLIP_MIN_H))
                         .w_full()
                         .overflow_hidden()
                         .border_l_2()
@@ -213,7 +213,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                     div()
                         .flex_grow(1. - split)
                         .flex_basis(px(0.))
-                        .min_h(px(96.))
+                        .min_h(px(crate::workspace::DEVICES_MIN_H))
                         .w_full()
                         .overflow_hidden()
                         .border_l_2()
@@ -232,7 +232,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     };
 
     let resizing = matches!(ws.drag, Some(Drag::BottomResize { .. } | Drag::BottomSplit { .. }));
-    let target = if ws.bottom_open { ws.bottom_h } else { m().dock_bar_h };
+    let target = if ws.bottom_open { ws.bottom_h_eff() } else { m().dock_bar_h };
     let handle = div()
         .id("bottom-resize")
         .absolute()
@@ -246,7 +246,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 cx.stop_propagation();
                 if e.click_count >= 2 {
                     // Double-click the edge: back to the default height.
-                    this.bottom_h = crate::workspace::bottom_h_clamped(m().dock_h, this.window_h);
+                    this.bottom_h = crate::workspace::bottom_h_fitted(m().dock_h, this.window_h, this.bottom_min_h());
                     cx.notify();
                 } else {
                     this.begin_bottom_resize(f32::from(e.position.y), cx);

@@ -1926,9 +1926,20 @@ impl Workspace {
 
     // ── Drags ──
 
+    /// The least height the detail panel may have in the view it shows now.
+    pub fn bottom_min_h(&self) -> f32 {
+        bottom_min_h(self.bottom_stacked, self.s.bottom_tab == BottomTab::Devices, theme::m().dock_bar_h)
+    }
+
+    /// The detail panel's height as drawn: the stored one, raised to what
+    /// the view needs (a panel saved at 264 px still shows every knob).
+    pub fn bottom_h_eff(&self) -> f32 {
+        bottom_h_fitted(self.bottom_h, self.window_h, self.bottom_min_h())
+    }
+
     /// Start dragging the top edge of the detail panel from window y `y`.
     pub fn begin_bottom_resize(&mut self, y: f32, cx: &mut Context<Self>) {
-        let start_h = self.bottom_h;
+        let start_h = self.bottom_h_eff();
         self.begin_drag(Drag::BottomResize { start_y: y, start_h }, cx);
     }
 
@@ -1942,8 +1953,8 @@ impl Workspace {
     pub fn toggle_bottom_stacked(&mut self, cx: &mut Context<Self>) {
         self.bottom_stacked = !self.bottom_stacked;
         self.bottom_open = true;
-        if self.bottom_stacked && self.bottom_h < 380. {
-            self.bottom_h = bottom_h_clamped(440., self.window_h);
+        if self.bottom_stacked && self.bottom_h < 480. {
+            self.bottom_h = bottom_h_fitted(480., self.window_h, self.bottom_min_h());
         }
         cx.notify();
     }
@@ -2196,10 +2207,10 @@ impl Workspace {
                 self.mixer_h = (*start_h + (*start_y - f32::from(e.position.y))).clamp(160., 520.);
             }
             Drag::BottomResize { start_y, start_h } => {
-                self.bottom_h = bottom_h_clamped(*start_h + (*start_y - y), self.window_h);
+                self.bottom_h = bottom_h_fitted(*start_h + (*start_y - y), self.window_h, self.bottom_min_h());
             }
             Drag::BottomSplit { start_y, start_split, total_h } => {
-                self.bottom_split = (*start_split + (y - *start_y) / total_h.max(120.)).clamp(0.25, 0.75);
+                self.bottom_split = split_fitted(*start_split + (y - *start_y) / total_h.max(120.), *total_h);
             }
             Drag::Notes { clip, originals, origin, resize, applied, preview } => {
                 let (tick, key) = self.piano_pos(e.position);
@@ -3301,7 +3312,7 @@ impl Workspace {
     /// height, independent of what the detail panel shows.
     /// The mixer section's height in the current window.
     pub fn mixer_h_fitted(&self) -> f32 {
-        let bottom = if self.bottom_open { self.bottom_h } else { theme::m().dock_bar_h };
+        let bottom = if self.bottom_open { self.bottom_h_eff() } else { theme::m().dock_bar_h };
         mixer_h_fitted(self.mixer_h, bottom, self.window_h)
     }
 
@@ -4077,9 +4088,39 @@ impl Render for Workspace {
     }
 }
 
-/// The detail panel's height: at least 160 px, at most 70 % of the window.
-pub fn bottom_h_clamped(h: f32, window_h: f32) -> f32 {
-    h.clamp(160., (window_h * 0.7).max(160.))
+/// What the device chain needs to show every knob of the tallest card: the
+/// card (title bar, body, padding) with room to spare.
+pub const DEVICES_MIN_H: f32 = 280.;
+/// The Clip half of the stacked detail panel never gets shorter than this.
+pub const STACK_CLIP_MIN_H: f32 = 120.;
+/// The divider between the stacked halves.
+pub const STACK_DIVIDER_H: f32 = 6.;
+
+/// The detail panel's height between `min` and 70 % of the window (the
+/// minimum wins on a window too short for both).
+pub fn bottom_h_fitted(h: f32, window_h: f32, min: f32) -> f32 {
+    h.clamp(min, (window_h * 0.7).max(min))
+}
+
+/// The least height the detail panel may have for what it shows: the whole
+/// device chain, alone or under the clip editor, must fit; other views keep 160 px.
+pub fn bottom_min_h(stacked: bool, devices_view: bool, bar_h: f32) -> f32 {
+    if stacked {
+        bar_h + STACK_CLIP_MIN_H + STACK_DIVIDER_H + DEVICES_MIN_H
+    } else if devices_view {
+        bar_h + DEVICES_MIN_H
+    } else {
+        160.
+    }
+}
+
+/// The stacked split (the Clip half's share of the room) kept inside the
+/// range that leaves both halves their minimum height.
+pub fn split_fitted(split: f32, total_h: f32) -> f32 {
+    let room = (total_h - STACK_DIVIDER_H).max(1.);
+    let lo = (STACK_CLIP_MIN_H / room).clamp(0.1, 0.9);
+    let hi = (1. - DEVICES_MIN_H / room).clamp(lo, 0.9);
+    split.clamp(lo, hi)
 }
 
 /// The arrangement keeps at least this much height when the mixer opens.
@@ -4131,7 +4172,7 @@ fn menu_overlay(
 
 #[cfg(test)]
 mod tests {
-    use super::{bottom_h_clamped, mixer_h_fitted};
+    use super::{DEVICES_MIN_H, STACK_CLIP_MIN_H, STACK_DIVIDER_H, bottom_h_fitted, bottom_min_h, mixer_h_fitted, split_fitted};
 
     fn loop_item(bpm: Option<f32>, is_loop: bool) -> crate::bridge::LibraryItem {
         crate::bridge::LibraryItem {
@@ -4422,11 +4463,36 @@ mod tests {
     }
 
     #[test]
+    fn the_device_chain_never_gets_less_than_a_card_needs() {
+        let bar = 32.;
+        assert_eq!(bottom_min_h(false, true, bar), bar + DEVICES_MIN_H);
+        assert_eq!(bottom_min_h(true, true, bar), bar + STACK_CLIP_MIN_H + STACK_DIVIDER_H + DEVICES_MIN_H);
+        assert_eq!(bottom_min_h(false, false, bar), 160., "the clip and mixer views keep their old floor");
+        // A panel saved at the old 264 px is raised; a big one is left alone; a tiny window keeps the minimum.
+        let min = bottom_min_h(true, true, bar);
+        assert_eq!(bottom_h_fitted(264., 1000., min), min);
+        assert_eq!(bottom_h_fitted(600., 1000., min), 600.);
+        assert_eq!(bottom_h_fitted(600., 300., min), min);
+    }
+
+    #[test]
+    fn the_stacked_split_leaves_both_halves_their_minimum() {
+        for total in [406., 440., 600., 900.] {
+            let room = total - STACK_DIVIDER_H;
+            for want in [0., 0.25, 0.5, 0.75, 1.] {
+                let s = split_fitted(want, total);
+                assert!(room * s >= STACK_CLIP_MIN_H - 0.01, "clip half {} at {total}", room * s);
+                assert!(room * (1. - s) >= DEVICES_MIN_H - 0.01, "devices half {} at {total}", room * (1. - s));
+            }
+        }
+    }
+
+    #[test]
     fn bottom_panel_stays_between_160_px_and_70_percent() {
-        assert_eq!(bottom_h_clamped(50., 1000.), 160.);
-        assert_eq!(bottom_h_clamped(900., 1000.), 700.);
-        assert_eq!(bottom_h_clamped(400., 1000.), 400.);
-        assert_eq!(bottom_h_clamped(400., 100.), 160.);
+        assert_eq!(bottom_h_fitted(50., 1000., 160.), 160.);
+        assert_eq!(bottom_h_fitted(900., 1000., 160.), 700.);
+        assert_eq!(bottom_h_fitted(400., 1000., 160.), 400.);
+        assert_eq!(bottom_h_fitted(400., 100., 160.), 160.);
     }
 
     #[test]

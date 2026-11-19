@@ -115,12 +115,23 @@ jobs:
           $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
           "WINDOWS_PFX_FILE=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      # NSIS is no longer on the runner image.
+      # NSIS is no longer on the runner image. Chocolatey's feed answers 503 now and then
+      # (v0.0.7 lost a Windows build to it, and the step still went green because its last
+      # command was the PATH update), so: retry, and fail here when makensis is not there.
       - name: Install NSIS
         shell: pwsh
         run: |
-          choco install nsis -y --no-progress
-          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $nsis = 'C:\Program Files (x86)\NSIS'
+          for ($i = 1; $i -le 5; $i++) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -eq 0 -and (Test-Path "$nsis\makensis.exe")) { break }
+            Write-Host "NSIS install attempt $i of 5 failed (choco exit $LASTEXITCODE)"
+            if ($i -lt 5) { Start-Sleep -Seconds (15 * $i) }
+          }
+          if (-not (Test-Path "$nsis\makensis.exe")) { throw 'makensis.exe is not there after 5 attempts to install NSIS' }
+          # The runner ends a pwsh step with `exit $LASTEXITCODE`: choco's last code (3010, say) must not fail a good install.
+          $global:LASTEXITCODE = 0
+          $nsis | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Package
         run: cargo xtask package --target win --sign
       - uses: actions/upload-artifact@v4
@@ -153,15 +164,28 @@ jobs:
           pattern: dist-*
           path: target/dist
           merge-multiple: true
+      # Two texts: notes.md goes into latest.json (the update dialog shows it as plain text, so
+      # it has to be short) and release-body.md is the GitHub release page. With a written
+      # docs/release-notes/<tag>.md the dialog gets that file and the page gets it plus the
+      # commit list; without one both are the commit list. Version-bump commits ("0.0.8") are left out.
       - name: Release notes
         run: |
           git fetch --tags --force
           prev=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
           if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then ref="$GITHUB_SHA"; else ref="$TAG"; fi
+          skip=(--extended-regexp --invert-grep --grep='^[0-9]+\.[0-9]+\.[0-9]+$')
           {
-            if [ -n "$prev" ]; then git log --no-merges --pretty='- %s (%h)' "${prev}..${ref}"; else git log --no-merges --pretty='- %s (%h)' -n 50 "$ref"; fi
-          } > "$RUNNER_TEMP/notes.md"
-          cat "$RUNNER_TEMP/notes.md"
+            if [ -n "$prev" ]; then git log --no-merges "${skip[@]}" --pretty='- %s (%h)' "${prev}..${ref}"; else git log --no-merges "${skip[@]}" --pretty='- %s (%h)' -n 50 "$ref"; fi
+          } > "$RUNNER_TEMP/commits.md"
+          written="docs/release-notes/${TAG}.md"
+          if [ -f "$written" ]; then
+            cp "$written" "$RUNNER_TEMP/notes.md"
+            { cat "$written"; printf '\n\nCommits:\n\n'; cat "$RUNNER_TEMP/commits.md"; } > "$RUNNER_TEMP/release-body.md"
+          else
+            cp "$RUNNER_TEMP/commits.md" "$RUNNER_TEMP/notes.md"
+            cp "$RUNNER_TEMP/commits.md" "$RUNNER_TEMP/release-body.md"
+          fi
+          cat "$RUNNER_TEMP/release-body.md"
       # The updater signatures (docs/updater.md) are made here, once, with the minisign tool:
       # the key is an unencrypted `minisign -G -W` key and only this job sees it.
       - name: Sign the updater artifacts
@@ -203,5 +227,5 @@ jobs:
           files=($(ls target/dist/AI-Track-* | grep -v -- '-symbols\.') target/dist/SHA256SUMS.txt)
           if [ -f target/dist/latest.json ]; then files+=(target/dist/latest.json); fi
           gh release create "$TAG" "${files[@]}" "${flags[@]}" \
-            --title "AI-Track ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md" \
+            --title "AI-Track ${VERSION}" --notes-file "$RUNNER_TEMP/release-body.md" \
             --target "$GITHUB_SHA" --repo "${{ github.repository }}"

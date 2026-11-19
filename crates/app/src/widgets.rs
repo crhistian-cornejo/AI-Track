@@ -49,7 +49,17 @@ pub fn divider_h() -> Div {
     div().h(px(1.)).w_full().flex_none().bg(border())
 }
 
-// ───────────────────────────── Tooltip ─────────────────────────────
+// ───────────────────────────── Tooltip & Info View ─────────────────────────────
+
+thread_local! {
+    /// Latest hovered tooltip's text and shortcut hint, read by the status bar's Info View strip.
+    static LAST_INFO: std::cell::RefCell<Option<(SharedString, Option<SharedString>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The most recently hovered control's help text and shortcut hint (for Info View).
+pub fn last_info() -> Option<(SharedString, Option<SharedString>)> {
+    LAST_INFO.with(|c| c.borrow().clone())
+}
 
 pub struct Tooltip {
     text: SharedString,
@@ -58,6 +68,7 @@ pub struct Tooltip {
 
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        LAST_INFO.with(|c| *c.borrow_mut() = Some((self.text.clone(), self.hint.clone())));
         let pal = p();
         motion::fade_in(
             "tooltip",
@@ -91,6 +102,11 @@ pub fn tip(text: &'static str, hint: Option<&'static str>) -> impl Fn(&mut Windo
 /// Tooltip with owned text.
 pub fn tip_owned(text: String) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_, cx| cx.new(|_| Tooltip { text: text.clone().into(), hint: None }).into()
+}
+
+/// Tooltip with owned primary text and optional hint badge.
+pub fn tip_owned_hint(text: String, hint: Option<String>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_, cx| cx.new(|_| Tooltip { text: text.clone().into(), hint: hint.clone().map(Into::into) }).into()
 }
 
 // ───────────────────────────── Buttons ─────────────────────────────
@@ -268,17 +284,25 @@ pub fn knob(id: impl Into<ElementId>, value: f32, bipolar: bool, side: f32, colo
                     let ang = KNOB_A0 + KNOB_SPAN * value;
                     match knob_style {
                         KnobStyle::Arc => {
-                            paint::arc(window, c, r, KNOB_A0, KNOB_A0 + KNOB_SPAN, 3., content(0.12));
-                            paint::arc(window, c, r, a, b, 3., color);
-                            let body = r - 4.;
-                            window.paint_quad(paint::rrect(
-                                gpui::Bounds::new(point(c.x - px(body), c.y - px(body)), gpui::size(px(body * 2.), px(body * 2.))),
-                                body,
-                                pal.raised,
-                            ));
-                            let p0 = point(c.x + px((body * 0.25) * ang.cos()), c.y + px((body * 0.25) * ang.sin()));
-                            let p1 = point(c.x + px((body - 1.) * ang.cos()), c.y + px((body - 1.) * ang.sin()));
-                            paint::polyline(window, &[p0, p1], 2., pal.text);
+                            let stroke = if side >= 40. { 3.5 } else { 3. };
+                            paint::arc(window, c, r, KNOB_A0, KNOB_A0 + KNOB_SPAN, stroke, content(0.11));
+                            if (b - a).abs() > 1e-4 {
+                                paint::arc(window, c, r, a, b, stroke, color);
+                            }
+                            let body = (r - 4.5).max(4.);
+                            let cap = gpui::Bounds::new(point(c.x - px(body), c.y - px(body)), gpui::size(px(body * 2.), px(body * 2.)));
+                            // Subtle cast shadow + bevelled cap + top rim sheen for tactile depth.
+                            let drop = gpui::Bounds::new(point(c.x - px(body), c.y - px(body - 1.)), gpui::size(px(body * 2.), px(body * 2.)));
+                            window.paint_quad(paint::rrect(drop, body, shadow(0.28)));
+                            window.paint_quad(paint::rrect_border(cap, body, pal.raised, border_strong(), 1.));
+                            if body >= 9. {
+                                // Subtle top specular arc on the knob cap.
+                                let pi = std::f32::consts::PI;
+                                paint::arc(window, c, body - 1.5, pi * 1.18, pi * 1.82, 1., content(0.14));
+                            }
+                            let p0 = point(c.x + px((body * 0.22) * ang.cos()), c.y + px((body * 0.22) * ang.sin()));
+                            let p1 = point(c.x + px((body - 1.5) * ang.cos()), c.y + px((body - 1.5) * ang.sin()));
+                            paint::polyline(window, &[p0, p1], if side >= 40. { 2.25 } else { 2. }, pal.text);
                         }
                         KnobStyle::Minimal => {
                             paint::arc(window, c, r - 1., KNOB_A0, KNOB_A0 + KNOB_SPAN, 1.5, content(0.16));
@@ -794,31 +818,59 @@ impl Render for TextInput {
         let pal = p();
         let focused = self.focus.is_focused(window);
         let empty = self.text.is_empty();
+        let body: gpui::AnyElement = if self.bare && !empty {
+            let mut full = self.text.clone();
+            let caret = if focused {
+                let start = full.len();
+                full.push('▎');
+                Some((start..full.len(), gpui::HighlightStyle { color: Some(pal.accent), ..Default::default() }))
+            } else {
+                None
+            };
+            let st = match caret {
+                Some(hl) => gpui::StyledText::new(full).with_highlights([hl]),
+                None => gpui::StyledText::new(full),
+            };
+            div()
+                .id("text-input-scroll")
+                .flex_1()
+                .min_w(px(0.))
+                .max_h(px(112.))
+                .overflow_y_scroll()
+                .text_size(px(fs(TEXT_MD)))
+                .line_height(px(18.))
+                .text_color(pal.text)
+                .child(st)
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .when(empty && focused, |d| d.child(div().w(px(1.)).h(px(14.)).mr(px(1.)).flex_none().bg(pal.accent)))
+                .child(label(if empty { self.placeholder.clone() } else { self.text.clone().into() }, TEXT_MD, if empty { pal.faint } else { pal.text }))
+                .when(!empty && focused, |d| d.child(div().w(px(1.)).h(px(14.)).ml(px(1.)).flex_none().bg(pal.accent)))
+                .into_any_element()
+        };
         div()
             .id("text-input")
             .key_context("TextInput")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
-            .h(px(m().control_h))
+            .when(self.bare, |d| d.min_h(px(m().control_h)).py(px(SP1)).items_start())
+            .when(!self.bare, |d| d.h(px(m().control_h)).items_center().bg(pal.well).border_1().border_color(if focused { accent_alpha(0.7) } else { border() }))
             .w_full()
+            .min_w(px(0.))
             .px(px(SP2))
             .gap(px(SP2))
             .flex()
-            .items_center()
             .rounded(px(r_md()))
-            .when(!self.bare, |d| d.bg(pal.well).border_1().border_color(if focused { accent_alpha(0.7) } else { border() }))
             .cursor_text()
             .when_some(self.leading, |d, i| d.child(icon(i, 14., pal.faint)))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .child(label(if empty { self.placeholder.clone() } else { self.text.clone().into() }, TEXT_MD, if empty { pal.faint } else { pal.text }))
-                    .when(focused, |d| d.child(div().w(px(1.)).h(px(14.)).ml(px(if empty { -1. } else { 1. })).bg(pal.accent))),
-            )
+            .child(body)
             .when(!empty, |d| {
                 d.child(
                     sized_icon_button("clear", Icon::X, false, 20., 12.)

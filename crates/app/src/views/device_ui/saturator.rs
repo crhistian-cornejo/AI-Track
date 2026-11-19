@@ -96,7 +96,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let labels: Vec<String> = (0..nb).map(|b| format!("{} {:.0} dB", STYLES.get(shapes[b].0).copied().unwrap_or(""), dev.plain(band(b, p::DRIVE)))).collect();
     let spectrum = kit::plot(ws, dev, PlotCfg { slot: 1, handles, ..Default::default() }, cx, move |r, window, cx| {
         let pal = p();
-        kit::freq_grid(window, cx, r, true);
+        let xover_xs: Vec<f32> = lines.iter().map(|fx| r.px(*fx)).collect();
+        kit::freq_grid_avoid(window, cx, r, true, &xover_xs);
         for b in 0..nb {
             let (a, z) = (r.px(freq_frac(e[b])), r.px(freq_frac(e[b + 1])));
             let color = series(b);

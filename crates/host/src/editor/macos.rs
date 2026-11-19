@@ -29,8 +29,12 @@ impl Window {
         if resizable {
             style |= NSWindowStyleMask::Resizable;
         }
-        let rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width as f64, height as f64));
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64));
         let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, style, NSBackingStoreType::Buffered, false) };
+        // Centre before attaching so AppKit's screen-frame constraint never
+        // shrinks a tall editor created near an arbitrary origin.
+        window.center();
+        window.setContentSize(NSSize::new(width as f64, height as f64));
         // We own the window; closing it must only hide it so the host can
         // detach the plugin view first.
         unsafe { window.setReleasedWhenClosed(false) };
@@ -66,7 +70,7 @@ impl Window {
 
     pub fn client_size(&self) -> (u32, u32) {
         let frame = self.view.frame();
-        (frame.size.width.max(0.0) as u32, frame.size.height.max(0.0) as u32)
+        (frame.size.width.max(0.0).round() as u32, frame.size.height.max(0.0).round() as u32)
     }
 
     pub fn top_left(&self) -> (f64, f64) {
@@ -139,6 +143,39 @@ impl Drop for Window {
     }
 }
 
+/// Compute the new macOS window frame `(x, y, w, h)` for a client resize,
+/// anchoring the top-left corner (unlike `NSWindow::setContentSize`, which
+/// anchors bottom-left and can push the title bar above the menu bar, causing
+/// AppKit to silently clip the window's height). Keeps the full requested
+/// `new_frame_size` intact and shifts the origin into `visible` when needed.
+pub(crate) fn frame_for_client_resize(
+    old_frame: (f64, f64, f64, f64),
+    new_frame_size: (f64, f64),
+    visible: Option<(f64, f64, f64, f64)>,
+) -> (f64, f64, f64, f64) {
+    let (ox, oy, _, oh) = old_frame;
+    let (nw, nh) = new_frame_size;
+    let mut x = ox;
+    let mut y = oy + oh - nh;
+    if let Some((vx, vy, vw, vh)) = visible {
+        let top = y + nh;
+        let max_top = vy + vh;
+        if top > max_top {
+            y = max_top - nh;
+        }
+        if y < vy {
+            y = (max_top - nh).max(vy);
+        }
+        if x + nw > vx + vw {
+            x = (vx + vw - nw).max(vx);
+        }
+        if x < vx {
+            x = vx;
+        }
+    }
+    (x, y, nw, nh)
+}
+
 pub(super) fn set_client_size(raw: usize, width: u32, height: u32) {
     if raw == 0 {
         return;
@@ -146,7 +183,19 @@ pub(super) fn set_client_size(raw: usize, width: u32, height: u32) {
     // SAFETY: `raw` comes from `Window::raw` and is only used while the
     // owning `Window` (which retains the NSWindow) is alive.
     let window = unsafe { &*(raw as *const NSWindow) };
-    window.setContentSize(NSSize::new(width as f64, height as f64));
+    let old = window.frame();
+    let content = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64));
+    let needed = window.frameRectForContentRect(content);
+    let visible = window.screen().map(|s| {
+        let v = s.visibleFrame();
+        (v.origin.x, v.origin.y, v.size.width, v.size.height)
+    });
+    let (nx, ny, nw, nh) = frame_for_client_resize(
+        (old.origin.x, old.origin.y, old.size.width, old.size.height),
+        (needed.size.width, needed.size.height),
+        visible,
+    );
+    window.setFrame_display(NSRect::new(NSPoint::new(nx, ny), NSSize::new(nw, nh)), true);
 }
 
 /// The displays, with the top edge as `y` (AppKit's y grows upwards).
@@ -206,4 +255,22 @@ pub(super) fn screen_locked() -> bool {
     dict.find(CFString::from_static_string("CGSSessionScreenIsLocked"))
         .and_then(|v| v.downcast::<CFBoolean>())
         .is_some_and(bool::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_resize_anchors_top_left_and_preserves_full_size() {
+        let visible = Some((0., 40., 1440., 835.));
+        // Growing taller keeps the top edge fixed (old top = 300 + 400 = 700).
+        let (x, y, w, h) = frame_for_client_resize((200., 300., 600., 400.), (600., 500.), visible);
+        assert_eq!((x, y, w, h), (200., 200., 600., 500.));
+        assert_eq!(y + h, 700., "top edge stays put");
+        // Growing past the bottom of the visible screen shifts up without clipping height.
+        let (_, y2, w2, h2) = frame_for_client_resize((200., 100., 600., 400.), (600., 520.), visible);
+        assert_eq!((w2, h2), (600., 520.), "requested height is never clipped");
+        assert!(y2 >= 40. && y2 + h2 <= 875.);
+    }
 }

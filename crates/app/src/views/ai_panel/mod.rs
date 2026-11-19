@@ -46,6 +46,34 @@ const CARD_W: f32 = AI_PANEL_W - 2. * SP3;
 const TOP_FADE: f32 = 20.;
 const BOTTOM_FADE: f32 = 28.;
 
+/// Insert zero-width break opportunities inside long unbroken tokens
+/// (sample filenames with underscores, paths, URLs) so GPUI's word wrapper
+/// never lets a single token push past the narrow assistant panel.
+pub(super) fn wrap_text(s: &str) -> String {
+    const BREAK_MIN: usize = 18;
+    let mut out = String::with_capacity(s.len());
+    let mut run = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            run = 0;
+            out.push(ch);
+            continue;
+        }
+        run += 1;
+        out.push(ch);
+        if run >= 6 && matches!(ch, '_' | '/' | '-' | ':' | '.') && chars.peek().is_some_and(|n| !n.is_whitespace()) {
+            // Only insert soft breaks when the surrounding token is actually long.
+            let ahead = chars.clone().take_while(|n| !n.is_whitespace()).count();
+            if run + ahead >= BREAK_MIN {
+                out.push('\u{200B}');
+                run = 0;
+            }
+        }
+    }
+    out
+}
+
 /// A band that fades the log out under the header (`down`) or above the composer.
 fn fade(down: bool, h: f32) -> impl IntoElement {
     let bg = pane_bg(crate::appearance::Pane::Assistant);
@@ -91,7 +119,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         })));
 
     // The log: our items interleaved with the workspace's cards.
-    let mut log = div().flex().flex_col().gap(px(SP3)).px(px(SP3)).pt(px(SP4)).pb(px(BOTTOM_FADE));
+    let mut log = div().w_full().min_w(px(0.)).overflow_x_hidden().flex().flex_col().gap(px(SP3)).px(px(SP3)).pt(px(SP4)).pb(px(BOTTOM_FADE));
     let entries = ws.chat_log.clone();
     let n_entries = entries.len();
     let mut rows: Vec<AnyElement> = Vec::new();
@@ -493,7 +521,7 @@ fn thinking(who: Option<&str>, id: usize) -> impl IntoElement {
 
 /// An answer: full width, no avatar.
 fn reply_row(body: AnyElement) -> AnyElement {
-    div().min_w(px(0.)).child(body).into_any_element()
+    div().w_full().min_w(px(0.)).overflow_hidden().child(body).into_any_element()
 }
 
 fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
@@ -501,16 +529,26 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
     let _ = cx;
     match it {
         Item::User { text, chips } => {
-            let mut col = div().flex().flex_col().items_end().gap(px(SP1));
+            let mut col = div().w_full().min_w(px(0.)).flex().flex_col().items_end().gap(px(SP1));
             if !chips.is_empty() {
-                let mut row = div().flex().flex_wrap().justify_end().gap(px(SP1)).max_w(px(CARD_W - 32.));
+                let mut row = div().flex().flex_wrap().justify_end().gap(px(SP1)).max_w(px(CARD_W - 24.));
                 for (ic, name) in chips {
                     row = row.child(div().h(px(20.)).px(px(SP2)).gap(px(SP1)).flex().items_center().rounded(px(r_md())).bg(content(0.06)).child(icon(ic, 10., pal.muted)).child(label(crate::paint::fit(&name, 120., TEXT_XS), TEXT_XS, pal.muted)));
                 }
                 col = col.child(row);
             }
-            col.child(div().max_w(px(CARD_W - 32.)).px(px(SP3)).py(px(SP2)).rounded(px(r_lg())).bg(content(0.07)).child(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(text)))
-                .into_any_element()
+            col.child(
+                div()
+                    .max_w(px(CARD_W - 24.))
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .px(px(SP3))
+                    .py(px(SP2))
+                    .rounded(px(r_lg()))
+                    .bg(content(0.07))
+                    .child(div().min_w(px(0.)).text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).child(wrap_text(&text))),
+            )
+            .into_any_element()
         }
         Item::Reply { text, model, state, mix, is_part } => {
             // A part's reply is its JSON spec: the card below shows the result.
@@ -522,13 +560,15 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
             };
             let footer = match &state {
                 ReplyState::Stopped => Some(label("Stopped", TEXT_XS, pal.faint)),
-                ReplyState::Failed(m) if !m.is_empty() => Some(label(m.clone(), TEXT_SM, pal.record)),
+                ReplyState::Failed(m) if !m.is_empty() => Some(label(wrap_text(m), TEXT_SM, pal.record).whitespace_normal()),
                 ReplyState::Failed(_) => Some(label("No answer", TEXT_SM, pal.record)),
                 ReplyState::Done if mix.is_some() => Some(label("Plan below as a proposal", TEXT_XS, pal.faint)),
                 ReplyState::Done if is_part => Some(label("Part below", TEXT_XS, pal.faint)),
                 _ => None,
             };
             let col = div()
+                .w_full()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap(px(SP1))
@@ -538,28 +578,43 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
             reply_row(col.into_any_element())
         }
         Item::Action { icon: ic, title, detail } => div()
+            .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .px(px(SP3))
             .py(px(SP2))
             .gap(px(SP2))
             .flex()
-            .items_center()
+            .items_start()
             .rounded(px(r_lg()))
             .border_1()
             .border_color(accent_alpha(0.3))
             .bg(accent_alpha(0.06))
             .child(div().size(px(24.)).flex_none().flex().items_center().justify_center().rounded(px(r_md())).bg(accent_alpha(0.14)).child(icon(ic, 12., pal.accent)))
-            .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM)).child(label(crate::paint::fit(&detail, CARD_W - 64., TEXT_XS), TEXT_XS, pal.muted)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(title))
+                    .child(div().min_w(px(0.)).text_size(px(fs(TEXT_XS))).line_height(px(15.)).text_color(pal.muted).child(wrap_text(&detail))),
+            )
             .into_any_element(),
         Item::Agent(r) => steps::view(i, &r, cx),
-        Item::Note(text) => reply_row(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.muted).child(text).into_any_element()),
+        Item::Note(text) => reply_row(div().w_full().min_w(px(0.)).text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.muted).child(wrap_text(&text)).into_any_element()),
     }
 }
 
 fn license_card(i: usize, notice: ModelNotice, status: ProposalStatus, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let size = notice.size.map_or("unknown size".to_owned(), |b| format!("{:.0} MB", b as f64 / 1_000_000.));
-    let line = |k: &'static str, v: String| div().flex().gap(px(SP2)).child(label(k, TEXT_XS, pal.faint).w(px(56.))).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).text_color(pal.text).child(v));
+    let line = |k: &'static str, v: String| div().min_w(px(0.)).flex().gap(px(SP2)).child(label(k, TEXT_XS, pal.faint).w(px(56.)).flex_none()).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.text).child(wrap_text(&v)));
     div()
+        .w_full()
+        .min_w(px(0.))
+        .overflow_hidden()
         .p(px(SP3))
         .gap(px(SP2))
         .flex()
@@ -569,19 +624,20 @@ fn license_card(i: usize, notice: ModelNotice, status: ProposalStatus, cx: &mut 
         .border_1()
         .border_color(if status == ProposalStatus::Pending { accent_alpha(0.45) } else { border() })
         .child(div().flex().items_center().gap(px(SP2)).child(icon(Icon::Split, 14., pal.accent)).child(label("Model download", TEXT_XS, pal.accent).font_weight(FontWeight::SEMIBOLD)))
-        .child(div().text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(notice.name.clone()))
+        .child(div().min_w(px(0.)).text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(wrap_text(&notice.name)))
         .child(line("Size", size))
         .child(line("License", notice.license.clone()))
         .child(line("Source", notice.source.clone()))
-        .when_some(notice.notice.clone(), |d, n| d.child(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(n)))
+        .when_some(notice.notice.clone(), |d, n| d.child(div().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(wrap_text(&n))))
         .child(match status {
             ProposalStatus::Pending => div()
                 .flex()
+                .flex_wrap()
                 .gap(px(SP2))
                 .child(text_button(("lic-accept", i), "Accept & download", Some(Icon::Check), true).on_click(cx.listener(move |this, _, _, cx| this.resolve_license(i, true, cx))))
                 .child(text_button(("lic-cancel", i), "Cancel", Some(Icon::X), false).on_click(cx.listener(move |this, _, _, cx| this.resolve_license(i, false, cx))))
                 .into_any_element(),
-            ProposalStatus::Accepted => label("Accepted · downloading with the job below", TEXT_SM, pal.play).into_any_element(),
+            ProposalStatus::Accepted => label("Accepted · downloading with the job below", TEXT_SM, pal.play).whitespace_normal().into_any_element(),
             ProposalStatus::Discarded => label("Cancelled", TEXT_SM, pal.faint).into_any_element(),
         })
         .into_any_element()
@@ -596,11 +652,22 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
     let sid = c.sid;
     let open = matches!(c.status, Status::Pending | Status::Trying | Status::Undone);
     let act = |action: PartAction| cx.listener(move |this: &mut Workspace, _, _, cx| state::part_action(this, sid, action, cx));
-    let mut list = div().flex().flex_col().gap(px(2.));
+    let mut list = div().w_full().min_w(px(0.)).flex().flex_col().gap(px(SP1));
     for s in c.summary.iter().take(6) {
-        list = list.child(div().flex().items_center().gap(px(SP2)).child(div().size(px(4.)).flex_none().rounded_full().bg(pal.faint)).child(label(s.clone(), TEXT_SM, pal.muted)));
+        list = list.child(
+            div()
+                .min_w(px(0.))
+                .flex()
+                .items_start()
+                .gap(px(SP2))
+                .child(div().mt(px(6.)).size(px(4.)).flex_none().rounded_full().bg(pal.faint))
+                .child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(wrap_text(s))),
+        );
     }
     let mut card = div()
+        .w_full()
+        .min_w(px(0.))
+        .overflow_hidden()
         .p(px(SP3))
         .gap(px(SP2))
         .flex()
@@ -611,6 +678,7 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
         .border_color(if open { accent_alpha(0.45) } else { border() })
         .child(
             div()
+                .min_w(px(0.))
                 .flex()
                 .items_center()
                 .gap(px(SP2))
@@ -620,13 +688,13 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
                 .child(badge(format!("Seed {}", c.seed), pal.faint))
                 .child(badge(c.origin.clone(), pal.muted)),
         )
-        .child(div().text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(c.label.clone()))
+        .child(div().min_w(px(0.)).text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(wrap_text(&c.label)))
         .child(list);
     if let Some(n) = &c.notice {
-        card = card.child(label(format!("{n}; the rules wrote this instead"), TEXT_XS, pal.record));
+        card = card.child(label(format!("{n}; the rules wrote this instead"), TEXT_XS, pal.record).whitespace_normal());
     }
     if c.destructive {
-        card = card.child(label("Replaces the notes of the clip — review before keeping", TEXT_XS, pal.record));
+        card = card.child(label("Replaces the notes of the clip — review before keeping", TEXT_XS, pal.record).whitespace_normal());
     }
     if open && !c.busy {
         if c.layers.len() > 1 || (c.layers.len() == 1 && c.bars.is_empty()) {
@@ -647,6 +715,7 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
     let main = match c.status {
         Status::Pending => div()
             .flex()
+            .flex_wrap()
             .gap(px(SP2))
             .child(text_button(("part-listen", sid as usize), "Listen", Some(Icon::Headphones), true).on_click(act(PartAction::Listen)))
             .child(text_button(("part-accept", sid as usize), "Accept", Some(Icon::Check), false).on_click(act(PartAction::Accept)))
@@ -654,12 +723,14 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
             .into_any_element(),
         Status::Trying => div()
             .flex()
+            .flex_wrap()
+            .items_center()
             .gap(px(SP2))
             .child(text_button(("part-keep", sid as usize), "Keep", Some(Icon::Check), true).on_click(act(PartAction::Keep)))
             .child(text_button(("part-undo", sid as usize), "Undo", Some(Icon::Undo), false).on_click(act(PartAction::Undo)))
-            .child(label("Playing on the track · Cmd+Z also removes it", TEXT_XS, pal.faint))
+            .child(label("Playing on the track · Cmd+Z also removes it", TEXT_XS, pal.faint).whitespace_normal())
             .into_any_element(),
-        Status::Undone => div().flex().items_center().gap(px(SP2)).child(label("Taken off with Cmd+Z", TEXT_SM, pal.faint)).child(text_button(("part-discard", sid as usize), "Close", Some(Icon::X), false).on_click(act(PartAction::Discard))).into_any_element(),
+        Status::Undone => div().flex().flex_wrap().items_center().gap(px(SP2)).child(label("Taken off with Cmd+Z", TEXT_SM, pal.faint)).child(text_button(("part-discard", sid as usize), "Close", Some(Icon::X), false).on_click(act(PartAction::Discard))).into_any_element(),
         Status::Accepted => div().flex().items_center().gap(px(SP1)).child(icon(Icon::Check, 12., pal.play)).child(label("Kept · one undo step", TEXT_SM, pal.play)).into_any_element(),
         Status::Discarded => label("Discarded", TEXT_SM, pal.faint).into_any_element(),
     };
@@ -670,6 +741,7 @@ fn part_card(c: PartCard, cx: &mut Context<Workspace>) -> AnyElement {
         } else {
             div()
                 .flex()
+                .flex_wrap()
                 .gap(px(SP2))
                 .child(text_button(("part-vary", sid as usize), "Vary", Some(Icon::Dice), false).on_click(act(PartAction::Vary)))
                 .child(text_button(("part-regen", sid as usize), "Regenerate", Some(Icon::Refresh), false).on_click(act(PartAction::Regenerate)))
@@ -685,6 +757,9 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
         ChatEntry::License { notice, status, .. } => license_card(i, notice, status, cx),
         ChatEntry::Assistant(text) => reply_row(markdown::view(200_000 + i, &text, false, cx)),
         ChatEntry::Job { label: text, fraction, done, .. } => div()
+            .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .p(px(SP3))
             .gap(px(SP2))
             .flex()
@@ -695,17 +770,21 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
             .border_color(border())
             .child(
                 div()
+                    .min_w(px(0.))
                     .flex()
                     .items_center()
                     .gap(px(SP2))
                     .child(icon(if done { Icon::Check } else { Icon::Loader }, 14., if done { pal.play } else { pal.accent }))
-                    .child(label(text, TEXT_SM, pal.text).flex_1())
-                    .child(mono(format!("{:.0}%", fraction * 100.), TEXT_XS, pal.muted)),
+                    .child(label(text, TEXT_SM, pal.text).flex_1().min_w(px(0.)).truncate())
+                    .child(mono(format!("{:.0}%", fraction * 100.), TEXT_XS, pal.muted).flex_none()),
             )
             .child(widgets::hbar(fraction, CARD_W - 2. * SP3 - 2., 4., if done { pal.play } else { pal.accent }))
             .into_any_element(),
         ChatEntry::Samples { title, items } => {
             let mut card = div()
+                .w_full()
+                .min_w(px(0.))
+                .overflow_hidden()
                 .p(px(SP2))
                 .gap(px(SP1))
                 .flex()
@@ -714,9 +793,9 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                 .bg(pal.surface)
                 .border_1()
                 .border_color(border())
-                .child(div().px(px(SP1)).flex().items_center().gap(px(SP2)).child(icon(Icon::Search, 12., pal.accent)).child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM)));
+                .child(div().min_w(px(0.)).px(px(SP1)).flex().items_center().gap(px(SP2)).child(icon(Icon::Search, 12., pal.accent)).child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM).flex_1().min_w(px(0.)).truncate()));
             if items.is_empty() {
-                card = card.child(div().px(px(SP1)).child(label("Nothing in the library matches yet.", TEXT_SM, pal.faint)));
+                card = card.child(div().px(px(SP1)).child(label("Nothing in the library matches yet.", TEXT_SM, pal.faint).whitespace_normal()));
             }
             for (j, it) in items.iter().enumerate() {
                 let name = it.name.clone();
@@ -724,6 +803,7 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                 card = card.child(
                     div()
                         .id(("sample-hit", i * 100 + j))
+                        .min_w(px(0.))
                         .h(px(ROW_H))
                         .px(px(SP1))
                         .gap(px(SP2))
@@ -733,7 +813,7 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                         .cursor_pointer()
                         .hover(|s| s.bg(hover()))
                         .child(icon(if it.is_loop { Icon::Loop } else { Icon::Waveform }, 12., pal.muted))
-                        .child(label(crate::paint::fit(&it.name, 130., TEXT_SM), TEXT_SM, pal.text).flex_1())
+                        .child(label(it.name.clone(), TEXT_SM, pal.text).flex_1().min_w(px(0.)).truncate())
                         .when_some(it.key, |d, k| d.child(badge(short_key(k), pal.accent)))
                         .when_some(it.bpm, |d, b| d.child(badge(format!("{b:.0}"), pal.solo)))
                         .child(
@@ -752,14 +832,25 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
         ChatEntry::Part(c) => part_card(c, cx),
         ChatEntry::Proposal { id, label: title, origin, summary, destructive, status } => {
             let pending = status == ProposalStatus::Pending;
-            let mut list = div().flex().flex_col().gap(px(2.));
+            let mut list = div().w_full().min_w(px(0.)).flex().flex_col().gap(px(SP1));
             for s in summary.iter().take(8) {
-                list = list.child(div().flex().items_center().gap(px(SP2)).child(div().size(px(4.)).flex_none().rounded_full().bg(pal.faint)).child(label(s.clone(), TEXT_SM, pal.muted)));
+                list = list.child(
+                    div()
+                        .min_w(px(0.))
+                        .flex()
+                        .items_start()
+                        .gap(px(SP2))
+                        .child(div().mt(px(6.)).size(px(4.)).flex_none().rounded_full().bg(pal.faint))
+                        .child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.muted).child(wrap_text(s))),
+                );
             }
             if summary.len() > 8 {
                 list = list.child(div().pl(px(SP3)).child(label(format!("+{} more", summary.len() - 8), TEXT_XS, pal.faint)));
             }
             div()
+                .w_full()
+                .min_w(px(0.))
+                .overflow_hidden()
                 .p(px(SP3))
                 .gap(px(SP2))
                 .flex()
@@ -770,6 +861,7 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                 .border_color(if pending { accent_alpha(0.45) } else { border() })
                 .child(
                     div()
+                        .min_w(px(0.))
                         .flex()
                         .items_center()
                         .gap(px(SP2))
@@ -778,12 +870,13 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                         .child(div().flex_1())
                         .child(badge(origin, pal.muted)),
                 )
-                .child(div().text_size(px(fs(TEXT_MD))).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(title))
+                .child(div().min_w(px(0.)).text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(wrap_text(&title)))
                 .child(list)
-                .when(destructive, |d| d.child(label("Deletes content — review before accepting", TEXT_XS, pal.record)))
+                .when(destructive, |d| d.child(label("Deletes content — review before accepting", TEXT_XS, pal.record).whitespace_normal()))
                 .child(match status {
                     ProposalStatus::Pending => div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(SP2))
                         .child(text_button(("accept", id as usize), "Accept", Some(Icon::Check), true).on_click(cx.listener(move |this, _, _, cx| this.resolve_proposal(id, true, cx))))
                         .child(text_button(("discard", id as usize), "Discard", Some(Icon::X), false).on_click(cx.listener(move |this, _, _, cx| this.resolve_proposal(id, false, cx))))
@@ -793,5 +886,18 @@ fn entry(i: usize, e: ChatEntry, cx: &mut Context<Workspace>) -> AnyElement {
                 })
                 .into_any_element()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_text_breaks_long_identifiers_without_touching_short_words() {
+        assert_eq!(wrap_text("Short_name stays intact"), "Short_name stays intact");
+        let long = wrap_text("789_TN_V1_124_OS_MUSIC_LOOP_2");
+        assert!(long.contains('\u{200B}'), "long underscore sample name gets soft break points: {long:?}");
+        assert_eq!(long.replace('\u{200B}', ""), "789_TN_V1_124_OS_MUSIC_LOOP_2");
     }
 }

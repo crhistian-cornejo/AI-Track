@@ -921,6 +921,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .gap(px(SP1))
         .flex()
         .items_center()
+        .overflow_hidden()
         .border_b_1()
         .border_color(border())
         .child(
@@ -952,7 +953,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .child(widgets::divider_v(16.))
         .child(
             widgets::icon_button("se-loop", Icon::Loop, looping)
-                .tooltip(widgets::tip("Loop the clip: drag the brace on the ruler, then pull the end marker out to repeat it", None))
+                .tooltip(widgets::tip("Loop the clip: drag the brace on the ruler, then pull the end marker out to repeat it", Some("Shift+L")))
                 .on_click(cx.listener(|this, _, _, cx| toggle_loop(this, cx))),
         )
         .child(widgets::divider_v(16.))

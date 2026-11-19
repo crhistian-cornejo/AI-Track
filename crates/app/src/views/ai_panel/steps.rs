@@ -153,6 +153,7 @@ fn thinking_line(i: usize, j: usize, text: &str, done: bool, open: bool, cx: &mu
     let head = div()
         .id(("think", i * 1024 + j))
         .h(px(20.))
+        .min_w(px(0.))
         .flex()
         .items_center()
         .gap(px(SP1))
@@ -162,22 +163,24 @@ fn thinking_line(i: usize, j: usize, text: &str, done: bool, open: bool, cx: &mu
         .on_click(cx.listener(move |_, _, _, cx| agent::toggle_expanded((i, j), cx)));
     let head: AnyElement = if done { head.into_any_element() } else { shimmer((i, j), head) };
     div()
+        .w_full()
+        .min_w(px(0.))
         .flex()
         .flex_col()
         .gap(px(SP1))
         .child(head)
         .when(open && has_text, |d| {
-            d.child(div().pl(px(SP2)).border_l_1().border_color(border()).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.faint).child(text.trim().to_owned()))
+            d.child(div().min_w(px(0.)).pl(px(SP2)).border_l_1().border_color(border()).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.faint).child(super::wrap_text(text.trim())))
         })
         .into_any_element()
 }
 
 /// The opened call: its input and its result.
-fn tool_body(name: &str, input: &Value, st: &ToolState) -> AnyElement {
+fn tool_body(i: usize, j: usize, name: &str, input: &Value, st: &ToolState) -> AnyElement {
     let pal = p();
-    let mut body = div().ml(px(20.)).mt(px(2.)).p(px(SP2)).gap(px(SP1)).flex().flex_col().rounded(px(r_md())).bg(content(0.035)).border_1().border_color(border());
+    let mut body = div().ml(px(SP4)).mt(px(2.)).min_w(px(0.)).overflow_hidden().p(px(SP2)).gap(px(SP1)).flex().flex_col().rounded(px(r_md())).bg(content(0.035)).border_1().border_color(border());
     for (k, v) in input_lines(input) {
-        body = body.child(div().flex().gap(px(SP2)).child(label(k, TEXT_XS, pal.faint).w(px(64.)).flex_none()).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(pal.muted).child(v)));
+        body = body.child(div().min_w(px(0.)).flex().items_start().gap(px(SP2)).child(label(k, TEXT_XS, pal.faint).w(px(64.)).flex_none()).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(pal.muted).child(super::wrap_text(&v))));
     }
     let result = match st {
         ToolState::Done(t) | ToolState::Failed(t) => t.trim(),
@@ -187,9 +190,9 @@ fn tool_body(name: &str, input: &Value, st: &ToolState) -> AnyElement {
         let lines: Vec<&str> = result.lines().take(14).collect();
         let more = result.lines().count().saturating_sub(lines.len());
         let color = if matches!(st, ToolState::Failed(_)) { with_alpha(pal.record, 0.85) } else { pal.muted };
-        let mut out = div().flex().flex_col().when(!input.as_object().is_none_or(|o| o.is_empty()), |d| d.mt(px(SP1)).pt(px(SP1)).border_t_1().border_color(border()));
+        let mut out = div().id(("tool-out", i * 1024 + j)).min_w(px(0.)).overflow_x_scroll().flex().flex_col().when(!input.as_object().is_none_or(|o| o.is_empty()), |d| d.mt(px(SP1)).pt(px(SP1)).border_t_1().border_color(border()));
         for l in lines {
-            out = out.child(mono(crate::paint::fit(l, 250., TEXT_XS), TEXT_XS, color));
+            out = out.child(mono(l.to_owned(), TEXT_XS, color));
         }
         if more > 0 {
             out = out.child(label(format!("+{more} more lines"), TEXT_XS, pal.faint));
@@ -222,12 +225,14 @@ fn tool_line(i: usize, j: usize, name: &str, input: &Value, st: &ToolState, open
     let row = div()
         .id(("tool", i * 1024 + j))
         .group("tool-row")
-        .min_h(px(22.))
+        .w_full()
+        .min_w(px(0.))
+        .h(px(22.))
         .px(px(SP1))
-        .mx(px(-SP1))
         .flex()
         .items_center()
         .gap(px(SP2))
+        .overflow_hidden()
         .rounded(px(r_md()))
         .when(can_open, |d| d.cursor_pointer().hover(|s| s.bg(content(0.04))))
         .child(icon(ic, 12., ic_color))
@@ -239,20 +244,20 @@ fn tool_line(i: usize, j: usize, name: &str, input: &Value, st: &ToolState, open
                 .items_center()
                 .gap(px(SP1))
                 .overflow_hidden()
-                .child(div().flex_none().max_w(px(CARD_W - 48.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(title_color).child(crate::paint::fit(&title, CARD_W - 48., TEXT_SM)))
-                .when(!tail.is_empty(), |d| d.child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&tail, CARD_W - 120., TEXT_SM), TEXT_SM, pal.faint)))),
+                .child(label(title, TEXT_SM, title_color).min_w(px(0.)).when(tail.is_empty(), |d| d.flex_1()).truncate())
+                .when(!tail.is_empty(), |d| d.child(label(tail, TEXT_SM, pal.faint).flex_1().min_w(px(0.)).truncate())),
         )
         .when(can_open, |d| d.child(div().flex_none().opacity(if open { 1. } else { 0. }).group_hover("tool-row", |s| s.opacity(1.)).child(chevron(open))))
         .when(can_open, |d| d.on_click(cx.listener(move |_, _, _, cx| agent::toggle_expanded((i, j), cx))));
     let row: AnyElement = if matches!(st, ToolState::Running) { shimmer((i, j), row) } else { row.into_any_element() };
-    let mut col = div().flex().flex_col().child(row);
+    let mut col = div().w_full().min_w(px(0.)).flex().flex_col().child(row);
     if let ToolState::Failed(e) = st
         && !open
     {
-        col = col.child(div().pl(px(20.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(with_alpha(pal.record, 0.8)).child(e.lines().next().unwrap_or_default().to_owned()));
+        col = col.child(div().min_w(px(0.)).pl(px(20.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(with_alpha(pal.record, 0.8)).child(super::wrap_text(e.lines().next().unwrap_or_default())));
     }
     if open && can_open {
-        col = col.child(tool_body(name, input, st));
+        col = col.child(tool_body(i, j, name, input, st));
     }
     col.into_any_element()
 }
@@ -273,23 +278,25 @@ fn lookups(i: usize, j: usize, run: &[Step], open: bool, expanded: &std::collect
     let head = div()
         .id(("lookups", i * 1024 + j))
         .group("lookup-row")
+        .w_full()
+        .min_w(px(0.))
         .h(px(22.))
         .px(px(SP1))
-        .mx(px(-SP1))
         .flex()
         .items_center()
         .gap(px(SP2))
+        .overflow_hidden()
         .rounded(px(r_md()))
         .cursor_pointer()
         .hover(|s| s.bg(content(0.04)))
         .child(icon(Icon::Search, 12., pal.faint))
         .child(label(format!("Explored the project · {}", run.len()), TEXT_SM, pal.muted).flex_none())
-        .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&tail, CARD_W - 190., TEXT_SM), TEXT_SM, pal.faint)))
+        .child(label(tail, TEXT_SM, pal.faint).flex_1().min_w(px(0.)).truncate())
         .child(div().flex_none().opacity(if open { 1. } else { 0. }).group_hover("lookup-row", |s| s.opacity(1.)).child(chevron(open)))
         .on_click(cx.listener(move |_, _, _, cx| agent::toggle_expanded((i, j), cx)));
-    let mut col = div().flex().flex_col().child(head);
+    let mut col = div().w_full().min_w(px(0.)).flex().flex_col().child(head);
     if open {
-        let mut inner = div().ml(px(6.)).pl(px(SP2)).border_l_1().border_color(border()).flex().flex_col();
+        let mut inner = div().ml(px(6.)).pl(px(SP2)).min_w(px(0.)).border_l_1().border_color(border()).flex().flex_col();
         for (k, s) in run.iter().enumerate() {
             if let Step::Tool { name, input, state: st } = s {
                 inner = inner.child(tool_line(i, j + k, name, input, st, expanded.contains(&(i, j + k)), cx));
@@ -300,33 +307,162 @@ fn lookups(i: usize, j: usize, run: &[Step], open: bool, expanded: &std::collect
     col.into_any_element()
 }
 
-const CARD_W: f32 = AI_PANEL_W - 2. * SP3;
+/// Key namespace for collapsed work groups (distinct from individual step indices).
+const GROUP_KEY: usize = 1 << 16;
 
-/// An agent reply: no avatar, its steps in order, a quiet footer.
+/// Summary icon, label and error flag for a finished run of thinking and tool steps.
+pub(super) fn work_summary(run: &[Step]) -> (Icon, String, bool) {
+    let mut tools_n = 0usize;
+    let mut read_only_n = 0usize;
+    let mut failed_n = 0usize;
+    let mut thoughts_n = 0usize;
+    for s in run {
+        match s {
+            Step::Thinking { .. } => thoughts_n += 1,
+            Step::Tool { name, state, .. } => {
+                if name == tools::ASK_USER {
+                    continue;
+                }
+                tools_n += 1;
+                if tools::is_read_only(name) {
+                    read_only_n += 1;
+                }
+                if matches!(state, ToolState::Failed(_)) {
+                    failed_n += 1;
+                }
+            }
+            Step::Text(_) => {}
+        }
+    }
+    if tools_n == 0 {
+        let text = if thoughts_n <= 1 { "Thought".to_owned() } else { format!("{thoughts_n} thoughts") };
+        return (Icon::Sparkles, text, false);
+    }
+    if failed_n > 0 {
+        let label = format!("Used {tools_n} {} · {failed_n} failed", if tools_n == 1 { "tool" } else { "tools" });
+        return (Icon::Alert, label, true);
+    }
+    if read_only_n == tools_n {
+        let label = format!("Explored project · {tools_n} {}", if tools_n == 1 { "step" } else { "steps" });
+        return (Icon::Search, label, false);
+    }
+    let mut label = format!("Used {tools_n} {}", if tools_n == 1 { "tool" } else { "tools" });
+    if thoughts_n > 0 {
+        label.push_str(&format!(" · {thoughts_n} {}", if thoughts_n == 1 { "thought" } else { "thoughts" }));
+    }
+    (Icon::Sliders, label, false)
+}
+
+/// Whether a contiguous run of thinking/tool steps `steps[start..end]` is finished
+/// and should collapse into a compact summary row (as monoBOT does once tools complete).
+pub(super) fn segment_is_finished(steps: &[Step], start: usize, end: usize, streaming: bool) -> bool {
+    if start >= end {
+        return false;
+    }
+    let slice = &steps[start..end];
+    let has_active = slice.iter().any(|s| match s {
+        Step::Thinking { done, .. } => !done,
+        Step::Tool { state: ToolState::Running, .. } => true,
+        _ => false,
+    });
+    if has_active {
+        return false;
+    }
+    // Collapse once the reply finished, or once text follows this tool batch.
+    !streaming || end < steps.len()
+}
+
+/// Render the individual steps of a work run (thinking, tool calls, folded lookups).
+fn render_run_steps(i: usize, base: usize, run: &[Step], expanded: &std::collections::HashSet<(usize, usize)>, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < run.len() {
+        let j = base + k;
+        match &run[k] {
+            Step::Thinking { text, done } => out.push(thinking_line(i, j, text, *done, expanded.contains(&(i, j)), cx)),
+            Step::Tool { name, input, state: st } => {
+                let quiet = |s: &Step| matches!(s, Step::Tool { name, state: ToolState::Done(_), .. } if tools::is_read_only(name));
+                let r = run[k..].iter().take_while(|s| quiet(s)).count();
+                if r > 1 {
+                    out.push(lookups(i, j, &run[k..k + r], expanded.contains(&(i, j)), expanded, cx));
+                    k += r;
+                    continue;
+                }
+                out.push(tool_line(i, j, name, input, st, expanded.contains(&(i, j)), cx));
+            }
+            Step::Text(_) => {}
+        }
+        k += 1;
+    }
+    out
+}
+
+/// A finished work run collapsed into one compact monoBOT-style disclosure bar.
+fn work_group(i: usize, base: usize, run: &[Step], open: bool, expanded: &std::collections::HashSet<(usize, usize)>, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let (ic, summary, failed) = work_summary(run);
+    let key = (i, GROUP_KEY + base);
+    let head = div()
+        .id(("work-group", i * 1024 + base))
+        .w_full()
+        .min_w(px(0.))
+        .h(px(26.))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP2))
+        .overflow_hidden()
+        .rounded(px(r_md()))
+        .bg(content(0.035))
+        .border_1()
+        .border_color(if failed { with_alpha(pal.record, 0.35) } else { border() })
+        .cursor_pointer()
+        .hover(|s| s.bg(content(0.065)))
+        .child(icon(ic, 12., if failed { pal.record } else { pal.muted }))
+        .child(label(summary, TEXT_SM, if failed { pal.record } else { pal.muted }).flex_1().min_w(px(0.)).truncate())
+        .child(div().flex_none().child(chevron(open)))
+        .on_click(cx.listener(move |_, _, _, cx| agent::toggle_expanded(key, cx)));
+    let mut col = div().w_full().min_w(px(0.)).flex().flex_col().gap(px(SP1)).child(head);
+    if open {
+        let mut inner = div().ml(px(SP2)).pl(px(SP2)).min_w(px(0.)).border_l_1().border_color(border()).flex().flex_col().gap(px(2.));
+        for el in render_run_steps(i, base, run, expanded, cx) {
+            inner = inner.child(el);
+        }
+        col = col.child(inner);
+    }
+    col.into_any_element()
+}
+
+/// An agent reply: no avatar, finished tool runs collapsed cleanly, a quiet footer.
 pub fn view(i: usize, r: &Reply, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
     let streaming = matches!(r.state, ReplyState::Waiting | ReplyState::Streaming);
     let expanded = agent(cx).expanded.clone();
-    let mut col = div().flex().flex_col().gap(px(SP1));
+    let mut col = div().w_full().min_w(px(0.)).overflow_hidden().flex().flex_col().gap(px(SP1));
     let last = r.steps.len().saturating_sub(1);
     let mut j = 0;
     while j < r.steps.len() {
-        match &r.steps[j] {
-            Step::Thinking { text, done } => col = col.child(thinking_line(i, j, text, *done, expanded.contains(&(i, j)), cx)),
-            Step::Text(t) => col = col.child(div().py(px(SP1)).child(markdown::view(i * 64 + j, t, streaming && j == last, cx))),
-            Step::Tool { name, input, state: st } => {
-                // A run of finished lookups reads as one quiet line.
-                let quiet = |s: &Step| matches!(s, Step::Tool { name, state: ToolState::Done(_), .. } if tools::is_read_only(name));
-                let run = r.steps[j..].iter().take_while(|s| quiet(s)).count();
-                if run > 1 {
-                    col = col.child(lookups(i, j, &r.steps[j..j + run], expanded.contains(&(i, j)), &expanded, cx));
-                    j += run;
-                    continue;
-                }
-                col = col.child(tool_line(i, j, name, input, st, expanded.contains(&(i, j)), cx));
+        if let Step::Text(t) = &r.steps[j] {
+            col = col.child(div().w_full().min_w(px(0.)).py(px(SP1)).child(markdown::view(i * 64 + j, t, streaming && j == last, cx)));
+            j += 1;
+            continue;
+        }
+        // Gather a contiguous run of thinking and tool steps.
+        let mut end = j;
+        while end < r.steps.len() && !matches!(r.steps[end], Step::Text(_)) {
+            end += 1;
+        }
+        let run = &r.steps[j..end];
+        // A single bare thinking step with no tools keeps its quiet inline Thinking line.
+        let only_single_thought = run.len() == 1 && matches!(run[0], Step::Thinking { .. });
+        if !only_single_thought && segment_is_finished(&r.steps, j, end, streaming) {
+            col = col.child(work_group(i, j, run, expanded.contains(&(i, GROUP_KEY + j)), &expanded, cx));
+        } else {
+            for el in render_run_steps(i, j, run, &expanded, cx) {
+                col = col.child(el);
             }
         }
-        j += 1;
+        j = end;
     }
     // While nothing is visibly moving, say that it is working.
     let idle = r.steps.last().is_none_or(|s| matches!(s, Step::Tool { state: ToolState::Done(_) | ToolState::Failed(_), .. } | Step::Thinking { done: true, .. }));
@@ -335,7 +471,7 @@ pub fn view(i: usize, r: &Reply, cx: &mut Context<Workspace>) -> AnyElement {
     }
     let footer: Option<AnyElement> = match &r.state {
         ReplyState::Waiting | ReplyState::Streaming => None,
-        ReplyState::Failed(m) => Some(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.record).child(if m.is_empty() { "No answer".to_owned() } else { m.clone() }).into_any_element()),
+        ReplyState::Failed(m) => Some(div().w_full().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.record).child(if m.is_empty() { "No answer".to_owned() } else { super::wrap_text(m) }).into_any_element()),
         end => {
             let text = r.text();
             let mut parts = vec![r.model.clone()];
@@ -345,7 +481,7 @@ pub fn view(i: usize, r: &Reply, cx: &mut Context<Workspace>) -> AnyElement {
             if r.changes > 0 {
                 parts.push(format!("{} change{}", r.changes, if r.changes == 1 { "" } else { "s" }));
             }
-            let mut row = div().mt(px(SP1)).h(px(20.)).flex().items_center().gap(px(SP2)).child(logo(r.vendor, 14.)).child(label(parts.join(" · "), TEXT_XS, pal.faint)).child(div().flex_1());
+            let mut row = div().mt(px(SP1)).w_full().min_w(px(0.)).h(px(20.)).overflow_hidden().flex().items_center().gap(px(SP2)).child(logo(r.vendor, 14.)).child(label(parts.join(" · "), TEXT_XS, pal.faint).flex_1().min_w(px(0.)).truncate());
             if !text.is_empty() {
                 row = row.child(widgets::sized_icon_button(("copy-reply", i), Icon::Copy, false, 20., 12.).tooltip(widgets::tip("Copy", None)).on_click(cx.listener(move |ws, _, _, cx| {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
@@ -375,16 +511,18 @@ pub fn welcome(ready: bool, cx: &mut Context<Workspace>) -> AnyElement {
         list = list.child(
             div()
                 .id(("suggest", k))
+                .min_w(px(0.))
                 .h(px(32.))
                 .px(px(SP2))
                 .gap(px(SP2))
                 .flex()
                 .items_center()
+                .overflow_hidden()
                 .rounded(px(r_md()))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
                 .child(icon(ic, 14., pal.faint))
-                .child(label(title, TEXT_SM, pal.muted))
+                .child(label(title, TEXT_SM, pal.muted).flex_1().min_w(px(0.)).truncate())
                 .on_click(cx.listener(move |ws, _, _, cx| state::submit_text(ws, prompt.to_owned(), cx))),
         );
     }
@@ -435,5 +573,42 @@ mod tests {
         let lines = input_lines(&json!({ "start_bar": 2, "notes": [1, 2, 3] }));
         assert!(lines.contains(&("start bar".to_owned(), "2".to_owned())));
         assert!(lines.contains(&("notes".to_owned(), "3 items".to_owned())));
+    }
+
+    #[test]
+    fn finished_tool_runs_collapse_with_a_clean_summary() {
+        let steps = vec![
+            Step::Thinking { text: "plan".into(), done: true },
+            Step::Tool { name: "create_track".into(), input: json!({}), state: ToolState::Done("ok".into()) },
+            Step::Tool { name: "write_clip".into(), input: json!({}), state: ToolState::Done("ok".into()) },
+            Step::Text("Done.".into()),
+        ];
+        // Even while streaming, a batch followed by text is finished and collapses.
+        assert!(segment_is_finished(&steps, 0, 3, true));
+        assert!(segment_is_finished(&steps, 0, 3, false));
+        let (_, summary, failed) = work_summary(&steps[0..3]);
+        assert_eq!(summary, "Used 2 tools · 1 thought");
+        assert!(!failed);
+
+        // An active tool at the tail stays open while streaming.
+        let running = vec![
+            Step::Tool { name: "create_track".into(), input: json!({}), state: ToolState::Done("ok".into()) },
+            Step::Tool { name: "write_clip".into(), input: json!({}), state: ToolState::Running },
+        ];
+        assert!(!segment_is_finished(&running, 0, 2, true));
+
+        // Read-only batches report as exploration; failures surface clearly.
+        let read_only = vec![
+            Step::Tool { name: "get_project".into(), input: json!({}), state: ToolState::Done("ok".into()) },
+            Step::Tool { name: "get_track".into(), input: json!({}), state: ToolState::Done("ok".into()) },
+        ];
+        let (ic, summary, failed) = work_summary(&read_only);
+        assert_eq!((ic, summary.as_str(), failed), (Icon::Search, "Explored project · 2 steps", false));
+
+        let with_err = vec![
+            Step::Tool { name: "write_clip".into(), input: json!({}), state: ToolState::Failed("boom".into()) },
+        ];
+        let (ic, summary, failed) = work_summary(&with_err);
+        assert_eq!((ic, summary.as_str(), failed), (Icon::Alert, "Used 1 tool · 1 failed", true));
     }
 }

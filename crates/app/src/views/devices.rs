@@ -277,6 +277,26 @@ pub fn move_device(ws: &mut Workspace, id: DeviceId, home: Container, index: usi
     ws.s.edit("Move device", cmds);
 }
 
+/// Move the selected device one slot left (`dir < 0`) or right (`dir > 0`) in its chain.
+pub fn nudge_device(ws: &mut Workspace, dir: isize) -> bool {
+    let Some(id) = ws.s.selected_devices().first().copied() else { return false };
+    let Some(slot) = racks::device_slot(&ws.s.project, id) else { return false };
+    let home = Container::of(slot);
+    let Some(chain) = racks::chain(&ws.s.project, home) else { return false };
+    let Some(pos) = chain.iter().position(|d| d.id == id) else { return false };
+    if chain.len() < 2 {
+        return false;
+    }
+    let next = (pos as isize + dir).clamp(0, (chain.len() - 1) as isize) as usize;
+    if next == pos {
+        return false;
+    }
+    ws.s.seal();
+    move_device(ws, id, home, next);
+    ws.s.seal();
+    true
+}
+
 pub fn empty(text: &'static str) -> AnyElement {
     div().size_full().flex().items_center().justify_center().child(label(text, TEXT_MD, p().faint)).into_any_element()
 }

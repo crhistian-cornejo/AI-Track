@@ -199,6 +199,73 @@ impl Plan {
         }
     }
 
+    /// Remove `a..b` on every track that holds clips and pull everything
+    /// after `b` earlier by `b - a` (Live's Delete Time / Cut Time); take
+    /// lanes, comp spans and track automation move with it.
+    pub fn close_gap(&mut self, a: Tick, b: Tick) {
+        let len = b - a;
+        if len <= 0 {
+            return;
+        }
+        let tracks: Vec<TrackId> = self.p.tracks.iter().filter(|t| t.kind.has_clips()).map(|t| t.id).collect();
+        for track in tracks {
+            self.clear(track, a, b);
+            let lanes = self.p.track(track).map_or(0, |t| t.take_lanes.len() as u16);
+            for lane in 1..=lanes {
+                for edge in [a, b] {
+                    for pl in self.placements_in(track, lane, |x, y| x < edge && edge < y) {
+                        if let Some(cmds) = aitrack_model::ops::split_at(&mut self.p, track, pl.id, edge) {
+                            self.run_all(cmds);
+                        }
+                    }
+                }
+                for pl in self.placements_in(track, lane, |x, y| x >= a && y <= b) {
+                    self.remove(track, &pl);
+                }
+            }
+            for lane in 0..=lanes {
+                for pl in self.placements_in(track, lane, |x, _| x >= b) {
+                    self.run(Command::MovePlacement { track, id: pl.id, to_track: track, start: (pl.start - len).max(0), lane: pl.lane });
+                }
+            }
+            let spans = self.p.track(track).map(|t| t.comp.clone()).unwrap_or_default();
+            if spans.iter().any(|c| c.end > a) {
+                let mut moved = Vec::with_capacity(spans.len());
+                for c in spans {
+                    if c.end <= a {
+                        moved.push(c);
+                    } else if c.start >= b {
+                        moved.push(CompSpan { start: c.start - len, end: c.end - len, ..c });
+                    } else {
+                        if c.start < a {
+                            moved.push(CompSpan { end: a, ..c });
+                        }
+                        if c.end > b {
+                            moved.push(CompSpan { start: a, end: c.end - len, ..c });
+                        }
+                    }
+                }
+                self.run(Command::SetComp { track, spans: moved });
+            }
+        }
+        let lanes: Vec<(TrackId, AutomationLane)> = self
+            .p
+            .tracks
+            .iter()
+            .flat_map(|t| t.automation.iter().filter(|l| l.points.iter().any(|pt| pt.tick >= a)).map(|l| (t.id, l.clone())))
+            .collect();
+        for (track, mut lane) in lanes {
+            let target = lane.target;
+            lane.points.retain(|pt| pt.tick < a || pt.tick >= b);
+            for pt in lane.points.iter_mut().filter(|pt| pt.tick >= b) {
+                pt.tick -= len;
+            }
+            lane.points.dedup_by_key(|pt| pt.tick);
+            let next = (!lane.points.is_empty()).then_some(lane);
+            self.run(Command::SetAutomation { track, target, lane: next });
+        }
+    }
+
     /// Whether one of the plan's steps did not apply.
     pub(super) fn failed(&self) -> bool {
         self.failed
@@ -292,6 +359,22 @@ impl AppState {
         let (source, n) = self.clip_notes(clip)?;
         let sel: Vec<Note> = n.notes.iter().filter(|n| self.selected_notes.contains(&n.id)).cloned().collect();
         (!sel.is_empty()).then_some((clip, source, sel))
+    }
+
+    /// Ctrl+Shift+C: copy the selected time slice across every clip track
+    /// without removing anything (Live's Copy Time).
+    pub fn copy_time(&mut self) -> bool {
+        let Some((start, end)) = self.time_selection().map(|s| (s.start, s.end)) else { return false };
+        let tracks = self.clip_tracks();
+        let mut scratch = Plan::new(self);
+        let rows: Vec<Row> = tracks.iter().filter_map(|&t| self.row(t, scratch.lift(t, start, end))).collect();
+        if rows.iter().all(|r| r.seeds.is_empty()) {
+            return false;
+        }
+        self.ed.copied = Some(super::CopiedRange { start, end, tracks: rows.iter().filter(|r| !r.seeds.is_empty()).map(|r| r.track).collect() });
+        self.ed.clipboard = Some(Clipboard::Clips { span: end - start, rows });
+        self.ed.marker = end;
+        true
     }
 
     /// Ctrl+C. Notes when the piano roll has the keys and notes are

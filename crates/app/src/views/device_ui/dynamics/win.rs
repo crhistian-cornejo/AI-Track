@@ -21,8 +21,6 @@ use gpui::{AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElem
 /// Width of one knob cell and the knob's diameter.
 pub const CELL_W: f32 = 68.;
 pub const KNOB: f32 = 44.;
-/// The value under a knob.
-const VALUE_SIZE: f32 = 13.;
 
 /// Whether the editor being built is for a device window.
 pub fn in_window(dev: &Dev) -> bool {
@@ -47,13 +45,14 @@ pub fn knob(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
             .items_center()
             .justify_center()
             .gap(px(SP1))
-            .child(label(info.short, TEXT_SM, pal.muted))
+            .child(label(info.short, DEV_LABEL, pal.muted))
             .child(kit::pick(dev, id, cx))
             .into_any_element();
     }
     let value = dev.norm(id);
     let target = KnobTarget::Param { device: dev.id, param: id, default: info.default_normalized() };
-    let k = knob_control_sized(("dyn-knob", dev.key(id as usize)), value, info.min < 0. && info.max > 0., dev.enabled, KNOB, target, cx);
+    let k = knob_control_sized(("dyn-knob", dev.key(id as usize)), value, info.min < 0. && info.max > 0., dev.enabled, KNOB, target, cx)
+        .tooltip(kit::param_tip(&info, value));
     div()
         .flex_none()
         .w(px(CELL_W))
@@ -61,9 +60,9 @@ pub fn knob(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
         .flex_col()
         .items_center()
         .gap(px(2.))
-        .child(label(paint::fit(info.short, CELL_W, TEXT_SM), TEXT_SM, pal.muted))
+        .child(label(paint::fit(info.short, CELL_W, DEV_LABEL), DEV_LABEL, pal.muted))
         .child(k)
-        .child(mono(paint::fit(&info.format(value), CELL_W, VALUE_SIZE), VALUE_SIZE, if dev.enabled { pal.text } else { pal.muted }).font_weight(gpui::FontWeight::SEMIBOLD))
+        .child(mono(paint::fit(&info.format(value), CELL_W, DEV_VALUE), DEV_VALUE, if dev.enabled { pal.text } else { pal.muted }).font_weight(gpui::FontWeight::SEMIBOLD))
         .into_any_element()
 }
 
@@ -77,7 +76,7 @@ fn card(dev: &Dev, title: &str, switch: Option<u32>, body: Vec<AnyElement>, cx: 
         .items_center()
         .justify_between()
         .gap(px(SP2))
-        .child(label(title.to_uppercase(), TEXT_SM, if on { pal.muted } else { pal.faint }).font_weight(gpui::FontWeight::SEMIBOLD))
+        .child(label(title.to_uppercase(), DEV_GROUP, if on { pal.muted } else { pal.faint }).font_weight(gpui::FontWeight::SEMIBOLD))
         .when_some(switch, |d, id| {
             d.child(
                 crate::widgets::switch(("win-card-on", dev.key(id as usize)), on)
@@ -89,7 +88,7 @@ fn card(dev: &Dev, title: &str, switch: Option<u32>, body: Vec<AnyElement>, cx: 
             )
         });
     div()
-        .flex_none()
+        .flex_shrink_0()
         .max_w(gpui::relative(1.))
         .p(px(SP3))
         .gap(px(SP2))
@@ -97,6 +96,8 @@ fn card(dev: &Dev, title: &str, switch: Option<u32>, body: Vec<AnyElement>, cx: 
         .flex_col()
         .rounded(px(r_md()))
         .bg(content(0.04))
+        .border_t_1()
+        .border_color(content(0.06))
         .child(header)
         .child(div().flex().flex_wrap().items_center().justify_around().gap(px(SP2)).when(!on, |d| d.opacity(0.45)).children(body))
 }

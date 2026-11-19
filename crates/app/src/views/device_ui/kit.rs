@@ -68,6 +68,108 @@ impl Rect {
         let w = w.min(self.w);
         (Rect { w, ..self }, Rect { x: self.x + w, w: self.w - w, ..self })
     }
+
+    /// Square obstacle centred on `(cx, cy)` with half-extent `radius`.
+    pub fn around(cx: f32, cy: f32, radius: f32) -> Self {
+        Self { x: cx - radius, y: cy - radius, w: radius * 2., h: radius * 2. }
+    }
+
+    /// Overlap area in px² between two rectangles (0 when disjoint).
+    pub fn overlap_area(self, other: Rect) -> f32 {
+        let ox = (self.right().min(other.right()) - self.x.max(other.x)).max(0.);
+        let oy = (self.bottom().min(other.bottom()) - self.y.max(other.y)).max(0.);
+        ox * oy
+    }
+
+    #[cfg(test)]
+    pub fn intersects(self, other: Rect) -> bool {
+        self.overlap_area(other) > 0.
+    }
+}
+
+/// Rough pixel width of a single-line UI label at `size` px.
+pub fn estimate_text_w(s: &str, size: f32) -> f32 {
+    s.chars().count() as f32 * fs(size) * 0.62
+}
+
+/// Place a label of `size = (w, h)` near `anchor = (ax, ay)` inside `bounds`,
+/// avoiding every obstacle in `avoid` (handle dots, crossover lines, previous
+/// labels). Tries above-right, above-left, below-right, below-left, centered
+/// above and centered below. Returns `None` if every candidate is heavily
+/// covered (> 40% overlap), so a crowded plot hides the label instead of
+/// painting text over a handle.
+pub fn place_label(anchor: (f32, f32), size: (f32, f32), bounds: Rect, avoid: &[Rect]) -> Option<Rect> {
+    let (ax, ay) = anchor;
+    let (w, h) = (size.0.max(1.), size.1.max(1.));
+    let inner = bounds.inset(4.);
+    if inner.w < w * 0.5 || inner.h < h * 0.5 {
+        return None;
+    }
+    let gap = 12.;
+    let candidates = [
+        // Above-right, above-left, below-right, below-left, centered-above, centered-below, pure-right, pure-left.
+        (ax + gap, ay - h - gap * 0.5),
+        (ax - w - gap, ay - h - gap * 0.5),
+        (ax + gap, ay + gap * 0.5),
+        (ax - w - gap, ay + gap * 0.5),
+        (ax - w * 0.5, ay - h - gap),
+        (ax - w * 0.5, ay + gap),
+        (ax + gap, ay - h * 0.5),
+        (ax - w - gap, ay - h * 0.5),
+    ];
+    let clamp_rect = |x: f32, y: f32| {
+        let max_x = (inner.right() - w).max(inner.x);
+        let max_y = (inner.bottom() - h).max(inner.y);
+        Rect { x: x.clamp(inner.x, max_x), y: y.clamp(inner.y, max_y), w, h }
+    };
+    let area = w * h;
+    let mut best: Option<(Rect, f32)> = None;
+    for (cx, cy) in candidates {
+        let r = clamp_rect(cx, cy);
+        let overlap: f32 = avoid.iter().map(|o| r.overlap_area(*o)).sum();
+        if overlap <= 0.5 {
+            return Some(r);
+        }
+        if best.is_none_or(|(_, b)| overlap < b) {
+            best = Some((r, overlap));
+        }
+    }
+    best.filter(|(_, overlap)| *overlap <= area * 0.4).map(|(r, _)| r)
+}
+
+/// Place and paint a label avoiding `avoid`, recording the placed rect into
+/// `avoid` so later labels stay clear of it too.
+#[allow(clippy::too_many_arguments)]
+pub fn placed_txt(
+    window: &mut Window,
+    cx: &mut App,
+    text: &str,
+    anchor: (f32, f32),
+    size: f32,
+    color: Hsla,
+    bounds: Rect,
+    avoid: &mut Vec<Rect>,
+) -> Option<Rect> {
+    let w = estimate_text_w(text, size) + 4.;
+    let h = (fs(size) * 1.35).ceil();
+    let placed = place_label(anchor, (w, h), bounds, avoid)?;
+    txt(window, cx, text, placed.x, placed.y, size, color, TextAlign::Left);
+    avoid.push(placed);
+    Some(placed)
+}
+
+/// Paint a compact floating value readout bubble near `anchor`, kept inside
+/// `bounds` and clear of `avoid` (used while dragging a plot handle).
+pub fn drag_bubble(window: &mut Window, cx: &mut App, text: &str, anchor: (f32, f32), bounds: Rect, avoid: &[Rect]) {
+    let pal = p();
+    let size = if in_window() { DEV_VALUE } else { TEXT_SM };
+    let tw = estimate_text_w(text, size);
+    let pad_x = 8.;
+    let w = tw + pad_x * 2.;
+    let h = (fs(size) * 1.35).ceil() + 6.;
+    let Some(r) = place_label(anchor, (w, h), bounds, avoid) else { return };
+    window.paint_quad(paint::rrect_border(paint::rect(r.x, r.y, r.w, r.h), r_sm(), with_alpha(pal.overlay, 0.94), border_strong(), 1.));
+    paint::text(window, cx, text, px(r.x + pad_x), px(r.y + 3.), size, pal.text, FontWeight::MEDIUM, TextAlign::Left);
 }
 
 pub const F_LO: f32 = 20.;
@@ -146,9 +248,32 @@ pub fn sample_curve(r: Rect, n: usize, f: impl Fn(f32) -> f32) -> Vec<Point<Pixe
         .collect()
 }
 
+/// Minimum horizontal distance (px) between two adjacent frequency-axis labels
+/// before the right-hand one is skipped so labels like `10k` and `20k` never touch.
+const FREQ_LABEL_MIN_GAP: f32 = 34.;
+
+/// Whether a frequency label at `x` clears the previous label at `last_x` and
+/// every x-coordinate in `avoid_x` (crossover lines, markers).
+pub fn freq_label_fits(x: f32, last_x: Option<f32>, avoid_x: &[f32]) -> bool {
+    if last_x.is_some_and(|prev| (x - prev).abs() < FREQ_LABEL_MIN_GAP) {
+        return false;
+    }
+    !avoid_x.iter().any(|ax| (x - *ax).abs() < 18.)
+}
+
 /// Vertical lines of a 20 Hz – 20 kHz log axis, decades stronger, with labels.
 pub fn freq_grid(window: &mut Window, cx: &mut App, r: Rect, labels: bool) {
+    freq_grid_avoid(window, cx, r, labels, &[]);
+}
+
+/// As [`freq_grid`], skipping tick labels that would collide with vertical
+/// lines at `avoid_x` (in window pixels, e.g. crossover frequencies).
+pub fn freq_grid_avoid(window: &mut Window, cx: &mut App, r: Rect, labels: bool, avoid_x: &[f32]) {
     let pal = p();
+    let label_size = if in_window() { DEV_AXIS } else { TEXT_XS };
+    let label_color = with_alpha(pal.faint, 0.8);
+    let label_y = r.bottom() - (fs(label_size) * 1.35).ceil() - 1.;
+    let mut last_x: Option<f32> = None;
     for (f, text, major) in [
         (20., "20", true),
         (50., "50", false),
@@ -163,12 +288,13 @@ pub fn freq_grid(window: &mut Window, cx: &mut App, r: Rect, labels: bool) {
     ] {
         let x = r.px(freq_frac(f));
         if f > 20. && f < 20_000. {
-            vline(window, r, x, if major { pal.grid_bar } else { pal.grid_beat });
+            vline(window, r, x, with_alpha(if major { pal.grid_bar } else { pal.grid_beat }, 0.7));
         }
-        if labels && r.w > 220. {
+        if labels && r.w > 220. && freq_label_fits(x, last_x, avoid_x) {
             let align = if f <= 20. { TextAlign::Left } else if f >= 20_000. { TextAlign::Right } else { TextAlign::Center };
             let dx = if f <= 20. { 3. } else if f >= 20_000. { -3. } else { 0. };
-            txt(window, cx, text, x + dx, r.bottom() - 13., TEXT_XS, pal.faint, align);
+            txt(window, cx, text, x + dx, label_y, label_size, label_color, align);
+            last_x = Some(x);
         }
     }
 }
@@ -176,13 +302,15 @@ pub fn freq_grid(window: &mut Window, cx: &mut App, r: Rect, labels: bool) {
 /// Horizontal lines every `step` dB between `lo` and `hi`, zero stronger.
 pub fn db_grid(window: &mut Window, cx: &mut App, r: Rect, lo: f32, hi: f32, step: f32, labels: bool) {
     let pal = p();
+    let label_size = if in_window() { DEV_AXIS } else { TEXT_XS };
+    let label_color = with_alpha(pal.faint, 0.8);
     let mut db = (lo / step).ceil() * step;
     while db <= hi + 1e-3 {
         let y = r.py((hi - db) / (hi - lo));
         if db > lo && db < hi {
-            hline(window, r, y, if db.abs() < 1e-3 { pal.grid_bar } else { pal.grid_beat });
+            hline(window, r, y, with_alpha(if db.abs() < 1e-3 { pal.grid_bar } else { pal.grid_beat }, 0.7));
             if labels {
-                txt(window, cx, &format!("{db:+.0}"), r.x + 4., y - 12., TEXT_XS, pal.faint, TextAlign::Left);
+                txt(window, cx, &format!("{db:+.0}"), r.x + 4., y - (fs(label_size) * 1.25).ceil(), label_size, label_color, TextAlign::Left);
             }
         }
         db += step;
@@ -290,10 +418,34 @@ pub fn plot(
     let region = ws.fx.region(dev.id, cfg.slot);
     let handles = Rc::new(cfg.handles);
     let focus = cfg.keys.then(|| ws.fx.focus(dev.id, cx));
+    // Live drag readout bubble (R5): while a handle on this plot is dragged,
+    // display the dragged parameter values next to the handle.
+    let active_bubble: Option<(f32, f32, String)> = ws.fx.drag.as_ref().filter(|d| d.device == dev.id).and_then(|drag| {
+        let active_params: Vec<u32> = [drag.x, drag.y, drag.alt].into_iter().flatten().map(|a| a.param).collect();
+        let h = handles.iter().find(|h| {
+            [h.x, h.y, h.alt].into_iter().flatten().any(|a| active_params.contains(&a.param))
+        })?;
+        let parts: Vec<String> = [h.x, h.y].into_iter().flatten().map(|a| dev.text(a.param)).filter(|s| !s.is_empty()).collect();
+        let text = if !parts.is_empty() {
+            parts.join(" · ")
+        } else {
+            h.alt.map(|a| dev.text(a.param)).filter(|s| !s.is_empty())?
+        };
+        Some((h.fx, h.fy, text))
+    });
     let store = region.clone();
     let surface = canvas(
         move |b, _, _| store.set(b),
-        move |b, _, window, cx| window.with_content_mask(Some(ContentMask { bounds: b }), |window| paint(Rect::of(b), window, cx)),
+        move |b, _, window, cx| {
+            window.with_content_mask(Some(ContentMask { bounds: b }), |window| {
+                let r = Rect::of(b);
+                paint(r, window, cx);
+                if let Some((fx, fy, text)) = &active_bubble {
+                    let (ax, ay) = (r.px(*fx), r.py(*fy));
+                    drag_bubble(window, cx, text, (ax, ay), r, &[Rect::around(ax, ay, 11.)]);
+                }
+            })
+        },
     )
     .size_full();
 
@@ -420,6 +572,19 @@ pub fn plot(
 
 // ───────────────────────────── Controls ─────────────────────────────
 
+/// Rich parameter tooltip (R5): full name, current value with unit, and default + interaction hint.
+pub fn param_tip(info: &ParamInfo, norm: f32) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let val = info.format(norm);
+    let def = info.format(info.default_normalized());
+    let primary = format!("{} — {val}", info.name);
+    let hint = if matches!(info.scale, ParamScale::Stepped) {
+        format!("Default: {def}")
+    } else {
+        format!("Default: {def} · Shift fine · 2×click reset")
+    };
+    widgets::tip_owned_hint(primary, Some(hint))
+}
+
 /// A compact number: the parameter's short name over its value. Drag
 /// vertically to change it (Shift = fine), click and type to enter it
 /// (Enter applies, Escape cancels), double-click for the default.
@@ -453,6 +618,10 @@ pub fn num_shown(
     let value = dev.norm(id);
     let default = info.default_normalized();
     let device = dev.id;
+    let windowed = in_window();
+    let lbl_sz = if windowed { DEV_AXIS } else { TEXT_XS };
+    let val_sz = if windowed { DEV_LABEL } else { TEXT_XS };
+    let box_h = if windowed { 36. } else { 32. };
     if let Some(edit) = ws
         .num_edit
         .as_ref()
@@ -465,7 +634,7 @@ pub fn num_shown(
             .id(("num", dev.key(id as usize)))
             .flex_none()
             .w(px(width))
-            .h(px(32.))
+            .h(px(box_h))
             .px(px(SP1 + 2.))
             .flex()
             .flex_col()
@@ -475,10 +644,10 @@ pub fn num_shown(
             .border_1()
             .border_color(accent_alpha(0.8))
             .overflow_hidden()
-            .tooltip(widgets::tip(info.name, None))
+            .tooltip(param_tip(&info, value))
             .child(label(
-                paint::fit(info.short, width - 8., TEXT_XS),
-                TEXT_XS,
+                paint::fit(info.short, width - 8., lbl_sz),
+                lbl_sz,
                 pal.faint,
             ))
             .child(
@@ -486,8 +655,8 @@ pub fn num_shown(
                     .flex()
                     .items_center()
                     .child(mono(
-                        paint::fit(&text, width - 10., TEXT_XS),
-                        TEXT_XS,
+                        paint::fit(&text, width - 10., val_sz),
+                        val_sz,
                         pal.text,
                     ))
                     .child(div().w(px(1.)).h(px(10.)).ml(px(1.)).bg(pal.accent)),
@@ -504,7 +673,7 @@ pub fn num_shown(
         .id(("num", dev.key(id as usize)))
         .flex_none()
         .w(px(width))
-        .h(px(32.))
+        .h(px(box_h))
         .px(px(SP1 + 2.))
         .relative()
         .flex()
@@ -515,9 +684,9 @@ pub fn num_shown(
         .hover(|s| s.bg(content(0.08)))
         .cursor_ns_resize()
         .overflow_hidden()
-        .tooltip(widgets::tip(info.name, None))
-        .child(label(paint::fit(info.short, width - 8., TEXT_XS), TEXT_XS, pal.faint))
-        .child(mono(paint::fit(&shown.unwrap_or_else(|| info.format(value)), width - 6., TEXT_XS), TEXT_XS, if dev.enabled { pal.text } else { pal.muted }))
+        .tooltip(param_tip(&info, value))
+        .child(label(paint::fit(info.short, width - 8., lbl_sz), lbl_sz, pal.muted))
+        .child(mono(paint::fit(&shown.unwrap_or_else(|| info.format(value)), width - 6., val_sz), val_sz, if dev.enabled { pal.text } else { pal.muted }))
         .child(div().absolute().left_0().bottom_0().h(px(2.)).w(px((width * fill).max(0.))).bg(with_alpha(if dev.enabled { pal.accent } else { pal.faint }, 0.7)))
         .on_mouse_down(
             MouseButton::Left,
@@ -572,11 +741,14 @@ pub fn pick(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
     let now = dev.choice(id);
     let switch = info.choices == ["Off", "On"];
     let on = switch && now == 1;
+    let windowed = in_window();
+    let chip_h = if windowed { 24. } else { 20. };
+    let text_sz = if windowed { DEV_AXIS } else { TEXT_XS };
     let text: String = if switch { info.short.to_owned() } else { info.choices.get(now).map_or_else(|| dev.text(id), |s| (*s).to_owned()) };
     div()
         .id(("pick", dev.key(id as usize)))
         .flex_none()
-        .h(px(20.))
+        .h(px(chip_h))
         .px(px(SP2))
         .gap(px(SP1))
         .flex()
@@ -585,8 +757,8 @@ pub fn pick(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
         .cursor_pointer()
         .bg(if on { accent_alpha(0.2) } else { content(0.06) })
         .hover(|s| s.bg(if on { accent_alpha(0.28) } else { content(0.12) }))
-        .tooltip(widgets::tip(info.name, None))
-        .child(label(text, TEXT_XS, if on { pal.accent } else { pal.text }).font_weight(FontWeight::MEDIUM))
+        .tooltip(param_tip(&info, dev.norm(id)))
+        .child(label(text, text_sz, if on { pal.accent } else { pal.text }).font_weight(FontWeight::MEDIUM))
         .when(!switch && info.choices.len() > 2, |d| d.child(icon(Icon::ChevronDown, 10., pal.faint)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
@@ -715,7 +887,8 @@ pub const WINDOW_PANEL_MIN_H: f32 = 280.;
 /// right): outside the plot, so it never sits under a handle or an axis label.
 pub fn plot_header(left: impl Into<gpui::SharedString>, right: Option<String>) -> Div {
     let pal = p();
-    div().flex_none().flex().justify_between().gap(px(SP2)).px(px(SP1)).child(label(left, TEXT_XS, pal.faint)).children(right.map(|r| label(r, TEXT_XS, pal.muted)))
+    let sz = if in_window() { DEV_AXIS } else { TEXT_XS };
+    div().flex_none().flex().justify_between().gap(px(SP2)).px(px(SP1)).child(label(left, sz, pal.faint)).children(right.map(|r| label(r, sz, pal.muted)))
 }
 
 pub fn panel(width: f32) -> Div {
@@ -750,9 +923,10 @@ pub fn grow(group: Div) -> Div {
 /// A small `label value` read-out in a box.
 pub fn readout(name: &str, value: String, color: Hsla) -> Div {
     let pal = p();
+    let sz = if in_window() { DEV_AXIS } else { TEXT_XS };
     div()
         .flex_none()
-        .h(px(20.))
+        .h(px(if in_window() { 24. } else { 20. }))
         .px(px(SP2))
         .gap(px(SP1))
         .flex()
@@ -761,8 +935,8 @@ pub fn readout(name: &str, value: String, color: Hsla) -> Div {
         .bg(pal.well)
         .border_1()
         .border_color(border())
-        .child(label(name.to_owned(), TEXT_XS, pal.faint))
-        .child(mono(value, TEXT_XS, color))
+        .child(label(name.to_owned(), sz, pal.faint))
+        .child(mono(value, sz, color))
 }
 
 pub fn fmt_db(db: f32) -> String {
@@ -864,12 +1038,14 @@ pub fn section(dev: &Dev, title: impl Into<gpui::SharedString>, switch: Option<u
     let pal = p();
     let device = dev.id;
     let on = switch.is_none_or(|id| dev.on(id));
+    let windowed = in_window();
+    let title_sz = if windowed { DEV_GROUP } else { TEXT_XS };
     let header = div()
         .flex()
         .items_center()
         .justify_between()
         .gap(px(SP2))
-        .child(label(title, TEXT_XS, if on { pal.text } else { pal.faint }).font_weight(FontWeight::SEMIBOLD))
+        .child(label(title, title_sz, if on { pal.text } else { pal.faint }).font_weight(FontWeight::SEMIBOLD))
         .when_some(switch, |d, id| {
             d.child(
                 widgets::switch(("sec-on", dev.key(id as usize)), on)
@@ -880,18 +1056,22 @@ pub fn section(dev: &Dev, title: impl Into<gpui::SharedString>, switch: Option<u
                     })),
             )
         });
-    div()
-        .flex_none()
+    let card = div()
+        .flex_shrink_0()
+        .when(windowed, |d| d.flex_grow_1())
+        .when(!windowed, |d| d.flex_none())
         .max_w(gpui::relative(1.))
-        .p(px(SP2))
-        .gap(px(SP1))
+        .p(px(if windowed { SP3 } else { SP2 }))
+        .gap(px(if windowed { SP2 } else { SP1 }))
         .flex()
         .flex_col()
         .rounded(px(r_md()))
-        .bg(content(0.03))
-        .border_1()
-        .border_color(if on { border_strong() } else { border() })
-        .child(header)
+        .bg(content(if windowed { 0.04 } else { 0.03 }))
+        // In a window, groups are surface-1 cards separated by tone + top sheen
+        // rather than nested heavy borders (R4).
+        .when(windowed, |d| d.border_t_1().border_color(content(0.06)))
+        .when(!windowed, |d| d.border_1().border_color(if on { border_strong() } else { border() }));
+    card.child(header)
         .child(div().flex().flex_wrap().items_center().gap(px(SP1)).when(!on, |d| d.opacity(0.45)).children(body))
 }
 
@@ -990,5 +1170,40 @@ mod tests {
         assert_eq!(wheel_change(ScrollDelta::Lines(point(0., 1.)), true, false, 4.), Some(0.25));
         assert_eq!(wheel_change(ScrollDelta::Pixels(point(px(0.), px(1.))), true, false, 4.), None);
         assert_eq!(wheel_change(ScrollDelta::Pixels(point(px(0.), px(-9.))), true, false, 4.), Some(-0.25));
+    }
+
+    #[test]
+    fn place_label_dodges_handles_edges_and_hides_when_blocked() {
+        let bounds = Rect { x: 0., y: 0., w: 300., h: 160. };
+        let handle = Rect::around(150., 80., 10.);
+        // Free space: picks above-right and never overlaps the handle.
+        let r = place_label((150., 80.), (56., 15.), bounds, &[handle]).unwrap();
+        assert!(!r.intersects(handle), "label {r:?} must not intersect handle {handle:?}");
+        assert!(r.x >= bounds.x + 4. && r.right() <= bounds.right() - 4.);
+        // Near right edge with an obstacle above-right: flips to the left of the handle.
+        let near_right = Rect::around(280., 80., 10.);
+        let r2 = place_label((280., 80.), (60., 15.), bounds, &[near_right]).unwrap();
+        assert!(!r2.intersects(near_right), "label {r2:?} must dodge near-right handle");
+        assert!(r2.right() <= bounds.right() - 4.);
+        // A second label anchored at the same spot avoids the first label too.
+        let r3 = place_label((150., 80.), (56., 15.), bounds, &[handle, r]).unwrap();
+        assert!(!r3.intersects(handle) && !r3.intersects(r));
+        // Completely covered plot: hides the label instead of colliding.
+        assert_eq!(place_label((150., 80.), (56., 15.), bounds, &[bounds]), None);
+    }
+
+    #[test]
+    fn freq_grid_skips_colliding_20k_and_crossover_labels() {
+        // On a narrow 280 px plot, 10k and 20k are only ~28 px apart -> 20k is skipped.
+        let narrow = Rect { x: 0., y: 0., w: 280., h: 100. };
+        let x10k = narrow.px(freq_frac(10_000.));
+        let x20k = narrow.px(freq_frac(20_000.));
+        assert!(!freq_label_fits(x20k, Some(x10k), &[]), "10k and 20k collide on narrow plots");
+        // On a wide 500 px plot they have plenty of room.
+        let wide = Rect { x: 0., y: 0., w: 500., h: 100. };
+        assert!(freq_label_fits(wide.px(freq_frac(20_000.)), Some(wide.px(freq_frac(10_000.))), &[]));
+        // A crossover line right at 200 Hz suppresses the "200" axis label.
+        let x200 = wide.px(freq_frac(200.));
+        assert!(!freq_label_fits(x200, None, &[x200]));
     }
 }

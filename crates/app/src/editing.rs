@@ -475,6 +475,12 @@ impl AppState {
                 self.selected_track = Some(lanes[next]);
                 true
             }
+            KeyEdit::SemitoneUp => self.nudge_audio_clips_transpose(1.).is_some(),
+            KeyEdit::SemitoneDown => self.nudge_audio_clips_transpose(-1.).is_some(),
+            KeyEdit::OctaveUp => self.nudge_audio_clips_transpose(12.).is_some(),
+            KeyEdit::OctaveDown => self.nudge_audio_clips_transpose(-12.).is_some(),
+            KeyEdit::VelocityUp => self.nudge_audio_clips_gain(1.).is_some(),
+            KeyEdit::VelocityDown => self.nudge_audio_clips_gain(-1.).is_some(),
             _ => false,
         }
     }

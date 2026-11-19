@@ -180,15 +180,19 @@ pub fn adsr(ws: &mut Workspace, dev: &Dev, slot: u8, ids: [u32; 4], color: Hsla,
     let text = format!("A {}  D {}  S {}  R {}", dev.text(a), dev.text(d), dev.text(s), dev.text(r));
     kit::plot(ws, dev, PlotCfg { slot, handles, ..Default::default() }, cx, move |rect, window, cx| {
         let pal = p();
+        let lbl_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
         kit::hline(window, rect, rect.py(0.9), pal.grid_bar);
         let line: Vec<_> = pts.iter().map(|(x, y)| rect.pt(*x, *y)).collect();
         kit::fill_to(window, &line, rect.py(0.9), with_alpha(color, 0.18));
         kit::line(window, &line, 2., color);
-        if rect.w > 200. {
-            kit::txt(window, cx, &text, rect.x + 6., rect.y + 3., TEXT_XS, pal.faint, TextAlign::Left);
-        }
+        let mut avoid: Vec<Rect> = marks.iter().map(|h| Rect::around(rect.px(h.fx), rect.py(h.fy), 11.)).collect();
         for h in &marks {
             kit::dot(window, rect.pt(h.fx, h.fy), 5.5, color, Some(pal.text));
+        }
+        if rect.w > 200. {
+            // Prefer top-right when Attack is near 0 ms so "A 0.0 ms" never sits under the attack handle.
+            let anchor = if pts[1].0 < 0.22 { (rect.right() - 6., rect.y + 10.) } else { (rect.x + 6., rect.y + 10.) };
+            kit::placed_txt(window, cx, &text, anchor, lbl_sz, pal.muted, rect, &mut avoid);
         }
     })
     .into_any_element()

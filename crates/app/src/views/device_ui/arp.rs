@@ -265,16 +265,12 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 }
             }
         }
-        // The octaves (every C).
+        // The octaves (every C): draw the grid lines now; place labels after notes so they never ghost over bars.
+        let mut octaves_c = Vec::new();
         for pitch in lo..=hi {
             if pitch.rem_euclid(12) == 0 {
                 kit::hline(window, r, r.py(y_of(pitch)), pal.grid_bar);
-                // In a window the keys that come in are named on the left, so the octaves go on the right.
-                if win {
-                    kit::txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), r.right() - 4., r.py(y_of(pitch)) - 14., TEXT_SM, pal.faint, TextAlign::Right);
-                } else {
-                    kit::txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), r.x + 4., r.py(y_of(pitch)) - 14., TEXT_SM, pal.faint, TextAlign::Left);
-                }
+                octaves_c.push(pitch);
             }
         }
         // The step grid, the cycles of the pattern and the head on the step it is on.
@@ -288,12 +284,12 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 kit::vline(window, r, r.px(k as f32 * cell), pal.grid_bar);
             }
             // The keys that come in: a name on each at its height, a faint line along it.
-            kit::txt(window, cx, "in", full.x + 6., full.y + 4., TEXT_SM, pal.faint, TextAlign::Left);
+            kit::txt(window, cx, "in", full.x + 6., full.y + 4., DEV_AXIS, pal.faint, TextAlign::Left);
             for key in &in_keys {
                 let y = r.py(y_of(*key));
                 kit::hline(window, r, y, content(0.08));
-                kit::bar(window, full.x + 6., y - 6., 30., 12., 3., with_alpha(pal.text, 0.28));
-                kit::txt(window, cx, &mk::note_name(*key), full.x + 21., y - 6., TEXT_SM, pal.text, TextAlign::Center);
+                kit::bar(window, full.x + 6., y - 7., 32., 14., 3., with_alpha(pal.text, 0.28));
+                kit::txt(window, cx, &mk::note_name(*key), full.x + 22., y - 7., DEV_AXIS, pal.text, TextAlign::Center);
             }
             kit::vline(window, full, r.x - 4., pal.grid_bar);
         }
@@ -303,6 +299,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         // The notes.
         let steps = vel_steps;
         let thick = if win { (row_h * 0.8).clamp(6., 18.) } else { 6. };
+        let mut avoid: Vec<Rect> = vec![Rect::around(r.px(handle_fx), r.py(y_of(first)), 11.)];
+        let vel_header_h = 18.;
         for (i, c) in cols.iter().enumerate() {
             let start = (i as f32 + offset + if i % 2 == 1 { swing * 0.5 } else { 0. }) * cell;
             let v = column_velocity(vel_mode, vel_fixed, &steps, vel_len, i);
@@ -310,25 +308,36 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let silent = win && i / cycle_cols_n >= cycles_played;
             for pitch in &c.notes {
                 let w = (gate.min(1.9) * cell * r.w).max(3.);
+                let nx = r.px(start);
+                let ny = r.py(y_of(*pitch)) - thick / 2.;
                 let playing = head.as_ref().is_some_and(|h| h.contains(&i));
                 let fill = with_alpha(if playing { pal.text } else { colour }, if silent { 0.1 } else { 0.3 + 0.7 * v });
-                kit::bar(window, r.px(start), r.py(y_of(*pitch)) - thick / 2., w, thick, 2., fill);
+                kit::bar(window, nx, ny, w, thick, 2., fill);
+                avoid.push(Rect { x: nx, y: ny, w, h: thick });
             }
             if win {
-                // The velocity of the step, under the grid.
-                let lane = Rect { x: r.x, y: full.y + full.h * (1. - geo.vel) + 20., w: r.w, h: full.h * geo.vel - 24. };
+                // The velocity of the step, strictly under the velocity header strip so bars never cover the label.
+                let ly = full.y + full.h * (1. - geo.vel);
+                let lane = Rect { x: r.x, y: ly + vel_header_h, w: r.w, h: (full.h * geo.vel - vel_header_h - 4.).max(4.) };
                 let bw = (cell * r.w - 3.).max(2.);
                 let bh = (lane.h * v).max(2.);
                 kit::bar(window, r.px(i as f32 * cell) + 1., lane.bottom() - bh, bw, bh, 1., with_alpha(if silent { pal.muted } else { colour }, if silent { 0.2 } else { 0.55 }));
             }
         }
+        // Place octave labels (C3, C4, …) avoiding drawn note bars and the gate handle.
+        for pitch in octaves_c {
+            let y = r.py(y_of(pitch));
+            let anchor = if win { (r.right() - 4., y) } else { (r.x + 4., y) };
+            kit::placed_txt(window, cx, &format!("C{}", pitch.div_euclid(12) - 1), anchor, DEV_AXIS, pal.faint, r, &mut avoid);
+        }
         if win {
             let ly = full.y + full.h * (1. - geo.vel);
             kit::hline(window, Rect { x: full.x, w: full.w, ..r }, ly, pal.grid_bar);
-            kit::txt(window, cx, &format!("velocity · {vel_name}"), full.x + 6., ly + 4., TEXT_SM, pal.faint, TextAlign::Left);
+            // Place inside the pattern x-column above the velocity bars so it never crosses the `in` divider or bars.
+            kit::txt(window, cx, &format!("velocity · {vel_name}"), r.x + 6., ly + 3., DEV_AXIS, pal.faint, TextAlign::Left);
         }
         kit::dot(window, r.pt(handle_fx, y_of(first)), 5.5, pal.accent, Some(pal.text));
-        kit::txt(window, cx, &title, r.right() - 6., r.y + 4., TEXT_SM, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, &title, r.right() - 6., r.y + 4., DEV_AXIS, pal.faint, TextAlign::Right);
     });
 
     let mut style_card = vec![kit::ctl(ws, dev, p::STYLE, cx), kit::ctl(ws, dev, p::RATE, cx), kit::ctl(ws, dev, p::OCTAVES, cx), kit::ctl(ws, dev, p::DISTANCE, cx), kit::ctl(ws, dev, p::NOTE_REPEAT, cx)];

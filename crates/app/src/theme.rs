@@ -42,6 +42,13 @@ pub const TEXT_SM: f32 = 11.;
 pub const TEXT_MD: f32 = 12.;
 pub const TEXT_LG: f32 = 14.;
 
+// ── Device editor type scale (floor 11 px in plugin windows) ──
+pub const DEV_AXIS: f32 = 11.;
+pub const DEV_GROUP: f32 = 11.;
+pub const DEV_LABEL: f32 = 12.;
+pub const DEV_VALUE: f32 = 13.;
+pub const DEV_TITLE: f32 = 16.;
+
 pub const FONT_MONO: &str = "Geist Mono";
 
 /// The cross-fade between themes.

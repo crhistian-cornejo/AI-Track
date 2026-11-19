@@ -33,6 +33,16 @@ pub struct Duplicated {
 /// Sends, sidechains and VCA membership keep pointing at the same tracks.
 /// `None` for Main or an unknown track.
 pub fn duplicate_track(p: &mut Project, id: TrackId) -> Option<Duplicated> {
+    duplicate_track_inner(p, id, true)
+}
+
+/// Duplicate a track (with its devices, routing and mixer state) but without
+/// clips, session slots or automation (Live's Duplicate Without Content).
+pub fn duplicate_track_empty(p: &mut Project, id: TrackId) -> Option<Duplicated> {
+    duplicate_track_inner(p, id, false)
+}
+
+fn duplicate_track_inner(p: &mut Project, id: TrackId, include_content: bool) -> Option<Duplicated> {
     p.track(id).filter(|t| t.kind != TrackKind::Main)?;
     let block: Vec<TrackId> = std::iter::once(id).chain(groups::descendants(p, id)).collect();
     let originals: Vec<Track> = block.iter().filter_map(|&t| p.track(t).cloned()).collect();
@@ -66,25 +76,31 @@ pub fn duplicate_track(p: &mut Project, id: TrackId) -> Option<Duplicated> {
         }
         copy.devices = copy_devices(p, &orig.devices, &mut devices);
         relink_devices(&mut copy.devices, &devices, &remap_track);
-        for lane in &mut copy.automation {
-            lane.target = match lane.target {
-                AutomationTarget::DeviceParam { device, param } => AutomationTarget::DeviceParam { device: devices.get(&device).copied().unwrap_or(device), param },
-                AutomationTarget::DeviceEnabled { device } => AutomationTarget::DeviceEnabled { device: devices.get(&device).copied().unwrap_or(device) },
-                AutomationTarget::Macro { device, index } => AutomationTarget::Macro { device: devices.get(&device).copied().unwrap_or(device), index },
-                other => other,
-            };
+        if include_content {
+            for lane in &mut copy.automation {
+                lane.target = match lane.target {
+                    AutomationTarget::DeviceParam { device, param } => AutomationTarget::DeviceParam { device: devices.get(&device).copied().unwrap_or(device), param },
+                    AutomationTarget::DeviceEnabled { device } => AutomationTarget::DeviceEnabled { device: devices.get(&device).copied().unwrap_or(device) },
+                    AutomationTarget::Macro { device, index } => AutomationTarget::Macro { device: devices.get(&device).copied().unwrap_or(device), index },
+                    other => other,
+                };
+            }
+        } else {
+            copy.automation.clear();
         }
         copy.arrangement.clear();
         copy.session_slots.clear();
         add_tracks.push(Command::AddTrack { track: Box::new(copy), index: base + k });
-        for pl in &orig.arrangement {
-            let Some(clip) = clips.copy(p, pl.clip) else { continue };
-            let placement = Placement { id: p.alloc_placement_id(), clip, start: pl.start, lane: pl.lane };
-            place.push(Command::PlaceClip { track: new_id, placement });
-        }
-        for (&scene, &slot) in &orig.session_slots {
-            let Some(clip) = clips.copy(p, slot) else { continue };
-            place.push(Command::SetSessionSlot { track: new_id, scene, clip: Some(clip) });
+        if include_content {
+            for pl in &orig.arrangement {
+                let Some(clip) = clips.copy(p, pl.clip) else { continue };
+                let placement = Placement { id: p.alloc_placement_id(), clip, start: pl.start, lane: pl.lane };
+                place.push(Command::PlaceClip { track: new_id, placement });
+            }
+            for (&scene, &slot) in &orig.session_slots {
+                let Some(clip) = clips.copy(p, slot) else { continue };
+                place.push(Command::SetSessionSlot { track: new_id, scene, clip: Some(clip) });
+            }
         }
     }
     let tracks: Vec<TrackId> = originals.iter().map(|t| track_map[&t.id]).collect();

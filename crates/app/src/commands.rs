@@ -78,6 +78,21 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
         },
         Cmd::SliceToDrumRack => crate::editing::slice::open_for_selection(ws, cx),
         Cmd::Rename => open_rename(ws, window, cx),
+        Cmd::ReverseClips => match ws.s.reverse_selected_clips() {
+            Some(true) => ws.toast("Reversed audio clip", cx),
+            Some(false) => ws.toast("Restored forward playback", cx),
+            None => ws.toast("Select an audio clip to reverse", cx),
+        },
+        Cmd::ToggleClipLoop => match ws.s.toggle_clips_loop() {
+            Some(true) => ws.toast("Clip loop on", cx),
+            Some(false) => ws.toast("Clip loop off", cx),
+            None => ws.toast("Select a clip to toggle looping", cx),
+        },
+        Cmd::ToggleClipWarp => match ws.s.toggle_selected_clips_warp() {
+            Some(true) => ws.toast("Clip warp on", cx),
+            Some(false) => ws.toast("Clip warp off", cx),
+            None => ws.toast("Select an audio clip to toggle warp", cx),
+        },
         Cmd::SetLocator => ws.set_locator_here(cx),
         Cmd::PrevLocator => ws.step_to_locator(false, cx),
         Cmd::NextLocator => ws.step_to_locator(true, cx),
@@ -108,6 +123,51 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             if !ws.s.insert_silence() {
                 ws.toast("Drag in an empty lane to select how much silence to insert", cx);
             }
+        }
+        Cmd::DeleteTime => {
+            if !ws.s.delete_time() {
+                ws.toast("Drag in an empty lane to select the time to delete", cx);
+            }
+        }
+        Cmd::CutTime => {
+            if !ws.s.cut_time() {
+                ws.toast("Drag in an empty lane to select the time to cut", cx);
+            }
+        }
+        Cmd::CopyTime => {
+            if ws.s.copy_time() {
+                ws.toast("Copied time selection", cx);
+            } else {
+                ws.toast("Drag in an empty lane to select the time to copy", cx);
+            }
+        }
+        Cmd::MoveDeviceLeft => {
+            if !crate::views::devices::nudge_device(ws, -1) {
+                ws.toast("Select a device in a chain to move it", cx);
+            }
+        }
+        Cmd::MoveDeviceRight => {
+            if !crate::views::devices::nudge_device(ws, 1) {
+                ws.toast("Select a device in a chain to move it", cx);
+            }
+        }
+        Cmd::DuplicateWithoutContent => {
+            let ids = ws.s.selected_tracks();
+            if !ws.s.duplicate_tracks_empty(&ids) {
+                ws.toast("Select a track to duplicate without content", cx);
+            }
+        }
+        Cmd::UnsoloAll => {
+            let n = ws.s.unsolo_all();
+            if n > 0 {
+                ws.toast(format!("Unsoloed {n} track{}", if n == 1 { "" } else { "s" }), cx);
+            }
+        }
+        Cmd::ToggleInfoView => {
+            ws.info_view = !ws.info_view;
+        }
+        Cmd::StackDetailView => {
+            ws.toggle_bottom_stacked(cx);
         }
         Cmd::CaptureMidi => {
             let n = ws.s.capture_midi();
@@ -187,6 +247,10 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
             if let Some(view) = ws.s.ed.zoom_stack.pop() {
                 ws.s.arrange = view;
             }
+        }
+        Cmd::FitTracksHeight => {
+            let h = f32::from(ws.regions.arrange.get().size.height).max(200.);
+            ws.s.fit_tracks_height(h);
         }
         Cmd::Follow => {
             ws.s.ed.follow = !ws.s.ed.follow;

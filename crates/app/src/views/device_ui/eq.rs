@@ -340,7 +340,7 @@ fn info_panel(ws: &mut Workspace, dev: &Dev, b: usize, s: &BandSpec, range: f32,
                 .flex()
                 .items_center()
                 .child(div().size(px(8.)).flex_none().rounded_full().bg(color))
-                .child(label(format!("Band {}", b + 1), TEXT_XS, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .child(label(format!("Band {}", b + 1), if kit::in_window() { DEV_LABEL } else { TEXT_XS }, pal.text).font_weight(FontWeight::SEMIBOLD))
                 .child(div().flex_1())
                 .child(kit::pick(dev, id(p::TYPE), cx))
                 .child(kit::pick(dev, id(p::CHANNEL), cx)),
@@ -410,6 +410,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     });
     let info = info_panel(ws, dev, selected, &bands[selected], range, cx);
 
+    let pill_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
     // One chip per band: the dot switches it on and off, the chip selects it.
     let mut chips = div().flex().items_center().gap(px(SP1));
     for (b, s) in bands.iter().enumerate() {
@@ -448,8 +449,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                             cx.notify();
                         })),
                 )
-                .child(mono(format!("{}", b + 1), TEXT_XS, if is_on { pal.text } else { pal.faint }))
-                .when(dev.big, |d| d.child(label(TYPE_SHORT[s.kind.index()], TEXT_XS, if is_on { pal.muted } else { pal.faint })))
+                .child(mono(format!("{}", b + 1), pill_sz, if is_on { pal.text } else { pal.faint }))
+                .when(dev.big, |d| d.child(label(TYPE_SHORT[s.kind.index()], pill_sz, if is_on { pal.muted } else { pal.faint })))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.fx.selected.insert(device, b);
                     cx.notify();
@@ -467,7 +468,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let range_chip = div()
         .id(("eq-range", dev.key(0)))
         .flex_none()
-        .h(px(20.))
+        .h(px(if kit::in_window() { 24. } else { 20. }))
         .px(px(SP2))
         .flex()
         .items_center()
@@ -476,7 +477,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .bg(content(0.06))
         .hover(|s| s.bg(content(0.12)))
         .tooltip(widgets::tip("Display range: ±18 dB / ±30 dB", None))
-        .child(mono(format!("±{range:.0} dB"), TEXT_XS, pal.text))
+        .child(mono(format!("±{range:.0} dB"), pill_sz, pal.text))
         .on_click(cx.listener(move |this, _, _, cx| {
             let now = this.fx.opt(device, RANGE, 18.);
             this.fx.opts.insert((device, RANGE), if now > 20. { 18. } else { 30. });

@@ -320,16 +320,16 @@ pub fn header(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>)
         .flex()
         .flex_col()
         .overflow_hidden()
-        .child(label(crate::paint::fit(&d.name, 220., TEXT_LG), TEXT_LG, if enabled { pal.text } else { pal.muted }).font_weight(FontWeight::SEMIBOLD))
+        .child(label(crate::paint::fit(&d.name, 220., DEV_TITLE), DEV_TITLE, if enabled { pal.text } else { pal.muted }).font_weight(FontWeight::SEMIBOLD))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(SP1))
                 .when_some(track, |r, (name, color)| {
-                    r.child(div().size(px(6.)).rounded_full().bg(track_color(color))).child(label(crate::paint::fit(&name, 140., TEXT_XS), TEXT_XS, pal.muted))
+                    r.child(div().size(px(6.)).rounded_full().bg(track_color(color))).child(label(crate::paint::fit(&name, 140., DEV_AXIS), DEV_AXIS, pal.muted))
                 })
-                .child(label(kind, TEXT_XS, pal.faint)),
+                .child(label(kind, DEV_AXIS, pal.faint)),
         );
 
     // The selector: [<] [name v] [>].

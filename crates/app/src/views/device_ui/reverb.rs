@@ -151,6 +151,7 @@ pub fn impulse_plot(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
         });
         kit::fill_to(window, &pts, base, with_alpha(color, 0.2));
         kit::line(window, &pts, 1.5, color);
+        let lbl_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
         if shimmer > 0.01 {
             // Each trip round the shimmer comes back an interval higher and
             // a little quieter.
@@ -162,7 +163,7 @@ pub fn impulse_plot(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
                 }
             }
             let sign = if interval >= 0. { "+" } else { "" };
-            kit::txt(window, cx, &format!("shimmer {sign}{interval:.0}"), r.right() - 6., r.y + 4., TEXT_XS, series(5), TextAlign::Right);
+            kit::txt(window, cx, &format!("shimmer {sign}{interval:.0}"), r.right() - 6., r.y + 4., lbl_sz, series(5), TextAlign::Right);
         }
         kit::bar(window, r.x + 2., r.py(0.1), 2., r.h * 0.8, 1., pal.text);
         for k in 0..8 {
@@ -170,15 +171,17 @@ pub fn impulse_plot(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
             let h = r.h * 0.6 * early * (1. - k as f32 / 11.);
             kit::bar(window, x_of(t), base - h, 1.5, h, 0., series(4));
         }
-        kit::txt(window, cx, &format!("pre {:.0} ms", pre * 1000.), x_of(pre) + 6., base - 14., TEXT_XS, pal.faint, TextAlign::Left);
         if duck > 0. {
             // How far the ducker holds the tail down right now.
             let h = r.h * 0.8 * (1. - duck_now.clamp(0., 1.));
             kit::bar(window, r.right() - 5., r.py(0.1), 3., h, 1.5, pal.accent2);
         }
+        let mut avoid: Vec<kit::Rect> = marks.iter().map(|h| kit::Rect::around(r.px(h.fx), r.py(h.fy), 11.)).collect();
         for h in &marks {
             kit::dot(window, r.pt(h.fx, h.fy), 6., series(h.index), Some(pal.text));
         }
+        let pre_anchor = marks.first().map_or((x_of(pre), base - 10.), |h| (r.px(h.fx), r.py(h.fy)));
+        kit::placed_txt(window, cx, &format!("pre {:.0} ms", pre * 1000.), pre_anchor, lbl_sz, pal.muted, r, &mut avoid);
     })
 }
 

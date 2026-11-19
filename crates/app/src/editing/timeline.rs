@@ -181,6 +181,35 @@ impl AppState {
         self.commit("Insert silence", plan)
     }
 
+    /// Ctrl+Shift+Backspace / Delete: remove the selected time on every track,
+    /// pulling what follows earlier to close the gap (Live's Delete Time).
+    pub fn delete_time(&mut self) -> bool {
+        let Some((start, end)) = self.time_selection().map(|s| (s.start, s.end)) else { return false };
+        let mut plan = Plan::new(self);
+        plan.close_gap(start, end);
+        if !self.commit("Delete time", plan) {
+            return false;
+        }
+        self.ed.marker = start;
+        self.ed.time = None;
+        true
+    }
+
+    /// Ctrl+Shift+X: copy the selected time across its tracks and delete that
+    /// time span on every track, pulling what follows earlier (Live's Cut Time).
+    pub fn cut_time(&mut self) -> bool {
+        let Some((start, end)) = self.time_selection().map(|s| (s.start, s.end)) else { return false };
+        let _ = self.copy();
+        let mut plan = Plan::new(self);
+        plan.close_gap(start, end);
+        if !self.commit("Cut time", plan) {
+            return false;
+        }
+        self.ed.marker = start;
+        self.ed.time = None;
+        true
+    }
+
     /// Ctrl+Shift+D: repeat the selected time on every track, pushing what
     /// follows later. The selection moves onto the copy.
     pub fn duplicate_time(&mut self) -> bool {
@@ -257,6 +286,153 @@ impl AppState {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// Selected audio clips (arrangement selection, else the clip open in the
+    /// Clip View when it is audio).
+    pub fn selected_audio_clips(&self) -> Vec<ClipId> {
+        let is_audio = |id: &ClipId| self.project.clips.get(id).is_some_and(|c| matches!(self.project.sources.get(&c.source), Some(Source::Audio(_))));
+        let mut ids: Vec<ClipId> = self.selected_clips().into_iter().filter(is_audio).collect();
+        if ids.is_empty()
+            && let Some(id) = self.selected_clip.filter(is_audio)
+        {
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// R (Live): reverse the selected audio clips, or restore them to forward
+    /// when every selected audio clip is already reversed. One undo step; a
+    /// sample shared with unselected clips is copied for the edited ones first.
+    pub fn reverse_selected_clips(&mut self) -> Option<bool> {
+        let ids = self.selected_audio_clips();
+        if ids.is_empty() {
+            return None;
+        }
+        let target = ids.iter().any(|id| {
+            self.project
+                .clips
+                .get(id)
+                .and_then(|c| self.project.sources.get(&c.source))
+                .is_some_and(|s| matches!(s, Source::Audio(a) if !a.warp.reverse))
+        });
+        self.seal();
+        let ok = self.set_warp_of("reverse-clips", &ids, |w| w.reverse = target);
+        self.seal();
+        ok.then_some(target)
+    }
+
+    /// Shift+W: toggle Warp on the selected audio clips (all follow the first).
+    pub fn toggle_selected_clips_warp(&mut self) -> Option<bool> {
+        let ids = self.selected_audio_clips();
+        let first = *ids.first()?;
+        let enable = self
+            .project
+            .clips
+            .get(&first)
+            .and_then(|c| self.project.sources.get(&c.source))
+            .is_some_and(|s| matches!(s, Source::Audio(a) if !a.warp.enabled));
+        let bpm = self.project.tempo.initial_bpm();
+        self.seal();
+        let ok = self.set_warp_of("warp-toggle", &ids, |w| {
+            w.enabled = enable;
+            if w.enabled && w.original_bpm.is_none() {
+                w.original_bpm = Some(bpm);
+            }
+        });
+        self.seal();
+        ok.then_some(enable)
+    }
+
+    /// Transpose the selected audio clips by `semitones` (clamped to -48..=48).
+    /// Returns the first clip's new transpose in semitones.
+    pub fn nudge_audio_clips_transpose(&mut self, semitones: f32) -> Option<f32> {
+        let ids = self.selected_audio_clips();
+        if ids.is_empty() {
+            return None;
+        }
+        self.seal();
+        let ok = self.set_warp_of("transpose-clips", &ids, |w| {
+            w.transpose = (w.transpose + semitones).round().clamp(-48., 48.);
+        });
+        self.seal();
+        if !ok {
+            return None;
+        }
+        let first = ids[0];
+        self.project.clips.get(&first).and_then(|c| match self.project.sources.get(&c.source) {
+            Some(Source::Audio(a)) => Some(a.warp.transpose),
+            _ => None,
+        })
+    }
+
+    /// Nudge clip gain of the selected audio clips by `delta_db` (clamped to -48..=+24 dB).
+    /// Returns the first clip's new gain in dB.
+    pub fn nudge_audio_clips_gain(&mut self, delta_db: f32) -> Option<f32> {
+        let ids = self.selected_audio_clips();
+        if ids.is_empty() {
+            return None;
+        }
+        let mut cmds = Vec::new();
+        let mut first_db = None;
+        for id in ids {
+            let Some(c) = self.project.clips.get(&id) else { continue };
+            let next = ((c.gain_db + delta_db) * 10.).round() / 10.;
+            let next = next.clamp(-48., 24.);
+            if (next - c.gain_db).abs() < 1e-4 {
+                continue;
+            }
+            if first_db.is_none() {
+                first_db = Some(next);
+            }
+            cmds.push(Command::UpdateClip { id, clip: Box::new(Clip { gain_db: next, ..c.clone() }) });
+        }
+        if cmds.is_empty() {
+            return None;
+        }
+        self.seal();
+        let ok = self.edit("Clip gain", cmds);
+        self.seal();
+        ok.then_some(first_db?).or(None)
+    }
+
+    /// H (Live): optimize arrangement track heights so every visible track
+    /// fits `viewport_h`, or return to the default height when already fitted.
+    pub fn fit_tracks_height(&mut self, viewport_h: f32) -> bool {
+        let m = crate::theme::m();
+        let visible: Vec<TrackId> = self
+            .project
+            .content_tracks()
+            .filter(|t| t.kind != TrackKind::Return && !groups::hidden(&self.project, t.id))
+            .map(|t| t.id)
+            .collect();
+        if visible.is_empty() {
+            return false;
+        }
+        let extras: f32 = visible
+            .iter()
+            .map(|id| self.shown_takes(*id) as f32 * m.take_h + self.shown_lanes(*id).len() as f32 * m.auto_h)
+            .sum();
+        let room = (viewport_h - extras - 8.).max(m.track_min_h * visible.len() as f32);
+        let fitted_shown = (((room / visible.len() as f32) / 4.).floor() * 4.).clamp(m.track_min_h, 96.);
+        let fitted_stored = m.stored_track_h(fitted_shown);
+        let already = visible.iter().all(|id| self.project.track(*id).is_some_and(|t| (m.track_h(t.height) - fitted_shown).abs() < 1.));
+        let target = if already { 56. } else { fitted_stored };
+        let cmds: Vec<Command> = visible
+            .iter()
+            .filter(|id| self.project.track(**id).is_some_and(|t| (t.height - target).abs() >= 1.))
+            .map(|id| Command::SetTrack { id: *id, change: TrackProp::Height(target) })
+            .collect();
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit("Optimize track heights", cmds);
+        self.seal();
+        if ok {
+            self.arrange.scroll_y = 0.;
+        }
+        ok
     }
 
     /// Switch the selected clips off, or back on when all of them are off.

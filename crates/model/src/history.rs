@@ -264,6 +264,11 @@ impl History {
         self.undo.iter().rev()
     }
 
+    /// Undone steps waiting to be redone, next-to-redo first.
+    pub fn redo_steps(&self) -> impl Iterator<Item = &Transaction> {
+        self.redo.iter().rev()
+    }
+
     // ── Proposals ──
 
     /// Stage commands for review. Validates them against a clone first.

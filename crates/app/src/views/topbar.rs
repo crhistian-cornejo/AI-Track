@@ -203,6 +203,22 @@ fn can_record(s: &crate::state::AppState) -> bool {
         || s.project.tracks.iter().any(|t| t.arm && (t.kind == TrackKind::Instrument || (t.kind == TrackKind::Audio && t.input != InputSource::None)))
 }
 
+/// Format a transport position in seconds as `MM:SS.mmm` (or `H:MM:SS.m` past an hour).
+pub fn format_position_time(seconds: f64) -> String {
+    let total_ms = (seconds.max(0.) * 1000.).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}.{}", ms / 100)
+    } else {
+        format!("{m:02}:{s:02}.{ms:03}")
+    }
+}
+
 fn cpu_color(load: f32) -> Hsla {
     let pal = p();
     if load > 0.8 {
@@ -254,6 +270,16 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let project = &ws.s.project;
     let (bar, beat, tick) = project.tempo.bars_beats(t.position);
     let sixteenth = tick / (PPQ / 4) + 1;
+    let pos_text = if ws.show_bars_timer {
+        format!("{bar}. {beat}. {sixteenth}")
+    } else {
+        format_position_time(project.tempo.tick_to_seconds(t.position))
+    };
+    let pos_tip = if ws.show_bars_timer {
+        "Arrangement position (bars . beats . sixteenths) — click to switch to time"
+    } else {
+        "Arrangement position (min:sec.ms) — click to switch to bars"
+    };
     let bpm = project.tempo.initial_bpm();
     let sig = project.tempo.signature_at(t.position);
     let scale = project.scale.map_or("No key".to_owned(), |s| s.display());
@@ -422,9 +448,15 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     // ── Position and transport ──
     let transport = group()
         .child(
-            readout("position", 72.)
-                .tooltip(widgets::tip("Arrangement position: bars . beats . sixteenths", None))
-                .child(mono(format!("{bar}. {beat}. {sixteenth}"), TEXT_MD, if t.playing { pal.accent } else { pal.text })),
+            readout("position", 84.)
+                .cursor_pointer()
+                .hover(|s| s.border_color(border_strong()))
+                .tooltip(widgets::tip(pos_tip, None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_bars_timer = !this.show_bars_timer;
+                    cx.notify();
+                }))
+                .child(mono(pos_text, TEXT_MD, if t.playing { pal.accent } else { pal.text })),
         )
         .child(div().w(px(SP1)))
         .child(
@@ -781,5 +813,13 @@ mod tests {
             assert_eq!((m.top_bar_h - m.bar_field_h) % 4., 0.);
         }
         assert_eq!(LEFT_INSET % 4., 0.);
+    }
+
+    #[test]
+    fn position_timer_formats_minutes_seconds_and_millis() {
+        assert_eq!(format_position_time(0.), "00:00.000");
+        assert_eq!(format_position_time(-1.5), "00:00.000");
+        assert_eq!(format_position_time(65.432), "01:05.432");
+        assert_eq!(format_position_time(3661.25), "1:01:01.2");
     }
 }

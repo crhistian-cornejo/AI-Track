@@ -293,6 +293,8 @@ struct ClipPaint {
     offset: Tick,
     /// Deactivated with 0: drawn drained of colour.
     muted: bool,
+    /// Reversed with R: drawn with a small Rev mark in the title strip.
+    reversed: bool,
     /// Where a looping audio clip starts over, in pixels from its left edge.
     repeats: Vec<f32>,
     /// On a frozen track: drawn in ice blue, locked.
@@ -425,6 +427,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 None => Body::Audio { wave: None, shape: arrange_clips::draw::shape_of(c) },
             };
             let audio = matches!(body, Body::Audio { .. });
+            let reversed = matches!(ws.s.project.sources.get(&c.source), Some(Source::Audio(file)) if file.warp.reverse);
             // Notes draw their own repeats; audio gets a notch at each one.
             let repeats = if matches!(body, Body::Audio { .. }) { crate::editing::overlay::loop_repeats(c, px_per_tick) } else { Vec::new() };
             let paint = ClipPaint {
@@ -442,6 +445,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 px_per_tick,
                 offset: c.offset,
                 muted: c.muted,
+                reversed,
                 repeats,
                 frozen: t.is_frozen(),
             };
@@ -492,6 +496,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 px_per_tick,
                 offset: 0,
                 muted: false,
+                reversed: false,
                 repeats: Vec::new(),
                 frozen: false,
             });
@@ -802,14 +807,16 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }))
         .on_scroll_wheel(cx.listener(on_wheel));
 
+    let tool_btn = 20.;
     let toolbar = div()
         .flex_none()
         .w(px(m().track_header_w))
         .h_full()
-        .px(px(SP2))
+        .px(px(SP1))
         .flex()
         .items_center()
         .gap(px(SP1))
+        .overflow_hidden()
         .bg(pal.surface)
         .border_r_1()
         .border_b_1()
@@ -817,11 +824,14 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .child(
             div()
                 .id("arr-snap")
-                .h(px(m().ruler_h - SP1))
-                .px(px(SP2))
+                .min_w(px(0.))
+                .flex_shrink(1.)
+                .h(px(tool_btn))
+                .px(px(SP1 + 2.))
                 .gap(px(SP1))
                 .flex()
                 .items_center()
+                .overflow_hidden()
                 .rounded(px(r_md()))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
@@ -830,34 +840,41 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                     let at = e.position();
                     this.open_menu(MenuKind::Snap, point(at.x - px(16.), at.y + px(14.)), cx);
                 }))
-                .child(icon(Icon::Magnet, 14., if ws.s.snap == Snap::Off { pal.faint } else { pal.accent }))
-                .child(label(ws.s.snap_label(crate::editing::GridView::Arrange), TEXT_SM, pal.text)),
+                .child(icon(Icon::Magnet, 12., if ws.s.snap == Snap::Off { pal.faint } else { pal.accent }))
+                .child(label(ws.s.snap_label(crate::editing::GridView::Arrange), TEXT_SM, pal.text).min_w(px(0.)).truncate()),
         )
-        .child(div().flex_1())
-        // Add Locator (Live's Set Locator): at the playhead, or the insert marker when stopped.
+        .child(div().flex_1().min_w(px(0.)))
         .child(
-            widgets::sized_icon_button("add-locator", Icon::Flag, false, m().ruler_h - SP1, 14.)
-                .tooltip(widgets::tip("Add a locator at the playhead, or the insert marker when stopped · click a mark to jump, drag to move, double-click to rename", None))
-                .on_click(cx.listener(|this, _, _, cx| this.set_locator_here(cx))),
-        )
-        // Live's Automation Arm: while recording, a control moved in a
-        // plugin's window writes its automation.
-        .child(
-            widgets::sized_icon_button("auto-arm", Icon::Automation, ws.s.automation_arm, m().ruler_h - SP1, 14.)
-                .when(ws.s.automation_arm, |d| d.bg(with_alpha(pal.record, 0.18)))
-                .tooltip(widgets::tip("Automation Arm: record plugin moves as automation", None))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_arm(cx))),
-        )
-        .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, m().ruler_h - SP1, 14.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
-            let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
-            this.s.arrange = crate::nav::zoom_at(this.s.arrange, 0.8, centre);
-            cx.notify();
-        })))
-        .child(widgets::sized_icon_button("zoom-in", Icon::ZoomIn, false, m().ruler_h - SP1, 14.).tooltip(widgets::tip("Zoom in", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
-            let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
-            this.s.arrange = crate::nav::zoom_at(this.s.arrange, 1.25, centre);
-            cx.notify();
-        })));
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                // Add Locator (Live's Set Locator): at the playhead, or the insert marker when stopped.
+                .child(
+                    widgets::sized_icon_button("add-locator", Icon::Flag, false, tool_btn, 13.)
+                        .tooltip(widgets::tip("Add a locator at the playhead, or the insert marker when stopped · click a mark to jump, drag to move, double-click to rename", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_locator_here(cx))),
+                )
+                // Live's Automation Arm: while recording, a control moved in a
+                // plugin's window writes its automation.
+                .child(
+                    widgets::sized_icon_button("auto-arm", Icon::Automation, ws.s.automation_arm, tool_btn, 13.)
+                        .when(ws.s.automation_arm, |d| d.bg(with_alpha(pal.record, 0.18)))
+                        .tooltip(widgets::tip("Automation Arm: record plugin moves as automation", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_arm(cx))),
+                )
+                .child(widgets::sized_icon_button("zoom-out", Icon::ZoomOut, false, tool_btn, 13.).tooltip(widgets::tip("Zoom out", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
+                    let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
+                    this.s.arrange = crate::nav::zoom_at(this.s.arrange, 0.8, centre);
+                    cx.notify();
+                })))
+                .child(widgets::sized_icon_button("zoom-in", Icon::ZoomIn, false, tool_btn, 13.).tooltip(widgets::tip("Zoom in", Some("Ctrl+Wheel"))).on_click(cx.listener(|this, _, _, cx| {
+                    let centre = f32::from(this.regions.arrange.get().size.width) / 2.;
+                    this.s.arrange = crate::nav::zoom_at(this.s.arrange, 1.25, centre);
+                    cx.notify();
+                }))),
+        );
 
     div()
         .size_full()
@@ -898,8 +915,9 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .h(px(m().bus_h))
                 .flex()
                 .items_center()
-                .gap(px(SP2))
-                .pr(px(SP2))
+                .gap(px(SP1))
+                .pr(px(SP1))
+                .overflow_hidden()
                 .bg(if selected { pal.raised } else { pal.surface })
                 .when(!selected, |d| d.hover(|s| s.bg(mix(pal.surface, pal.raised, 0.55))))
                 .border_b_1()
@@ -910,9 +928,9 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     this.s.selected_track = Some(id);
                     cx.notify();
                 }))
-                .child(div().w(px(4.)).h_full().bg(track_color(t.color)))
-                .child(icon(if is_main { Icon::Volume } else { Icon::Return }, 14., pal.muted))
-                .child(label(paint::fit(&t.name, m().track_header_w - 118., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
+                .child(div().w(px(4.)).h_full().flex_none().bg(track_color(t.color)))
+                .child(icon(if is_main { Icon::Volume } else { Icon::Return }, 13., pal.muted))
+                .child(label(t.name.clone(), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1().min_w(px(0.)).truncate())
                 .child(chip(("bus-m", id.0 as usize), "M", mute, pal.mute).on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.s.set_track(id, TrackProp::Mute(!mute));
@@ -925,7 +943,7 @@ fn bus_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         cx.notify();
                     })))
                 })
-                .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted))
+                .child(mono(crate::state::format_db(t.volume_db), TEXT_XS, pal.muted).flex_none())
                 .child(widgets::meter(ws.b.engine.meter(id), 24., 6.)),
         );
         lanes = lanes.child(
@@ -1023,57 +1041,87 @@ fn paint_take_row(window: &mut Window, o: Point<Pixels>, t: &TakePaint, w: f32) 
 }
 
 fn paint_clip(window: &mut Window, cx: &mut gpui::App, o: Point<Pixels>, c: &ClipPaint, canvas_w: f32, hot: Option<Zone>) {
-    let body = at(o, c.x + 1., c.y, (c.w - 2.).max(2.), c.h);
+    let body_w = (c.w - 2.).max(2.);
+    let body = at(o, c.x + 1., c.y, body_w, c.h);
     let fill = if c.muted { mix(clip_fill(c.color), p().well, 0.7) } else { clip_fill(c.color) };
     let fill = if c.frozen { mix(fill, p().frozen, 0.45) } else { fill };
     let fg = if c.muted { p().muted } else { clip_text(c.color) };
-    window.paint_quad(paint::rrect_border(body, r_sm(), with_alpha(fill, 0.55), if c.selected { accent() } else { with_alpha(fill, 1.) }, if c.selected { 1.5 } else { 1. }));
-    window.paint_quad(paint::rrect(at(o, c.x + 1., c.y, (c.w - 2.).max(2.), CLIP_HEAD), r_sm(), fill));
+    // Subtle, unmistakable selection: slightly richer body fill, refined accent-tinted
+    // header strip, and a crisp perimeter border painted on top so the header never masks it.
+    let body_alpha = if c.selected { 0.68 } else { 0.48 };
+    let head_fill = if c.selected { mix(fill, accent(), 0.18) } else { fill };
+    window.paint_quad(paint::rrect(body, r_sm(), with_alpha(fill, body_alpha)));
+    window.paint_quad(paint::rrect(at(o, c.x + 1.5, c.y + 0.5, (body_w - 1.).max(1.), CLIP_HEAD - 0.5), r_sm(), head_fill));
     if hot.is_some() {
         window.paint_quad(paint::rrect(body, r_sm(), hover()));
     }
-    let glyph = if c.looping { arrange_clips::draw::loop_glyph(window, cx, o, &c.bx, fg) } else { 0. };
+    let loop_w = if c.looping { arrange_clips::draw::loop_glyph(window, cx, o, &c.bx, fg) } else { 0. };
+    let rev_w = if c.reversed && c.w >= 48. + loop_w {
+        let rx = c.x + c.w - loop_w - 24.;
+        paint::text(window, cx, "REV", o.x + px(rx), o.y + px(c.y + 1.), TEXT_XS - 1., with_alpha(fg, 0.85), FontWeight::SEMIBOLD, TextAlign::Left);
+        26.
+    } else {
+        0.
+    };
+    let glyph = loop_w + rev_w;
     if c.w > 28. {
         window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
-            paint::text(window, cx, &paint::fit(&c.name, c.w - 10. - glyph, TEXT_XS), o.x + px(c.x + 5.), o.y + px(c.y + 0.5), TEXT_XS, fg, FontWeight::MEDIUM, TextAlign::Left);
+            paint::text(
+                window,
+                cx,
+                &paint::fit(&c.name, c.w - 10. - glyph, TEXT_XS),
+                o.x + px(c.x + 5.),
+                o.y + px(c.y + 0.5),
+                TEXT_XS,
+                fg,
+                if c.selected { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
+                TextAlign::Left,
+            );
         });
     }
     let inner_y = c.y + CLIP_HEAD + 2.;
     let inner_h = c.h - CLIP_HEAD - 4.;
-    if inner_h < 4. {
-        return;
-    }
-    window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| match &c.body {
-        Body::Notes { notes, lo, hi, loop_len } => {
-            let span = (*hi as f32 - *lo as f32 + 1.).max(8.);
-            let row = (inner_h / span).clamp(1.5, 5.);
-            let used = row * (*hi as f32 - *lo as f32 + 1.);
-            let base = inner_y + (inner_h - used) / 2.;
-            let reps = ((c.w / c.px_per_tick) / *loop_len as f32).ceil() as i64;
-            for rep in 0..reps.max(1) {
-                let ox = c.x + (rep * loop_len) as f32 * c.px_per_tick - c.offset as f32 * c.px_per_tick;
-                if rep > 0 {
-                    window.paint_quad(paint::fill_rect(at(o, ox, inner_y, 1., inner_h), with_alpha(fg, 0.15)));
-                }
-                for (k, s, l) in notes {
-                    if *s >= *loop_len {
-                        continue;
+    if inner_h >= 4. {
+        window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| match &c.body {
+            Body::Notes { notes, lo, hi, loop_len } => {
+                let span = (*hi as f32 - *lo as f32 + 1.).max(8.);
+                let row = (inner_h / span).clamp(1.5, 5.);
+                let used = row * (*hi as f32 - *lo as f32 + 1.);
+                let base = inner_y + (inner_h - used) / 2.;
+                let reps = ((c.w / c.px_per_tick) / *loop_len as f32).ceil() as i64;
+                for rep in 0..reps.max(1) {
+                    let ox = c.x + (rep * loop_len) as f32 * c.px_per_tick - c.offset as f32 * c.px_per_tick;
+                    if rep > 0 {
+                        window.paint_quad(paint::fill_rect(at(o, ox, inner_y, 1., inner_h), with_alpha(fg, 0.15)));
                     }
-                    let nx = ox + *s as f32 * c.px_per_tick;
-                    let ny = base + (*hi - *k) as f32 * row;
-                    window.paint_quad(paint::fill_rect(at(o, nx, ny, (*l as f32 * c.px_per_tick - 1.).max(1.), (row - 0.5).max(1.)), with_alpha(fg, 0.85)));
+                    for (k, s, l) in notes {
+                        if *s >= *loop_len {
+                            continue;
+                        }
+                        let nx = ox + *s as f32 * c.px_per_tick;
+                        let ny = base + (*hi - *k) as f32 * row;
+                        window.paint_quad(paint::fill_rect(at(o, nx, ny, (*l as f32 * c.px_per_tick - 1.).max(1.), (row - 0.5).max(1.)), with_alpha(fg, 0.85)));
+                    }
                 }
             }
-        }
-        Body::Audio { wave, shape } => {
-            // The file's peaks as they will sound, then the fades over them.
-            arrange_clips::draw::wave(window, o, &c.bx, shape, wave.as_ref(), canvas_w, crate::theme::mix(fg, p().waveform, 0.5));
-            arrange_clips::draw::fades(window, o, &c.bx, canvas_w, hot, fg);
-        }
-    });
-    // Where a looping clip starts over.
-    crate::editing::overlay::paint_repeats(window, o, c.x, inner_y, inner_h, &c.repeats, fg);
-    if hot.is_some() || c.selected {
+            Body::Audio { wave, shape } => {
+                // The file's peaks as they will sound, then the fades over them.
+                arrange_clips::draw::wave(window, o, &c.bx, shape, wave.as_ref(), canvas_w, crate::theme::mix(fg, p().waveform, 0.5));
+                arrange_clips::draw::fades(window, o, &c.bx, canvas_w, hot, fg);
+            }
+        });
+        // Where a looping clip starts over.
+        crate::editing::overlay::paint_repeats(window, o, c.x, inner_y, inner_h, &c.repeats, fg);
+    }
+    // Perimeter frame painted on top of body and header so selection stays crisp across all 4 edges.
+    if c.selected {
+        let ring = mix(accent(), p().text, 0.18);
+        window.paint_quad(paint::fill_rect(at(o, c.x + 2.5, c.y + 0.5, (body_w - 3.).max(1.), 2.), accent()));
+        window.paint_quad(paint::rrect_border(body, r_sm(), gpui::transparent_black(), ring, 1.5));
+    } else {
+        window.paint_quad(paint::rrect_border(body, r_sm(), gpui::transparent_black(), with_alpha(fill, 0.95), 1.));
+    }
+    if inner_h >= 4. && (hot.is_some() || c.selected) {
         arrange_clips::draw::handles(window, o, &c.bx, hot);
     }
 }
@@ -1264,6 +1312,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
             div()
                 .flex_1()
                 .min_w(px(0.))
+                .overflow_hidden()
                 .pl(px(SP2 + indent))
                 .pr(px(SP2))
                 .when(is_group, |d| d.bg(with_alpha(track_color(t.color), 0.10)))
@@ -1274,6 +1323,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                 .gap(px(SP1))
                 .child(
                     div()
+                        .min_w(px(0.))
                         .flex()
                         .items_center()
                         .gap(if single { px(SP1) } else { px(SP2) })
@@ -1283,7 +1333,9 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                         .child(
                             label(paint::fit(&shown_name, name_w, TEXT_MD), TEXT_MD, if selected { pal.text } else { with_alpha(pal.text, 0.92) })
                                 .font_weight(if selected || is_group { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-                                .flex_1(),
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate(),
                         )
                         .when(single, |d| d.child(div().flex().items_center().gap(px(SP1)).children(buttons.take().unwrap_or_default()).child(auto_chip.take().unwrap())))
                         .when(!single && audio, |d| d.child(volume_box(ws, id, t.volume_db, cx))),
@@ -1379,8 +1431,8 @@ fn take_header(ws: &Workspace, t: &Track, k: usize, indent: f32, cx: &mut Contex
                 this.open_menu(MenuKind::TakeLaneContext(id, k), e.position, cx);
             }),
         )
-        .child(div().w(px(SP1)).h(px(SP3)).rounded(px(r_sm())).bg(if used { accent() } else { pal.faint }))
-        .child(label(paint::fit(&name, m().track_header_w - 72. - indent, TEXT_SM), TEXT_SM, if used { pal.text } else { pal.muted }).flex_1())
+        .child(div().w(px(SP1)).h(px(SP3)).flex_none().rounded(px(r_sm())).bg(if used { accent() } else { pal.faint }))
+        .child(label(name, TEXT_SM, if used { pal.text } else { pal.muted }).flex_1().min_w(px(0.)).truncate())
         .child(
             widgets::sized_icon_button(("take-del", key), Icon::Trash, false, 20., 12.)
                 .tooltip(widgets::tip("Delete this take lane", None))
@@ -1434,7 +1486,7 @@ fn lane_header(ws: &mut Workspace, t: &Track, k: usize, target: AutomationTarget
                     open_chooser(this, id, k, point(at.x - px(24.), at.y + px(12.)), window, cx);
                 }))
                 .child(icon(Icon::Automation, 12., if lane.is_some() { pal.automation } else { pal.faint }))
-                .child(label(paint::fit(&target_name(ws, target), m().track_header_w - 72. - indent, TEXT_SM), TEXT_SM, pal.text).flex_1())
+                .child(label(target_name(ws, target), TEXT_SM, pal.text).flex_1().min_w(px(0.)).truncate())
                 .child(icon(Icon::ChevronDown, 10., pal.muted)),
         )
         .child(
@@ -1948,5 +2000,16 @@ mod tests {
         assert_eq!((depth(&s, outer), depth(&s, inner), depth(&s, ids[0]), depth(&s, ids[1])), (Some(0), Some(1), Some(2), Some(0)));
         s.set_track(outer, TrackProp::Collapsed(true));
         assert_eq!((depth(&s, outer), depth(&s, inner), depth(&s, ids[0])), (Some(0), None, None));
+    }
+
+    #[test]
+    fn arrangement_toolbar_fits_inside_track_header_width() {
+        // Outer padding (2*SP1) + right border (1) + 4 buttons (20px) + 3 inner gaps (2px)
+        // + main gap (SP1) must leave plenty of room for the snap pill ("Auto 1 Bar").
+        let buttons_w = 4. * 20. + 3. * 2.;
+        for metrics in [Metrics::COMFORTABLE, Metrics::COMPACT] {
+            let room_for_snap = metrics.track_header_w - 2. * SP1 - 1. - buttons_w - SP1;
+            assert!(room_for_snap >= 96., "toolbar left only {room_for_snap}px for snap pill");
+        }
     }
 }

@@ -3,6 +3,7 @@
 //! shaded area is the gain actually applied (the curve scaled by Depth), and
 //! a marker rides the curve at the position the plugin is at right now.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, ax};
 use super::Dev;
 use crate::theme::*;
@@ -74,10 +75,40 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::vline(window, r, r.px(phase), with_alpha(pal.text, 0.35));
             kit::dot(window, r.pt(phase, level_frac(gain)), 4., pal.text, None);
         }
+        let lbl_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
         let trig_txt = if trig == 1 { format!("audio trig · {rate}") } else { format!("one cycle = {rate}") };
-        kit::txt(window, cx, &trig_txt, r.x + 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Left);
-        kit::txt(window, cx, y_label, r.right() - 6., r.y + 4., TEXT_XS, pal.faint, TextAlign::Right);
+        kit::txt(window, cx, &trig_txt, r.x + 6., r.y + 4., lbl_sz, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, y_label, r.right() - 6., r.y + 4., lbl_sz, pal.faint, TextAlign::Right);
     });
+
+    if win::in_window(dev) {
+        let top = div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(SP3))
+            .child(win::captioned("Mode", kit::pick(dev, p::MODE, cx)))
+            .child(win::captioned("Trigger", kit::pick(dev, p::TRIGGER, cx)));
+        let mut shape_ids = vec![p::RATE, p::DEPTH, p::SMOOTH, p::TENSION];
+        if trig == 1 {
+            shape_ids.push(p::THRESHOLD);
+        }
+        let mut primary = vec![win::group(dev, "Shaper", None, &shape_ids, cx)];
+        if mode == 1 {
+            primary.push(win::group(dev, "Filter", None, &[p::CUTOFF, p::RESONANCE], cx));
+        }
+        let mut more_ids = vec![p::PHASE];
+        if trig != 1 {
+            more_ids.push(p::THRESHOLD);
+        }
+        if mode != 1 {
+            more_ids.extend([p::CUTOFF, p::RESONANCE]);
+        }
+        let more = vec![win::group(dev, "Details", None, &more_ids, cx)];
+        let displays = div().child(div().flex_1().min_w(px(0.)).h_full().child(plot));
+        return win::arrange(ws, dev, 680., Some(top), displays, primary, more, cx).into_any_element();
+    }
 
     let mut primary = vec![p::MODE, p::TRIGGER, p::RATE, p::DEPTH, p::SMOOTH, p::TENSION];
     if trig == 1 {

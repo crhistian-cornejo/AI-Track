@@ -1451,3 +1451,142 @@ fn an_edit_that_arrives_during_a_drag_does_not_settle_it() {
     s.seal();
     assert_eq!(spans(&s, midi), [(4 * BEAT, 4 * BEAT), (9 * BEAT, 2 * BEAT)], "dropped clear of it: nothing is replaced");
 }
+
+#[test]
+fn ableton_clip_reverse_warp_pitch_and_gain_shortcuts() {
+    let Song { mut s, audio, .. } = song();
+    let a = audio_clip(&mut s, audio, 0, 2 * BEAT);
+    let b = audio_clip(&mut s, audio, 4 * BEAT, 2 * BEAT);
+    s.click_clip(a, false);
+    // R reverses only the selected audio clip and toggles cleanly in one undo step.
+    assert_eq!(s.reverse_selected_clips(), Some(true));
+    let rev_of = |s: &AppState, pid| match &s.project.sources[&clip_of(s, pid).source] {
+        Source::Audio(f) => f.warp.reverse,
+        _ => unreachable!(),
+    };
+    assert!(rev_of(&s, a));
+    assert!(!rev_of(&s, b), "unselected clip keeps forward playback");
+    assert_eq!(s.reverse_selected_clips(), Some(false));
+    assert!(!rev_of(&s, a));
+    assert!(s.undo());
+    assert!(rev_of(&s, a));
+
+    // Shift+W toggles warp on the selected audio clip.
+    assert_eq!(s.toggle_selected_clips_warp(), Some(true));
+    assert_eq!(s.toggle_selected_clips_warp(), Some(false));
+
+    // Alt+Up/Down & Shift+Up/Down transpose audio clips; Cmd+Up/Down nudges clip gain.
+    assert!(s.key_edit(KeyEdit::SemitoneUp));
+    assert!(s.key_edit(KeyEdit::OctaveUp));
+    let st = match &s.project.sources[&clip_of(&s, a).source] {
+        Source::Audio(f) => f.warp.transpose,
+        _ => unreachable!(),
+    };
+    assert_eq!(st, 13.);
+    assert!(s.key_edit(KeyEdit::VelocityDown));
+    assert_eq!(clip_of(&s, a).gain_db, -1.);
+}
+
+#[test]
+fn delete_time_and_cut_time_remove_range_and_close_the_gap() {
+    let Song { mut s, midi, audio, .. } = song();
+    midi_clip(&mut s, midi, 0, 2 * BEAT, &[(60, 0, BEAT)]);
+    midi_clip(&mut s, midi, 6 * BEAT, 2 * BEAT, &[(64, 0, BEAT)]);
+    audio_clip(&mut s, audio, 0, 8 * BEAT);
+    s.set_time_selection((2 * BEAT, midi), (6 * BEAT, audio));
+    assert!(s.delete_time());
+    assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (2 * BEAT, 2 * BEAT)]);
+    assert_eq!(spans(&s, audio), [(0, 2 * BEAT), (2 * BEAT, 2 * BEAT)]);
+    assert_eq!(s.ed.marker, 2 * BEAT);
+    assert!(s.ed.time.is_none());
+    assert!(s.undo());
+    assert_eq!(spans(&s, midi), [(0, 2 * BEAT), (6 * BEAT, 2 * BEAT)]);
+
+    // Cut Time copies the selection and closes the gap.
+    s.set_time_selection((0, midi), (2 * BEAT, audio));
+    assert!(s.cut_time());
+    assert!(s.ed.clipboard.is_some());
+    assert_eq!(spans(&s, midi), [(4 * BEAT, 2 * BEAT)]);
+}
+
+#[test]
+fn fit_tracks_height_optimizes_and_toggles_back_to_default() {
+    let Song { mut s, midi, .. } = song();
+    assert!(s.fit_tracks_height(240.));
+    let fitted = s.project.track(midi).unwrap().height;
+    assert_ne!(fitted, 56.);
+    // Pressing H again restores default height.
+    assert!(s.fit_tracks_height(240.));
+    assert_eq!(s.project.track(midi).unwrap().height, 56.);
+}
+
+#[test]
+fn copy_time_copies_all_clip_tracks_without_deleting() {
+    let Song { mut s, midi, audio, .. } = song();
+    midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT)]);
+    audio_clip(&mut s, audio, 0, 4 * BEAT);
+    s.set_time_selection((0, midi), (2 * BEAT, midi));
+    assert!(s.copy_time());
+    // Original clips stay intact.
+    assert_eq!(spans(&s, midi), [(0, 4 * BEAT)]);
+    assert_eq!(spans(&s, audio), [(0, 4 * BEAT)]);
+    // Pasting at bar 3 lays down slices on both tracks.
+    s.ed.marker = 8 * BEAT;
+    assert!(s.paste());
+    assert_eq!(spans(&s, midi), [(0, 4 * BEAT), (8 * BEAT, 2 * BEAT)]);
+    assert_eq!(spans(&s, audio), [(0, 4 * BEAT), (8 * BEAT, 2 * BEAT)]);
+}
+
+#[test]
+fn duplicate_without_content_keeps_devices_and_drops_clips() {
+    let Song { mut s, midi, .. } = song();
+    let _eq = s.add_stock_device(midi, "fx.eq", "EQ").unwrap();
+    midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT), (64, BEAT, BEAT)]);
+    let base = steps(&s);
+    assert!(s.duplicate_tracks_empty(&[midi]));
+    assert_eq!(steps(&s), base + 1);
+    let dup_id = s.selected_track.unwrap();
+    assert_ne!(dup_id, midi);
+    let dup = s.project.track(dup_id).unwrap();
+    assert_eq!(dup.devices.len(), 1, "devices are copied");
+    assert!(dup.arrangement.is_empty() && dup.session_slots.is_empty(), "clips are omitted");
+    assert!(dup.automation.is_empty(), "automation is omitted");
+}
+
+#[test]
+fn unsolo_all_and_redo_steps_work_in_one_step() {
+    let Song { mut s, midi, audio, .. } = song();
+    s.set_track(midi, TrackProp::Solo(true));
+    s.set_track(audio, TrackProp::Solo(true));
+    let base = steps(&s);
+    assert_eq!(s.unsolo_all(), 2);
+    assert_eq!(steps(&s), base + 1);
+    assert!(s.project.tracks.iter().all(|t| !t.solo));
+    assert!(s.undo());
+    assert_eq!(s.history.redo_steps().count(), 1);
+    assert_eq!(s.history.redo_steps().next().map(|t| t.label.as_str()), Some("Unsolo all"));
+}
+
+#[test]
+fn chance_lane_edits_note_probability_and_follow_actions_round_trip() {
+    let Song { mut s, midi, .. } = song();
+    let pl = midi_clip(&mut s, midi, 0, 4 * BEAT, &[(60, 0, BEAT), (64, BEAT, BEAT)]);
+    let clip = s.placement(pl).unwrap().1.clip;
+    s.selected_clip = Some(clip);
+    s.ed.area = Area::Piano;
+    let first_id = s.clip_notes(clip).unwrap().1.notes[0].id;
+    s.selected_notes.insert(first_id);
+    // Nudge probability via Chance lane + Cmd+Down (-10%).
+    s.note_lane = crate::state::NoteLane::Chance;
+    assert!(s.key_edit(crate::state::KeyEdit::VelocityDown));
+    let prob = s.clip_notes(clip).unwrap().1.notes[0].probability;
+    assert!((prob - 0.9).abs() < 1e-4, "expected 0.9, got {prob}");
+    assert!(s.nudge_probability(clip, -0.3));
+    let prob2 = s.clip_notes(clip).unwrap().1.notes[0].probability;
+    assert!((prob2 - 0.6).abs() < 1e-4, "expected 0.6, got {prob2}");
+    // Follow Actions UI helpers update clip.launch.follow in one undo step.
+    crate::views::bottom::set_follow_action(&mut s, clip, Some(FollowAction::Next { after_bars: 2 }));
+    assert_eq!(s.project.clips[&clip].launch.follow, Some(FollowAction::Next { after_bars: 2 }));
+    assert_eq!(crate::views::bottom::follow_action_name(s.project.clips[&clip].launch.follow), "Play Next");
+    assert_eq!(crate::views::bottom::follow_action_bars(s.project.clips[&clip].launch.follow), 2);
+}

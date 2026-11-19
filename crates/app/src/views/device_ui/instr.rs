@@ -8,7 +8,7 @@ use super::{Dev, caption, kit};
 use crate::paint;
 use crate::theme::*;
 use crate::views::devices::knob_control_sized;
-use crate::widgets::{self, knob_cell, label, mono};
+use crate::widgets::{label, mono};
 use crate::workspace::{KnobTarget, Workspace};
 use gpui::{
     AnyElement, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div,
@@ -16,7 +16,7 @@ use gpui::{
 };
 
 /// Diameter of a knob in a group.
-pub const DIAL: f32 = 40.;
+pub const DIAL: f32 = 44.;
 /// Width of the cell a knob sits in (a name above, its value below).
 pub const CELL: f32 = DIAL + 24.;
 
@@ -48,16 +48,16 @@ pub fn group(title: &str, accent: Hsla, body: Vec<AnyElement>) -> Div {
         .flex()
         .flex_col()
         .rounded(px(r_md()))
-        .bg(content(0.03))
-        .border_1()
-        .border_color(border())
+        .bg(content(0.04))
+        .border_t_1()
+        .border_color(content(0.06))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(SP2))
                 .child(div().w(px(3.)).h(px(12.)).rounded(px(2.)).bg(accent))
-                .child(label(title.to_owned(), TEXT_XS, pal.muted).font_weight(FontWeight::SEMIBOLD)),
+                .child(label(title.to_owned(), DEV_GROUP, pal.muted).font_weight(FontWeight::SEMIBOLD)),
         )
         .child(div().flex().items_start().justify_around().gap(px(SP2)).children(body))
 }
@@ -75,11 +75,22 @@ pub fn dial(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
     if matches!(info.scale, aitrack_dsp::ParamScale::Stepped) && !info.choices.is_empty() {
         return chips(dev, id, cx);
     }
+    let pal = p();
     let value = dev.norm(id);
     let target = KnobTarget::Param { device: dev.id, param: id, default: info.default_normalized() };
     let k = knob_control_sized(("inst-knob", dev.key(id as usize)), value, info.min < 0. && info.max > 0., dev.enabled, DIAL, target, cx)
-        .tooltip(widgets::tip(info.name, Some("Drag · Shift fine · double-click resets")));
-    knob_cell(k, info.short, info.format(value), CELL).into_any_element()
+        .tooltip(kit::param_tip(&info, value));
+    div()
+        .flex_none()
+        .w(px(CELL))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(2.))
+        .child(label(paint::fit(info.short, CELL, DEV_LABEL), DEV_LABEL, pal.muted))
+        .child(k)
+        .child(mono(paint::fit(&info.format(value), CELL, DEV_VALUE), DEV_VALUE, if dev.enabled { pal.text } else { pal.muted }).font_weight(FontWeight::SEMIBOLD))
+        .into_any_element()
 }
 
 /// Every choice of a stepped parameter as a chip under its name; the
@@ -119,7 +130,7 @@ pub fn chips(dev: &Dev, id: u32, cx: &mut Context<Workspace>) -> AnyElement {
         .flex()
         .flex_col()
         .gap(px(SP1))
-        .child(label(paint::fit(info.name, 140., TEXT_XS), TEXT_XS, pal.muted))
+        .child(label(paint::fit(info.name, 140., DEV_GROUP), DEV_GROUP, pal.muted))
         .child(row)
         .into_any_element()
 }
@@ -136,7 +147,7 @@ pub fn tag(name: &str, value: String, color: Hsla, live: bool) -> Div {
 
 /// A small caption-and-text pair for hints under a stage.
 pub fn hint(text: &str) -> Div {
-    div().flex_none().child(mono(text.to_owned(), TEXT_XS, p().faint))
+    div().flex_none().child(mono(text.to_owned(), DEV_AXIS, p().faint))
 }
 
 #[cfg(test)]

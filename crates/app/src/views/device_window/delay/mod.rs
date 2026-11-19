@@ -39,7 +39,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(labelled("Taps", choice_row(dev, p::TAPS, false, cx)))
         .child(crate::views::device_ui::kit::pick(dev, p::SYNC, cx))
         .child(crate::views::device_ui::kit::pick(dev, p::FREEZE, cx));
-    let mut controls = div().flex_none().flex().flex_wrap().items_start().gap(px(SP2));
+    let mut controls = crate::views::device_ui::kit::flow();
     for (title, ids) in sections(dev.on(p::SYNC)) {
         controls = controls.child(section(ws, dev, title, &ids, cx));
     }
@@ -51,7 +51,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .flex()
         .flex_col()
         .child(top)
-        .child(div().flex_1().min_h(px(160.)).child(timeline))
+        .child(div().flex_1().min_h(px(200.)).child(timeline))
         .child(div().flex_none().h(px(32.)).child(filter))
         .child(controls)
         .into_any_element()

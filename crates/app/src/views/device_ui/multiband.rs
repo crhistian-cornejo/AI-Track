@@ -2,7 +2,8 @@
 //! are draggable lines, each band's gain is a draggable level line, and the
 //! per-band mute / solo / delta switches sit under the display.
 
-use super::kit::{self, F_HI, F_LO, Handle, PlotCfg, ax, freq_frac};
+use super::dynamics::win;
+use super::kit::{self, F_HI, F_LO, Handle, PlotCfg, Rect, ax, freq_frac};
 use super::{Dev, caption};
 use crate::theme::*;
 use crate::widgets::label;
@@ -79,7 +80,12 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         cx,
         move |r, window, cx| {
             let pal = p();
-            kit::freq_grid(window, cx, r, true);
+            let lbl_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
+            let xover_xs: Vec<f32> = lines.iter().map(|fx| r.px(*fx)).collect();
+            kit::freq_grid_avoid(window, cx, r, true, &xover_xs);
+            let mut avoid: Vec<Rect> = xover_xs.iter().map(|&x| Rect { x: x - 8., y: r.y, w: 16., h: r.h }).collect();
+            // Reserve the top band-name strip and handle dots before placing gain labels.
+            let mut band_centers = Vec::with_capacity(3);
             for b in 0..3 {
                 let a = r.px(freq_frac(e[b]));
                 let z = r.px(freq_frac(e[b + 1]));
@@ -93,7 +99,9 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     0.,
                     with_alpha(color, if b == selected { 0.16 } else { 0.07 }),
                 );
-                let y = r.py((0.5 - gains[b] / 48.).clamp(0.03, 0.97));
+                let fy = (0.5 - gains[b] / 48.).clamp(0.03, 0.97);
+                let hx = r.px(freq_frac((e[b] * e[b + 1]).sqrt()));
+                let hy = r.py(fy);
                 kit::line(
                     window,
                     &[
@@ -122,37 +130,73 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     names[b],
                     (a + z) / 2.,
                     r.y + 4.,
-                    TEXT_XS,
+                    lbl_sz,
                     pal.muted,
                     TextAlign::Center,
                 );
-                kit::txt(
-                    window,
-                    cx,
-                    &kit::fmt_db(gains[b]),
-                    (a + z) / 2.,
-                    y - 13.,
-                    TEXT_XS,
-                    if b == selected { pal.text } else { pal.muted },
-                    TextAlign::Center,
-                );
-                kit::dot(
-                    window,
-                    r.pt(
-                        freq_frac((e[b] * e[b + 1]).sqrt()),
-                        (0.5 - gains[b] / 48.).clamp(0.03, 0.97),
-                    ),
-                    6.,
-                    if enabled { color } else { pal.muted },
-                    (b == selected).then_some(pal.text),
-                );
+                avoid.push(Rect::around((a + z) / 2., r.y + 10., 18.));
+                avoid.push(Rect::around(hx, hy, 11.));
+                band_centers.push((b, hx, hy, a, z));
             }
             for fx in &lines {
                 kit::vline(window, r, r.px(*fx), pal.text);
                 kit::dot(window, r.pt(*fx, 0.5), 6., pal.raised, Some(pal.text));
+                avoid.push(Rect::around(r.px(*fx), r.py(0.5), 11.));
+            }
+            for (b, hx, hy, a, z) in band_centers {
+                let color = series(b);
+                kit::dot(
+                    window,
+                    gpui::point(px(hx), px(hy)),
+                    6.,
+                    if enabled { color } else { pal.muted },
+                    (b == selected).then_some(pal.text),
+                );
+                let band_rect = Rect { x: a, y: r.y + 18., w: (z - a).max(1.), h: (r.h - 38.).max(1.) };
+                kit::placed_txt(
+                    window,
+                    cx,
+                    &kit::fmt_db(gains[b]),
+                    (hx, hy),
+                    lbl_sz,
+                    if b == selected { pal.text } else { pal.muted },
+                    band_rect,
+                    &mut avoid,
+                );
             }
         },
     );
+
+    if win::in_window(dev) {
+        let mut primary = Vec::new();
+        for (b, name) in names.iter().enumerate() {
+            let body = vec![
+                win::knob(dev, p::band(b as u32, p::GAIN), cx),
+                win::chip_row(vec![
+                    kit::pick(dev, p::band(b as u32, p::MUTE), cx),
+                    kit::pick(dev, p::band(b as u32, p::SOLO), cx),
+                    kit::pick(dev, p::band(b as u32, p::DELTA), cx),
+                ]),
+            ];
+            primary.push(win::group_of(dev, name, None, body, cx).border_t_2().border_color(with_alpha(series(b), if b == selected { 0.9 } else { 0.4 })));
+        }
+        primary.push(win::group(dev, "Crossovers", None, &[p::XOVER_LOW, p::XOVER_HIGH], cx));
+        let top = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(SP3))
+            .child(win::captioned("Mode", kit::pick(dev, p::MODE, cx)))
+            .child(kit::pick(dev, p::BYPASS, cx))
+            .child(div().flex_1())
+            .child(caption(if dev.choice(p::MODE) == 1 {
+                "LINEAR — LATENCY COMPENSATED"
+            } else {
+                "MINIMUM PHASE — ZERO LATENCY"
+            }));
+        let displays = div().child(div().flex_1().min_w(px(0.)).h_full().child(plot));
+        return win::arrange(ws, dev, 720., Some(top), displays, primary, Vec::new(), cx).into_any_element();
+    }
 
     let mut rows = div().flex().flex_col().gap(px(SP1));
     for (b, name) in names.iter().enumerate() {

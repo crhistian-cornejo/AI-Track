@@ -3,6 +3,7 @@
 //! the cutoff the plugin is at right now. The curve helpers are shared with
 //! the synth and sampler filter sections.
 
+use super::dynamics::win;
 use super::kit::{self, Handle, PlotCfg, Rect, ax, frac_freq, freq_frac};
 use super::Dev;
 use crate::theme::*;
@@ -93,31 +94,65 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let (sr, enabled) = (dev.sample_rate, dev.enabled);
     let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
         let pal = p();
+        let lbl_sz = if kit::in_window() { DEV_AXIS } else { TEXT_XS };
         // Modulation ranges behind the curve: LFO both ways, envelope one way.
         if lfo.abs() > 0.01 {
             let (a, b) = (r.px(freq_frac(cutoff * 2f32.powf(-lfo.abs())).clamp(0., 1.)), r.px(freq_frac(cutoff * 2f32.powf(lfo.abs())).clamp(0., 1.)));
             kit::bar(window, a, r.y, b - a, r.h, 0., with_alpha(series(1), 0.13));
-            kit::txt(window, cx, "LFO", a + 4., r.y + 4., TEXT_XS, with_alpha(series(1), 0.9), TextAlign::Left);
+            kit::txt(window, cx, "LFO", a + 4., r.y + 4., lbl_sz, with_alpha(series(1), 0.9), TextAlign::Left);
         }
         if env.abs() > 0.01 {
             let (a, b) = (r.px(freq_frac(cutoff)), r.px(freq_frac(cutoff * 2f32.powf(env)).clamp(0., 1.)));
             kit::bar(window, a.min(b), r.y + r.h * 0.55, (a - b).abs(), r.h * 0.45, 0., with_alpha(series(3), 0.16));
-            kit::txt(window, cx, "Env", a.min(b) + 4., r.bottom() - 28., TEXT_XS, with_alpha(series(3), 0.9), TextAlign::Left);
+            kit::txt(window, cx, "Env", a.min(b) + 4., r.bottom() - 28., lbl_sz, with_alpha(series(3), 0.9), TextAlign::Left);
         }
         let color = if enabled { pal.accent } else { pal.muted };
         match lad {
             Some(k) => paint_ladder_response(window, cx, r, (k, cutoff, resonance), color, true),
             None => paint_response(window, cx, r, &secs, sr, color, true),
         }
-        // Where the modulated cutoff is right now (left and right channel).
-        for hz in live {
+        // Where the modulated cutoff is right now (left and right channel), with a live dot on the curve.
+        for (ch, hz) in live.into_iter().enumerate() {
             if hz > 10. && (hz / cutoff - 1.).abs() > 0.01 {
-                kit::vline(window, r, r.px(freq_frac(hz).clamp(0., 1.)), with_alpha(pal.accent2, 0.8));
+                let lfx = freq_frac(hz).clamp(0., 1.);
+                kit::vline(window, r, r.px(lfx), with_alpha(pal.accent2, 0.75));
+                if ch == 0 {
+                    let lfy = match lad {
+                        Some(k) => ladder_frac(k, hz, cutoff, resonance),
+                        None => db_frac(svf_cascade_db(&secs, hz as f64, sr) as f32),
+                    };
+                    let pt = r.pt(lfx, lfy.clamp(0.04, 0.96));
+                    kit::dot(window, pt, 7., with_alpha(pal.accent2, 0.25), None);
+                    kit::dot(window, pt, 4., pal.accent2, Some(pal.text));
+                }
             }
         }
         kit::dot(window, r.pt(fx, fy), 8., pal.accent, Some(pal.text));
     });
     let rate = if dev.on(p::LFO_SYNC) { p::LFO_DIV } else { p::LFO_RATE };
+    if win::in_window(dev) {
+        let top = div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(SP3))
+            .child(win::captioned("Type", kit::pick(dev, p::TYPE, cx)))
+            .child(win::captioned("Slope", kit::pick(dev, p::SLOPE, cx)))
+            .child(win::captioned("Model", kit::pick(dev, p::LADDER, cx)))
+            .child(kit::pick(dev, p::LFO_SYNC, cx));
+        let primary = vec![
+            win::group(dev, "Filter", None, &[p::CUTOFF, p::RESONANCE, p::DRIVE, p::MIX], cx),
+            win::group(dev, "Modulation", None, &[p::LFO_DEPTH, rate, p::ENV_AMOUNT], cx),
+        ];
+        let more = vec![
+            win::group(dev, "LFO", None, &[p::LFO_SHAPE, p::LFO_STEREO], cx),
+            win::group(dev, "Envelope", None, &[p::ENV_ATTACK, p::ENV_RELEASE], cx),
+            win::group(dev, "Output", None, &[p::OUTPUT], cx),
+        ];
+        let displays = div().child(div().flex_1().min_w(px(0.)).h_full().child(plot));
+        return win::arrange(ws, dev, 700., Some(top), displays, primary, more, cx).into_any_element();
+    }
     kit::panel(if dev.big { 640. } else { 440. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
         .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LADDER, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))

@@ -159,9 +159,11 @@ pub enum Drag {
     TrackHeight { track: TrackId, start_y: f32, start_h: f32 },
     Tempo { last_y: f32, bpm: f64 },
     BottomResize { start_y: f32, start_h: f32 },
+    BottomSplit { start_y: f32, start_split: f32, total_h: f32 },
     MixerResize { start_y: f32, start_h: f32 },
     Notes { clip: ClipId, originals: Vec<Note>, origin: (Tick, i32), resize: bool, applied: (Tick, i32), preview: Option<(TrackId, u8)> },
     Velocity { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
+    Probability { clip: ClipId, originals: Vec<Note>, last_y: f32, lane_h: f32, delta: f32 },
     Audition { track: TrackId, key: Option<u8> },
     /// A pad of a Drum Rack held down (it sounds until the button is let go).
     Pad,
@@ -234,9 +236,12 @@ pub enum MenuKind {
     /// Right-click on a device row in the Cmd+K palette (favorite / reassign group).
     PaletteDevice { key: String, name: String, instrument: bool },
     TimeSignature,
-    /// A clip's launch mode and launch quantisation (the Clip View).
+    /// A clip's launch mode, launch quantisation and follow action (the Clip View).
     ClipLaunch(ClipId),
     ClipQuantize(ClipId),
+    ClipFollow(ClipId),
+    /// Undo / redo history popover opened from the status bar.
+    UndoHistory,
     /// Right-click on a Stutter step: copy, paste, clear, fill.
     StutterStep { device: DeviceId, step: usize },
     /// File: new from a template, open, save.
@@ -362,6 +367,14 @@ pub struct Workspace {
     /// Height of the detail panel (drag its top edge: [`Workspace::begin_bottom_resize`]).
     pub bottom_h: f32,
     pub bottom_open: bool,
+    /// Show Clip View and Device View stacked together (Live 12 split detail panel).
+    pub bottom_stacked: bool,
+    /// Fraction of the stacked detail body given to Clip View (0.25..=0.75).
+    pub bottom_split: f32,
+    /// Show the live Info View help strip in the status bar (`?` toggles).
+    pub info_view: bool,
+    /// When false (default), the top-bar timer displays `MM:SS.mmm`; click to toggle to bars.
+    pub show_bars_timer: bool,
     /// Window height at the last render, for clamping panel resizes.
     pub window_h: f32,
     pub window_w: f32,
@@ -548,6 +561,10 @@ impl Workspace {
             device_menu_search,
             bottom_h: theme::Metrics::of(look.app.density).dock_h,
             bottom_open: true,
+            bottom_stacked: false,
+            bottom_split: 0.5,
+            info_view: false,
+            show_bars_timer: false,
             window_h: 920.,
             window_w: 1480.,
             palette: Default::default(),
@@ -1915,6 +1932,22 @@ impl Workspace {
         self.begin_drag(Drag::BottomResize { start_y: y, start_h }, cx);
     }
 
+    /// Start dragging the divider between stacked Clip and Device views.
+    pub fn begin_bottom_split_resize(&mut self, y: f32, total_h: f32, cx: &mut Context<Self>) {
+        let start_split = self.bottom_split;
+        self.begin_drag(Drag::BottomSplit { start_y: y, start_split, total_h: total_h.max(120.) }, cx);
+    }
+
+    /// Toggle Live 12 stacked Clip + Devices mode in the detail panel.
+    pub fn toggle_bottom_stacked(&mut self, cx: &mut Context<Self>) {
+        self.bottom_stacked = !self.bottom_stacked;
+        self.bottom_open = true;
+        if self.bottom_stacked && self.bottom_h < 380. {
+            self.bottom_h = bottom_h_clamped(440., self.window_h);
+        }
+        cx.notify();
+    }
+
     pub fn begin_drag(&mut self, drag: Drag, cx: &mut Context<Self>) {
         // Map mode: a press on a knob maps it (or picks a macro) instead of dragging.
         if let Drag::Knob { target, .. } = &drag
@@ -2165,6 +2198,9 @@ impl Workspace {
             Drag::BottomResize { start_y, start_h } => {
                 self.bottom_h = bottom_h_clamped(*start_h + (*start_y - y), self.window_h);
             }
+            Drag::BottomSplit { start_y, start_split, total_h } => {
+                self.bottom_split = (*start_split + (y - *start_y) / total_h.max(120.)).clamp(0.25, 0.75);
+            }
             Drag::Notes { clip, originals, origin, resize, applied, preview } => {
                 let (tick, key) = self.piano_pos(e.position);
                 let raw = tick - origin.0;
@@ -2210,6 +2246,17 @@ impl Workspace {
                     if next != *delta {
                         *delta = next;
                         self.s.set_velocity(*clip, originals, *delta);
+                    }
+                }
+            }
+            Drag::Probability { clip, originals, last_y, lane_h, delta } => {
+                let dy = *last_y - y;
+                *last_y = y;
+                if dy != 0. {
+                    let next = crate::state::probability_delta(originals, *delta + dy / lane_h.max(1.) * fine);
+                    if next != *delta {
+                        *delta = next;
+                        self.s.set_probability(*clip, originals, *delta);
                     }
                 }
             }
@@ -2976,8 +3023,79 @@ impl Workspace {
                     .items_center()
                     .child(step("status-undo", Icon::Undo, &undo, "Undo", if mac { "⌘Z" } else { "Ctrl+Z" }).on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))))
                     .child(step("status-redo", Icon::Redo, &redo, "Redo", if mac { "⇧⌘Z" } else { "Ctrl+Shift+Z" }).on_click(cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx))))
-                    .when_some(undo, |d, l| d.child(div().pl(px(SP1)).child(crate::widgets::label(crate::paint::fit(&l, 200., TEXT_SM), TEXT_SM, pal.muted)))),
+                    .child(
+                        item("status-history")
+                            .tooltip(crate::widgets::tip("Undo History: click to view and jump to any step", None))
+                            .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+                                let at = e.position();
+                                this.open_menu(MenuKind::UndoHistory, gpui::point(at.x, at.y - px(260.)), cx);
+                            }))
+                            .child(crate::widgets::label(
+                                undo.as_deref().map_or_else(|| "History".to_owned(), |l| crate::paint::fit(l, 180., TEXT_SM)),
+                                TEXT_SM,
+                                if undo.is_some() { pal.muted } else { pal.faint },
+                            )),
+                    ),
             )
+            .child(crate::widgets::divider_v(12.))
+            .child(
+                crate::widgets::icon_chip("status-info-toggle", Icon::Help, self.info_view, pal.accent)
+                    .tooltip(crate::widgets::tip("Info View: show live help for the control under the pointer", Some("?")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.info_view = !this.info_view;
+                        cx.notify();
+                    })),
+            )
+            .when_some(
+                {
+                    let soloed = self.s.project.tracks.iter().filter(|t| t.solo).count();
+                    (soloed > 0).then_some(soloed)
+                },
+                |d, soloed| {
+                    d.child(
+                        div()
+                            .id("status-unsolo-all")
+                            .flex_none()
+                            .h(px(18.))
+                            .px(px(SP2))
+                            .flex()
+                            .items_center()
+                            .gap(px(SP1))
+                            .rounded(px(r_sm()))
+                            .cursor_pointer()
+                            .bg(with_alpha(pal.solo, 0.22))
+                            .border_1()
+                            .border_color(with_alpha(pal.solo, 0.6))
+                            .hover(|s| s.bg(with_alpha(pal.solo, 0.32)))
+                            .tooltip(crate::widgets::tip("Unsolo all tracks", None))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.s.unsolo_all();
+                                cx.notify();
+                            }))
+                            .child(crate::widgets::label(format!("Unsolo ({soloed})"), TEXT_XS, pal.solo).font_weight(gpui::FontWeight::SEMIBOLD)),
+                    )
+                },
+            )
+            .when(self.info_view, |d| {
+                let info = crate::widgets::last_info();
+                d.child(crate::widgets::divider_v(12.)).child(
+                    div()
+                        .flex_shrink(1.)
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .gap(px(SP2))
+                        .overflow_hidden()
+                        .child(crate::widgets::label(
+                            info.as_ref().map_or_else(|| "Hover any control to see its description here".into(), |(t, _)| t.clone()),
+                            TEXT_SM,
+                            if info.is_some() { pal.text } else { pal.faint },
+                        ).truncate())
+                        .when_some(info.and_then(|(_, h)| h), |row, h| {
+                            row.child(div().flex_none().px(px(SP1)).rounded(px(r_sm())).bg(content(0.08)).child(crate::widgets::mono(h, TEXT_XS, pal.muted)))
+                        }),
+                )
+            })
             .child(crate::widgets::divider_v(12.))
             .child(
                 item("status-save")
@@ -3247,8 +3365,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// An arrow-key edit of the selection (notes, or the selected clip).
+    /// An arrow-key edit of the selection (notes, the selected clip, or device preset stepping).
     fn key_edit(&mut self, e: KeyEdit, cx: &mut Context<Self>) {
+        // Alt+↑/↓ in the Device View steps the selected device's presets (Live 13 contextual browser).
+        if self.s.ed.area == crate::editing::Area::Devices
+            && matches!(e, KeyEdit::SemitoneUp | KeyEdit::SemitoneDown)
+            && let Some(dev_id) = self.s.selected_devices().first().copied()
+        {
+            let dir = if e == KeyEdit::SemitoneUp { -1 } else { 1 };
+            views::device_window::chrome::step(self, dev_id, dir, cx);
+            return;
+        }
         if self.s.key_edit(e) {
             cx.notify();
         }
@@ -3675,7 +3802,7 @@ impl Render for Workspace {
         if self.modal.is_some() && self.palette.open {
             views::palette::close(self, window, cx);
         }
-        let editors_visible = self.bottom_open && self.s.bottom_tab == BottomTab::Devices;
+        let editors_visible = self.bottom_open && (self.bottom_stacked || self.s.bottom_tab == BottomTab::Devices);
         let animate = window.is_visible()
             && (self.wants_frames() || self.drag.is_some() || theme::tweening() || (editors_visible && self.fx.wants_frames()) || self.meters.wants_frames() || views::sample_editor::wants_frames(self) || views::ai_panel::wants_frames(self) || views::sounds::wants_frames(self));
         let throttle_ok = !self.look.app.low_power || self.drag.is_some() || self.last_frame.elapsed() >= Duration::from_millis(50);
@@ -3851,10 +3978,19 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleDetailView, _, cx| {
-                // Shift+Tab in Live: swap the detail view between devices and the clip.
-                let next = if this.s.bottom_tab == BottomTab::Devices { BottomTab::PianoRoll } else { BottomTab::Devices };
+                // Shift+Tab in Live: when stacked, move focus between Clip and Devices; otherwise swap tabs.
                 this.bottom_open = true;
-                this.set_tab(next, cx);
+                if this.bottom_stacked {
+                    this.s.ed.area = if this.s.ed.area == crate::editing::Area::Devices {
+                        crate::editing::Area::Piano
+                    } else {
+                        crate::editing::Area::Devices
+                    };
+                    cx.notify();
+                } else {
+                    let next = if this.s.bottom_tab == BottomTab::Devices { BottomTab::PianoRoll } else { BottomTab::Devices };
+                    this.set_tab(next, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &ShowMixer, _, cx| {
                 this.mixer_open = !this.mixer_open;

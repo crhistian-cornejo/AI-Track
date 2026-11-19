@@ -18,7 +18,7 @@ use crate::views::sample_editor::geom;
 use crate::widgets::{self, label, mono};
 use crate::workspace::{Drag, KnobTarget, MenuKind, NumTarget, Workspace, plain_text};
 use aitrack_model::{
-    AutomationTarget, Clip, ClipId, Command, LaunchMode, LoopRegion, Note, Quantize, Source, Tick, TimeSignature,
+    AutomationTarget, Clip, ClipId, Command, FollowAction, LaunchMode, LoopRegion, Note, Quantize, Source, Tick, TimeSignature,
 };
 use gpui::{
     AnimationExt, AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
@@ -89,10 +89,11 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
             }
         });
     });
+    let stacked = ws.bottom_stacked;
     let tabs = widgets::segmented("detail-view", &[(Some(Icon::Device), "Device"), (Some(Icon::Piano), "Clip")], usize::from(clip_view), 96., on_view);
 
     // What the panel is showing, next to the switch.
-    let context = if clip_view {
+    let context = if clip_view || stacked {
         clip_id.and_then(|c| ws.s.project.clips.get(&c)).map(|c| (c.name.clone(), c.color))
     } else {
         ws.s.selected_track.and_then(|t| ws.s.project.track(t)).map(|t| (t.name.clone(), t.color))
@@ -105,13 +106,21 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .flex()
         .items_center()
         .child(tabs)
+        .child(
+            widgets::icon_chip("detail-stack", Icon::Layers, stacked, pal.accent)
+                .tooltip(widgets::tip(
+                    if stacked { "Unstack Clip & Devices (show one view at a time)" } else { "Stack Clip & Devices together (Live 12 split view)" },
+                    Some("Shift+Tab switches focus"),
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_bottom_stacked(cx))),
+        )
         .when_some(context, |d, (name, color)| {
             d.child(div().w(px(SP1)))
                 .child(div().size(px(8.)).rounded_full().bg(track_color(color)))
                 .child(label(crate::paint::fit(&name, 144., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
         });
     // MIDI clips choose between the piano roll and the step sequencer.
-    if clip_view && !audio && step_clip.is_some() {
+    if (clip_view || stacked) && !audio && step_clip.is_some() {
         let weak = cx.entity().downgrade();
         let on_editor: widgets::OnSelect = Rc::new(move |i, _, cx| {
             let _ = weak.update(cx, |this, cx| this.set_tab(if i == 0 { BottomTab::PianoRoll } else { BottomTab::Steps }, cx));
@@ -126,7 +135,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     }
     bar = bar.child(div().flex_1());
     // The note tools act on a clip: without one the bar stays clear.
-    if clip_view && editor == ClipEditor::Piano && ws.bottom_open && clip_id.is_some() {
+    if (clip_view || stacked) && editor == ClipEditor::Piano && ws.bottom_open && clip_id.is_some() {
         bar = bar.child(piano_tools(ws, cx));
     }
     bar = bar.child(
@@ -142,9 +151,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     );
 
     let body = if ws.bottom_open {
-        let content = if !clip_view {
-            crate::views::devices::render(ws, window, cx)
-        } else {
+        let render_clip = |ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
             let editor_el = match editor {
                 ClipEditor::Sample => crate::views::sample_editor::render(ws, window, cx),
                 ClipEditor::Piano => crate::views::piano_roll::render(ws, window, cx),
@@ -158,12 +165,73 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(div().flex_1().min_w(px(0.)).h_full().child(editor_el))
                 .into_any_element()
         };
+        let content = if stacked {
+            let clip_el = render_clip(ws, window, cx);
+            let dev_el = crate::views::devices::render(ws, window, cx);
+            let split = ws.bottom_split.clamp(0.25, 0.75);
+            let total_h = (ws.bottom_h - m().dock_bar_h).max(120.);
+            let dev_focused = ws.s.ed.area == crate::editing::Area::Devices;
+            let divider = div()
+                .id("bottom-split-resize")
+                .flex_none()
+                .h(px(6.))
+                .w_full()
+                .cursor_row_resize()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(content(0.03))
+                .hover(|s| s.bg(accent_alpha(0.18)))
+                .tooltip(widgets::tip("Drag to resize Clip / Devices split · Double-click to reset", None))
+                .child(div().w(px(36.)).h(px(2.)).rounded_full().bg(if dev_focused { pal.accent } else { border_strong() }))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if e.click_count >= 2 {
+                        this.bottom_split = 0.5;
+                        cx.notify();
+                    } else {
+                        this.begin_bottom_split_resize(f32::from(e.position.y), total_h, cx);
+                    }
+                }));
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_grow(split)
+                        .flex_basis(px(0.))
+                        .min_h(px(84.))
+                        .w_full()
+                        .overflow_hidden()
+                        .border_l_2()
+                        .border_color(if !dev_focused { accent_alpha(0.6) } else { gpui::transparent_black() })
+                        .child(clip_el),
+                )
+                .child(divider)
+                .child(
+                    div()
+                        .flex_grow(1. - split)
+                        .flex_basis(px(0.))
+                        .min_h(px(96.))
+                        .w_full()
+                        .overflow_hidden()
+                        .border_l_2()
+                        .border_color(if dev_focused { accent_alpha(0.6) } else { gpui::transparent_black() })
+                        .child(dev_el),
+                )
+                .into_any_element()
+        } else if !clip_view {
+            crate::views::devices::render(ws, window, cx)
+        } else {
+            render_clip(ws, window, cx)
+        };
         Some(motion::rise_in(gpui::ElementId::Name(format!("tab-{}", ws.tab_switch).into()), div().size_full().child(content), if ws.tab_switch == 0 { 0. } else { 8. }))
     } else {
         None
     };
 
-    let resizing = matches!(ws.drag, Some(Drag::BottomResize { .. }));
+    let resizing = matches!(ws.drag, Some(Drag::BottomResize { .. } | Drag::BottomSplit { .. }));
     let target = if ws.bottom_open { ws.bottom_h } else { m().dock_bar_h };
     let handle = div()
         .id("bottom-resize")
@@ -532,6 +600,53 @@ pub fn transposed(notes: &[Note], semitones: i32) -> Option<Vec<Note>> {
     (!moved.is_empty()).then_some(moved)
 }
 
+/// Human label for a clip's Follow Action.
+pub fn follow_action_name(action: Option<FollowAction>) -> &'static str {
+    match action {
+        None => "None",
+        Some(FollowAction::Next { .. }) => "Play Next",
+        Some(FollowAction::Previous { .. }) => "Play Prev",
+        Some(FollowAction::First { .. }) => "Play First",
+        Some(FollowAction::Random { .. }) => "Play Any",
+        Some(FollowAction::Stop { .. }) => "Stop",
+    }
+}
+
+pub fn follow_action_bars(action: Option<FollowAction>) -> u32 {
+    match action {
+        None => 1,
+        Some(
+            FollowAction::Next { after_bars }
+            | FollowAction::Previous { after_bars }
+            | FollowAction::First { after_bars }
+            | FollowAction::Random { after_bars }
+            | FollowAction::Stop { after_bars },
+        ) => after_bars.max(1),
+    }
+}
+
+pub fn set_follow_action(s: &mut crate::state::AppState, id: ClipId, action: Option<FollowAction>) {
+    let Some(mut clip) = s.project.clips.get(&id).cloned() else { return };
+    if clip.launch.follow == action {
+        return;
+    }
+    clip.launch.follow = action;
+    s.seal();
+    s.edit("Follow action", vec![Command::UpdateClip { id, clip: Box::new(clip) }]);
+    s.seal();
+}
+
+pub fn with_follow_bars(action: FollowAction, after_bars: u32) -> FollowAction {
+    let after_bars = after_bars.clamp(1, 64);
+    match action {
+        FollowAction::Next { .. } => FollowAction::Next { after_bars },
+        FollowAction::Previous { .. } => FollowAction::Previous { after_bars },
+        FollowAction::First { .. } => FollowAction::First { after_bars },
+        FollowAction::Random { .. } => FollowAction::Random { after_bars },
+        FollowAction::Stop { .. } => FollowAction::Stop { after_bars },
+    }
+}
+
 /// Replace a clip with an edited copy (one undo step).
 fn update_clip(ws: &mut Workspace, id: ClipId, label: &str, f: impl FnOnce(&mut Clip)) {
     let Some(mut clip) = ws.s.project.clips.get(&id).cloned() else { return };
@@ -670,7 +785,33 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                 let at = e.position();
                 this.open_menu(MenuKind::ClipQuantize(id), point(at.x - px(12.), at.y - px(220.)), cx);
             })),
-        ));
+        ))
+        .child(row(
+            "Follow",
+            dropdown(("clip-follow", n), follow_action_name(clip.launch.follow), "Follow Action: what Session View plays after this clip runs").on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                let at = e.position();
+                this.open_menu(MenuKind::ClipFollow(id), point(at.x - px(12.), at.y - px(200.)), cx);
+            })),
+        ))
+        .when_some(clip.launch.follow, |d, follow| {
+            let bars = follow_action_bars(Some(follow));
+            d.child(row(
+                "After",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SP1))
+                    .child(small_button(("follow-bars-down", n), "−", bars > 1).on_click(cx.listener(move |this, _, _, cx| {
+                        set_follow_action(&mut this.s, id, Some(with_follow_bars(follow, bars.saturating_sub(1))));
+                        cx.notify();
+                    })))
+                    .child(value_box(if bars == 1 { "1 bar".into() } else { format!("{bars} bars") }))
+                    .child(small_button(("follow-bars-up", n), "+", bars < 64).on_click(cx.listener(move |this, _, _, cx| {
+                        set_follow_action(&mut this.s, id, Some(with_follow_bars(follow, bars + 1)));
+                        cx.notify();
+                    }))),
+            ))
+        });
 
     let mut column = div().flex().flex_col().child(clip_box);
 
@@ -806,7 +947,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                 ))
                 .child(row(
                     "Reverse",
-                    toggle_button(("reverse", n), "Rev", warp.reverse).tooltip(widgets::tip("Play the sample backwards", None)).on_click(cx.listener(move |this, _, _, cx| {
+                    toggle_button(("reverse", n), "Rev", warp.reverse).tooltip(widgets::tip("Play the sample backwards", Some("R"))).on_click(cx.listener(move |this, _, _, cx| {
                         this.s.seal();
                         this.s.set_clip_warp("reverse", id, |w| w.reverse = !reversed);
                         this.s.seal();
@@ -889,6 +1030,20 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                             cx.notify();
                         }))),
                 ))
+                .child(row(
+                    "Chance",
+                    div()
+                        .flex()
+                        .gap(px(SP1))
+                        .child(small_button(("chance-down", n), "−10%", has_notes).tooltip(widgets::tip("Lower note playback probability by 10%", None)).on_click(cx.listener(move |this, _, _, cx| {
+                            this.s.nudge_probability(id, -0.1);
+                            cx.notify();
+                        })))
+                        .child(small_button(("chance-up", n), "+10%", has_notes).tooltip(widgets::tip("Raise note playback probability by 10%", None)).on_click(cx.listener(move |this, _, _, cx| {
+                            this.s.nudge_probability(id, 0.1);
+                            cx.notify();
+                        }))),
+                ))
                 .child(
                     div()
                         .px(px(SP2))
@@ -924,11 +1079,11 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
         }
     }
     if clip.envelopes.is_empty() {
-        env_box = env_box.child(div().px(px(SP2)).py(px(SP1)).child(label(
+        env_box = env_box.child(div().px(px(SP2)).py(px(SP1)).min_w(px(0.)).child(label(
             if audio { "Double-click the waveform to draw the volume envelope." } else { "No clip envelopes yet." },
             TEXT_SM,
             pal.faint,
-        )));
+        ).whitespace_normal()));
     }
     for (i, lane) in clip.envelopes.iter().enumerate() {
         let points = lane.points.len();

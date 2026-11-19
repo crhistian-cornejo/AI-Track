@@ -165,11 +165,80 @@ fn strip(ws: &mut Workspace, id: TrackId, returns: &[(TrackId, String)], rows: R
     let mut inserts = div().flex().flex_col().gap(px(2.));
     let fx: Vec<&Device> = t.devices.iter().filter(|d| !d.is_instrument()).collect();
     for i in 0..rows.inserts {
-        inserts = inserts.child(match fx.get(i) {
-            Some(d) => slot(crate::paint::fit(&d.name, m().strip_w - 24., TEXT_XS), d.enabled, None),
-            None if !is_vca => slot("", false, None),
-            None => div().h(px(slot_h())),
-        });
+        let cell: AnyElement = match fx.get(i) {
+            Some(d) => {
+                let dev_id = d.id;
+                let dev_on = d.enabled;
+                let dev_name = d.name.clone();
+                div()
+                    .id(("mix-insert", (id.0 as usize) << 4 | i))
+                    .h(px(slot_h()))
+                    .px(px(SP1))
+                    .gap(px(SP1))
+                    .flex()
+                    .items_center()
+                    .rounded(px(r_sm()))
+                    .bg(if dev_on { content(0.07) } else { content(0.03) })
+                    .border_1()
+                    .border_color(border())
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(border_strong()))
+                    .tooltip(widgets::tip_owned(format!("{dev_name} — click to show, double-click to open window, dot to bypass")))
+                    .child(
+                        div()
+                            .id(("mix-insert-on", (id.0 as usize) << 4 | i))
+                            .flex_none()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(if dev_on { pal.accent } else { pal.faint })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.s.toggle_device(dev_id);
+                                cx.notify();
+                            })),
+                    )
+                    .child(label(crate::paint::fit(&dev_name, m().strip_w - 30., TEXT_XS), TEXT_XS, if dev_on { pal.text } else { pal.faint }))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                        this.s.selected_track = Some(id);
+                        this.s.click_device(dev_id, false, false);
+                        this.s.ed.area = crate::editing::Area::Devices;
+                        if e.click_count() >= 2 {
+                            crate::views::device_window::open(this, dev_id, cx);
+                        } else if !this.bottom_stacked {
+                            this.set_tab(crate::state::BottomTab::Devices, cx);
+                        } else {
+                            this.bottom_open = true;
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            None if !is_vca => div()
+                .id(("mix-insert-add", (id.0 as usize) << 4 | i))
+                .h(px(slot_h()))
+                .px(px(SP1 + 2.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(r_sm()))
+                .bg(content(0.03))
+                .border_1()
+                .border_color(border())
+                .cursor_pointer()
+                .hover(|s| s.border_color(border_strong()).bg(content(0.06)))
+                .tooltip(widgets::tip("Add device to this track", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                    this.s.selected_track = Some(id);
+                    let at = e.position();
+                    this.open_menu(crate::workspace::MenuKind::AddDevice(id), gpui::point(at.x, at.y - px(260.)), cx);
+                }))
+                .child(label("+", TEXT_XS, pal.faint))
+                .into_any_element(),
+            None => div().h(px(slot_h())).into_any_element(),
+        };
+        inserts = inserts.child(cell);
     }
     // Sends: one row per return, so every strip has the same rows.
     let mut sends = div().flex().flex_col().gap(px(2.));

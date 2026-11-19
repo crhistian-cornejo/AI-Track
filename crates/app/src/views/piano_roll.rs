@@ -46,12 +46,24 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 || ws.audition.any_pressed(&kbd_tracks, *key)
         })
         .collect();
-    let velocity_text = {
+    let lane_mode = ws.s.note_lane;
+    let lane_readout = {
         let chosen: Vec<_> = notes.iter().filter(|n| selected.contains(&n.id)).collect();
-        if chosen.is_empty() {
-            "1–127".to_string()
-        } else {
-            format!("{}", (chosen.iter().map(|n| n.velocity).sum::<f32>() / chosen.len() as f32 * 127.).round() as u8)
+        match lane_mode {
+            crate::state::NoteLane::Velocity => {
+                if chosen.is_empty() {
+                    "1–127".to_string()
+                } else {
+                    format!("{}", (chosen.iter().map(|n| n.velocity).sum::<f32>() / chosen.len() as f32 * 127.).round() as u8)
+                }
+            }
+            crate::state::NoteLane::Chance => {
+                if chosen.is_empty() {
+                    "0–100%".to_string()
+                } else {
+                    format!("{:.0}%", chosen.iter().map(|n| n.probability).sum::<f32>() / chosen.len() as f32 * 100.)
+                }
+            }
         }
     };
     let color = clip.color;
@@ -241,6 +253,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 let body = with_alpha(if sel { theme_mix(base, pal.clip_text_light, 0.35) } else { base }, if n.muted { 0.45 } else { 0.55 + 0.45 * n.velocity });
                 let outline = if sel { pal.accent } else if out_of_scale { pal.record } else { shadow(0.35) };
                 window.paint_quad(paint::rrect_border(at(o, x + 0.5, y + 0.5, nw - 1., nh - 1.), 2.5, body, outline, if sel { 1.5 } else { 1. }));
+                // Mark probabilistic notes (< 100% chance) with a subtle corner dot.
+                if n.probability < 0.99 && nw > 6. && nh > 5. {
+                    window.paint_quad(paint::rrect(at(o, x + 2.5, y + 2.5, 4., 4.), 2., pal.accent2));
+                }
                 // Resize grip.
                 if nw > 10. {
                     window.paint_quad(paint::fill_rect(at(o, x + nw - 4., y + 3., 1., nh - 6.), shadow(0.3)));
@@ -262,21 +278,23 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     )
     .size_full();
 
-    // ── Velocity lane ──
+    // ── Velocity / Chance lane ──
     let regions = ws.regions.clone();
     let vel_notes = notes;
     let vel_sel = selected;
+    let is_chance = lane_mode == crate::state::NoteLane::Chance;
     let velocity = canvas(
         move |b, _, _| regions.velocity.set(b),
         move |b, _, window, _| {
+            let pal = p();
             let o = b.origin;
             let w = f32::from(b.size.width);
             let h = f32::from(b.size.height);
-            window.paint_quad(paint::fill_rect(b, p().well));
+            window.paint_quad(paint::fill_rect(b, pal.well));
             for frac in [0.25, 0.5, 0.75] {
                 window.paint_quad(paint::fill_rect(at(o, 0., 4. + (h - 8.) * frac, w, 1.), content(0.04)));
             }
-            let fill = track_color(color);
+            let fill = if is_chance { pal.accent2 } else { track_color(color) };
             for n in &vel_notes {
                 let x = n.start as f32 * ppt - view.scroll_x;
                 if x < -8. || x > w + 8. {
@@ -284,8 +302,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 }
                 let sel = vel_sel.contains(&n.id);
                 let c = if sel { accent() } else { fill };
-                let top = 4. + (h - 8.) * (1. - n.velocity);
-                window.paint_quad(paint::fill_rect(at(o, x, top, 2., h - 4. - top), with_alpha(c, 0.8)));
+                let val = if is_chance { n.probability } else { n.velocity };
+                let top = 4. + (h - 8.) * (1. - val.clamp(0., 1.));
+                window.paint_quad(paint::fill_rect(at(o, x, top, 2., (h - 4. - top).max(0.)), with_alpha(c, 0.8)));
                 window.paint_quad(paint::rrect(at(o, x - 2.5, top - 3., 7., 7.), 3.5, c));
             }
             window.paint_quad(paint::fill_rect(at(o, 0., 0., w, 1.), border()));
@@ -356,9 +375,42 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .child(label("VEL", TEXT_XS, pal.faint).font_weight(FontWeight::SEMIBOLD))
-                        .child(label(velocity_text, TEXT_XS, pal.text))
-                        .tooltip(crate::widgets::tip("Velocity: drag a marker or Ctrl + drag a note; Shift for fine adjustment", None))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .id("lane-vel")
+                                        .px(px(3.))
+                                        .rounded(px(r_sm()))
+                                        .cursor_pointer()
+                                        .bg(if !is_chance { accent_alpha(0.22) } else { gpui::transparent_black() })
+                                        .tooltip(crate::widgets::tip("Velocity lane: drag markers or Cmd+↑/↓", None))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.s.note_lane = crate::state::NoteLane::Velocity;
+                                            cx.notify();
+                                        }))
+                                        .child(label("VEL", TEXT_XS, if !is_chance { pal.accent } else { pal.faint }).font_weight(FontWeight::SEMIBOLD)),
+                                )
+                                .child(
+                                    div()
+                                        .id("lane-chance")
+                                        .px(px(3.))
+                                        .rounded(px(r_sm()))
+                                        .cursor_pointer()
+                                        .bg(if is_chance { with_alpha(pal.accent2, 0.22) } else { gpui::transparent_black() })
+                                        .tooltip(crate::widgets::tip("Chance lane (probability 0–100%): drag markers or Cmd+↑/↓ ±10%", None))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.s.note_lane = crate::state::NoteLane::Chance;
+                                            cx.notify();
+                                        }))
+                                        .child(label("CH%", TEXT_XS, if is_chance { pal.accent2 } else { pal.faint }).font_weight(FontWeight::SEMIBOLD)),
+                                ),
+                        )
+                        .child(label(lane_readout, TEXT_XS, pal.text))
                         .child(label(crate::paint::fit(&name, KEYS_W - 4., TEXT_XS), TEXT_XS, pal.faint)),
                 )
                 .child(
@@ -474,10 +526,14 @@ fn velocity_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, cx: &mut 
     let Some((_, src)) = ws.s.clip_notes(clip) else { return };
     let y = f32::from(e.position.y - b.origin.y);
     let lane_h = f32::from(b.size.height) - 8.;
+    let is_chance = ws.s.note_lane == crate::state::NoteLane::Chance;
     let hit = src
         .notes
         .iter()
-        .map(|n| ((n.start as f32 * ppt - x).abs(), (4. + lane_h * (1. - n.velocity) - y).abs(), n.clone()))
+        .map(|n| {
+            let v = if is_chance { n.probability } else { n.velocity };
+            ((n.start as f32 * ppt - x).abs(), (4. + lane_h * (1. - v) - y).abs(), n.clone())
+        })
         .filter(|(dx, _, _)| *dx < 8.)
         .min_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)))
         .map(|(_, _, n)| n);
@@ -486,7 +542,11 @@ fn velocity_down(ws: &mut Workspace, clip: ClipId, e: &MouseDownEvent, cx: &mut 
         ws.s.selected_notes = [n.id].into();
     }
     let originals = selected_notes(ws, clip);
-    ws.begin_drag(Drag::Velocity { clip, originals, last_y: f32::from(e.position.y), lane_h, delta: 0. }, cx);
+    if is_chance {
+        ws.begin_drag(Drag::Probability { clip, originals, last_y: f32::from(e.position.y), lane_h, delta: 0. }, cx);
+    } else {
+        ws.begin_drag(Drag::Velocity { clip, originals, last_y: f32::from(e.position.y), lane_h, delta: 0. }, cx);
+    }
 }
 
 /// Zoom limits of the piano roll, in px per beat and px per row.

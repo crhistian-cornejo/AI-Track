@@ -116,7 +116,7 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         }))
         .child(widgets::divider_h())
         .child(action("clip-split", Icon::Split, "Split at Marker", keys::action_hint("SplitClip"), false, cx, |this, _, cx| this.split_clips(cx)))
-        .child(action("clip-loop", Icon::Loop, "Loop", None, looping, cx, |this, _, cx| match this.s.toggle_clips_loop() {
+        .child(action("clip-loop", Icon::Loop, "Loop", keys::hint(Cmd::ToggleClipLoop), looping, cx, |this, _, cx| match this.s.toggle_clips_loop() {
             Some(true) => this.toast("Clip loops: drag its right edge to repeat it", cx),
             Some(false) => this.toast("Clip no longer loops", cx),
             None => {}
@@ -128,6 +128,40 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         .child(action("clip-active", Icon::Power, if muted { "Activate" } else { "Deactivate" }, keys::action_hint("ToggleActive"), false, cx, |this, _, _| {
             this.s.toggle_clips_active();
         }));
+    // Audio clip actions: Reverse (R), Warp (Shift+W), and Auto-Warp.
+    let audio_clips = ws.s.selected_audio_clips();
+    let any_audio = !audio_clips.is_empty();
+    let all_reversed = any_audio
+        && audio_clips.iter().all(|c| {
+            ws.s.project
+                .clips
+                .get(c)
+                .and_then(|c| ws.s.project.sources.get(&c.source))
+                .is_some_and(|s| matches!(s, aitrack_model::Source::Audio(a) if a.warp.reverse))
+        });
+    let all_warped = any_audio
+        && audio_clips.iter().all(|c| {
+            ws.s.project
+                .clips
+                .get(c)
+                .and_then(|c| ws.s.project.sources.get(&c.source))
+                .is_some_and(|s| matches!(s, aitrack_model::Source::Audio(a) if a.warp.enabled))
+        });
+    let card = if any_audio {
+        card.child(widgets::divider_h())
+            .child(action("clip-reverse", Icon::Refresh, "Reverse", keys::hint(Cmd::ReverseClips), all_reversed, cx, |this, _, cx| {
+                if let Some(rev) = this.s.reverse_selected_clips() {
+                    this.toast(if rev { "Reversed audio clip" } else { "Restored forward playback" }, cx);
+                }
+            }))
+            .child(action("clip-warp", Icon::Metronome, "Warp", keys::hint(Cmd::ToggleClipWarp), all_warped, cx, |this, _, cx| {
+                if let Some(on) = this.s.toggle_selected_clips_warp() {
+                    this.toast(if on { "Clip warp on" } else { "Clip warp off" }, cx);
+                }
+            }))
+    } else {
+        card
+    };
     // One audio clip: listen for its beats and put it on the grid.
     let warpable = (clips.len() == 1).then(|| clips[0].1.clip).filter(|c| ws.s.project.clips.get(c).is_some_and(|c| matches!(ws.s.project.sources.get(&c.source), Some(aitrack_model::Source::Audio(_)))));
     let card = match warpable {
@@ -339,6 +373,18 @@ pub fn track_menu(ws: &mut Workspace, track: TrackId, cx: &mut Context<Workspace
             |this, _, _| {
                 let ids = this.s.selected_tracks();
                 this.s.duplicate_tracks(&ids);
+            },
+        ))
+        .child(action(
+            "track-duplicate-empty",
+            Icon::Copy,
+            "Duplicate Without Content",
+            None,
+            false,
+            cx,
+            |this, _, _| {
+                let ids = this.s.selected_tracks();
+                this.s.duplicate_tracks_empty(&ids);
             },
         ))
         .child(action(

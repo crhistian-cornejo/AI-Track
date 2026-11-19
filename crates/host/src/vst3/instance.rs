@@ -523,10 +523,12 @@ impl Vst3Main {
             let mut rect: ViewRect = std::mem::zeroed();
             if view.getSize(&mut rect) == OK {
                 let (nw, nh) = rect_size(&rect);
-                if nw > 0 && nh > 0 && (nw, nh) != (w, h) {
+                if nw > 0 && nh > 0 && ((nw, nh) != (w, h) || window.client_size() != (nw, nh)) {
                     (w, h) = (nw, nh);
                     *self.frame.size.lock() = (w, h);
                     window.set_client_size(w, h);
+                    let mut r = ViewRect { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+                    view.onSize(&mut r);
                 }
             }
             let now = view.canResize() == OK;
@@ -536,18 +538,21 @@ impl Vst3Main {
             }
             if resizable {
                 let (min, max) = Self::limits(&view);
-                window.set_limits(min, max);
                 // The size the user left it at, if the plugin takes it.
                 if let Some(saved) = recalled.filter(|s| s.w > 0 && s.h > 0) {
                     let want = Self::constrain(&view, (saved.w, saved.h));
                     if want != (w, h) {
-                        let mut r = ViewRect { left: 0, top: 0, right: want.0 as i32, bottom: want.1 as i32 };
-                        view.onSize(&mut r);
                         (w, h) = want;
                         *self.frame.size.lock() = (w, h);
+                        // Resize the native host window BEFORE onSize so the parent
+                        // content view has the final bounds when the plugin lays out.
                         window.set_client_size(w, h);
+                        let mut r = ViewRect { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+                        view.onSize(&mut r);
                     }
                 }
+                let (min, max) = sanitize_limits(min, max, (w, h));
+                window.set_limits(min, max);
             }
         }
         if let Some((x, y)) = recalled.and_then(|s| editor::restorable(&s)) {
@@ -639,10 +644,10 @@ impl Vst3Main {
                 view.checkSizeConstraint(&mut r);
                 let (nw, nh) = rect_size(&r);
                 *self.frame.size.lock() = (nw, nh);
-                view.onSize(&mut r);
                 if (nw, nh) != (cw, ch) {
                     window.set_client_size(nw, nh);
                 }
+                view.onSize(&mut r);
             } else {
                 window.set_client_size(fw, fh);
             }
@@ -656,6 +661,19 @@ fn audio_t() -> MediaType {
 
 fn rect_size(r: &ViewRect) -> (u32, u32) {
     ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)
+}
+
+/// Ensure reported min/max resize limits never contradict the plugin's own
+/// accepted `(w, h)` size (some fixed-aspect-ratio plugins return surprising
+/// rects for synthetic `(1, 1)` or `(8192, 8192)` constraint probes).
+pub(crate) fn sanitize_limits(
+    min: (u32, u32),
+    max: Option<(u32, u32)>,
+    current: (u32, u32),
+) -> ((u32, u32), Option<(u32, u32)>) {
+    let min = (min.0.min(current.0).max(16), min.1.min(current.1).max(16));
+    let max = max.map(|(mw, mh)| (mw.max(current.0), mh.max(current.1)));
+    (min, max)
 }
 
 /// Our container: `"AIV3" | u32 version | u32 len | component | u32 len |
@@ -933,5 +951,14 @@ mod tests {
         assert!(!listed(0, 7, &midi), "JUCE-style MIDI CC proxy");
         assert!(listed(kCanAutomate as i32, 9, &midi), "an automatable param mapped to a CC stays");
         assert!(!listed(kIsHidden as i32 | kCanAutomate as i32, 1, &midi));
+    }
+
+    #[test]
+    fn sanitize_limits_never_contradicts_current_size() {
+        // Aspect-ratio plugin returning min > current or max < current is clamped around current.
+        assert_eq!(sanitize_limits((800, 600), Some((500, 300)), (600, 403)), ((600, 403), Some((600, 403))));
+        // Normal limits stay intact; tiny minimums stay >= 16.
+        assert_eq!(sanitize_limits((1, 1), Some((1920, 1080)), (600, 403)), ((16, 16), Some((1920, 1080))));
+        assert_eq!(sanitize_limits((320, 240), None, (600, 403)), ((320, 240), None));
     }
 }

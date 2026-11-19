@@ -87,7 +87,7 @@ pub fn footer(ws: &Workspace, dev: &Dev, notes: &Notes) -> AnyElement {
     let pal = p();
     let cpu = ws.b.engine.cpu_load().clamp(0., 1.);
     let item = |name: &str, value: String, color: gpui::Hsla| {
-        div().flex_none().flex().items_center().gap(px(SP1)).child(label(name.to_owned(), TEXT_XS, pal.faint)).child(mono(value, TEXT_XS, color))
+        div().flex_none().flex().items_center().gap(px(SP1)).child(label(name.to_owned(), DEV_AXIS, pal.faint)).child(mono(value, DEV_AXIS, color))
     };
     div()
         .flex_none()
@@ -109,9 +109,9 @@ pub fn footer(ws: &Workspace, dev: &Dev, notes: &Notes) -> AnyElement {
                 .flex()
                 .items_center()
                 .gap(px(SP1))
-                .child(label("DSP", TEXT_XS, pal.faint))
+                .child(label("DSP", DEV_AXIS, pal.faint))
                 .child(widgets::hbar(cpu, 48., 4., if cpu > 0.85 { pal.record } else if cpu > 0.6 { pal.meter_mid } else { pal.muted }))
-                .child(mono(format!("{:.0}%", cpu * 100.), TEXT_XS, pal.muted)),
+                .child(mono(format!("{:.0}%", cpu * 100.), DEV_AXIS, pal.muted)),
         )
         .child(div().flex_1())
         .when_some(notes.warning.clone(), |d, w| {
@@ -124,7 +124,7 @@ pub fn footer(ws: &Workspace, dev: &Dev, notes: &Notes) -> AnyElement {
                     .items_center()
                     .rounded(px(r_sm()))
                     .bg(with_alpha(pal.record, 0.16))
-                    .child(label(w, TEXT_XS, pal.record).font_weight(FontWeight::SEMIBOLD)),
+                    .child(label(w, DEV_AXIS, pal.record).font_weight(FontWeight::SEMIBOLD)),
             )
         })
         .when(!dev.enabled, |d| {
@@ -137,7 +137,7 @@ pub fn footer(ws: &Workspace, dev: &Dev, notes: &Notes) -> AnyElement {
                     .items_center()
                     .rounded(px(r_sm()))
                     .bg(with_alpha(pal.mute, 0.18))
-                    .child(label("Bypassed: the signal passes untouched", TEXT_XS, pal.mute).font_weight(FontWeight::SEMIBOLD)),
+                    .child(label("Bypassed: the signal passes untouched", DEV_AXIS, pal.mute).font_weight(FontWeight::SEMIBOLD)),
             )
         })
         .child(item("RATE", format!("{:.1} kHz", dev.sample_rate / 1000.), pal.faint))

@@ -26,7 +26,7 @@ pub fn view(key: usize, text: &str, streaming: bool, cx: &mut Context<Workspace>
     let blocks = md::parse(text, streaming);
     let mut r = Render { key, seq: 0 };
     let pal = p();
-    let mut col = div().flex().flex_col().gap(px(SP2)).min_w(px(0.));
+    let mut col = div().w_full().min_w(px(0.)).flex().flex_col().gap(px(SP2));
     if blocks.is_empty() && streaming {
         col = col.child(r.text(&[], Tone::body(pal.text), true));
     }
@@ -71,7 +71,7 @@ fn styled(spans: &[Span], tone: Tone) -> Runs {
     let mut s = Runs { text: String::new(), highlights: Vec::new(), mono: Vec::new(), links: Vec::new() };
     for sp in spans {
         let start = s.text.len();
-        s.text.push_str(&sp.text);
+        s.text.push_str(&super::wrap_text(&sp.text));
         let range = start..s.text.len();
         if range.is_empty() {
             continue;
@@ -111,7 +111,7 @@ fn styled(spans: &[Span], tone: Tone) -> Runs {
 }
 
 fn text_box(tone: Tone) -> gpui::Div {
-    div().min_w(px(0.)).text_size(px(fs(tone.size))).line_height(px(tone.line)).text_color(tone.color).font_weight(tone.weight)
+    div().w_full().min_w(px(0.)).text_size(px(fs(tone.size))).line_height(px(tone.line)).text_color(tone.color).font_weight(tone.weight)
 }
 
 /// The caret's blink: on for the first half of each cycle.
@@ -173,7 +173,7 @@ impl Render {
             Block::Code { lang, code } => self.code(lang.as_deref(), code, caret, cx),
             Block::List { start, items } => self.list(*start, items, color, caret, cx),
             Block::Quote(inner) => {
-                let mut col = div().flex().flex_col().gap(px(SP2)).min_w(px(0.));
+                let mut col = div().w_full().min_w(px(0.)).flex().flex_col().gap(px(SP2));
                 let n = inner.len();
                 for (i, b) in inner.iter().enumerate() {
                     col = col.child(self.block(b, pal.muted, caret && i + 1 == n, cx));

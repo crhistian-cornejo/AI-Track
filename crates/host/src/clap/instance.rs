@@ -338,6 +338,15 @@ impl ClapMain {
                 return Err(Error::Editor(format!("gui.set_parent: {e:?}")));
             }
             let _ = gui.show(&handle);
+            // Some plugins only compute their real size once attached and shown;
+            // re-sync the host window so the bottom/edges are never clipped.
+            if let Some(after) = gui.get_size(&handle).filter(|s| s.width > 0 && s.height > 0) {
+                let actual = (after.width, after.height);
+                if actual != size || window.client_size() != actual {
+                    size = actual;
+                    window.set_client_size(size.0, size.1);
+                }
+            }
             if let Some((x, y)) = recalled.and_then(|s| editor::restorable(&s)) {
                 window.place(x, y);
             }

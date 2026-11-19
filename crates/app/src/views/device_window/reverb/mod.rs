@@ -38,7 +38,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     if classic {
         top = top.child(labelled("Mode", choice_row(dev, p::MODE, false, cx)));
     }
-    let mut controls = div().flex_none().flex().flex_wrap().items_start().gap(px(SP2));
+    let mut controls = crate::views::device_ui::kit::flow();
     for (title, ids) in SECTIONS {
         controls = controls.child(section(ws, dev, title, ids, cx));
     }
@@ -53,7 +53,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(
             div()
                 .flex_1()
-                .min_h(px(160.))
+                .min_h(px(220.))
                 .flex()
                 .gap(px(SP3))
                 .child(div().flex_1().min_w(px(0.)).h_full().child(decay))

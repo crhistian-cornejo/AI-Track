@@ -213,10 +213,14 @@ fn paint_transfer(t: &Transfer, level: f32, r: Rect, window: &mut Window, cx: &m
     if t.kind == Kind::Gate && t.hysteresis > 0.05 && t.mode == 0 {
         kit::vline(window, r, r.px(t.frac(t.threshold - t.hysteresis)), with_alpha(pal.accent2, 0.25));
     }
-    kit::txt(window, cx, &format!("{:.1} dB", t.threshold), tx + 4., r.y + 3., TEXT_SM, pal.muted, TextAlign::Left);
-    // Where the signal is on the curve right now.
+    let ty = r.py(1. - t.frac(t.out(t.threshold)));
+    let mut avoid = vec![Rect::around(tx, ty, 12.)];
+    kit::placed_txt(window, cx, &format!("{:.1} dB", t.threshold), (tx, r.y + 14.), DEV_AXIS, pal.muted, r, &mut avoid);
+    // Where the signal is on the curve right now (live operating point with subtle halo).
     if level > t.floor + 0.5 {
-        kit::dot(window, r.pt(t.frac(level), 1. - t.frac(t.out(level))), 3.5, pal.text, None);
+        let pt = r.pt(t.frac(level), 1. - t.frac(t.out(level)));
+        kit::dot(window, pt, 7., with_alpha(pal.accent, 0.28), None);
+        kit::dot(window, pt, 3.5, pal.text, None);
     }
 }
 

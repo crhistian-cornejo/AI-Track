@@ -61,14 +61,20 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         let c = amp_frac(db_amp(ceiling));
         kit::hline(window, r, r.py(c), pal.record);
         kit::hline(window, r, r.py(1. - c), with_alpha(pal.record, 0.5));
-        kit::txt(window, cx, &format!("ceiling {ceiling:+.1} dB"), r.px(0.94) - 16., r.py(c) - 15., TEXT_SM, pal.muted, TextAlign::Right);
         // Gain reduction from the top edge: 12 dB over a third of the height.
         let gr = trace(r, &h.traces[0], |db| (-db / 36.).min(0.34));
         kit::fill_to(window, &gr, r.y, with_alpha(pal.record, 0.4));
         kit::line(window, &gr, 1.5, pal.record);
-        kit::dot(window, r.pt(0.94, c), 7., pal.record, Some(pal.text));
-        kit::dot(window, r.pt(0.06, 0.5), 7., series(1), Some(pal.text));
-        kit::txt(window, cx, &format!("in {gain:+.1} dB"), r.px(0.06) + 12., r.py(0.5) - 15., TEXT_SM, pal.muted, TextAlign::Left);
+        let ceil_pt = r.pt(0.94, c);
+        let in_pt = r.pt(0.06, 0.5);
+        kit::dot(window, ceil_pt, 7., pal.record, Some(pal.text));
+        kit::dot(window, in_pt, 7., series(1), Some(pal.text));
+        let mut avoid = vec![
+            kit::Rect::around(r.px(0.94), r.py(c), 12.),
+            kit::Rect::around(r.px(0.06), r.py(0.5), 12.),
+        ];
+        kit::placed_txt(window, cx, &format!("ceiling {ceiling:+.1} dB"), (r.px(0.94), r.py(c)), DEV_AXIS, pal.muted, r, &mut avoid);
+        kit::placed_txt(window, cx, &format!("in {gain:+.1} dB"), (r.px(0.06), r.py(0.5)), DEV_AXIS, pal.muted, r, &mut avoid);
     });
 
     // The plugin publishes its own BS.1770 meters (integrated, short-term,

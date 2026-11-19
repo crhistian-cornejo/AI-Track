@@ -35,6 +35,8 @@ pub fn render(ws: &mut Workspace, menu: &Menu, window: &mut Window, cx: &mut Con
         MenuKind::TimeSignature => sig_menu(ws, cx),
         MenuKind::ClipLaunch(clip) => launch_menu(ws, *clip, cx),
         MenuKind::ClipQuantize(clip) => quantize_menu(ws, *clip, cx),
+        MenuKind::ClipFollow(clip) => follow_menu(ws, *clip, cx),
+        MenuKind::UndoHistory => undo_history_menu(ws, cx),
         MenuKind::StutterStep { device, step } => crate::views::device_ui::stutter::step_menu(ws, *device, *step, cx),
         MenuKind::File => file_menu(ws, window, cx),
         MenuKind::SliceToDrumRack(track, placement) => crate::editing::slice::slice_menu(ws, *track, *placement, cx),
@@ -1349,6 +1351,97 @@ fn quantize_menu(ws: &mut Workspace, clip: aitrack_model::ClipId, cx: &mut Conte
         )));
     }
     card.into_any_element()
+}
+
+/// The follow actions of a clip, as a menu.
+fn follow_menu(ws: &mut Workspace, clip: aitrack_model::ClipId, cx: &mut Context<Workspace>) -> AnyElement {
+    use aitrack_model::FollowAction;
+    let current = ws.s.project.clips.get(&clip).and_then(|c| c.launch.follow);
+    let bars = crate::views::bottom::follow_action_bars(current);
+    let choices: [Option<FollowAction>; 6] = [
+        None,
+        Some(FollowAction::Next { after_bars: bars }),
+        Some(FollowAction::Previous { after_bars: bars }),
+        Some(FollowAction::First { after_bars: bars }),
+        Some(FollowAction::Random { after_bars: bars }),
+        Some(FollowAction::Stop { after_bars: bars }),
+    ];
+    let mut card = widgets::menu_card("follow-menu", 156.).child(menu_header("FOLLOW ACTION"));
+    for (i, choice) in choices.into_iter().enumerate() {
+        let active = match (choice, current) {
+            (Some(a), Some(b)) => std::mem::discriminant(&a) == std::mem::discriminant(&b),
+            (None, None) => true,
+            _ => false,
+        };
+        card = card.child(menu_item(("follow-opt", i), None, crate::views::bottom::follow_action_name(choice), None, active).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                crate::views::bottom::set_follow_action(&mut this.s, clip, choice);
+                cx.notify();
+            },
+        )));
+    }
+    card.into_any_element()
+}
+
+/// Undo / Redo history list: click any step to jump straight to that point.
+fn undo_history_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let redos: Vec<String> = ws.s.history.redo_steps().take(12).map(|t| t.label.clone()).collect();
+    let undos: Vec<String> = ws.s.history.steps().take(24).map(|t| t.label.clone()).collect();
+    let mut list = div().id("undo-history-list").max_h(px(280.)).overflow_y_scroll().flex().flex_col();
+    for (i, text) in redos.iter().enumerate().rev() {
+        let steps = i + 1;
+        list = list.child(
+            menu_item(("hist-redo", i), Some(Icon::Redo), format!("+{steps} · {text}"), None, false)
+                .opacity(0.65)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.menu = None;
+                    for _ in 0..steps {
+                        if !this.s.redo() {
+                            break;
+                        }
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+    if undos.is_empty() && redos.is_empty() {
+        list = list.child(div().px(px(SP3)).py(px(SP2)).child(label("No edits yet", TEXT_SM, pal.faint)));
+    } else {
+        for (i, text) in undos.iter().enumerate() {
+            let is_current = i == 0;
+            let undo_count = i;
+            let row_label = if is_current { text.clone() } else { format!("−{undo_count} · {text}") };
+            list = list.child(
+                menu_item(("hist-undo", i), Some(if is_current { Icon::Check } else { Icon::Undo }), row_label, None, is_current)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        for _ in 0..undo_count {
+                            if !this.s.undo() {
+                                break;
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let total = undos.len();
+        list = list.child(
+            menu_item("hist-origin", Some(Icon::Clock), format!("−{total} · Before first step"), None, false)
+                .opacity(0.75)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.menu = None;
+                    for _ in 0..total {
+                        if !this.s.undo() {
+                            break;
+                        }
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+    widgets::menu_card("undo-history-menu", 240.).child(menu_header("UNDO HISTORY")).child(list).into_any_element()
 }
 
 #[cfg(test)]

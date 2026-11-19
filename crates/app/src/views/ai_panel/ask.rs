@@ -54,8 +54,8 @@ pub fn card(cx: &mut Context<Workspace>) -> Option<AnyElement> {
                         .min_w(px(0.))
                         .flex()
                         .flex_col()
-                        .child(label(title.clone(), TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM))
-                        .when(!hint.is_empty(), |d| d.child(div().text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(pal.muted).child(hint.clone()))),
+                        .child(div().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.text).font_weight(FontWeight::MEDIUM).child(super::wrap_text(title)))
+                        .when(!hint.is_empty(), |d| d.child(div().min_w(px(0.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(pal.muted).child(super::wrap_text(hint)))),
                 )
                 .on_click(cx.listener(move |_, _, _, cx| agent::pick(i, cx))),
         );
@@ -71,6 +71,7 @@ pub fn card(cx: &mut Context<Workspace>) -> Option<AnyElement> {
         });
     let el = div()
         .flex_none()
+        .overflow_hidden()
         .mx(px(SP3))
         .mb(px(SP2))
         .p(px(SP3))

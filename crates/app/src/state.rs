@@ -203,6 +203,14 @@ pub enum BottomTab {
     Mixer,
 }
 
+/// Which per-note lane is shown under the piano roll grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteLane {
+    #[default]
+    Velocity,
+    Chance,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -360,6 +368,8 @@ pub struct AppState {
     pub note_length: Tick,
     /// Ableton-style Scale Mode in the piano roll: fold vertically to show only keys in the active scale.
     pub piano_scale_fold: bool,
+    /// Per-note lane under the piano roll (Velocity or Chance probability).
+    pub note_lane: NoteLane,
     pub last_error: Option<String>,
 }
 
@@ -418,6 +428,7 @@ impl AppState {
             capture: Default::default(),
             note_length: PPQ / 2,
             piano_scale_fold: true,
+            note_lane: NoteLane::Velocity,
             last_error: None,
         };
         // Start on a melodic clip so the piano roll has something to show.
@@ -980,6 +991,28 @@ impl AppState {
         self.edit_coalesced("notes-velocity", "Change velocity", vec![Command::UpdateNotes { source, notes }])
     }
 
+    /// Set playback chance (probability 0..=1) of `originals` offset by `dp` (one coalesced drag).
+    pub fn set_probability(&mut self, clip: ClipId, originals: &[Note], dp: f32) -> bool {
+        let Some((source, _)) = self.clip_notes(clip) else { return false };
+        if originals.is_empty() { return false }
+        let dp = probability_delta(originals, dp);
+        let notes = originals.iter().map(|n| Note { probability: (n.probability + dp).clamp(0., 1.), ..n.clone() }).collect();
+        self.edit_coalesced("notes-chance", "Change chance", vec![Command::UpdateNotes { source, notes }])
+    }
+
+    /// Nudge probability of selected notes (or all notes in `clip`) by `delta`, in one undo step.
+    pub fn nudge_probability(&mut self, clip: ClipId, delta: f32) -> bool {
+        let Some((source, notes)) = self.tool_targets(clip) else { return false };
+        if notes.is_empty() {
+            return false;
+        }
+        let changed: Vec<Note> = notes.into_iter().map(|n| Note { probability: (n.probability + delta).clamp(0., 1.), ..n }).collect();
+        self.seal();
+        let ok = self.edit("Change chance", vec![Command::UpdateNotes { source, notes: changed }]);
+        self.seal();
+        ok
+    }
+
     /// The notes a tool acts on: the selection, or the whole clip.
     fn tool_targets(&self, clip: ClipId) -> Option<(SourceId, Vec<Note>)> {
         let (source, n) = self.clip_notes(clip)?;
@@ -1363,8 +1396,20 @@ impl AppState {
                         KeyEdit::Right => n.start += grid,
                         KeyEdit::Longer => n.length += grid,
                         KeyEdit::Shorter => n.length = (n.length - grid).max(grid.min(PPQ / 4)),
-                        KeyEdit::VelocityUp => n.velocity = (n.velocity + 0.08).min(1.),
-                        KeyEdit::VelocityDown => n.velocity = (n.velocity - 0.08).max(0.01),
+                        KeyEdit::VelocityUp => {
+                            if self.note_lane == NoteLane::Chance {
+                                n.probability = (n.probability + 0.1).min(1.);
+                            } else {
+                                n.velocity = (n.velocity + 0.08).min(1.);
+                            }
+                        }
+                        KeyEdit::VelocityDown => {
+                            if self.note_lane == NoteLane::Chance {
+                                n.probability = (n.probability - 0.1).max(0.);
+                            } else {
+                                n.velocity = (n.velocity - 0.08).max(0.01);
+                            }
+                        }
                     }
                     n
                 })
@@ -1376,7 +1421,7 @@ impl AppState {
             let label = match e {
                 KeyEdit::Left | KeyEdit::Right => "Move notes",
                 KeyEdit::Longer | KeyEdit::Shorter => "Resize notes",
-                KeyEdit::VelocityUp | KeyEdit::VelocityDown => "Change velocity",
+                KeyEdit::VelocityUp | KeyEdit::VelocityDown => if self.note_lane == NoteLane::Chance { "Change chance" } else { "Change velocity" },
                 _ => "Transpose notes",
             };
             let ok = self.edit(label, vec![Command::UpdateNotes { source, notes }]);
@@ -1663,7 +1708,7 @@ impl AppState {
     }
 
     /// The sample edit of [`Self::set_clip_warp`] on exactly `targets`.
-    fn set_warp_of(&mut self, key: &str, targets: &[ClipId], f: impl Fn(&mut Warp)) -> bool {
+    pub(crate) fn set_warp_of(&mut self, key: &str, targets: &[ClipId], f: impl Fn(&mut Warp)) -> bool {
         let mut sources: Vec<SourceId> = Vec::new();
         for c in targets {
             if let Some(s) = self.project.clips.get(c).map(|c| c.source).filter(|s| !sources.contains(s)) {
@@ -2333,6 +2378,51 @@ impl AppState {
         ok
     }
 
+    /// Duplicate `ids` with their devices, routing and mixer state, but without
+    /// clips or automation (Live's Duplicate Without Content). One undo step.
+    pub fn duplicate_tracks_empty(&mut self, ids: &[TrackId]) -> bool {
+        let roots: Vec<TrackId> = ids.iter().copied().filter(|&t| !groups::ancestors(&self.project, t).any(|a| ids.contains(&a))).collect();
+        let mut scratch = self.project.clone();
+        let (mut cmds, mut made) = (Vec::new(), Vec::new());
+        for id in roots {
+            let Some(d) = tracks::duplicate_track_empty(&mut scratch, id) else { continue };
+            if (Command::Batch { commands: d.commands.clone() }).apply(&mut scratch).is_err() {
+                continue;
+            }
+            cmds.extend(d.commands);
+            made.push(d.track);
+        }
+        if cmds.is_empty() {
+            return false;
+        }
+        self.seal();
+        let ok = self.edit(if made.len() == 1 { "Duplicate track without content" } else { "Duplicate tracks without content" }, cmds);
+        self.seal();
+        if ok {
+            self.ed.tracks = made.iter().copied().collect();
+            self.selected_track = made.first().copied();
+        }
+        ok
+    }
+
+    /// Clear Solo on every soloed track in one undo step. Returns how many tracks were unsoloed.
+    pub fn unsolo_all(&mut self) -> usize {
+        let cmds: Vec<Command> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.solo)
+            .map(|t| Command::SetTrack { id: t.id, change: TrackProp::Solo(false) })
+            .collect();
+        let count = cmds.len();
+        if count > 0 {
+            self.seal();
+            self.edit("Unsolo all", cmds);
+            self.seal();
+        }
+        count
+    }
+
     /// Give `ids` the palette colour `color`.
     pub fn set_tracks_color(&mut self, ids: &[TrackId], color: Color) -> bool {
         let pairs: Vec<(TrackId, Color)> = ids.iter().map(|id| (*id, color)).collect();
@@ -2743,6 +2833,13 @@ pub fn velocity_delta(originals: &[Note], delta: f32) -> f32 {
     if originals.is_empty() { return 0. }
     let lower = originals.iter().map(|n| 0.01 - n.velocity).fold(f32::NEG_INFINITY, f32::max);
     let upper = originals.iter().map(|n| 1. - n.velocity).fold(f32::INFINITY, f32::min);
+    delta.clamp(lower, upper)
+}
+
+pub fn probability_delta(originals: &[Note], delta: f32) -> f32 {
+    if originals.is_empty() { return 0. }
+    let lower = originals.iter().map(|n| 0. - n.probability).fold(f32::NEG_INFINITY, f32::max);
+    let upper = originals.iter().map(|n| 1. - n.probability).fold(f32::INFINITY, f32::min);
     delta.clamp(lower, upper)
 }
 

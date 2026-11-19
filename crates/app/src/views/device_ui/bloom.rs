@@ -33,7 +33,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
     let bezel = pal.surface;
     let field = stage::stage(ws, dev, &scene, stage::Opts { swatches: false, outer: bezel, slot: 1, zoom: 1.2 }, cx);
     let sound = format!("{:02} {}", selected + 1, view::names(ws, dev, &scene)[selected]);
-    let family = if view::kind(dev).is_tonal() { view::kind(dev).label() } else { scene.species.label() };
+    // A tonal kind shows its kind (with its glyph) and the patch's name.
+    let kind = view::kind(dev);
+    let family = if kind.is_tonal() { kind.label() } else { scene.species.label() };
+    let locked = view::locked(ws, dev, &scene, selected);
     let overlay = |text: String, color: gpui::Hsla| div().px(px(SP1)).h(px(16.)).flex().items_center().rounded(px(r_sm())).bg(with_alpha(pal.surface, 0.72)).child(mono(text, TEXT_XS, color));
     let well = div()
         .id(("bloom-card-stage", dev.key(0x700)))
@@ -46,9 +49,18 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
         .bg(bezel)
         .border_1()
         .border_color(border())
-        .tooltip(widgets::tip(window::TIP_STAGE, None))
+        .tooltip(widgets::tip(if kind.is_tonal() { window::TIP_STAGE_TONAL } else { window::TIP_STAGE }, None))
         .child(field)
-        .child(div().absolute().top(px(SP2)).left(px(SP2)).child(overlay(format!("{} · {:06}", family, bloom::seed_of(dev.plain(p::SEED))), pal.muted)))
+        .child(
+            div()
+                .absolute()
+                .top(px(SP2))
+                .left(px(SP2))
+                .flex()
+                .gap(px(SP1))
+                .when(kind.is_tonal(), |d| d.child(div().size(px(16.)).flex().items_center().justify_center().rounded(px(r_sm())).bg(with_alpha(pal.surface, 0.72)).child(crate::icons::icon(window::kind_icon(kind), 10., pal.text))))
+                .child(overlay(format!("{} · {:06}", family, bloom::seed_of(dev.plain(p::SEED))), pal.muted)),
+        )
         .child(
             div()
                 .absolute()
@@ -57,7 +69,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, _d: &Device, cx: &mut Context<Works
                 .flex()
                 .gap(px(SP1))
                 .child(overlay(sound, pal.text))
-                .when(scene.locked(selected), |d| d.child(overlay("locked".into(), pal.accent))),
+                .when(locked, |d| d.child(overlay("locked".into(), pal.accent))),
         );
     // Roll and Mutate, the history, and the way into the window.
     let d = dev.clone();
@@ -102,7 +114,8 @@ pub fn card_layout(big: bool) -> CardLayout {
 
 /// The dev-view words: `bloom` adds a Bloom on a new track with a seeded
 /// scene (the Devices tab open), `bloomwin` returns it to open in its window,
-/// `bloomplay` lights some cells with synthetic activity.
+/// `bloomplay` lights some cells with synthetic activity, `bloomkind=pad`
+/// (any kind's name) switches it to that kind of sound.
 pub fn dev_word(ws: &mut Workspace, word: &str) -> Option<DeviceId> {
     let existing = ws.s.project.tracks.iter().flat_map(|t| &t.devices).find(|d| matches!(&d.kind, aitrack_model::DeviceKind::Stock { plugin_id } if plugin_id == bloom::ID)).map(|d| d.id);
     let id = match existing {
@@ -129,6 +142,13 @@ pub fn dev_word(ws: &mut Workspace, word: &str) -> Option<DeviceId> {
         }
     };
     ws.s.bottom_tab = crate::state::BottomTab::Devices;
+    if let Some(name) = word.strip_prefix("bloomkind=")
+        && let Some(kind) = aitrack_stock::instrument::bloom::patch::Kind::ALL.into_iter().find(|k| k.label().eq_ignore_ascii_case(name))
+    {
+        let params = bloom::params();
+        let value = params.iter().find(|i| i.id == p::KIND).map_or(0., |i| i.to_normalized(kind.index() as f32));
+        ws.s.edit("Bloom kind", vec![Command::SetParam { device: id, param: p::KIND, value: Some(value) }]);
+    }
     if word == "bloomplay" {
         let v = ws.fx.bloom.view(id);
         let mut env = [0.0; 16];

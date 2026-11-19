@@ -19,6 +19,14 @@
 //! * with a second argument `knobs`, only `knobs-{light,dark}.png`: one sound
 //!   under each knob turned (timbre re-analysed under the knobs, then the
 //!   direct mapping), at rest and a moment after a hit.
+//! * with a second argument `tonal` (and an optional seed third), only
+//!   `tonal-{light,dark}.png`: per tonal kind (a row each: Bass, Lead, Pad,
+//!   Pluck, Keys, FX, Texture) the scene `tonal::generate(seed, kind)` grows,
+//!   its patches' timbres (`bloom::patch_timbre`) mapped to looks with the
+//!   kind's bias (`mapping::with_kind`): at rest, then 0.12 s, 0.6 s and
+//!   1.6 s into a note of the first patch (its envelope from its render),
+//!   the sixteen pad colours along the bottom; `tonal-kinds.txt` lists the
+//!   timbres.
 
 #![allow(dead_code, unused_imports)]
 
@@ -182,6 +190,11 @@ fn main() {
         knobs(&gpu, &target, &scene, &dir);
         return;
     }
+    if only == "tonal" {
+        let seed = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1_337);
+        tonal_shots(&gpu, seed, &dir);
+        return;
+    }
     if only == "ensemble" || only.is_empty() {
         ensemble_shots(&gpu, &looks_l, &looks_d, &dir);
         if !only.is_empty() {
@@ -293,6 +306,85 @@ fn ensemble_shots(gpu: &Gpu, looks_l: &[SoundLook; SOUNDS], looks_d: &[SoundLook
         });
         let (g, gw, gh) = grid(&sheet, W, H, 4);
         save(dir, &format!("ensemble-materials-{theme}.png"), &g, gw, gh);
+    }
+}
+
+/// Every tonal kind's scene: a row per kind, at rest and through a note of
+/// its first patch, the sixteen pads' colours along the bottom of the rest tile.
+fn tonal_shots(gpu: &Gpu, seed: u64, dir: &Path) {
+    use aitrack_stock::instrument::bloom::patch::Kind;
+    use aitrack_stock::instrument::bloom::{self as bloom, tonal};
+    let (w, h) = (360u32, 280u32);
+    let target = gpu.target(w, h);
+    let knobs = tonal::Knobs::default();
+    let mut report = String::new();
+    let scenes: Vec<_> = Kind::TONAL
+        .iter()
+        .map(|&kind| {
+            let s = tonal::generate(seed, kind);
+            let names = tonal::scene_names(&s);
+            let t: Vec<timbre::Timbre> = s.patches.iter().map(|p| look::ringing(&bloom::patch_timbre(p, &knobs, 0.0))).collect();
+            report.push_str(&format!("== {kind:?} (seed {seed})\n"));
+            for (i, x) in t.iter().enumerate() {
+                report.push_str(&format!(
+                    "{i:2} {:<18} cen={:6.0} noise={:.2} en={:.2} att={:4.0} dec={:4.0} inh={:.2} wob={:.2}\n",
+                    names[i], x.centroid, x.noisiness, x.energy, x.attack_ms, x.decay_ms, x.inharmonic, x.wobble
+                ));
+            }
+            // The first patch's envelope at 120 Hz, from its demo note.
+            let (l, r) = bloom::render_patch(&s.patches[0], &knobs, 0.0, 48_000.0);
+            let env: Vec<f32> = l.chunks(400).zip(r.chunks(400)).map(|(a, b)| (a.iter().chain(b).map(|v| v * v).sum::<f32>() / (2 * a.len()) as f32).sqrt()).collect();
+            let peak = env.iter().fold(1e-6f32, |m, v| m.max(*v));
+            (kind, t, env.into_iter().map(|v| v / peak).collect::<Vec<f32>>())
+        })
+        .collect();
+    std::fs::write(dir.join("tonal-kinds.txt"), &report).expect("report");
+    for light in [true, false] {
+        let theme = if light { "light" } else { "dark" };
+        let mut tiles = Vec::new();
+        for (kind, t, env) in &scenes {
+            let looks: [SoundLook; SOUNDS] = std::array::from_fn(|i| matter::mapping::with_kind(&sound_look(&t[i], light), *kind));
+            let mut a = Animator::default();
+            let dt = 1.0 / 120.0;
+            let quiet = [0.0; SOUNDS];
+            for _ in 0..180 {
+                a.step(dt, &Live { env: &quiet, pulse: &quiet, looks: &looks, selected: 0, hits: &NO_HITS, level: 0.0 }, None, false);
+            }
+            let shoot = |a: &Animator| {
+                let mut px = gpu.render_bgra(&target, &a.uniforms(Material::Obsidian, &panel(light, w, h), 0.0)).expect("render");
+                bgra_to_rgba(&mut px);
+                px
+            };
+            let mut rest = shoot(&a);
+            // The pads' colours: sixteen squares along the bottom.
+            let side = w / SOUNDS as u32;
+            for (i, x) in t.iter().enumerate() {
+                let c = look::with_kind(&look::look(x, !light), *kind, !light).rgb.map(|v| (look::encode(v) * 255.0).round() as u8);
+                for y in h - side..h - 2 {
+                    for xx in i as u32 * side + 1..(i as u32 + 1) * side - 1 {
+                        let at = ((y * w + xx) * 4) as usize;
+                        rest[at..at + 3].copy_from_slice(&c);
+                    }
+                }
+            }
+            tiles.push(rest);
+            let mut hits = NO_HITS;
+            hits[0] = 1.0;
+            let mut k = 0usize;
+            for until in [0.12f32, 0.6, 1.6] {
+                while (k as f32) * dt < until {
+                    let tt = k as f32 * dt;
+                    let (mut e, mut pulse) = ([0.0; SOUNDS], [0.0; SOUNDS]);
+                    e[0] = env.get(k).copied().unwrap_or(0.0);
+                    pulse[0] = (-tt / 0.06).exp();
+                    a.step(dt, &Live { env: &e, pulse: &pulse, looks: &looks, selected: 0, hits: &hits, level: 0.3 * e[0] }, None, false);
+                    k += 1;
+                }
+                tiles.push(shoot(&a));
+            }
+        }
+        let (g, gw, gh) = grid(&tiles, w, h, 4);
+        save(dir, &format!("tonal-{theme}.png"), &g, gw, gh);
     }
 }
 

@@ -13,8 +13,14 @@
 //! mapped into the sRGB gamut by lowering the chroma, so two cells of equal
 //! lightness look equally light whatever their hue.
 
+use aitrack_stock::instrument::bloom::demo_note;
 use aitrack_stock::instrument::bloom::genome::{Genome, g};
+#[cfg(test)]
+use aitrack_stock::instrument::bloom::genome::SOUNDS;
+use aitrack_stock::instrument::bloom::patch::{Kind, Patch};
 use aitrack_stock::instrument::bloom::timbre::Timbre;
+use aitrack_stock::instrument::bloom::tonal;
+use aitrack_stock::instrument::wavetable::p as w;
 
 /// How a cell looks.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -144,9 +150,128 @@ pub fn estimate(genome: &Genome) -> Timbre {
     }
 }
 
+/// A tonal timbre as the looks read it. A patch is measured over 750 ms of
+/// a held note: when it is still rising or sounding at the end of that
+/// window (a pad's slow attack, a held lead), its "decay" is the window
+/// running out, not the sound falling, so it counts as still ringing (as a
+/// drum sound's 200 ms do) instead of as a click.
+pub fn ringing(t: &Timbre) -> Timbre {
+    let mut o = *t;
+    if t.attack_ms + t.decay_ms >= 600.0 {
+        o.decay_ms = o.decay_ms.max(750.0 - t.attack_ms).max(200.0);
+    }
+    o
+}
+
+/// `l` as a sound of `kind` wears it: the hue stays the timbre's, the kind
+/// sets how deep and vivid it is (identity for drums). A bass deep and
+/// saturated, a lead vivid, a pad an airy pastel, a pluck bright, FX
+/// greyer, a texture a grey fog; the CPU field's spikes follow the kind too.
+pub fn with_kind(l: &Look, kind: Kind, dark: bool) -> Look {
+    let (dl, kc, ks): (f32, f32, f32) = match kind {
+        Kind::Drums => return *l,
+        Kind::Bass => (-0.05, 1.2, 0.5),
+        Kind::Lead => (0.04, 1.25, 1.1),
+        Kind::Pad => (0.08, 0.6, 0.15),
+        Kind::Pluck => (0.03, 1.15, 1.6),
+        Kind::Keys => (0.0, 0.9, 1.0),
+        Kind::Fx => (0.0, 0.7, 1.2),
+        Kind::Texture => (0.03, 0.45, 0.6),
+    };
+    let lightness = (l.l + if dark { dl } else { dl * 0.6 }).clamp(0.3, 0.9);
+    let (rgb, c) = oklch_to_linear(lightness, l.c * kc, l.h);
+    Look { l: lightness, c, rgb, spikes: (l.spikes * ks + if kind == Kind::Pluck { 0.25 } else { 0.0 }).clamp(0.0, 0.9), ..*l }
+}
+
+/// A first guess of a tonal patch's timbre from its synth parameters (the
+/// kind's demo note through the oscillators, the low-pass and the amp
+/// envelope), shown until the render-based analysis arrives.
+pub fn estimate_patch(patch: &Patch) -> Timbre {
+    let x = patch.folded();
+    let (key, hold, _) = demo_note(patch.kind);
+    let f0 = 440.0 * 2f32.powf((f32::from(key) - 69.0) / 12.0);
+    // Brightness of the sources: a saw-rich table ~6 harmonics up, a sine ~1.
+    let lit: Vec<(f32, f32)> = (0..3u32).map(|o| (x.plain(w::osc(o, w::LEVEL)), x.plain(w::osc(o, w::POS)) / 100.0)).filter(|(l, _)| *l > 5.0).collect();
+    let level: f32 = lit.iter().map(|(l, _)| l).sum::<f32>().max(1.0);
+    let rich = lit.iter().map(|(l, pos)| l * (3.0 + 4.0 * pos)).sum::<f32>() / level;
+    let mut centroid = f0 * if lit.is_empty() { 2.0 } else { rich };
+    if x.choice(w::filt(0, w::F_ENABLE)) == 1 {
+        let cutoff = x.plain(w::CUTOFF) * 2f32.powf(x.plain(w::FILTER_ENV) / 100.0 * 2.0);
+        centroid = match x.choice(w::FILTER_TYPE) {
+            0 => centroid.min(f0 + cutoff * 0.6),
+            1 => centroid.max(cutoff),
+            _ => (centroid * cutoff).sqrt(),
+        };
+    }
+    let noise = tonal::noise_share(&x);
+    centroid = centroid * (1.0 - noise) + 5_000.0 * noise;
+    let sustain = x.plain(w::AMP_SUSTAIN) / 100.0;
+    let decay = x.plain(w::AMP_DECAY);
+    let held = (hold * 1000.0).min(750.0);
+    let decay_ms = if sustain > 0.3 { held } else { (x.plain(w::AMP_ATTACK) + decay).min(750.0) };
+    Timbre {
+        centroid,
+        noisiness: (noise * 0.9).clamp(0.0, 1.0),
+        energy: (0.15 + 0.55 * sustain + 0.2 * (decay / 1_500.0).min(1.0)).clamp(0.05, 0.85),
+        attack_ms: x.plain(w::AMP_ATTACK).min(750.0),
+        decay_ms,
+        inharmonic: if (0..3u32).any(|o| x.choice(w::osc(o, w::WARP)) >= 8) { 0.4 } else { 0.05 },
+        wobble: tonal::motion(&x),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_patch_estimate_tells_the_kinds_apart() {
+        let mean = |k: Kind, f: &dyn Fn(&Timbre) -> f32| {
+            let s = tonal::generate(1_337, k);
+            s.patches.iter().map(|p| f(&estimate_patch(p))).sum::<f32>() / SOUNDS as f32
+        };
+        // A bass sits low, a lead high; a pad swells slowly, a pluck is short.
+        assert!(mean(Kind::Bass, &|t| t.centroid) < mean(Kind::Lead, &|t| t.centroid));
+        assert!(mean(Kind::Pad, &|t| t.attack_ms) > 5.0 * mean(Kind::Pluck, &|t| t.attack_ms).max(1.0));
+        assert!(mean(Kind::Pluck, &|t| t.decay_ms) < mean(Kind::Pad, &|t| t.decay_ms));
+        assert!(mean(Kind::Texture, &|t| t.noisiness) > mean(Kind::Keys, &|t| t.noisiness));
+        for k in Kind::TONAL {
+            for p in &tonal::generate(7, k).patches {
+                let t = estimate_patch(p);
+                assert!(t.centroid.is_finite() && t.centroid > 0.0, "{k:?} {t:?}");
+                assert!((0.0..=1.0).contains(&t.noisiness) && (0.0..=1.0).contains(&t.energy) && (0.0..=1.0).contains(&t.wobble), "{k:?} {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_note_still_sounding_at_the_window_end_is_ringing() {
+        // A pad peaking at the end of the 750 ms window, a held lead, a pluck.
+        let pad = Timbre { attack_ms: 744.0, decay_ms: 6.0, ..Timbre::default() };
+        let lead = Timbre { attack_ms: 3.0, decay_ms: 747.0, ..Timbre::default() };
+        let pluck = Timbre { attack_ms: 2.0, decay_ms: 97.0, ..Timbre::default() };
+        assert!(ringing(&pad).decay_ms >= 200.0 && ringing(&lead).decay_ms >= 200.0);
+        assert_eq!(ringing(&pluck), pluck);
+        assert!(look(&ringing(&pad), true).spikes < 0.1, "a pad is round, not a click");
+    }
+
+    #[test]
+    fn kinds_wear_their_colour_differently() {
+        let base = look(&timbre(600.0, 0.1, 0.4, 200.0, 0.0), true);
+        assert_eq!(with_kind(&base, Kind::Drums, true), base);
+        let (pad, lead, bass, tex) = (with_kind(&base, Kind::Pad, true), with_kind(&base, Kind::Lead, true), with_kind(&base, Kind::Bass, true), with_kind(&base, Kind::Texture, true));
+        assert!(pad.l > base.l && pad.c < base.c, "an airy pastel");
+        assert!(lead.c >= base.c - 1e-4, "vivid");
+        assert!(bass.l < base.l, "deep");
+        assert!(tex.c < pad.c, "a grey fog");
+        assert!(with_kind(&base, Kind::Pluck, true).spikes > pad.spikes);
+        for k in Kind::ALL {
+            for dark in [true, false] {
+                let l = with_kind(&base, k, dark);
+                assert!(l.rgb.iter().all(|v| (0.0..=1.0).contains(v)) && l.h == base.h, "{k:?}");
+            }
+        }
+    }
 
     fn timbre(centroid: f32, noisiness: f32, energy: f32, decay_ms: f32, inharmonic: f32) -> Timbre {
         Timbre { centroid, noisiness, energy, attack_ms: 1.0, decay_ms, inharmonic, wobble: 0.0 }

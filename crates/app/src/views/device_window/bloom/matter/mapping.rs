@@ -9,6 +9,7 @@
 //! | energy, decay | size and how far a hit swells it |
 
 use super::super::look::{brightness, hue, oklch_to_linear};
+use aitrack_stock::instrument::bloom::patch::Kind;
 use aitrack_stock::instrument::bloom::timbre::Timbre;
 
 /// What one sound does to the matter (on top of the material).
@@ -207,6 +208,123 @@ pub fn with_controls(l: &SoundLook, c: &Controls) -> SoundLook {
     o
 }
 
+/// `l` as a sound of `kind` carries it: the timbre says what the sound is,
+/// the kind how it moves (the identity for drums).
+///
+/// | kind | the matter |
+/// |---|---|
+/// | Bass | heavy and large: a bigger, lumpier mass with broad, slow folds, a thick (warm) film, little vapour, low blunt spikes |
+/// | Lead | taut and bright: a smaller mass, a thinner film, finer folds, sharp spikes on each note |
+/// | Pad | airy and slow: long vapour rising slowly, a slow churn, a smooth surface, almost no spikes, a long swell |
+/// | Pluck | sharp: needle spikes thrown on every note, dense, little vapour |
+/// | Keys | glassy: a smooth surface, clean cone spikes, a light vapour |
+/// | FX | noisy and turbulent: a rough, churning surface, wild vapour, a tremble |
+/// | Texture | grainy fog: dense vapour, a rough, lumpy, finely folded surface, fine spikes, a slow churn |
+pub fn with_kind(l: &SoundLook, kind: Kind) -> SoundLook {
+    let mut o = *l;
+    match kind {
+        Kind::Drums => return o,
+        Kind::Bass => {
+            o.size = o.size.max(1.04) + 0.06;
+            o.swell = o.swell.max(0.8);
+            o.lumps = (o.lumps + 0.04).max(0.16);
+            o.fold_freq *= 0.65;
+            o.film_shift = (o.film_shift + 0.08).max(0.1);
+            o.smoke_amount *= 0.3;
+            o.smoke_rise *= 0.7;
+            o.churn *= 0.7;
+            o.spike_sharp = o.spike_sharp.min(1.6);
+            o.spike_count = o.spike_count.min(48.0);
+            o.spike_gain *= 0.6;
+            o.wobble_freq *= 0.6;
+        }
+        Kind::Lead => {
+            o.size = o.size.min(0.94);
+            o.film_shift -= 0.06;
+            o.fold_freq *= 1.2;
+            o.spike_sharp = o.spike_sharp.max(2.6);
+            o.spike_gain = o.spike_gain.max(0.6);
+            o.spike_count = o.spike_count.max(80.0);
+            o.smoke_amount *= 0.8;
+            o.churn *= 1.1;
+        }
+        Kind::Pad => {
+            o.smoke_amount = o.smoke_amount.max(0.95);
+            o.smoke_rise *= 0.5;
+            o.turbulence *= 0.6;
+            o.churn *= 0.45;
+            o.roughness *= 0.4;
+            o.spike_gain *= 0.15;
+            o.spike_sharp = 1.2;
+            o.swell = o.swell.max(0.9);
+            o.fold_freq *= 0.85;
+            o.wobble_freq *= 0.5;
+            o.film_range += 0.1;
+        }
+        Kind::Pluck => {
+            o.size = o.size.min(0.95);
+            o.spike_sharp = o.spike_sharp.max(3.2) + 0.8;
+            o.spike_gain = o.spike_gain.max(0.9);
+            o.spike_count = o.spike_count.max(110.0);
+            o.smoke_amount *= 0.5;
+            o.smoke_rise *= 1.3;
+            o.churn *= 1.15;
+            o.swell *= 0.7;
+        }
+        Kind::Keys => {
+            o.roughness *= 0.3;
+            o.spike_sharp = o.spike_sharp.clamp(2.0, 2.6);
+            o.spike_gain = o.spike_gain.max(0.55);
+            o.spike_count = o.spike_count.clamp(60.0, 90.0);
+            o.film_range *= 0.6;
+            o.smoke_amount = o.smoke_amount.min(0.35);
+            o.churn *= 0.85;
+        }
+        Kind::Fx => {
+            o.turbulence = o.turbulence.max(1.4) * 1.4;
+            o.roughness += 0.08;
+            o.churn = o.churn.max(0.14) * 1.5;
+            o.wobble_amp += 0.02;
+            o.wobble_freq *= 1.4;
+            o.smoke_amount = o.smoke_amount.max(0.55) + 0.15;
+            o.smoke_rise *= 1.4;
+            o.lumps += 0.05;
+            o.film_range += 0.12;
+            o.spike_count *= 1.3;
+        }
+        Kind::Texture => {
+            o.smoke_amount = 1.0;
+            o.smoke_rise *= 0.65;
+            o.turbulence *= 1.25;
+            o.roughness += 0.1;
+            o.lumps = o.lumps.max(0.2);
+            o.fold_freq *= 1.45;
+            o.churn *= 0.7;
+            o.spike_gain *= 0.4;
+            o.spike_count = 160.0;
+            o.spike_sharp = o.spike_sharp.max(2.2);
+            o.film_range += 0.15;
+        }
+    }
+    o.size = o.size.clamp(0.8, 1.1);
+    o.swell = clamp01(o.swell);
+    o.lumps = o.lumps.clamp(0.06, 0.24);
+    o.fold_freq = o.fold_freq.clamp(0.7, 2.8);
+    o.film_shift = o.film_shift.clamp(-0.25, 0.25);
+    o.film_range = o.film_range.clamp(0.0, 0.45);
+    o.smoke_amount = clamp01(o.smoke_amount);
+    o.smoke_rise = o.smoke_rise.clamp(0.08, 0.6);
+    o.turbulence = o.turbulence.clamp(0.3, 2.4);
+    o.churn = o.churn.clamp(0.03, 0.3);
+    o.roughness = o.roughness.clamp(0.0, 0.25);
+    o.spike_sharp = o.spike_sharp.clamp(1.0, 6.0);
+    o.spike_count = o.spike_count.clamp(30.0, 160.0);
+    o.spike_gain = clamp01(o.spike_gain);
+    o.wobble_amp = o.wobble_amp.clamp(0.0, 0.06);
+    o.wobble_freq = o.wobble_freq.clamp(1.2, 8.0);
+    o
+}
+
 impl Default for SoundLook {
     fn default() -> Self {
         sound_look(&Timbre { centroid: 900.0, noisiness: 0.3, energy: 0.4, attack_ms: 2.0, decay_ms: 120.0, inharmonic: 0.1, wobble: 0.1 }, false)
@@ -339,6 +457,43 @@ mod tests {
         let dark = smoke_colours(&timbre(800.0, 0.1, 0.5, 100.0, 0.0, 0.0), false);
         let light = smoke_colours(&timbre(800.0, 0.1, 0.5, 100.0, 0.0, 0.0), true);
         assert!(lum(light[1]) < lum(dark[1]));
+    }
+
+    #[test]
+    fn each_kind_reads_as_itself_and_stays_in_range() {
+        let base = SoundLook::default();
+        let k = |kind: Kind| with_kind(&base, kind);
+        assert_eq!(k(Kind::Drums), base, "drums keep the timbre's look");
+        // A bass is heavy, low and large; a lead is smaller and sharper.
+        assert!(k(Kind::Bass).size > k(Kind::Lead).size);
+        assert!(k(Kind::Bass).film_shift > base.film_shift && k(Kind::Bass).fold_freq < base.fold_freq);
+        assert!(k(Kind::Bass).smoke_amount < base.smoke_amount);
+        // A pad is airy and slow: lots of slow vapour, a slow churn, no spikes.
+        let pad = k(Kind::Pad);
+        assert!(pad.smoke_amount >= 0.8 && pad.smoke_rise < base.smoke_rise && pad.churn < base.churn);
+        assert!(pad.spike_gain < 0.15);
+        // A pluck spikes sharply on every note.
+        let pluck = k(Kind::Pluck);
+        assert!(pluck.spike_sharp > pad.spike_sharp + 2.0 && pluck.spike_gain >= 0.9);
+        // FX are noisy and turbulent; a texture is a grainy fog.
+        let fx = k(Kind::Fx);
+        assert!(fx.turbulence > base.turbulence && fx.roughness > base.roughness && fx.churn > base.churn);
+        let tex = k(Kind::Texture);
+        assert!(tex.smoke_amount >= 0.85 && tex.roughness > base.roughness && tex.fold_freq > base.fold_freq);
+        // Keys are glassy.
+        assert!(k(Kind::Keys).roughness < base.roughness);
+        // Any timbre under any kind and any knobs stays in range.
+        for c in [40.0, 900.0, 12_000.0] {
+            for n in [0.0, 1.0] {
+                let l = sound_look(&timbre(c, n, n, 300.0 * n, n, n), n > 0.5);
+                for kind in Kind::ALL {
+                    let o = with_kind(&l, kind);
+                    assert!(all_bounded(&o), "{kind:?} {c} {n}: {o:?}");
+                    let all = Controls { decay: 1.0, body: 1.0, tone: 1.0, grit: 1.0, space: 1.0, deviance: 1.0, tune: 24.0, volume_db: 6.0 };
+                    assert!(all_bounded(&with_controls(&o, &all)), "{kind:?} under the knobs");
+                }
+            }
+        }
     }
 
     #[test]

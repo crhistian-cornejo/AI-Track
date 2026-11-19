@@ -1,6 +1,7 @@
 //! The sixteen sounds as pads under the stage: each in its own colour with
-//! its number and role, lit while it plays, ringed when selected, a lock
-//! when locked. Click a pad to select and hear it, Alt-click to lock it.
+//! its number and role (on a tonal kind, its patch name and the kind's
+//! glyph), lit while it plays, ringed when selected, a lock when locked.
+//! Click a pad to select and hear it, Alt-click to lock it.
 
 use super::look::Look;
 use super::view;
@@ -30,7 +31,14 @@ pub fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[Look; SOUND
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let matching = ws.fx.bloom.view(dev.id).matching.as_ref().map(|m| (m.cell, m.fraction));
     let names = view::names(ws, dev, scene);
-    let locks: [bool; SOUNDS] = std::array::from_fn(|i| view::locked(ws, dev, scene, i));
+    let kind = view::kind(dev);
+    let locks: [bool; SOUNDS] = if kind.is_tonal() {
+        let ps = view::patches(ws, dev);
+        std::array::from_fn(|i| ps.locked(i))
+    } else {
+        std::array::from_fn(|i| scene.locked(i))
+    };
+    let glyph = kind.is_tonal().then(|| super::kind_icon(kind));
     let mut grid = div().w_full().flex().flex_col().gap(px(SP1));
     let cols = cols.clamp(1, SOUNDS);
     for row in 0..SOUNDS.div_ceil(cols) {
@@ -74,10 +82,14 @@ pub fn pads(ws: &mut Workspace, dev: &Dev, scene: &Scene, colours: &[Look; SOUND
                         .gap(px(SP1))
                         .child(mono(format!("{:02}", i + 1), TEXT_XS, if on { pal.text } else { pal.faint }))
                         .child(div().flex_1())
-                        .when_locked(locked, pal.accent),
+                        .when_locked(locked, pal.accent)
+                        .children(glyph.filter(|_| !locked).map(|g| icon(g, 10., with_alpha(c, if on { 1.0 } else { 0.7 })))),
                 )
                 .child(div().pb(px(SP1)).overflow_hidden().child(caption))
-                .tooltip(widgets::tip_owned(format!("{:02} {} — click: hear · Alt-click: lock", i + 1, name)))
+                .tooltip(widgets::tip_owned(match glyph {
+                    Some(_) => format!("{:02} {} · {} patch — click: hear · Alt-click: lock", i + 1, name, kind.label()),
+                    None => format!("{:02} {} — click: hear · Alt-click: lock", i + 1, name),
+                }))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     if e.modifiers.alt {

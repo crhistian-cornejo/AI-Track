@@ -1224,7 +1224,7 @@ impl Workspace {
                 "vaultwin" => self.window_pending = self.dev_vault(),
                 // A Bloom on a new track with a seeded scene; `bloomwin` opens its
                 // window, `bloomplay` lights cells with synthetic activity.
-                "bloom" | "bloomplay" => {
+                _ if word == "bloom" || word == "bloomplay" || word.starts_with("bloomkind=") => {
                     let _ = views::device_ui::bloom::dev_word(self, word);
                 }
                 "bloomwin" => self.window_pending = views::device_ui::bloom::dev_word(self, word),

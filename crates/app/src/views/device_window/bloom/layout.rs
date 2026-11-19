@@ -13,14 +13,14 @@
 //! Every hint lives in a tooltip; the frame timings only show with `AITRACK_FPS`.
 
 use super::matter::{self, Material};
-use super::{TIP_KIND, TIP_SAVE_WT, TIP_BACK, TIP_EXPORT, TIP_FWD, TIP_MATERIAL, TIP_MORPH, TIP_MUTATE, TIP_ROLL, TIP_SPECIES, TIP_STAGE, dial, dial_w, dna, icon_action, knobs, morph, pads, stage, tools, view};
+use super::{TIP_BACK, TIP_EXPORT, TIP_FWD, TIP_KIND, TIP_MATERIAL, TIP_MORPH, TIP_MUTATE, TIP_ROLL, TIP_SPECIES, TIP_STAGE, TIP_STAGE_TONAL, dial, dial_w, dna, icon_action, kind_icon, knobs, morph, pads, patch_view, stage, tools, view};
 use crate::icons::{Icon, icon};
 use crate::theme::*;
 use crate::views::device_ui::{Dev, instr, kit};
 use crate::widgets::{self, label, mono};
 use crate::workspace::{DraggedSample, Workspace};
 use aitrack_stock::instrument::bloom::genome::{SOUNDS, Scene, Species, g};
-use aitrack_stock::instrument::bloom::patch::Kind;
+use aitrack_stock::instrument::bloom::patch::{Kind, Patch};
 use aitrack_stock::instrument::bloom::{VOICES, p};
 use gpui::{
     AnyElement, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, canvas, div,
@@ -340,12 +340,9 @@ fn generator(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
         cx.notify();
     }));
     let place = if len == 0 { "No history yet".to_owned() } else { format!("Scene {} of {}", at + 1, len) };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(SP2))
-        .child(div().flex().gap(px(SP2)).child(roll).child(mutate))
-        .child(div().flex().items_center().gap(px(SP2)).child(prev).child(div().flex_1().flex().justify_center().child(mono(place, TEXT_XS, pal.muted))).child(next))
+    // The history holds drum scenes; a tonal kind steps back with undo.
+    let history = (!view::kind(dev).is_tonal()).then(|| div().flex().items_center().gap(px(SP2)).child(prev).child(div().flex_1().flex().justify_center().child(mono(place, TEXT_XS, pal.muted))).child(next));
+    div().flex().flex_col().gap(px(SP2)).child(div().flex().gap(px(SP2)).child(roll).child(mutate)).children(history)
 }
 
 /// The points of an attack–hold–decay envelope (decay = time to −40 dB),
@@ -368,16 +365,30 @@ pub fn envelope_points(attack: f32, hold: f32, decay: f32, total: f32, n: usize)
 }
 
 /// The selected sound: its colour and name, its lock, its amplitude envelope
-/// (the resonator's ring counts when it outlasts the body) filled in its colour.
-fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, name: String, locked: bool, color: Hsla, cx: &mut Context<Workspace>) -> Div {
+/// filled in its colour: a drum's (the resonator's ring counts when it
+/// outlasts the body), or a tonal patch's amp ADSR over its demo note.
+#[allow(clippy::too_many_arguments)]
+fn selected_sound(dev: &Dev, scene: &Scene, patch: Option<&Patch>, cell: usize, name: String, locked: bool, color: Hsla, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
-    let genome = &scene.sounds[cell.min(SOUNDS - 1)];
-    let gn = genome.folded();
-    let (a, h) = (gn.plain(g::ATTACK), gn.plain(g::HOLD).max(0.0));
-    let ring = if gn.plain(g::RES_MIX) > 0.2 { gn.plain(g::RES_DECAY) * 0.8 } else { 0.0 };
-    let decay = gn.plain(g::DECAY).max(ring).max(1.0);
-    let total = (a + h + decay * 1.15).max(10.0);
-    let pts = envelope_points(a, h, decay, total, 64);
+    let (pts, total, tip) = match patch {
+        Some(x) => {
+            let x = x.folded();
+            let (pts, total) = patch_view::envelope(&x, 0, 64);
+            let w = |f: u32| x.plain(aitrack_stock::instrument::wavetable::p::env(0, f));
+            use aitrack_stock::instrument::wavetable::p as wp;
+            let tip = format!("Amp envelope — attack {:.0} ms · decay {:.0} ms · sustain {:.0}% · release {:.0} ms", w(wp::E_ATTACK), w(wp::E_DECAY), w(wp::E_SUSTAIN), w(wp::E_RELEASE));
+            (pts, total, tip)
+        }
+        None => {
+            let gn = scene.sounds[cell.min(SOUNDS - 1)].folded();
+            let (a, h) = (gn.plain(g::ATTACK), gn.plain(g::HOLD).max(0.0));
+            let ring = if gn.plain(g::RES_MIX) > 0.2 { gn.plain(g::RES_DECAY) * 0.8 } else { 0.0 };
+            let decay = gn.plain(g::DECAY).max(ring).max(1.0);
+            let total = (a + h + decay * 1.15).max(10.0);
+            (envelope_points(a, h, decay, total, 64), total, format!("Envelope — attack {a:.0} ms · decay {decay:.0} ms"))
+        }
+    };
+    let glyph = patch.map(|x| icon(kind_icon(x.kind), 12., pal.muted));
     let grid = pal.grid_beat;
     let plot = canvas(
         |_, _, _| {},
@@ -414,7 +425,8 @@ fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, name: String, locked: b
                 .items_center()
                 .gap(px(SP2))
                 .child(div().size(px(12.)).rounded_full().bg(color))
-                .child(label(format!("{:02} {}", cell + 1, name), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .child(label(crate::paint::fit(&format!("{:02} {}", cell + 1, name), SIDE_W - 96., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
+                .children(glyph)
                 .child(div().flex_1())
                 .child(lock),
         )
@@ -429,16 +441,15 @@ fn selected_sound(dev: &Dev, scene: &Scene, cell: usize, name: String, locked: b
                 .border_color(border())
                 .overflow_hidden()
                 .child(plot)
-                .tooltip(widgets::tip_owned(format!("Envelope — attack {a:.0} ms · decay {decay:.0} ms"))),
+                .tooltip(widgets::tip_owned(tip)),
         )
 }
 
 /// The export chip: renders the selected sound to a WAV, then drags onto a
 /// track or a pad as a sample.
-fn export_chip(ws: &mut Workspace, dev: &Dev, scene: &Scene, cx: &mut Context<Workspace>) -> AnyElement {
+fn export_chip(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
-    let cell = dev.choice(p::SELECTED).min(SOUNDS - 1);
-    let genome = scene.sounds[cell].hash();
+    let genome = view::export_key(ws, dev);
     let v = ws.fx.bloom.view(dev.id);
     let busy = v.export.is_some();
     let ready = v.exported.clone().filter(|e| e.genome == genome);
@@ -496,15 +507,22 @@ fn knob_group(dev: &Dev, group: knobs::Group, cx: &mut Context<Workspace>) -> Op
     Some(div().flex().flex_col().gap(px(SP2)).child(section(group.title(), Some(group.tip()))).child(grid))
 }
 
+/// How a tonal kind plays, under its Play tab.
+pub const TONAL_PLAY: &str = "Kit and Chromatic play the selected patch across the keyboard; Single plays it at its home note.";
+
 /// The tabs under the stage.
 pub const TABS: [(&str, &str); 3] = [("Genes", "Genes — every gene of the selected sound"), ("Play", "Play — how notes reach the sounds"), ("Tools", "Tools — match, Drum Rack, render")];
+
+/// The tabs of a tonal kind (the same three, said for patches).
+pub const TONAL_TABS: [(&str, &str); 3] = [("Genes", "Genes — the selected patch's oscillators, filter, envelopes, motion, FX"), ("Play", "Play — how notes reach the patch"), ("Tools", "Tools — render, open in Wavetable Synth")];
 
 /// The tabs as a segmented control.
 fn tab_strip(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let now = ws.fx.bloom.view(dev.id).stage.tab;
     let mut row = div().flex_none().p(px(2.)).flex().items_center().gap(px(2.)).rounded(px(r_md())).bg(content(0.06)).border_1().border_color(border());
-    for (k, (name, tip)) in TABS.iter().enumerate() {
+    let tabs = if view::kind(dev).is_tonal() { &TONAL_TABS } else { &TABS };
+    for (k, (name, tip)) in tabs.iter().enumerate() {
         let d = dev.clone();
         let on = k == now;
         row = row.child(
@@ -535,35 +553,26 @@ pub fn narrow(width: f32) -> bool {
     width > 0. && width < NARROW_W
 }
 
-/// The Genes tab of a tonal kind: the patch's name and kind, and saving it
-/// as a Wavetable Synth preset (its genes are that synth's parameters).
-fn tonal_panel(dev: &Dev, cell: usize, name: String, color: Hsla, cx: &mut Context<Workspace>) -> AnyElement {
+/// What a tonal patch is like, as five small bars in its colour (in place
+/// of the morph, which blends drum scenes), and how far it has grown.
+fn character(dev: &Dev, x: &Patch, distance: f32, color: Hsla) -> Div {
     let pal = p();
-    let d = dev.clone();
-    let save = big_button(("bloom-save-wt", dev.key(0x6A0)), "Save as Wavetable preset", Icon::Download, false, TIP_SAVE_WT)
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(cx.listener(move |this, _, _, cx| {
-            match view::save_patch_preset(this, &d, cell) {
-                Ok(n) => this.toast(format!("Saved {n} in Wavetable Synth presets"), cx),
-                Err(e) => this.toast(e, cx),
-            }
-            cx.notify();
-        }));
-    card()
-        .child(section("PATCH", None))
-        .child(
+    let mut rows = div().flex().flex_col().gap(px(SP1));
+    for (k, (name, v)) in patch_view::character(x).into_iter().enumerate() {
+        rows = rows.child(
             div()
+                .id(("bloom-character", dev.key(0x6B0 | k)))
+                .h(px(12.))
                 .flex()
                 .items_center()
-                .gap(px(SP3))
-                .child(div().size(px(12.)).rounded_full().bg(color))
-                .child(label(format!("{:02} {}", cell + 1, name), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
-                .child(label(view::kind(dev).label(), TEXT_SM, pal.muted))
-                .child(div().flex_1())
-                .child(div().w(px(260.)).child(save)),
-        )
-        .child(label("Played by Bloom's built-in Wavetable Synth. Save it to open and edit every parameter there.", TEXT_SM, pal.muted))
-        .into_any_element()
+                .gap(px(SP2))
+                .child(div().w(px(44.)).child(label(name, TEXT_XS, pal.muted)))
+                .child(div().flex_1().h(px(4.)).rounded(px(2.)).bg(content(0.08)).child(div().h_full().w(gpui::relative(v.clamp(0.02, 1.))).rounded(px(2.)).bg(color)))
+                .child(div().w(px(28.)).flex().justify_end().child(mono(format!("{:.0}", v * 100.), TEXT_XS, pal.faint)))
+                .tooltip(widgets::tip_owned(format!("{name} — {:.0} %", v * 100.))),
+        );
+    }
+    rows.child(div().pt(px(SP1)).flex().items_center().gap(px(SP2)).child(label("Grown", TEXT_XS, pal.muted)).child(div().flex_1()).child(mono(format!("{distance:.2} from its core"), TEXT_XS, pal.faint)))
 }
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
@@ -571,28 +580,35 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let pal = p();
     let scene = view::shown(ws, dev);
     let cell = ws.fx.bloom.view(dev.id).dna_cell.unwrap_or_else(|| dev.choice(p::SELECTED)).min(SOUNDS - 1);
-    let looks = view::looks(ws, &scene, view::Shape::of(dev));
+    let looks = view::looks(ws, dev, &scene);
     let cell_color = stage::colour(&looks[cell]);
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let sel_color = stage::colour(&looks[selected]);
     let names = view::names(ws, dev, &scene);
     let tonal = view::kind(dev).is_tonal();
+    let shown_patches = tonal.then(|| view::shown_patches(ws, dev));
     let root_region = ws.fx.region(dev.id, 20);
     let width = f32::from(root_region.get().size.width);
     let narrow = narrow(width);
 
-    // Left: the generator and the selected sound.
+    // Left: the generator and the selected sound, then the morph (drums) or
+    // the patch's character (tonal kinds, which do not morph).
+    let sel_patch = shown_patches.as_ref().map(|ps| ps.patches[selected]);
+    let lower: (Stateful<Div>, Div) = match &shown_patches {
+        Some(ps) => (section("CHARACTER", Some("Character — what the selected patch is like")), character(dev, &ps.patches[selected], ps.distances[selected], sel_color)),
+        None => (section("MORPH", Some(TIP_MORPH)), morph(ws, dev, 92., cx)),
+    };
     let left = card()
         .flex_none()
         .w(px(SIDE_W))
         .child(section("GENERATE", None))
         .child(generator(ws, dev, cx))
         .child(section("SELECTED SOUND", None))
-        .child(selected_sound(dev, &scene, selected, names[selected].clone(), view::locked(ws, dev, &scene, selected), sel_color, cx))
-        .child(section("MORPH", Some(TIP_MORPH)))
-        .child(morph(ws, dev, 92., cx))
+        .child(selected_sound(dev, &scene, sel_patch.as_ref(), selected, names[selected].clone(), view::locked(ws, dev, &scene, selected), sel_color, cx))
+        .child(lower.0)
+        .child(lower.1)
         .child(div().flex_1())
-        .child(export_chip(ws, dev, &scene, cx));
+        .child(export_chip(ws, dev, cx));
 
     // Middle: the stage, inset in a bezel whose colour the panel's corners take, and the pads.
     let bezel = pal.surface;
@@ -608,7 +624,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .border_1()
         .border_color(border())
         .child(st)
-        .tooltip(widgets::tip(TIP_STAGE, None));
+        .tooltip(widgets::tip(if tonal { TIP_STAGE_TONAL } else { TIP_STAGE }, None));
     let columns = if narrow { 1. } else { 2. };
     let stage_w = if width > 0. { width - 2. * SP4 - columns * (SIDE_W + SP3) } else { 560. };
     let cols = if pads::rows(stage_w) == 1 { SOUNDS } else { SOUNDS / 2 };
@@ -627,7 +643,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     // Tabs: the genes of the selected sound, the morph, the play settings, the tools.
     let tab = ws.fx.bloom.view(dev.id).stage.tab.min(TABS.len() - 1);
     let body = match tab {
-        0 if tonal => tonal_panel(dev, cell, names[cell].clone(), cell_color, cx),
+        0 if let Some(ps) = &shown_patches => patch_view::panel(ws, dev, ps, cell, &names[cell], cell_color, cx),
         0 => dna::panel(ws, dev, &scene, cell, cell_color, cx),
         1 => card()
             .child(section("PLAY", None))
@@ -638,9 +654,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                     .items_end()
                     .gap(px(SP4))
                     .child(div().flex().flex_col().gap(px(SP1)).child(label("Mode", TEXT_XS, pal.muted)).child(instr::chips(dev, p::MODE, cx)))
-                    .child(div().flex().flex_col().gap(px(SP1)).child(label("Choke", TEXT_XS, pal.muted)).child(instr::chips(dev, p::CHOKE, cx)))
-                    .child(dial(dev, p::BASE, KNOB, cx))
-                    .child(dial(dev, p::SELECTED, KNOB, cx)),
+                    // Choke and Base lay out drum kits; a tonal patch plays chromatically.
+                    .when(!tonal, |d| d.child(div().flex().flex_col().gap(px(SP1)).child(label("Choke", TEXT_XS, pal.muted)).child(instr::chips(dev, p::CHOKE, cx))).child(dial(dev, p::BASE, KNOB, cx)))
+                    .child(dial(dev, p::SELECTED, KNOB, cx))
+                    .when(tonal, |d| d.child(dial(dev, p::GLIDE, KNOB, cx)).child(dial(dev, p::VELOCITY, KNOB, cx)).child(label(TONAL_PLAY, TEXT_XS, pal.faint))),
             )
             .into_any_element(),
         _ => card().child(section("TOOLS", None)).child(tools(ws, dev, cx)).into_any_element(),

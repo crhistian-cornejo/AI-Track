@@ -95,7 +95,10 @@ pub fn audition(ws: &mut Workspace, dev: &Dev, i: usize, cx: &mut Context<Worksp
         set_now(ws, dev.id, p::SELECTED, dev.to_norm(p::SELECTED, i as f32));
     }
     let Some(track) = ws.s.project.device_track(dev.id) else { return };
+    let kind = view::kind(dev);
     let key = match dev.choice(p::MODE) {
+        // A tonal patch is heard at its kind's demo note (a bass low, a lead high).
+        _ if kind.is_tonal() => aitrack_stock::instrument::bloom::demo_note(kind).0,
         0 => (dev.plain(p::BASE).round() as i32 + i as i32).clamp(0, 127) as u8,
         _ => 60,
     };
@@ -120,10 +123,19 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
     if let Some((cell, _, Some(best))) = matching {
         shown.sounds[cell] = best;
     }
-    let looks = view::looks(ws, &shown, view::Shape::of(dev));
+    let looks = view::looks(ws, dev, &shown);
+    // A tonal kind's cells rest at its patches' distances, labelled by kind.
+    let tonal = view::kind(dev).is_tonal();
+    let (distances, locks) = if tonal {
+        let ps = view::shown_patches(ws, dev);
+        (ps.distances, std::array::from_fn::<bool, SOUNDS, _>(|i| ps.locked(i)))
+    } else {
+        (scene.distances, std::array::from_fn(|i| scene.locked(i)))
+    };
+    let kind_label = view::kind(dev).label();
     let busy = ws.fx.bloom.busy();
     let v = ws.fx.bloom.view(device);
-    let moving = view::step(v, &scene.distances, &env, &hits, reduced);
+    let moving = view::step(v, &distances, &env, &hits, reduced);
     let cells: Vec<CellPaint> = (0..SOUNDS)
         .map(|i| {
             let a = v.anim[i];
@@ -137,8 +149,8 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
                 r: base * (1.0 + 0.6 * a.swell) * grow,
                 look,
                 selected: i == selected,
-                locked: scene.locked(i),
-                label: scene.sounds[i].role.short(),
+                locked: locks[i],
+                label: if tonal { kind_label } else { scene.sounds[i].role.short() },
                 phase: i as f32 * 0.7 + v.time * 0.25 * look.wobble,
                 swell: a.swell,
                 progress,
@@ -191,7 +203,7 @@ pub fn visual(ws: &mut Workspace, dev: &Dev, scene: &Scene, labels: bool, cx: &m
             cx.notify();
             return;
         }
-        let dist = view::scene(this, &d).distances[i];
+        let dist = view::distance(this, &d, i);
         this.fx.bloom.view(d.id).drag = Some(CellDrag { cell: i, from: (f32::from(e.position.x), f32::from(e.position.y)), moved: false, distance: dist, start: dist });
         this.fx.bloom.view(d.id).dna_cell = Some(i);
         audition(this, &d, i, cx);
@@ -256,7 +268,6 @@ fn capture(dev: &Dev, region: crate::views::device_ui::Region, cx: &mut Context<
                 }
                 let _ = w.update(cx, |this, cx| {
                     let (ux, uy) = units(rr.get(), e.position);
-                    let scene = view::scene(this, &dd);
                     let v = this.fx.bloom.view(dd.id);
                     let Some(mut drag) = v.drag else { return };
                     let (fx, fy) = drag.from;
@@ -267,7 +278,7 @@ fn capture(dev: &Dev, region: crate::views::device_ui::Region, cx: &mut Context<
                         // Steps of 0.02: a drag visits a bounded set of sounds.
                         drag.distance = (view::distance_of((ux * ux + uy * uy).sqrt()) * 50.).round() / 50.;
                         v.drag = Some(drag);
-                        v.preview = Some(aitrack_stock::instrument::bloom::grow::regrow(&scene, drag.cell, drag.distance));
+                        view::preview_regrow(this, &dd, drag.cell, drag.distance);
                     }
                     cx.notify();
                 });
@@ -279,14 +290,8 @@ fn capture(dev: &Dev, region: crate::views::device_ui::Region, cx: &mut Context<
                 }
                 let _ = w.update(cx, |this, cx| {
                     this.release_audition(cx);
-                    let v = this.fx.bloom.view(dd.id);
-                    let Some(drag) = v.drag.take() else { return };
-                    let preview = v.preview.take();
-                    if drag.moved
-                        && let Some(scene) = preview
-                    {
-                        view::commit(this, &dd, &scene, None, "Regrow sound");
-                    }
+                    let Some(drag) = this.fx.bloom.view(dd.id).drag.take() else { return };
+                    view::finish_regrow(this, &dd, drag.moved);
                     cx.notify();
                 });
             });

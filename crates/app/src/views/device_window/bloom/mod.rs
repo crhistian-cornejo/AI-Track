@@ -11,6 +11,7 @@ pub mod layout;
 pub mod look;
 pub mod matter;
 pub mod pads;
+pub mod patch_view;
 pub mod stage;
 pub mod view;
 pub mod visual;
@@ -26,6 +27,7 @@ use crate::widgets::{self, knob_cell, label, mono, text_button};
 use crate::workspace::{KnobTarget, Workspace};
 use aitrack_stock::instrument::bloom::genome::SOUNDS;
 use aitrack_stock::instrument::bloom::p;
+use aitrack_stock::instrument::bloom::patch::Kind;
 use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
@@ -58,6 +60,9 @@ pub const TIP_FWD: &str = "Forward — the next scene";
 pub const TIP_SPECIES: &str = "Species — the family Roll grows from";
 pub const TIP_KIND: &str = "Kind — drums, bass, lead, pad, keys, FX…";
 pub const TIP_SAVE_WT: &str = "Save — this sound as a Wavetable Synth preset";
+pub const TIP_OPEN_WT: &str = "Open — this sound as a Wavetable Synth after Bloom";
+pub const TIP_STAGE_TONAL: &str = "Click: hear · drag: regrow · Alt-click: lock";
+pub const TIP_RENDER_TONAL: &str = "Render — 16 WAVs of the patches' notes into the library";
 pub const TIP_MATERIAL: &str = "Matter — the look only, not the sound";
 pub const TIP_STAGE: &str = "Click: hear · drag: regrow · Alt-click: lock · drop a sample: match";
 pub const TIP_OPEN: &str = "Open — the full Bloom window";
@@ -67,6 +72,20 @@ pub const TIP_RENDER: &str = "Render — 16 WAVs into the library";
 pub const TIP_EXPORT: &str = "Export — the selected sound as a WAV to drag";
 pub const TIP_CORNER: &str = "Store the scene here · Alt-click clears";
 pub const TIP_MORPH: &str = "Morph — blend the four stored scenes";
+
+/// The glyph of a kind of sound.
+pub fn kind_icon(kind: Kind) -> Icon {
+    match kind {
+        Kind::Drums => Icon::Drum,
+        Kind::Bass => Icon::Waveform,
+        Kind::Lead => Icon::MusicNote,
+        Kind::Pad => Icon::Cloud,
+        Kind::Pluck => Icon::Strum,
+        Kind::Keys => Icon::Piano,
+        Kind::Fx => Icon::Sparkles,
+        Kind::Texture => Icon::Layers,
+    }
+}
 
 /// A button that runs `f` on the workspace.
 pub fn action(id: (&'static str, usize), text: &'static str, i: Icon, primary: bool, tip: &'static str, cx: &mut Context<Workspace>, f: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static) -> AnyElement {
@@ -95,17 +114,21 @@ pub fn icon_action(id: (&'static str, usize), i: Icon, enabled: bool, tip: &'sta
         .into_any_element()
 }
 
-/// Roll, Mutate and the history arrows.
+/// Roll, Mutate and the history arrows (drums only: tonal kinds step back
+/// with undo).
 pub fn grow_buttons(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
     let v = ws.fx.bloom.view(dev.id);
     let (back, fwd) = (v.at > 0, v.at + 1 < v.history.len());
     let (d1, d2, d3, d4) = (dev.clone(), dev.clone(), dev.clone(), dev.clone());
-    vec![
+    let mut out = vec![
         action(("bloom-roll", dev.key(1)), "Roll", Icon::Dice, true, TIP_ROLL, cx, move |ws, _| view::roll(ws, &d1, None)),
         action(("bloom-mutate", dev.key(2)), "Mutate", Icon::Shuffle, false, TIP_MUTATE, cx, move |ws, _| view::mutate(ws, &d2)),
-        icon_action(("bloom-back", dev.key(3)), Icon::ChevronLeft, back, TIP_BACK, cx, move |ws, _| view::step_history(ws, &d3, -1)),
-        icon_action(("bloom-fwd", dev.key(4)), Icon::ChevronRight, fwd, TIP_FWD, cx, move |ws, _| view::step_history(ws, &d4, 1)),
-    ]
+    ];
+    if !view::kind(dev).is_tonal() {
+        out.push(icon_action(("bloom-back", dev.key(3)), Icon::ChevronLeft, back, TIP_BACK, cx, move |ws, _| view::step_history(ws, &d3, -1)));
+        out.push(icon_action(("bloom-fwd", dev.key(4)), Icon::ChevronRight, fwd, TIP_FWD, cx, move |ws, _| view::step_history(ws, &d4, 1)));
+    }
+    out
 }
 
 /// The morph corners and the X/Y pad.
@@ -156,8 +179,39 @@ pub fn morph(ws: &mut Workspace, dev: &Dev, pad: f32, cx: &mut Context<Workspace
     div().flex().gap(px(SP2)).child(slots).child(pad_el)
 }
 
-/// Match, the next-best matches, the Drum Rack and the sample export.
+/// The tools of a tonal kind: the sixteen patches rendered to WAVs, the
+/// selected one opened in the Wavetable Synth or saved as its preset
+/// (matching and the Drum Rack grow drums).
+fn tonal_tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
+    let pal = p();
+    let rendering = ws.fx.bloom.view(dev.id).rendering.as_ref().map(|r| r.done);
+    let cell = dev.choice(p::SELECTED).min(SOUNDS - 1);
+    let (d1, d2, d3) = (dev.clone(), dev.clone(), dev.clone());
+    let mut row = div().flex().flex_wrap().gap(px(SP1));
+    row = row.child(match rendering {
+        Some(n) => div().h(px(m().control_h)).px(px(SP2)).flex().items_center().child(mono(format!("Rendering {n}/16…"), TEXT_XS, pal.muted)).into_any_element(),
+        None => action(("bloom-render", dev.key(7)), "Render samples", Icon::Download, false, TIP_RENDER_TONAL, cx, move |ws, _| view::start_render(ws, &d1)),
+    });
+    row = row.child(action(("bloom-open-wt-tool", dev.key(8)), "Open in Wavetable Synth", Icon::OpenWindow, false, TIP_OPEN_WT, cx, move |ws, cx| view::open_in_wavetable(ws, &d2, cell, cx)));
+    row = row.child(action(("bloom-save-wt-tool", dev.key(9)), "Save as Wavetable preset", Icon::Download, false, TIP_SAVE_WT, cx, move |ws, cx| match view::save_patch_preset(ws, &d3, cell) {
+        Ok(n) => ws.toast(format!("Saved {n} in Wavetable Synth presets"), cx),
+        Err(e) => ws.toast(e, cx),
+    }));
+    let kind = view::kind(dev).label();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .child(row)
+        .child(label(format!("{kind} patches play through Bloom's built-in Wavetable Synth; open one there to edit every parameter."), TEXT_XS, pal.faint))
+}
+
+/// Match, the next-best matches, the Drum Rack and the sample export (on a
+/// tonal kind, [`tonal_tools`]).
 pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
+    if view::kind(dev).is_tonal() {
+        return tonal_tools(ws, dev, cx);
+    }
     let pal = p();
     let v = ws.fx.bloom.view(dev.id);
     let matching = v.matching.as_ref().map(|m| (m.fraction, m.name.clone(), m.distance, m.started.elapsed().as_secs()));

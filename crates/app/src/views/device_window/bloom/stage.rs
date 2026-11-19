@@ -15,7 +15,7 @@
 //! it into the selected sound.
 
 use super::matter::frame::{Live, Panel};
-use super::matter::mapping::{Controls, SoundLook, blend, sound_look, with_controls};
+use super::matter::mapping::{Controls, SoundLook, blend, sound_look, with_controls, with_kind};
 use super::matter::service::{self, Image, Status};
 use super::matter::uniforms::Uniforms;
 use super::view::{self, CellDrag};
@@ -96,6 +96,8 @@ pub struct StageState {
     pub kind_menu: bool,
     /// Gene groups folded in the gene editor (bit per group).
     pub folded: u16,
+    /// Groups folded in the patch view of tonal kinds (bit per group).
+    pub patch_folded: u16,
     /// The tab under the stage (DNA, Morph, Play, Tools).
     pub tab: usize,
     /// UI-side cost of the last frame, ms (the stage's own work only).
@@ -297,12 +299,15 @@ pub fn available() -> Option<bool> {
     }
 }
 
-/// The looks of every sound of `scene` on the stage: from its analysed
-/// timbre, leaning towards what the meter hears while it plays.
+/// The looks of every sound on the stage (`scene`'s drums, or on a tonal
+/// kind the patches): from its analysed timbre, leaning towards what the
+/// meter hears while it plays, carried the way its kind moves
+/// ([`with_kind`]), under the knobs.
 pub fn sound_looks(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> [SoundLook; SOUNDS] {
     let light = !p().dark;
     let knobs = controls(dev);
-    let timbres = view::timbres(ws, scene, view::Shape::of(dev));
+    let kind = view::kind(dev);
+    let timbres = view::timbres(ws, dev, scene);
     let st = &mut ws.fx.bloom.view(dev.id).stage;
     if st.looks.len() > 1_024 {
         st.looks.clear();
@@ -313,9 +318,9 @@ pub fn sound_looks(ws: &mut Workspace, dev: &Dev, scene: &Scene) -> [SoundLook; 
         let env = dev.m(i).clamp(0.0, 1.0);
         if env > 0.02 {
             let live = Timbre { centroid: live_centroid(dev.m(48 + i)), noisiness: dev.m(64 + i).clamp(0.0, 1.0), ..t };
-            with_controls(&blend(&base, &sound_look(&live, light), 0.5 * env), &knobs)
+            with_controls(&with_kind(&blend(&base, &sound_look(&live, light), 0.5 * env), kind), &knobs)
         } else {
-            with_controls(&base, &knobs)
+            with_controls(&with_kind(&base, kind), &knobs)
         }
     })
 }
@@ -344,7 +349,9 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
     let playing = ws.b.engine.transport().playing;
     let selected = dev.choice(p::SELECTED).min(SOUNDS - 1);
     let matching = ws.fx.bloom.view(device).matching.as_ref().map(|m| (m.cell, m.fraction, m.best));
+    let tonal = view::kind(dev).is_tonal();
     let looks = match matching {
+        _ if tonal => sound_looks(ws, dev, scene),
         Some((cell, _, Some(best))) => {
             let mut shown = view::played(ws, dev, scene);
             shown.sounds[cell] = best;
@@ -356,6 +363,7 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
         }
     };
     let material = view::parsed(ws, device).material;
+    let grown_from = if tonal { view::patches(ws, dev).seed } else { scene.seed };
     let busy = ws.fx.bloom.busy();
     let v = ws.fx.bloom.view(device);
     let (env, pulse, hits, level) = live_meter(dev, v.fake, v.stage.anim.time);
@@ -390,7 +398,7 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
     let light = !pal.dark;
     let bg = linear(pal.well);
     let outer = encoded(opts.outer);
-    let seed = scene.seed as f32 % 997.0 + selected as f32 * 0.37;
+    let seed = grown_from as f32 % 997.0 + selected as f32 * 0.37;
     let corner = r_md();
     let (swatches, zoom) = (opts.swatches, opts.zoom);
     let key_base = device.0 << 24 | u64::from(opts.slot) << 16;
@@ -479,7 +487,7 @@ pub fn stage(ws: &mut Workspace, dev: &Dev, scene: &Scene, opts: Opts, cx: &mut 
             cx.notify();
             return;
         }
-        let dist = view::scene(this, &d).distances[cell];
+        let dist = view::distance(this, &d, cell);
         let v = this.fx.bloom.view(d.id);
         v.drag = Some(CellDrag { cell, from: (f32::from(e.position.x), f32::from(e.position.y)), moved: false, distance: dist, start: dist });
         v.dna_cell = Some(cell);
@@ -567,7 +575,6 @@ fn capture(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
                     return;
                 }
                 let _ = w.update(cx, |this, cx| {
-                    let scene = view::scene(this, &dd);
                     let v = this.fx.bloom.view(dd.id);
                     let Some(mut drag) = v.drag else { return };
                     let (fx, fy) = drag.from;
@@ -580,7 +587,7 @@ fn capture(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
                         // of 0.02, so a drag visits a bounded set of sounds.
                         drag.distance = ((drag.start + (dx - dy) / 260.).clamp(0.0, 1.5) * 50.).round() / 50.;
                         v.drag = Some(drag);
-                        v.preview = Some(aitrack_stock::instrument::bloom::grow::regrow(&scene, drag.cell, drag.distance));
+                        view::preview_regrow(this, &dd, drag.cell, drag.distance);
                     }
                     cx.notify();
                 });
@@ -592,14 +599,8 @@ fn capture(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
                 }
                 let _ = w.update(cx, |this, cx| {
                     this.release_audition(cx);
-                    let v = this.fx.bloom.view(dd.id);
-                    let Some(drag) = v.drag.take() else { return };
-                    let preview = v.preview.take();
-                    if drag.moved
-                        && let Some(scene) = preview
-                    {
-                        view::commit(this, &dd, &scene, None, "Regrow sound");
-                    }
+                    let Some(drag) = this.fx.bloom.view(dd.id).drag.take() else { return };
+                    view::finish_regrow(this, &dd, drag.moved);
                     cx.notify();
                 });
             });

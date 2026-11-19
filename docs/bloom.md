@@ -21,7 +21,7 @@ embedded Wavetable Synth (see [Tonal kinds](#tonal-kinds)).
 | `crates/stock/examples/bloom_kinds.rs` | Offline audition: per kind, a WAV of sixteen patches playing a phrase, a spectrogram PNG, a stats table |
 | `crates/ai/src/generate/bloom.rs` | Matching a sample (evolution search over the embedding) |
 | `crates/app/src/views/device_ui/bloom.rs` | The Device View card, dev views |
-| `crates/app/src/views/device_window/bloom/` | The window (`layout.rs`), the GPU stage (`stage.rs`, `matter/`), the CPU field fallback, the look mapping, the DNA panel |
+| `crates/app/src/views/device_window/bloom/` | The window (`layout.rs`), the GPU stage (`stage.rs`, `matter/`), the CPU field fallback, the look mapping, the DNA panel, the tonal patch view (`patch_view.rs`) |
 
 ## Parameters
 
@@ -231,6 +231,67 @@ with other block sizes differ only by the synth's control-rate grid.
   `state_json_with` writes no `extra.patches` (the device then regrows the
   same scene from Seed and Kind; only edits and locks would be lost).
 
+### In the editor
+
+Everything the drum scene has, the tonal scene has too, said for patches:
+
+- **The visual follows the patches.** Each patch is analysed off the UI
+  thread (`view::patch_timbre`: the first 750 ms of its demo note, exactly
+  `bloom::patch_timbre` but rendering only those 750 ms in whole 256-frame
+  blocks; 6–25 ms a patch, about 0.2 s for a new scene of sixteen) on its own
+  worker (`bloom-tonal-analysis`, newest request first, so the last frame of
+  a drag is analysed next; drums keep theirs). Results are cached by the
+  patch's hash and a `view::PatchShape`: every knob that reaches a patch
+  (`tonal::Knobs` and Tune) rounded to 5 % steps (the defaults sit on the
+  grid), Glide to 10 ms. While an
+  analysis is pending, the same patch under other knobs stands in, else
+  what that cell showed last in this scene (an edit, a regrow), else
+  `look::estimate_patch` (the demo note through the oscillators, the
+  low-pass and the amp envelope): a knob drag or an edit never flickers.
+  The window's looks, the stage's `sound_looks`, the pads' colours, the
+  card and the CPU field all read them.
+- **Each kind moves as itself** (`mapping::with_kind`, on top of the
+  timbre's look and under the knobs): a bass is heavy, low and large (a
+  bigger, lumpier mass, broad slow folds, a thick warm film, little vapour,
+  blunt spikes); a lead taut and bright (smaller, thinner film, sharp spikes
+  on each note); a pad airy and slow (long vapour rising slowly, a slow
+  churn, a smooth surface, almost no spikes); a pluck sharp (needle spikes
+  on every note); keys glassy (smooth, clean cones, light vapour); FX noisy
+  and turbulent (rough, churning, wild vapour, a tremble); a texture a
+  grainy fog (dense vapour, rough fine folds, fine spikes). The selected
+  patch's meter slots follow the synth (envelope, a pulse and a hit per
+  note, live centroid, noise share), so the stage swells and spikes as it
+  plays.
+- **The patch view** (the Genes tab, `patch_view.rs`): the selected patch in
+  the gene editor's language, folding groups of small knobs in its colour:
+  Osc A–C (wave, position, level, unison voices, detune; B and C when they
+  sound), Sub · Noise, Filter (type, model, cutoff, resonance, env amount,
+  drive), the amp and mod envelopes as small curves with their A/D/S/R, the
+  Motion (every LFO and route in words: "LFO 1 · Sine 0.40 Hz → Osc 1
+  Position +35 %") and the FX (drive, chorus, delay, reverb on/off). A
+  drag previews the patch and stores it on release as one undo step through
+  `SetDeviceState` (`view::set_patch_params` → `tonal::replace`, so the
+  cell's core is re-based and it keeps its place on its path); a
+  double-click resets a value to the synth's default; switches skip the "—"
+  padding of the append-only lists. **Save as Wavetable preset** writes it
+  (knobs baked in, Bloom's level) to the synth's user presets; **Open in
+  Wavetable Synth** adds an `instrument.wavetable` with those parameters
+  right after Bloom on the same chain (`view::wavetable_commands`, one
+  `AddDevice`, one undo step) and opens its window.
+- **Pads and labels**: the patch's name, the kind's glyph (Bass a waveform,
+  Lead a note, Pad a cloud, Pluck a strum, Keys a piano, FX sparkles,
+  Texture layers); the tooltip "03 Glass Choir · Pad patch — click: hear ·
+  Alt-click: lock". A pad is heard at its kind's demo note. The card's
+  overlay shows the kind (glyph, name, seed) and the patch name.
+- **Drum-only parts step aside**: the species picker, the "Scene n of m"
+  history (undo steps back through tonal rolls), Match (and dropping a
+  sample on the stage), To Drum Rack, Choke and Base. The left column shows
+  the patch's **Character** (Bright, Width, Motion, Grit, Air, and how far
+  it has grown) where drums show the Morph. **Export sound** and **Render
+  samples** write the patches' demo notes (`bloom::render_patch`, 24-bit
+  48 kHz, the silent tail trimmed) to `AI-Track/Bloom/<kind> <seed>`.
+  Dragging the mass regrows the selected patch (`tonal::regrow`).
+
 Audition offline (no window):
 `cargo run -p aitrack-stock --release --example bloom_kinds -- <out_dir> [seed]`
 writes `<kind>.wav` and `<kind>.png` (spectrogram, 30 Hz–16 kHz log, patch
@@ -333,7 +394,11 @@ Offline preview (headless, no window):
 writes every material at rest and on a hit, six sounds' looks, light and dark
 panels, a 30-frame strip and `timing.txt`. `MATTER_WGSL=<file>` renders with
 another copy of the shader, to tune it without rebuilding. A second argument
-`knobs` writes only `knobs-{light,dark}.png`: one sound under each knob.
+`knobs` writes only `knobs-{light,dark}.png`: one sound under each knob;
+`tonal [seed]` writes only `tonal-{light,dark}.png` (a row per tonal kind:
+its scene at rest with the sixteen pad colours, then 0.12, 0.6 and 1.6 s
+into a note of its first patch) and `tonal-kinds.txt` (every patch's
+timbre).
 
 ## The field (CPU fallback)
 
@@ -376,7 +441,10 @@ neighbours. It never runs on the audio thread and stops when cancelled.
   Bloom in Single mode holding the scene (so a pad can be switched to
   another sound later), hats in one choke group.
 - **Render samples**: sixteen 24-bit WAVs in `AI-Track/Bloom/<species> <seed>`
-  of the music folder, added to the library.
+  of the music folder, added to the library (tonal kinds: each patch's demo
+  note in `AI-Track/Bloom/<kind> <seed>`).
+- **Open in Wavetable Synth** (tonal kinds): the selected patch as a new
+  Wavetable Synth after Bloom, its window open.
 - **Export sound** (the chip under the macros): the selected sound as one
   WAV in the same folder; the chip then drags it onto a track or a pad as a
   sample (inside the app: GPUI has no drag out to the OS).
@@ -386,4 +454,5 @@ neighbours. It never runs on the audio thread and stops when cancelled.
 
 `AITRACK_DEV_VIEW=bloom` (a Bloom on a new track, seeded scene, card
 visible), `bloomwin` (its window open), `bloomplay` (synthetic activity:
-some cells glow and ring).
+some cells glow and ring), `bloomkind=pad` (any kind's name: the Bloom
+grows that kind; e.g. `bloomkind=pluck,bloomplay,bloomwin`).

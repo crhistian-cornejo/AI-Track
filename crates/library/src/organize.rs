@@ -435,7 +435,8 @@ mod tests {
     #[test]
     fn move_updates_index_and_undo_restores() {
         let (dir, lib, root) = setup();
-        let dest = dir.path().canonicalize().unwrap().join("ByCat");
+        // As the library stores folders (on Windows without the `\\?\` prefix of `canonicalize`).
+        let dest = crate::db::normalize_for_roots(dir.path()).join("ByCat");
         let plan = lib.plan_organize(&[], &dest, OrganizeLayout::ByCategory, OrganizeMode::Move).unwrap();
         let j = plan.execute(&lib).unwrap();
         assert!(!root.join("PackA/Pad C#maj.wav").exists());

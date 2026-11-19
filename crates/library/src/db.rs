@@ -23,14 +23,15 @@ pub const SCHEMA_VERSION: i32 = 4;
 /// its symlinks resolved, because the OS reports canonical paths to the
 /// watcher (on macOS `/var` is `/private/var`), and a root stored through a
 /// link would never match them. Relative paths (the portable factory library)
-/// and paths that do not exist yet are kept as given.
+/// and paths that do not exist yet are kept as given (on Windows without a
+/// `\\?\` prefix: a root written with it matches no path looked up later).
 pub(crate) fn stored_root_path(path: &Path) -> String {
     let real = path
         .is_absolute()
         .then(|| path.canonicalize().ok())
         .flatten()
-        .map(strip_verbatim)
         .unwrap_or_else(|| path.to_path_buf());
+    let real = strip_verbatim(real);
     real.to_string_lossy().replace('\\', "/")
 }
 
@@ -1165,6 +1166,14 @@ mod tests {
         let missing = dir.path().join("not-yet");
         assert_eq!(stored_root_path(&missing), missing.to_string_lossy().replace('\\', "/"));
         assert_eq!(stored_root_path(Path::new("factory/samples")), "factory/samples");
+    }
+
+    /// `canonicalize` gives `\\?\C:\…`; a folder that is not there yet cannot be
+    /// canonicalized again, and must still be stored without the prefix.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_root_given_with_the_verbatim_prefix_is_stored_without_it() {
+        assert_eq!(stored_root_path(Path::new(r"\\?\C:\nowhere\not-yet")), "C:/nowhere/not-yet");
     }
 
     #[test]

@@ -540,7 +540,9 @@ mod tests {
         use crate::test_util::write_wav;
 
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap();
+        // The folder as the library stores and reports it: symlinks resolved, and on Windows
+        // without the `\\?\` prefix of `canonicalize` (a path with it never equals one without).
+        let home = crate::db::normalize_for_roots(dir.path());
         let drive = home.join("Library/CloudStorage/GoogleDrive-me@example.com/My Drive");
         let pack = drive.join("Trap Pack");
         mkdirs(&pack, &["Kicks", "Loops"]);
@@ -611,7 +613,7 @@ mod tests {
         use crate::test_util::write_wav;
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("Dropbox");
+        let root = crate::db::normalize_for_roots(dir.path()).join("Dropbox");
         std::fs::create_dir_all(&root).unwrap();
         let lib = Library::open(dir.path().join("lib.db")).unwrap();
         lib.add_root(&root, RootKind::User).unwrap();
@@ -640,7 +642,7 @@ mod tests {
         use crate::test_util::write_wav;
 
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
+        let base = crate::db::normalize_for_roots(dir.path());
         let root = base.join("OneDrive");
         std::fs::create_dir_all(&root).unwrap();
         let db = base.join("lib.db");

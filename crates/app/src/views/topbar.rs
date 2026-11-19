@@ -252,7 +252,7 @@ impl BarLayout {
     /// before they are clipped. Counted from the controls themselves, with a
     /// little to spare.
     fn right_width(self) -> f32 {
-        let mut w = 24. * 3. + 24. + 156. + 24. + 3. * SP1 + 9. + SP1 * 6.;
+        let mut w = 24. * 3. + 24. + 160. + 24. + 3. * SP1 + 9. + SP1 * 6.;
         if self.cpu {
             w += 92. + 9. + 2. * SP1;
         }

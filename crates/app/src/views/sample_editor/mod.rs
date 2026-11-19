@@ -763,7 +763,9 @@ fn tool_button(id: &'static str, text: &'static str, enabled: bool) -> Stateful<
 /// selected envelope. A dot marks the ones the clip has.
 fn envelope_chooser(selected: ClipEnv, has: [bool; 3], cx: &mut Context<Workspace>) -> impl IntoElement {
     let pal = p();
-    let mut row = div().flex().items_center().gap(px(2.)).p(px(2.)).rounded(px(r_md())).bg(pal.well);
+    let inner_r = r_sm();
+    let outer_r = if inner_r > 0. { inner_r + 3. } else { 0. };
+    let mut row = div().flex().items_center().gap(px(2.)).p(px(3.)).rounded(px(outer_r)).bg(pal.well).border_1().border_color(border());
     for (kind, has) in ClipEnv::ALL.into_iter().zip(has) {
         let on = kind == selected;
         let color = draw::env_color(kind, pal.accent);
@@ -776,10 +778,10 @@ fn envelope_chooser(selected: ClipEnv, has: [bool; 3], cx: &mut Context<Workspac
                 .flex()
                 .items_center()
                 .gap(px(SP1))
-                .rounded(px(r_sm()))
+                .rounded(px(inner_r))
                 .cursor_pointer()
-                .when(on, |d| d.bg(pal.raised))
-                .hover(|s| s.bg(hover()))
+                .when(on, |d| d.bg(pal.raised).border_1().border_color(border_strong()).shadow_sm())
+                .when(!on, |d| d.hover(|s| s.bg(hover())))
                 .tooltip(widgets::tip(
                     match kind {
                         ClipEnv::Volume => "Volume envelope: the level over the clip",

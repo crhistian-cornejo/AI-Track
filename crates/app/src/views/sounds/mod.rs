@@ -72,6 +72,8 @@ pub struct Sounds {
     splice_probe: Option<Instant>,
     /// All the folder chips are shown, not the first few.
     folders_expanded: bool,
+    /// The extra filters drawer (groups, source, folders, tags, fit options) is expanded.
+    filters_open: bool,
     analysis_asked: bool,
     loaded: bool,
     /// Dev view: pick and play the first result once there is one.
@@ -103,6 +105,7 @@ impl Sounds {
             splice_there: false,
             splice_probe: None,
             folders_expanded: false,
+            filters_open: false,
             analysis_asked: false,
             loaded: false,
             play_first_pending: false,
@@ -339,16 +342,17 @@ pub fn wants_frames(ws: &Workspace) -> bool {
 
 // ───────────────────────────── Drawing ─────────────────────────────
 
-/// A text chip, 20 px high.
+/// A text chip, 22 px high.
 fn chip(id: impl Into<gpui::ElementId>, text: impl Into<gpui::SharedString>, on: bool) -> Stateful<gpui::Div> {
     let pal = p();
     div()
         .id(id)
         .flex_none()
-        .h(px(20.))
+        .h(px(22.))
         .px(px(SP2))
         .flex()
         .items_center()
+        .gap(px(SP1))
         .rounded(px(r_sm()))
         .cursor_pointer()
         .border_1()
@@ -356,6 +360,34 @@ fn chip(id: impl Into<gpui::ElementId>, text: impl Into<gpui::SharedString>, on:
         .bg(if on { accent_alpha(0.16) } else { content(0.06) })
         .when(!on, |d| d.hover(|s| s.bg(content(0.12))))
         .child(label(text, TEXT_XS, if on { pal.accent } else { pal.muted }).font_weight(FontWeight::SEMIBOLD))
+}
+
+/// How many filters hidden inside the collapsible drawer are currently active.
+fn drawer_filter_count(f: &Filters, fit_enabled: bool) -> usize {
+    usize::from(f.group.is_some())
+        + usize::from(f.origin.is_some())
+        + usize::from(f.folder.is_some())
+        + usize::from(f.tag.is_some())
+        + usize::from(fit_enabled && f.key_exact)
+}
+
+/// Clear all filters that live inside the collapsible drawer.
+fn clear_drawer_filters(f: &mut Filters) {
+    f.group = None;
+    f.origin = None;
+    f.folder = None;
+    f.tag = None;
+    f.key_exact = false;
+}
+
+/// A labelled group of filter chips inside the collapsible Filters drawer.
+fn filter_group(title: &'static str, chips: gpui::Div) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(SP1))
+        .child(label(title, TEXT_XS, p().faint).font_weight(FontWeight::SEMIBOLD))
+        .child(chips)
 }
 
 fn short_key(s: aitrack_model::Scale) -> String {
@@ -427,130 +459,357 @@ pub fn render(ws: &mut Workspace, side: Side, cx: &mut Context<Workspace>) -> Op
         )
         .child(widgets::icon_button("sounds-close", Icon::X, false).tooltip(widgets::tip("Close", Some("Ctrl+Shift+K"))).on_click(cx.listener(|this, _, _, cx| toggle(this, cx))));
 
-    // ── Fit to song ──
+    // ── Search + Filters drawer toggle ──
+    let filters_open = ws.sounds.filters_open;
+    let active_drawer = drawer_filter_count(&f, fit);
+    let filters_active = filters_open || active_drawer > 0;
+    let filters_btn = div()
+        .id("sounds-filters-toggle")
+        .flex_none()
+        .h(px(m().control_h))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .rounded(px(r_md()))
+        .cursor_pointer()
+        .border_1()
+        .border_color(if filters_active { accent_alpha(0.5) } else { border() })
+        .bg(if filters_active { accent_alpha(0.14) } else { content(0.05) })
+        .hover(|s| s.bg(if filters_active { accent_alpha(0.2) } else { content(0.1) }))
+        .child(icon(Icon::Sliders, 13., if filters_active { pal.accent } else { pal.muted }))
+        .when(active_drawer > 0, |d| {
+            d.child(
+                div()
+                    .h(px(16.))
+                    .px(px(5.))
+                    .rounded_full()
+                    .bg(pal.accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(mono(active_drawer.to_string(), TEXT_XS, pal.on_accent).font_weight(FontWeight::SEMIBOLD)),
+            )
+        })
+        .child(icon(if filters_open { Icon::ChevronUp } else { Icon::ChevronDown }, 11., if filters_active { pal.accent } else { pal.faint }))
+        .tooltip(widgets::tip("Show or hide filters (group, source, folders, tags, key & BPM)", None))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sounds.filters_open = !this.sounds.filters_open;
+            cx.notify();
+        }));
+    let search_row = div()
+        .flex()
+        .items_center()
+        .gap(px(SP1 + 2.))
+        .child(div().flex_1().min_w(px(0.)).child(ws.sounds.query.clone()))
+        .child(filters_btn);
+
+    // ── Fit to song (single compact row) ──
     let key_text = song_scale.map(|s| format!("{} ({})", short_key(s), s.camelot().unwrap_or_default())).unwrap_or_default();
     let fit_row = div()
         .flex()
-        .flex_wrap()
         .items_center()
-        .gap(px(SP2))
-        .child(widgets::switch("sounds-fit", fit).on_click(cx.listener(|this, _, _, cx| {
-            this.sounds.prefs.fit = !this.sounds.prefs.fit;
-            this.sounds.prefs.save();
-            this.sounds.dirty = true;
-            cx.notify();
-        })))
-        .child(label("Fit to song", TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
+        .gap(px(SP1 + 2.))
+        .overflow_hidden()
+        .child(
+            widgets::switch("sounds-fit", fit)
+                .tooltip(widgets::tip("Fit to song: adjust previews and drops to the song's tempo and key", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.sounds.prefs.fit = !this.sounds.prefs.fit;
+                    this.sounds.prefs.save();
+                    this.sounds.dirty = true;
+                    cx.notify();
+                })),
+        )
+        .child(label("Fit", TEXT_SM, if fit { pal.text } else { pal.muted }).font_weight(FontWeight::MEDIUM))
+        .when(!fit, |d| d.child(label("Off", TEXT_XS, pal.faint)))
         .when(fit, |d| {
-            d.child(chip("sounds-bpm", format!("♪ {song_bpm:.0} BPM"), f.by_bpm).on_click(cx.listener(|this, _, _, cx| {
-                this.sounds.filters.by_bpm = !this.sounds.filters.by_bpm;
-                cx.notify();
-            })))
+            d.child(
+                chip("sounds-bpm", format!("♪ {song_bpm:.0}"), f.by_bpm)
+                    .tooltip(widgets::tip_owned(format!("Filter by song tempo ({song_bpm:.0} BPM, ±{:.0}%)", f.bpm_tolerance)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sounds.filters.by_bpm = !this.sounds.filters.by_bpm;
+                        cx.notify();
+                    })),
+            )
             .child(match song_scale {
                 Some(_) => chip("sounds-key", format!("♯ {key_text}"), f.by_key)
+                    .tooltip(widgets::tip(
+                        if f.key_exact { "Filter by song key (exact match)" } else { "Filter by song key (Camelot compatible)" },
+                        None,
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sounds.filters.by_key = !this.sounds.filters.by_key;
                         cx.notify();
                     }))
                     .into_any_element(),
-                None => chip("sounds-set-key", "Set the song's key", false)
+                None => chip("sounds-set-key", "Set key", false)
                     .tooltip(widgets::tip("The song has no key yet: choose one to filter by it and transpose to it", None))
                     .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                         this.open_menu(MenuKind::Scale, e.position(), cx);
                     }))
                     .into_any_element(),
             })
+            .when(f.by_bpm, |d| {
+                d.child(
+                    chip("sounds-tol-inline", format!("±{:.0}%", f.bpm_tolerance), false)
+                        .tooltip(widgets::tip("Click to cycle tempo tolerance (½× and 2× also match)", None))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sounds.filters.bpm_tolerance = match this.sounds.filters.bpm_tolerance as u32 {
+                                0..=3 => 6.,
+                                4..=6 => 12.,
+                                7..=12 => 25.,
+                                _ => 3.,
+                            };
+                            cx.notify();
+                        })),
+                )
+            })
         });
-    let fit_options = div().when(fit, |d| {
-        d.flex().flex_wrap().items_center().gap(px(SP1)).child(label("Key", TEXT_XS, pal.faint))
-            .child(chip("sounds-key-compat", "Compatible", !f.key_exact).tooltip(widgets::tip("The song's key, its relative and its neighbours on the Camelot wheel", None)).on_click(cx.listener(|this, _, _, cx| {
-                this.sounds.filters.key_exact = false;
-                cx.notify();
-            })))
-            .child(chip("sounds-key-exact", "Exact", f.key_exact).on_click(cx.listener(|this, _, _, cx| {
-                this.sounds.filters.key_exact = true;
-                cx.notify();
-            })))
-            .child(label("BPM", TEXT_XS, pal.faint).ml(px(SP2)))
-            .child(chip("sounds-tol", format!("±{:.0} %", f.bpm_tolerance), false).tooltip(widgets::tip("Click to change how far from the song's tempo (½× and 2× count)", None)).on_click(cx.listener(|this, _, _, cx| {
-                this.sounds.filters.bpm_tolerance = match this.sounds.filters.bpm_tolerance as u32 {
-                    0..=3 => 6.,
-                    4..=6 => 12.,
-                    7..=12 => 25.,
-                    _ => 3.,
-                };
-                cx.notify();
-            })))
-    });
 
-    // ── Chips: type, group, collection, tags, favourites ──
-    let mut kinds = div().flex().flex_wrap().gap(px(SP1));
+    // ── Kind segmented strip + Favourites star (single compact row) ──
+    let kind_inner_r = r_sm();
+    let kind_outer_r = if kind_inner_r > 0. { kind_inner_r + 3. } else { 0. };
+    let mut kind_seg = div()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .p(px(3.))
+        .rounded(px(kind_outer_r))
+        .bg(content(0.05))
+        .border_1()
+        .border_color(border());
     for (k, name) in [(SoundKind::All, "All"), (SoundKind::Loops, "Loops"), (SoundKind::OneShots, "One-shots")] {
-        kinds = kinds.child(chip(("sounds-kind", k as usize), name, f.kind == k).on_click(cx.listener(move |this, _, _, cx| {
-            this.sounds.filters.kind = k;
-            cx.notify();
-        })));
-    }
-    kinds = kinds.child(
-        chip("sounds-fav", "★ Favourites", f.favorites).on_click(cx.listener(|this, _, _, cx| {
-            this.sounds.filters.favorites = !this.sounds.filters.favorites;
-            cx.notify();
-        })),
-    );
-    let mut groups = div().flex().flex_wrap().gap(px(SP1));
-    for g in SoundGroup::ALL {
-        let on = f.group == Some(g);
-        groups = groups.child(chip(("sounds-group", g as usize), g.label(), on).on_click(cx.listener(move |this, _, _, cx| {
-            this.sounds.filters.group = if on { None } else { Some(g) };
-            cx.notify();
-        })));
-    }
-    let mut origins = div().flex().flex_wrap().items_center().gap(px(SP1)).child(label("From", TEXT_XS, pal.faint));
-    for o in SoundOrigin::ALL {
-        let on = f.origin == Some(o);
-        origins = origins.child(chip(("sounds-origin", o as usize), o.label(), on).on_click(cx.listener(move |this, _, _, cx| {
-            this.sounds.filters.origin = if on { None } else { Some(o) };
-            cx.notify();
-        })));
-    }
-    let folders_open = ws.sounds.folders_expanded;
-    let mut folders = div().flex().flex_wrap().items_center().gap(px(SP1)).child(label("In", TEXT_XS, pal.faint));
-    let all_folders = ws.sounds.page.folders.clone();
-    // The chosen folder always shows, even when it is not among the biggest.
-    let mut shown: Vec<&crate::bridge::SoundFolder> = all_folders.iter().take(if folders_open { usize::MAX } else { FOLDER_CHIPS }).collect();
-    if let Some(sel) = f.folder.as_ref()
-        && !shown.iter().any(|x| x.library == sel.library && x.root == sel.root && x.under == sel.under)
-    {
-        shown.insert(0, sel);
-    }
-    for (i, fo) in shown.iter().enumerate() {
-        let on = f.folder.as_ref().is_some_and(|x| x.library == fo.library && x.root == fo.root && x.under == fo.under);
-        let pick = (*fo).clone();
-        folders = folders.child(
-            chip(("sounds-folder", i), format!("{} {}", fo.label, fo.count), on)
-                .tooltip(widgets::tip_owned(fo.under.clone().unwrap_or_else(|| fo.label.clone())))
+        let on = f.kind == k;
+        kind_seg = kind_seg.child(
+            div()
+                .id(("sounds-kind", k as usize))
+                .flex_none()
+                .h(px(20.))
+                .px(px(SP2))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(kind_inner_r))
+                .cursor_pointer()
+                .when(on, |d| d.bg(pal.raised).border_1().border_color(border_strong()).shadow_sm())
+                .when(!on, |d| d.hover(|s| s.bg(content(0.06))))
+                .child(label(name, TEXT_XS, if on { pal.text } else { pal.muted }).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.sounds.filters.folder = if on { None } else { Some(pick.clone()) };
+                    this.sounds.filters.kind = k;
                     cx.notify();
                 })),
         );
     }
-    if all_folders.len() > FOLDER_CHIPS {
-        let more = if folders_open { "Less".to_owned() } else { format!("More (+{})", all_folders.len() - FOLDER_CHIPS) };
-        folders = folders.child(chip("sounds-folder-more", more, folders_open).on_click(cx.listener(|this, _, _, cx| {
-            this.sounds.folders_expanded = !this.sounds.folders_expanded;
+    let fav_btn = div()
+        .id("sounds-fav")
+        .flex_none()
+        .h(px(28.))
+        .px(px(SP2))
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .rounded(px(kind_outer_r))
+        .cursor_pointer()
+        .border_1()
+        .border_color(if f.favorites { with_alpha(pal.solo, 0.5) } else { border() })
+        .bg(if f.favorites { with_alpha(pal.solo, 0.14) } else { content(0.05) })
+        .hover(|s| s.bg(if f.favorites { with_alpha(pal.solo, 0.2) } else { content(0.1) }))
+        .child(icon(if f.favorites { Icon::StarFilled } else { Icon::Star }, 12., if f.favorites { pal.solo } else { pal.muted }))
+        .tooltip(widgets::tip("Show only favourites", None))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sounds.filters.favorites = !this.sounds.filters.favorites;
             cx.notify();
-        })));
-    }
-    let mut tags = div().flex().flex_wrap().gap(px(SP1));
-    for (i, (t, n)) in ws.sounds.page.tags.iter().take(8).enumerate() {
-        let on = f.tag.as_deref() == Some(t.as_str());
-        let tag = t.clone();
-        tags = tags.child(chip(("sounds-tag", i), format!("{t} {n}"), on).on_click(cx.listener(move |this, _, _, cx| {
-            this.sounds.filters.tag = if on { None } else { Some(tag.clone()) };
-            cx.notify();
-        })));
-    }
+        }));
+    let kind_row = div().flex().items_center().gap(px(SP1 + 2.)).child(kind_seg).child(div().flex_1()).child(fav_btn);
+
+    // ── Active filter summary pills (shown only when drawer is collapsed and a filter is active) ──
+    let active_summary = (!filters_open && active_drawer > 0).then(|| {
+        let mut bar = div().flex().flex_wrap().items_center().gap(px(SP1));
+        if let Some(g) = f.group {
+            bar = bar.child(chip("sounds-active-group", format!("{} ×", g.label()), true).on_click(cx.listener(|this, _, _, cx| {
+                this.sounds.filters.group = None;
+                cx.notify();
+            })));
+        }
+        if let Some(o) = f.origin {
+            bar = bar.child(chip("sounds-active-origin", format!("{} ×", o.label()), true).on_click(cx.listener(|this, _, _, cx| {
+                this.sounds.filters.origin = None;
+                cx.notify();
+            })));
+        }
+        if let Some(fo) = f.folder.as_ref() {
+            bar = bar.child(chip("sounds-active-folder", format!("{} ×", fo.label), true).on_click(cx.listener(|this, _, _, cx| {
+                this.sounds.filters.folder = None;
+                cx.notify();
+            })));
+        }
+        if let Some(tag) = f.tag.as_ref() {
+            bar = bar.child(chip("sounds-active-tag", format!("{tag} ×"), true).on_click(cx.listener(|this, _, _, cx| {
+                this.sounds.filters.tag = None;
+                cx.notify();
+            })));
+        }
+        if fit && f.key_exact {
+            bar = bar.child(chip("sounds-active-exact", "Exact key ×", true).on_click(cx.listener(|this, _, _, cx| {
+                this.sounds.filters.key_exact = false;
+                cx.notify();
+            })));
+        }
+        bar.child(
+            div()
+                .id("sounds-clear-summary")
+                .px(px(SP1))
+                .cursor_pointer()
+                .child(label("Clear", TEXT_XS, pal.faint))
+                .hover(|s| s.text_color(pal.text))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    clear_drawer_filters(&mut this.sounds.filters);
+                    cx.notify();
+                })),
+        )
+    });
+
+    // ── Collapsible Filters Drawer ──
+    let filters_drawer = filters_open.then(|| {
+        let fit_match = fit.then(|| {
+            let row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(SP1))
+                .child(
+                    chip("sounds-key-compat", "Compatible", !f.key_exact)
+                        .tooltip(widgets::tip("The song's key, its relative and its neighbours on the Camelot wheel", None))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sounds.filters.key_exact = false;
+                            cx.notify();
+                        })),
+                )
+                .child(chip("sounds-key-exact", "Exact", f.key_exact).on_click(cx.listener(|this, _, _, cx| {
+                    this.sounds.filters.key_exact = true;
+                    cx.notify();
+                })))
+                .child(
+                    chip("sounds-tol", format!("BPM ±{:.0}%", f.bpm_tolerance), false)
+                        .tooltip(widgets::tip("Click to change how far from the song's tempo (½× and 2× count)", None))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sounds.filters.bpm_tolerance = match this.sounds.filters.bpm_tolerance as u32 {
+                                0..=3 => 6.,
+                                4..=6 => 12.,
+                                7..=12 => 25.,
+                                _ => 3.,
+                            };
+                            cx.notify();
+                        })),
+                );
+            filter_group("KEY & TEMPO", row)
+        });
+
+        let mut groups = div().flex().flex_wrap().gap(px(SP1));
+        for g in SoundGroup::ALL {
+            let on = f.group == Some(g);
+            groups = groups.child(chip(("sounds-group", g as usize), g.label(), on).on_click(cx.listener(move |this, _, _, cx| {
+                this.sounds.filters.group = if on { None } else { Some(g) };
+                cx.notify();
+            })));
+        }
+
+        let mut origins = div().flex().flex_wrap().gap(px(SP1));
+        for o in SoundOrigin::ALL {
+            let on = f.origin == Some(o);
+            origins = origins.child(chip(("sounds-origin", o as usize), o.label(), on).on_click(cx.listener(move |this, _, _, cx| {
+                this.sounds.filters.origin = if on { None } else { Some(o) };
+                cx.notify();
+            })));
+        }
+
+        let folders_open = ws.sounds.folders_expanded;
+        let all_folders = ws.sounds.page.folders.clone();
+        let folders_sec = (!all_folders.is_empty()).then(|| {
+            let mut folders = div().flex().flex_wrap().gap(px(SP1));
+            let mut shown: Vec<&crate::bridge::SoundFolder> = all_folders.iter().take(if folders_open { usize::MAX } else { FOLDER_CHIPS }).collect();
+            if let Some(sel) = f.folder.as_ref()
+                && !shown.iter().any(|x| x.library == sel.library && x.root == sel.root && x.under == sel.under)
+            {
+                shown.insert(0, sel);
+            }
+            for (i, fo) in shown.iter().enumerate() {
+                let on = f.folder.as_ref().is_some_and(|x| x.library == fo.library && x.root == fo.root && x.under == fo.under);
+                let pick = (*fo).clone();
+                folders = folders.child(
+                    chip(("sounds-folder", i), format!("{} {}", fo.label, fo.count), on)
+                        .tooltip(widgets::tip_owned(fo.under.clone().unwrap_or_else(|| fo.label.clone())))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.sounds.filters.folder = if on { None } else { Some(pick.clone()) };
+                            cx.notify();
+                        })),
+                );
+            }
+            if all_folders.len() > FOLDER_CHIPS {
+                let more = if folders_open { "Less".to_owned() } else { format!("More (+{})", all_folders.len() - FOLDER_CHIPS) };
+                folders = folders.child(chip("sounds-folder-more", more, folders_open).on_click(cx.listener(|this, _, _, cx| {
+                    this.sounds.folders_expanded = !this.sounds.folders_expanded;
+                    cx.notify();
+                })));
+            }
+            filter_group("FOLDERS", folders)
+        });
+
+        let tags_sec = (!ws.sounds.page.tags.is_empty()).then(|| {
+            let mut tags = div().flex().flex_wrap().gap(px(SP1));
+            for (i, (t, n)) in ws.sounds.page.tags.iter().take(8).enumerate() {
+                let on = f.tag.as_deref() == Some(t.as_str());
+                let tag = t.clone();
+                tags = tags.child(chip(("sounds-tag", i), format!("{t} {n}"), on).on_click(cx.listener(move |this, _, _, cx| {
+                    this.sounds.filters.tag = if on { None } else { Some(tag.clone()) };
+                    cx.notify();
+                })));
+            }
+            filter_group("TAGS", tags)
+        });
+
+        div()
+            .id("sounds-filters-drawer")
+            .max_h(px(224.))
+            .overflow_y_scroll()
+            .p(px(SP2))
+            .gap(px(SP2))
+            .flex()
+            .flex_col()
+            .rounded(px(r_md()))
+            .bg(content(0.035))
+            .border_1()
+            .border_color(border())
+            .when(active_drawer > 0, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(label(format!("{active_drawer} active"), TEXT_XS, pal.accent).font_weight(FontWeight::MEDIUM))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("sounds-filters-reset")
+                                .px(px(SP1 + 2.))
+                                .py(px(2.))
+                                .rounded(px(r_sm()))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(content(0.08)))
+                                .child(label("Reset", TEXT_XS, pal.muted).font_weight(FontWeight::MEDIUM))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    clear_drawer_filters(&mut this.sounds.filters);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .children(fit_match)
+            .child(filter_group("GROUP", groups))
+            .child(filter_group("SOURCE", origins))
+            .children(folders_sec)
+            .children(tags_sec)
+    });
 
     // ── The list ──
     let n = ws.sounds.page.hits.len();
@@ -613,7 +872,18 @@ pub fn render(ws: &mut Workspace, side: Side, cx: &mut Context<Workspace>) -> Op
                 .child(div().flex_1())
                 .child(label(format!("{n}{}", if ws.sounds.page.more { "+" } else { "" }), TEXT_XS, pal.faint)),
         )
-        .child(label(status.0, TEXT_XS, if status.1 { pal.solo } else { pal.faint }));
+        .when(!status.0.is_empty(), |d| {
+            let tip = status.0.clone();
+            d.child(
+                div()
+                    .id("sounds-status")
+                    .w_full()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .tooltip(widgets::tip_owned(tip))
+                    .child(label(status.0, TEXT_XS, if status.1 { pal.solo } else { pal.faint }).overflow_hidden().text_ellipsis()),
+            )
+        });
 
     let grip = div()
         .id("sounds-grip")
@@ -639,18 +909,16 @@ pub fn render(ws: &mut Workspace, side: Side, cx: &mut Context<Workspace>) -> Op
         .child(
             div()
                 .flex_none()
-                .p(px(SP3))
-                .gap(px(SP2))
+                .px(px(SP3))
+                .py(px(SP2))
+                .gap(px(SP1 + 2.))
                 .flex()
                 .flex_col()
-                .child(ws.sounds.query.clone())
+                .child(search_row)
                 .child(fit_row)
-                .child(fit_options)
-                .child(kinds)
-                .child(groups)
-                .child(origins)
-                .when(!ws.sounds.page.folders.is_empty(), |d| d.child(folders))
-                .when(!ws.sounds.page.tags.is_empty(), |d| d.child(tags)),
+                .child(kind_row)
+                .children(active_summary)
+                .children(filters_drawer),
         )
         .child(div().h(px(1.)).w_full().bg(border()))
         .child(list)
@@ -830,5 +1098,19 @@ mod tests {
         assert_eq!(short_key(Scale::new(Key(9), ScaleKind::Minor)), "Am");
         assert_eq!(short_key(Scale::new(Key(0), ScaleKind::Major)), "C");
         assert_eq!(short_key(Scale::new(Key(2), ScaleKind::Dorian)), "D Dorian");
+    }
+
+    #[test]
+    fn drawer_filter_count_and_clear_track_hidden_filters() {
+        let mut f = Filters::default();
+        assert_eq!(drawer_filter_count(&f, true), 0);
+        f.group = Some(SoundGroup::Drums);
+        f.origin = Some(SoundOrigin::Mine);
+        f.tag = Some("EDM".into());
+        f.key_exact = true;
+        assert_eq!(drawer_filter_count(&f, true), 4);
+        assert_eq!(drawer_filter_count(&f, false), 3, "exact key only counts when fit is enabled");
+        clear_drawer_filters(&mut f);
+        assert_eq!(drawer_filter_count(&f, true), 0);
     }
 }

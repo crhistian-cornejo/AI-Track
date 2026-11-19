@@ -119,7 +119,9 @@ fn style_bar(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     let now = style_now(dev);
     let device = dev.id;
     let classic = dev.choice(p::STYLE);
-    let mut row = div().flex_none().h(px(20.)).flex().items_center().gap(px(2.)).p(px(2.)).rounded(px(r_sm())).bg(pal.well);
+    let inner_r = r_sm();
+    let outer_r = if inner_r > 0. { inner_r + 3. } else { 0. };
+    let mut row = div().flex_none().flex().items_center().gap(px(2.)).p(px(3.)).rounded(px(outer_r)).bg(pal.well).border_1().border_color(border());
     for (i, name) in compressor::STYLE_NAMES.iter().enumerate() {
         let (st, model) = style_values(i, classic);
         let values = [(p::STYLE, dev.to_norm(p::STYLE, st)), (p::MODEL, dev.to_norm(p::MODEL, model))];
@@ -127,11 +129,11 @@ fn style_bar(dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
         row = row.child(
             div()
                 .id(("comp-style", dev.key(i)))
-                .h(px(16.))
+                .h(px(18.))
                 .px(px(SP1 + 2.))
                 .flex()
                 .items_center()
-                .rounded(px(r_sm()))
+                .rounded(px(inner_r))
                 .cursor_pointer()
                 .bg(if on { accent_alpha(0.24) } else { gpui::transparent_black() })
                 .hover(|d| d.bg(if on { accent_alpha(0.3) } else { content(0.08) }))

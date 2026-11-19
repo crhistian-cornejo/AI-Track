@@ -520,7 +520,9 @@ pub const TONAL_TABS: [(&str, &str); 3] = [("Genes", "Genes — the selected pat
 fn tab_strip(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
     let now = ws.fx.bloom.view(dev.id).stage.tab;
-    let mut row = div().flex_none().p(px(2.)).flex().items_center().gap(px(2.)).rounded(px(r_md())).bg(content(0.06)).border_1().border_color(border());
+    let inner_r = r_sm();
+    let outer_r = if inner_r > 0. { inner_r + 3. } else { 0. };
+    let mut row = div().flex_none().p(px(3.)).flex().items_center().gap(px(2.)).rounded(px(outer_r)).bg(content(0.06)).border_1().border_color(border());
     let tabs = if view::kind(dev).is_tonal() { &TONAL_TABS } else { &TABS };
     for (k, (name, tip)) in tabs.iter().enumerate() {
         let d = dev.clone();
@@ -532,7 +534,7 @@ fn tab_strip(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
                 .px(px(SP4))
                 .flex()
                 .items_center()
-                .rounded(px(r_sm()))
+                .rounded(px(inner_r))
                 .cursor_pointer()
                 .when(on, |d| d.bg(pal.surface).shadow_sm())
                 .when(!on, |d| d.hover(|s| s.bg(content(0.06))))

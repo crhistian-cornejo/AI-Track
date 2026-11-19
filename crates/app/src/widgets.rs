@@ -197,38 +197,73 @@ pub fn icon_chip(id: impl Into<ElementId>, i: Icon, on: bool, on_color: Hsla) ->
 
 pub type OnSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SegmentedLayout {
+    outer_w: f32,
+    outer_h: f32,
+    pad: f32,
+    inner_h: f32,
+    seg_w: f32,
+}
+
+impl SegmentedLayout {
+    const BORDER: f32 = 1.;
+    const PAD: f32 = 3.;
+
+    /// Border-box dimensions so the sliding pill sits inside the 1 px outer
+    /// border with the exact same [`Self::PAD`] inset on all four sides (top,
+    /// bottom, left and right).
+    fn compute(control_h: f32, seg_w: f32, count: usize) -> Self {
+        let chrome = 2. * (Self::BORDER + Self::PAD);
+        let outer_h = control_h + 4.;
+        let inner_h = (outer_h - chrome).max(16.);
+        let outer_w = seg_w * count as f32 + chrome;
+        Self { outer_w, outer_h, pad: Self::PAD, inner_h, seg_w }
+    }
+
+    fn indicator_left(self, selected: usize) -> f32 {
+        self.pad + self.seg_w * selected as f32
+    }
+
+    fn indicator_top(self) -> f32 {
+        self.pad
+    }
+}
+
 /// Equal-width segments with a sliding indicator (spring, keeps velocity
 /// when changed mid-flight). `items` are `(icon, label)`.
 pub fn segmented(id: &'static str, items: &[(Option<Icon>, &'static str)], selected: usize, seg_w: f32, on_select: OnSelect) -> Div {
     let pal = p();
-    let h = m().control_h;
-    let inner = h - 4.;
+    let lay = SegmentedLayout::compute(m().control_h, seg_w, items.len());
+    let inner_r = (r_md() - 1.).max(0.);
+    let outer_r = if inner_r > 0. { inner_r + lay.pad } else { 0. };
     let indicator = div()
         .absolute()
-        .top(px(2.))
-        .w(px(seg_w))
-        .h(px(inner))
-        .rounded(px(r_md() - 1.))
+        .top(px(lay.indicator_top()))
+        .w(px(lay.seg_w))
+        .h(px(lay.inner_h))
+        .rounded(px(inner_r))
         .bg(pal.raised)
         .border_1()
         .border_color(border_strong())
         .shadow_sm()
         .with_spring(
             ElementId::Name(format!("{id}-indicator").into()),
-            motion::spring(motion::INDICATOR_SPRING, 2. + seg_w * selected as f32),
+            motion::spring(motion::INDICATOR_SPRING, lay.indicator_left(selected)),
             |d, x| d.left(px(x)),
         );
     let mut row = div()
         .relative()
         .flex_none()
-        .h(px(h))
-        .w(px(seg_w * items.len() as f32 + 4.))
-        .p(px(2.))
-        .rounded(px(r_md() + 1.))
+        .h(px(lay.outer_h))
+        .w(px(lay.outer_w))
+        .p(px(lay.pad))
+        .rounded(px(outer_r))
         .bg(content(0.05))
         .border_1()
         .border_color(border())
         .flex()
+        .items_center()
         .child(indicator);
     for (i, (ic, text)) in items.iter().enumerate() {
         let on = i == selected;
@@ -238,15 +273,20 @@ pub fn segmented(id: &'static str, items: &[(Option<Icon>, &'static str)], selec
             div()
                 .id(ElementId::Name(format!("{id}-{i}").into()))
                 .relative()
-                .w(px(seg_w))
-                .h(px(inner))
+                .flex_none()
+                .w(px(lay.seg_w))
+                .h(px(lay.inner_h))
+                .rounded(px(inner_r))
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap(px(SP1 + 2.))
                 .cursor_pointer()
+                .when(!on, |d| d.hover(|s| s.bg(content(0.05))))
                 .when_some(*ic, |d, ic| d.child(icon(ic, 14., if on { pal.accent } else { color })))
-                .when(!text.is_empty(), |d| d.child(label(*text, TEXT_SM, color).font_weight(FontWeight::MEDIUM)))
+                .when(!text.is_empty(), |d| {
+                    d.child(label(*text, TEXT_SM, color).font_weight(if on { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }))
+                })
                 .on_click(move |_, window, cx| cb(i, window, cx)),
         );
     }
@@ -879,4 +919,34 @@ impl Render for TextInput {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segmented_indicator_has_equal_insets_on_all_four_sides() {
+        for metrics in [Metrics::COMFORTABLE, Metrics::COMPACT] {
+            for (count, seg_w) in [(2usize, 120.), (3, 84.), (4, 80.)] {
+                let lay = SegmentedLayout::compute(metrics.control_h, seg_w, count);
+                // Padding box inside the 1 px outer border.
+                let pad_box_w = lay.outer_w - 2. * SegmentedLayout::BORDER;
+                let pad_box_h = lay.outer_h - 2. * SegmentedLayout::BORDER;
+
+                let top_gap = lay.indicator_top();
+                let bottom_gap = pad_box_h - (lay.indicator_top() + lay.inner_h);
+                let left_gap = lay.indicator_left(0);
+                let right_gap = pad_box_w - (lay.indicator_left(count - 1) + lay.seg_w);
+
+                assert_eq!(top_gap, SegmentedLayout::PAD);
+                assert_eq!(bottom_gap, SegmentedLayout::PAD);
+                assert_eq!(left_gap, SegmentedLayout::PAD);
+                assert_eq!(right_gap, SegmentedLayout::PAD);
+                assert!(lay.outer_h <= metrics.dock_bar_h, "fits inside dock bar");
+                assert!(lay.outer_h <= metrics.top_bar_h, "fits inside top bar");
+            }
+        }
+    }
+}
+
 

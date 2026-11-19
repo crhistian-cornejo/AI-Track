@@ -592,21 +592,25 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let narrow = narrow(width);
 
     // Left: the generator and the selected sound, then the morph (drums) or
-    // the patch's character (tonal kinds, which do not morph).
+    // the patch's character and the morph (tonal kinds).
     let sel_patch = shown_patches.as_ref().map(|ps| ps.patches[selected]);
     let lower: (Stateful<Div>, Div) = match &shown_patches {
         Some(ps) => (section("CHARACTER", Some("Character — what the selected patch is like")), character(dev, &ps.patches[selected], ps.distances[selected], sel_color)),
         None => (section("MORPH", Some(TIP_MORPH)), morph(ws, dev, 92., cx)),
     };
     let left = card()
+        .id(("bloom-left-column", dev.key(0x6A2)))
         .flex_none()
         .w(px(SIDE_W))
+        .overflow_y_scroll()
         .child(section("GENERATE", None))
         .child(generator(ws, dev, cx))
         .child(section("SELECTED SOUND", None))
         .child(selected_sound(dev, &scene, sel_patch.as_ref(), selected, names[selected].clone(), view::locked(ws, dev, &scene, selected), sel_color, cx))
         .child(lower.0)
         .child(lower.1)
+        // Tonal kinds morph too: their corners below the character.
+        .when(shown_patches.is_some(), |c| c.child(section("MORPH", Some(TIP_MORPH))).child(morph(ws, dev, 76., cx)))
         .child(div().flex_1())
         .child(export_chip(ws, dev, cx));
 

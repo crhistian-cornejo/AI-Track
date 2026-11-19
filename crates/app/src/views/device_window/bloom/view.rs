@@ -38,6 +38,8 @@ pub struct Parsed {
     pub material: Material,
     /// The tonal patches the state stores (tonal kinds only).
     pub patches: Option<PatchScene>,
+    /// Which tonal morph corners are stored.
+    pub patch_corners: [bool; 4],
 }
 
 /// How the device plays its sounds: its Tune and macro knobs, rounded so a
@@ -505,7 +507,8 @@ pub fn parsed(ws: &mut Workspace, device: DeviceId) -> Rc<Parsed> {
     let (stored, corners) = bloom::parse_state(state.as_deref());
     let material = bloom::visual_of(state.as_deref()).and_then(|k| Material::from_key(&k)).unwrap_or_default();
     let patches = bloom::parse_patches(state.as_deref());
-    let p = Rc::new(Parsed { stored, corners, material, patches });
+    let patch_corners = bloom::parse_patch_corners(state.as_deref()).each_ref().map(Option::is_some);
+    let p = Rc::new(Parsed { stored, corners, material, patches, patch_corners });
     v.parsed = Some((h, p.clone()));
     p
 }
@@ -559,6 +562,8 @@ pub fn commit(ws: &mut Workspace, dev: &Dev, scene: &Scene, corners: Option<Corn
     // The tonal patches (edits, locks) stay in the state.
     let patches = bloom::parse_patches(d.state.as_deref());
     let state = bloom::state_json_full(&params, scene, &corners, visual.as_deref(), patches.as_ref());
+    // The tonal morph corners stay in the state.
+    let state = bloom::keep_patch_corners(d.state.as_deref(), state);
     let device = dev.id;
     let cmds = vec![
         Command::SetDeviceState { device, state: Some(state), preset: d.preset.clone() },
@@ -629,6 +634,8 @@ pub fn commit_patches(ws: &mut Workspace, dev: &Dev, patches: &PatchScene, label
     params.insert(p::SEED, seed);
     params.insert(p::SPECIES, dev.to_norm(p::SPECIES, drums.species.index() as f32));
     let state = bloom::state_json_full(&params, &drums, &corners, visual.as_deref(), Some(patches));
+    // The tonal morph corners stay in the state.
+    let state = bloom::keep_patch_corners(d.state.as_deref(), state);
     let device = dev.id;
     let cmds = vec![Command::SetDeviceState { device, state: Some(state), preset: d.preset.clone() }, Command::SetParam { device, param: p::SEED, value: Some(seed) }];
     ws.s.seal();
@@ -822,6 +829,8 @@ pub fn set_material(ws: &mut Workspace, dev: &Dev, material: Material) {
     params.insert(p::SPECIES, dev.to_norm(p::SPECIES, s.species.index() as f32));
     let patches = bloom::parse_patches(d.state.as_deref());
     let state = bloom::state_json_full(&params, &s, &corners, Some(material.key()), patches.as_ref());
+    // The tonal morph corners stay in the state.
+    let state = bloom::keep_patch_corners(d.state.as_deref(), state);
     let cmd = Command::SetDeviceState { device: dev.id, state: Some(state), preset: d.preset.clone() };
     ws.s.seal();
     ws.s.edit(&format!("Bloom material: {}", material.name()), vec![cmd]);
@@ -830,6 +839,16 @@ pub fn set_material(ws: &mut Workspace, dev: &Dev, material: Material) {
 
 /// Store the current scene's sounds in morph corner `k`, or clear it.
 pub fn set_corner(ws: &mut Workspace, dev: &Dev, k: usize, clear: bool) {
+    if kind(dev).is_tonal() {
+        let now = patches(ws, dev);
+        let Some(d) = ws.s.project.device(dev.id) else { return };
+        let state = bloom::set_patch_corner(d.state.as_deref(), k, if clear { None } else { Some(&now) });
+        let cmd = Command::SetDeviceState { device: dev.id, state: Some(state), preset: d.preset.clone() };
+        ws.s.seal();
+        ws.s.edit(if clear { "Clear morph corner" } else { "Set morph corner" }, vec![cmd]);
+        ws.s.seal();
+        return;
+    }
     let s = scene(ws, dev);
     let mut corners = bloom::parse_state(ws.s.project.device(dev.id).and_then(|d| d.state.as_deref())).1;
     corners[k] = if clear { None } else { Some(Box::new(s.sounds)) };

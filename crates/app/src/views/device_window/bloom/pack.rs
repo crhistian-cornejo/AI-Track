@@ -27,7 +27,6 @@ use crate::workspace::Workspace;
 
 /// What [`grow_pack`] makes.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // the lead wires the buttons
 pub struct PackOpts {
     /// The members, in track order (a kind listed twice is grown once).
     pub kinds: Vec<Kind>,
@@ -165,7 +164,6 @@ pub fn pack_commands(p: &mut Project, opts: &PackOpts, seed: u64) -> Grown {
 /// Grow a Bloom pack into the project as one undo step ("Grow Bloom
 /// pack"): the tracks, their Blooms and their clips; the first new track is
 /// selected and a toast names the pack.
-#[allow(dead_code)] // the lead wires the buttons
 pub fn grow_pack(ws: &mut Workspace, opts: PackOpts, cx: &mut Context<Workspace>) {
     let seed = opts.seed.unwrap_or_else(fresh_seed);
     let grown = pack_commands(&mut ws.s.project, &opts, seed);

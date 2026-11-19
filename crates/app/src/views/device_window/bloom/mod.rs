@@ -70,6 +70,7 @@ pub const TIP_OPEN: &str = "Open — the full Bloom window";
 pub const TIP_MATCH: &str = "Match — grow the selected sound towards a sample";
 pub const TIP_RACK: &str = "To Drum Rack — 16 pads, one Bloom sound each";
 pub const TIP_RENDER: &str = "Render — 16 WAVs into the library";
+pub const TIP_PACK: &str = "Grow pack — new tracks: drums, bass, lead, pad… with clips";
 pub const TIP_EXPORT: &str = "Export — the selected sound as a WAV to drag";
 pub const TIP_CORNER: &str = "Store the scene here · Alt-click clears";
 pub const TIP_MORPH: &str = "Morph — blend the four stored scenes";
@@ -135,7 +136,8 @@ pub fn grow_buttons(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) 
 /// The morph corners and the X/Y pad.
 pub fn morph(ws: &mut Workspace, dev: &Dev, pad: f32, cx: &mut Context<Workspace>) -> Div {
     let pal = p();
-    let corners = view::parsed(ws, dev.id).corners.iter().map(Option::is_some).collect::<Vec<_>>();
+    let parsed = view::parsed(ws, dev.id);
+    let corners: Vec<bool> = if view::kind(dev).is_tonal() { parsed.patch_corners.to_vec() } else { parsed.corners.iter().map(Option::is_some).collect() };
     let mut slots = div().flex().flex_col().gap(px(SP1));
     for (k, name) in ["A", "B", "C", "D"].into_iter().enumerate() {
         let set = corners[k];
@@ -193,6 +195,7 @@ fn tonal_tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Di
         Some(n) => div().h(px(m().control_h)).px(px(SP2)).flex().items_center().child(mono(format!("Rendering {n}/16…"), TEXT_XS, pal.muted)).into_any_element(),
         None => action(("bloom-render", dev.key(7)), "Render samples", Icon::Download, false, TIP_RENDER_TONAL, cx, move |ws, _| view::start_render(ws, &d1)),
     });
+    row = row.child(action(("bloom-pack-tonal", dev.key(10)), "Grow pack", Icon::Sparkles, true, TIP_PACK, cx, |ws, cx| pack::grow_pack(ws, pack::PackOpts::default(), cx)));
     row = row.child(action(("bloom-open-wt-tool", dev.key(8)), "Open in Wavetable Synth", Icon::OpenWindow, false, TIP_OPEN_WT, cx, move |ws, cx| view::open_in_wavetable(ws, &d2, cell, cx)));
     row = row.child(action(("bloom-save-wt-tool", dev.key(9)), "Save as Wavetable preset", Icon::Download, false, TIP_SAVE_WT, cx, move |ws, cx| match view::save_patch_preset(ws, &d3, cell) {
         Ok(n) => ws.toast(format!("Saved {n} in Wavetable Synth presets"), cx),
@@ -240,6 +243,7 @@ pub fn tools(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Div 
         Some(n) => div().h(px(m().control_h)).px(px(SP2)).flex().items_center().child(mono(format!("Rendering {n}/16…"), TEXT_XS, pal.muted)).into_any_element(),
         None => action(("bloom-render", dev.key(7)), "Render samples", Icon::Download, false, TIP_RENDER, cx, move |ws, _| view::start_render(ws, &d3)),
     });
+    row = row.child(action(("bloom-pack", dev.key(10)), "Grow pack", Icon::Sparkles, true, TIP_PACK, cx, |ws, cx| pack::grow_pack(ws, pack::PackOpts::default(), cx)));
     col = col.child(row);
     if let Some((f, name, dist, secs)) = matching {
         col = col.child(mono(format!("Matching {name} · {:.0}% · distance {dist:.2} · {secs} s", f * 100.), TEXT_XS, pal.accent2));

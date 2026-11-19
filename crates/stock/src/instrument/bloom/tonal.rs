@@ -33,12 +33,15 @@
 //!
 //! Only arithmetic, `sqrt` and rounding are used (see `genome::det_log2`).
 
-use super::genome::{SOUNDS, det_exp2, quantize, reflect};
+use super::genome::{SOUNDS, det_exp2, det_log2, quantize, reflect};
 use super::patch::{Kind, PATCH_LEN, Patch, PatchScene, det_norm, det_plain, layout};
 use super::rng::{Rng, part};
 use crate::instrument::wavetable::{self as wt, WavetableSynth, p as w, src as msrc, vdst};
 use aitrack_dsp::{AudioBuffer, Event, EventKind, ProcessContext, Processor, Transport};
 use std::sync::OnceLock;
+
+/// Packs: one scene per kind from one producer's palette (`pack.rs`).
+pub use super::pack::{Pack, PackCharacter, pack};
 
 // ── Priors ──────────────────────────────────────────────────────────────────
 
@@ -1228,6 +1231,128 @@ pub fn morph(a: &Patch, b: &Patch, t: f32) -> Patch {
     out
 }
 
+// ── Morph X/Y ───────────────────────────────────────────────────────────────
+
+/// The four tonal morph corners a state may hold (`extra.patch_corners`):
+/// each the sixteen patches of a stored scene, A (x 0, y 0), B (1, 0),
+/// C (0, 1), D (1, 1). A corner counts only while its kind is the device's.
+pub type PatchCorners = [Option<Box<[Patch; SOUNDS]>>; 4];
+
+/// Bilinear weights of the corners A, B, C, D at `(x, y)` (each 0..1).
+pub fn corner_weights(x: f32, y: f32) -> [f32; 4] {
+    let (x, y) = (if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 }, if y.is_finite() { y.clamp(0.0, 1.0) } else { 0.0 });
+    [(1.0 - x) * (1.0 - y), x * (1.0 - y), (1.0 - x) * y, x * y]
+}
+
+/// Whether a slot snaps (a choice or a stepped value) instead of sliding.
+fn snaps(k: usize) -> bool {
+    let info = &layout().infos[k];
+    info.scale == aitrack_dsp::ParamScale::Stepped || !info.choices.is_empty()
+}
+
+/// The patch at `(x, y)` between four corners (A top left, B top right, C
+/// bottom left, D bottom right; the kind is the heaviest corner's):
+/// continuous values slide bilinearly (in normalised space, so times and
+/// frequencies move geometrically); choices and stepped values snap to the
+/// heaviest corner; a modulation route keeps the heaviest corner's source
+/// and destination and blends its depth only with the corners that have
+/// the same route there (the others count as depth 0, so a route fades in
+/// and out instead of jumping onto another target). Then the kind's rules
+/// are applied again. At a corner it is that corner exactly. Deterministic
+/// and allocation-free (the device calls it on the audio thread).
+pub fn morph4(c: [&Patch; 4], x: f32, y: f32) -> Patch {
+    let w = corner_weights(x, y);
+    if let Some(k) = w.iter().position(|v| *v >= 1.0) {
+        return c[k].folded();
+    }
+    let mut win = 0;
+    for k in 1..4 {
+        if w[k] > w[win] {
+            win = k;
+        }
+    }
+    let f = [c[0].folded(), c[1].folded(), c[2].folded(), c[3].folded()];
+    let mut out = f[win];
+    let l = layout();
+    for k in 0..l.len {
+        if !snaps(k) {
+            out.v[k] = quantize(w[0] * f[0].v[k] + w[1] * f[1].v[k] + w[2] * f[2].v[k] + w[3] * f[3].v[k]);
+        }
+    }
+    let route = |out: &mut Patch, src: u32, dst: u32, amt: u32| {
+        let (Some(s), Some(d), Some(a)) = (Patch::slot(src), Patch::slot(dst), Patch::slot(amt)) else { return };
+        let zero = quantize(det_norm(&l.infos[a], 0.0));
+        let mut v = 0.0;
+        for k in 0..4 {
+            let same = f[k].v[s] == f[win].v[s] && f[k].v[d] == f[win].v[d];
+            v += w[k] * if same { f[k].v[a] } else { zero };
+        }
+        out.v[a] = quantize(v);
+    };
+    for s in 0..8 {
+        route(&mut out, w::slot(s, w::MOD_SRC), w::slot(s, w::MOD_DST), w::slot(s, w::MOD_AMT));
+    }
+    for s in 0..32 {
+        route(&mut out, w::slot_x(s, w::M_SRC), w::slot_x(s, w::M_DST), w::slot_x(s, w::M_AMT));
+    }
+    out.kind = c[win].kind;
+    constrain(&mut out);
+    out
+}
+
+/// The level gain at `(x, y)` between the corners' measured gains:
+/// interpolated in decibels (geometrically), with the bilinear weights of
+/// [`morph4`]. Deterministic and allocation-free.
+pub fn morph_gain(g: [f32; 4], x: f32, y: f32) -> f32 {
+    let w = corner_weights(x, y);
+    if let Some(k) = w.iter().position(|v| *v >= 1.0) {
+        return g[k];
+    }
+    let mut lg = 0.0;
+    for k in 0..4 {
+        lg += w[k] * det_log2(if g[k].is_finite() { g[k].max(1e-6) } else { 1.0 });
+    }
+    det_exp2(lg)
+}
+
+/// Store `scene`'s sixteen patches as corner `k` (0..4 = A..D), or clear
+/// it (`None`).
+pub fn set_corner(corners: &mut PatchCorners, k: usize, scene: Option<&PatchScene>) {
+    if let Some(slot) = corners.get_mut(k) {
+        *slot = scene.map(|s| Box::new(s.patches));
+    }
+}
+
+/// The four corner patches of cell `i` for a scene of `kind`: a stored
+/// corner of that kind, else the scene's own patch.
+pub fn corner_patches<'a>(scene: &'a PatchScene, corners: &'a PatchCorners, i: usize) -> [&'a Patch; 4] {
+    let i = i.min(SOUNDS - 1);
+    let pick = |k: usize| match &corners[k] {
+        Some(c) if c[i].kind == scene.kind => &c[i],
+        _ => &scene.patches[i],
+    };
+    [pick(0), pick(1), pick(2), pick(3)]
+}
+
+/// Whether any corner holds a scene of `kind` (Morph X/Y then morphs it).
+pub fn corners_active(corners: &PatchCorners, kind: Kind) -> bool {
+    kind.is_tonal() && corners.iter().any(|c| c.as_ref().is_some_and(|c| c[0].kind == kind))
+}
+
+/// The scene as Morph X/Y makes it sound at `(x, y)`: every cell's patch
+/// morphed between the corners (for display; the cores, paths and distances
+/// are the scene's own). Without a corner of the scene's kind it is the
+/// scene.
+pub fn morph_scene(scene: &PatchScene, corners: &PatchCorners, x: f32, y: f32) -> PatchScene {
+    let mut out = scene.clone();
+    if corners_active(corners, scene.kind) {
+        for i in 0..SOUNDS {
+            out.patches[i] = morph4(corner_patches(scene, corners, i), x, y);
+        }
+    }
+    out
+}
+
 /// A new roll: the scene of `seed`, reached from `prev` by `deviance`
 /// (1 = entirely new). Locked cells stay. A roll to another kind is a new
 /// scene of that kind (locks kept only within a kind).
@@ -1304,13 +1429,13 @@ pub fn replace(scene: &PatchScene, i: usize, patch: &Patch) -> PatchScene {
 
 // ── Names ───────────────────────────────────────────────────────────────────
 
-const DARK: &[&str] = &["Velvet", "Smoky", "Deep", "Murky", "Midnight", "Shadow", "Umber", "Sunken"];
-const BRIGHT: &[&str] = &["Glass", "Crystal", "Neon", "Silver", "Solar", "Prism", "Chrome", "Glacier"];
-const WIDE: &[&str] = &["Lush", "Choral", "Swarm", "Cloud", "Wide", "Halo", "Vast", "Plush"];
-const GRIT: &[&str] = &["Rusty", "Burnt", "Feral", "Gritty", "Molten", "Scorched", "Raw", "Torn"];
-const MOVING: &[&str] = &["Drifting", "Breathing", "Shifting", "Wandering", "Tidal", "Restless", "Orbiting", "Swaying"];
+pub(crate) const DARK: &[&str] = &["Velvet", "Smoky", "Deep", "Murky", "Midnight", "Shadow", "Umber", "Sunken"];
+pub(crate) const BRIGHT: &[&str] = &["Glass", "Crystal", "Neon", "Silver", "Solar", "Prism", "Chrome", "Glacier"];
+pub(crate) const WIDE: &[&str] = &["Lush", "Choral", "Swarm", "Cloud", "Wide", "Halo", "Vast", "Plush"];
+pub(crate) const GRIT: &[&str] = &["Rusty", "Burnt", "Feral", "Gritty", "Molten", "Scorched", "Raw", "Torn"];
+pub(crate) const MOVING: &[&str] = &["Drifting", "Breathing", "Shifting", "Wandering", "Tidal", "Restless", "Orbiting", "Swaying"];
 const NOISY: &[&str] = &["Dusty", "Hazy", "Static", "Misty", "Sandy", "Frosted", "Ashen", "Grainy"];
-const SOFT: &[&str] = &["Warm", "Soft", "Hollow", "Round", "Amber", "Quiet", "Mellow", "Honey"];
+pub(crate) const SOFT: &[&str] = &["Warm", "Soft", "Hollow", "Round", "Amber", "Quiet", "Mellow", "Honey"];
 
 fn nouns(kind: Kind) -> &'static [&'static str] {
     match kind {

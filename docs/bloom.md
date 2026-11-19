@@ -11,6 +11,9 @@ embedded Wavetable Synth (see [Tonal kinds](#tonal-kinds)).
 |---|---|
 | `crates/stock/src/instrument/bloom/genome.rs` | The 44 genes, `Genome`, `Role`, `Species`, `Scene` (the state blob) |
 | `crates/stock/src/instrument/bloom/grow.rs` | Generation, roll, mutate, regrow, re-base, morph (pure, deterministic) |
+| `crates/stock/src/instrument/bloom/pack.rs` | Packs: one scene per kind from one pack character (pure, deterministic) |
+| `crates/ai/src/generate/pack.rs` | A pack's clips: one key, one progression, drums on Bloom's pads |
+| `crates/app/src/views/device_window/bloom/pack.rs` | `grow_pack`: a pack as tracks, Blooms and clips in one undo step |
 | `crates/stock/src/instrument/bloom/voice.rs` | The Body and Resonator engines |
 | `crates/stock/src/instrument/bloom/space.rs` | The shared ambience |
 | `crates/stock/src/instrument/bloom/render.rs` | Offline renders: level normalisation, export, matching |
@@ -32,7 +35,7 @@ embedded Wavetable Synth (see [Tonal kinds](#tonal-kinds)).
 | 2 | Deviance | 0–100 % (100) | how far Roll / Mutate move (editor) | same |
 | 3–6 | Decay, Body, Tone, Grit | −100–100 % (0) | per-voice macros | amp / mod / env-3 decay and release ×0.35–2.8; sub and unison width; both cutoffs ±2 oct (and the EQ's top); distortion and filter drive |
 | 7 | Space | 0–100 % (25) | ambience return | ambience return, and the patch's reverb ×(0.4 + 2.4·Space) |
-| 8, 9 | Morph X / Y | 0–1 | corner scenes | — (not yet) |
+| 8, 9 | Morph X / Y | 0–1 | corner scenes | the selected patch between the tonal corners (30 ms glide) |
 | 10 | Selected Sound | 0–15 | the sound of Chromatic / Single | the patch that plays |
 | 11 | Play Mode | Kit, Chromatic, Single | as below | Kit = Chromatic; Single = key 60 for any key |
 | 12, 13 | Base Note, Choke | | kit layout, hat choke | — |
@@ -186,7 +189,23 @@ no high-pass where the body matters, pitch and amp modulation capped per
 kind (free for FX).
 
 Growth, `roll` (Deviance), `mutate`, `regrow`, `replace` and locks work like
-the drum scene's. Morph X/Y does not morph tonal scenes in this version.
+the drum scene's.
+
+**Morph X/Y** (`tonal::morph4`): the state may hold four tonal corners
+(`extra.patch_corners`, each a stored scene's sixteen patches; A = x 0 y 0,
+B = 1 0, C = 0 1, D = 1 1; a missing corner, or one of another kind, is the
+scene itself). The selected patch plays bilinearly blended between them:
+continuous values slide in normalised space (times and frequencies move
+geometrically), choices and stepped values snap to the heaviest corner, and
+a modulation route keeps the heaviest corner's source and destination while
+its depth blends only with corners routed the same way (others count as
+depth 0, so routes fade instead of jumping targets); then `constrain` holds
+the blend to the kind's rules. At a corner it is that corner exactly. The
+level is the corners' measured gains interpolated in dB (`morph_gain`;
+corners are measured when the state loads). On the audio thread the morph
+position glides to Morph X/Y with a 30 ms one-pole (`MORPH_GLIDE`) and the
+synth gets the new blend each time it has moved 0.004 (at most once per
+block, only the values that changed): no allocation (tested), no steps.
 Names (`tonal::patch_name`, `scene_names`): an adjective from what the
 patch is (dark, bright, wide, gritty, moving, noisy, soft) and a noun of its
 kind ("Velvet Reese", "Glass Choir"), picked by its fingerprint.
@@ -230,6 +249,17 @@ with other block sizes differ only by the synth's control-rate grid.
   `Bloom::kind()`, `patches()`, `patch_gains()`. The editor's existing
   `state_json_with` writes no `extra.patches` (the device then regrows the
   same scene from Seed and Kind; only edits and locks would be lost).
+
+- Morph: `tonal::PatchCorners`, `tonal::morph4(corners, x, y)`,
+  `morph_gain`, `corner_weights`, `set_corner(corners, k, scene)`,
+  `corner_patches`, `corners_active`, `morph_scene(scene, corners, x, y)`
+  (the sixteen patches as they sound at X/Y, for display);
+  `bloom::parse_patch_corners(state)`, `set_patch_corner(state, k,
+  Some(scene) | None)` (the corner buttons for a tonal kind),
+  `with_patch_corners`, `state_json_tonal(…, patch_corners)`, and
+  `keep_patch_corners(old_state, new_state)`: the editor's `commit` /
+  `commit_patches` rebuild the blob without the tonal corners and should
+  pass it through this; `Bloom::morph_position()`, `playing_patch()`.
 
 ### In the editor
 
@@ -292,10 +322,54 @@ Everything the drum scene has, the tonal scene has too, said for patches:
   48 kHz, the silent tail trimmed) to `AI-Track/Bloom/<kind> <seed>`.
   Dragging the mass regrows the selected patch (`tonal::regrow`).
 
+### Packs
+
+`pack::PackCharacter::of(seed, style, key)` draws what every member shares:
+brightness (−1..1, the members' place in their kind's cutoff band), a wave
+family (`FAMILIES`: Analog, Digital, Glass, Vocal, Dirty; each kind takes
+the first factory wave of the family it can use), an FX flavour (dry, plate,
+hall, chorus, dist: shares of each kind's reverb, decay and chorus bands, or
+distortion on every non-pad kind), movement, analog drift vs digital, width,
+a time scale, a shared delay, and the drum member: a species and, out of 48
+candidate seeds, the one whose scene character is nearest the pack's
+brightness, grit and room (and in the project's key). `Style` (Dark, Bright,
+Warm, Digital, Gritty, Lush) narrows the draws. `tonal::pack(seed,
+&character, kinds)` (`pack::pack`) grows one member per kind: a tonal
+kind's scene uses the pack's character instead of its own (only the lineage
+parent is drawn per kind), each core is imprinted with the family's wave,
+the drift, the cutoff place and the distortion, then held to the rules; the
+member selects the cell nearest the pack's traits. The pack path is salted
+apart from `tonal::generate`, which grows exactly what it did before
+(pinned by a fingerprint test). Members of one pack sit measurably closer in
+the shared traits (`pack::traits`: cutoff, drift, reverb mix and decay,
+chorus, distortion, motion, each within its kind's band) than the same
+kinds in other packs (tested over 24 packs).
+
+`bloom::member_device(pack, member)` gives a member's Bloom parameters and
+state (Kind, Seed = the pack's seed or the drum seed, Species, the selected
+cell, Kit or Chromatic mode, the sounds in `extra.patches` / `extra.scene`).
+`aitrack_ai::generate::pack::plan` writes the clips: the seed's chord
+progression first (every chord part plays it, the others follow it bar by
+bar), drums on the Bloom kit's pads (`bloom_pads`: sound `i` on 36 + `i`),
+then bass (clear of the kick), pad and texture (held chords), keys (stabs),
+pluck (arpeggio), lead (melody), FX (a hit on bar 1, one halfway through
+clips of 8+ bars, a long note over the last bar). The app's
+`grow_pack(ws, PackOpts, cx)` adds it all as one undo step: a track per
+member ("Bloom Bass — Velvet Growl", a palette colour per kind, a starting
+fader per kind), its Bloom and its clip at the loop's first bar.
+
 Audition offline (no window):
 `cargo run -p aitrack-stock --release --example bloom_kinds -- <out_dir> [seed]`
 writes `<kind>.wav` and `<kind>.png` (spectrogram, 30 Hz–16 kHz log, patch
 boundaries marked) per kind and prints each patch's stats.
+
+A pack (the clips need the app's commands, so it is an ignored app test that
+renders the tracks `grow_pack` makes through their Blooms, twice through the
+clip, at their faders):
+`BLOOM_PACK_OUT=<dir> BLOOM_PACK_SEEDS=4242,77 cargo test -p aitrack-app --release --bin aitrack bloom_pack_audition -- --ignored --nocapture`
+writes `<seed>-<member>.wav` / `.png` per member and `<seed>-mix.wav` / `.png`,
+and prints each member's RMS and peak (the faders in `pack::fader_db` come
+from it).
 
 ## Sound → colour and shape
 

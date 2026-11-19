@@ -16,15 +16,18 @@
 //!   factory presets of that kind. The **selected** patch plays,
 //!   chromatically: *Kit* and *Chromatic* both play it across the keyboard
 //!   at the synth's own pitch (key 60 = C3 is the patch's home), *Single*
-//!   plays it at key 60 whatever the key. Base and Choke do nothing there,
-//!   and Morph X/Y does not morph tonal scenes (yet).
+//!   plays it at key 60 whatever the key. Base and Choke do nothing there.
+//!   Morph X/Y blends the selected patch between up to four stored tonal
+//!   corners (`extra.patch_corners`, [`tonal::morph4`]), gliding there over
+//!   [`MORPH_GLIDE`] so automation never steps.
 //! * **Engines** (`voice.rs`): a Body (oscillators, pitch sweep, FM, noise,
 //!   drive, filter, AHD-R amp) exciting a modal Resonator, plus a shared
 //!   ambience (`space.rs`). Tonal kinds: the embedded
 //!   [`WavetableSynth`] (allocated at creation), its output into the same
 //!   ambience.
 //! * **State**: the genomes live in the state blob (`extra.scene`, the four
-//!   morph corners, and for a tonal kind `extra.patches`), never as
+//!   morph corners, for a tonal kind `extra.patches`, and the tonal morph
+//!   corners `extra.patch_corners`), never as
 //!   parameters. The parameters are the performance surface: Seed, Species
 //!   and Kind (what the scene was grown from), Deviance (read by the
 //!   editor's Roll and Mutate), the Decay / Body / Tone / Grit / Space
@@ -68,6 +71,7 @@
 
 pub mod genome;
 pub mod grow;
+pub mod pack;
 pub mod patch;
 pub mod render;
 pub mod rng;
@@ -88,7 +92,7 @@ use patch::{KIND_NAMES, Kind, PATCH_LEN, Patch, PatchScene};
 use render::{MEASURE_FRAMES, measure_gain, noise_seed};
 use serde_json::{Value, json};
 use space::Space;
-use tonal::{Knobs, Leveler};
+use tonal::{Knobs, Leveler, PatchCorners};
 use voice::{Macros, Patch as DrumPatch, Perform, Voice};
 
 pub const ID: &str = "instrument.bloom";
@@ -104,6 +108,11 @@ pub const DEFAULT_SEED: u64 = 1_337;
 const TONAL_SEND: f32 = 0.35;
 /// Most events handed to the synth in one block.
 const SYNTH_EVENTS: usize = 1024;
+/// Seconds a tonal morph takes to follow Morph X/Y (one pole).
+pub const MORPH_GLIDE: f32 = 0.03;
+/// How far (in X + Y) the gliding morph moves before the synth gets the
+/// next blend: patches change in small steps, at most once per block.
+const MORPH_STEP: f32 = 0.004;
 
 pub mod p {
     pub const SEED: u32 = 0;
@@ -227,15 +236,25 @@ pub fn state_json_with(params: &std::collections::BTreeMap<u32, f32>, scene: &Sc
 /// [`state_json_with`] with a tonal scene (`extra.patches`; stored only
 /// when given, i.e. when the Kind parameter is tonal).
 pub fn state_json_full(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>) -> Vec<u8> {
+    state_json_tonal(params, scene, corners, visual, patches, &Default::default())
+}
+
+/// [`state_json_full`] with the tonal morph corners (`extra.patch_corners`,
+/// written only when one is set).
+pub fn state_json_tonal(params: &std::collections::BTreeMap<u32, f32>, scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>, patch_corners: &PatchCorners) -> Vec<u8> {
     let mut p = serde_json::Map::new();
     for (k, v) in params {
         p.insert(k.to_string(), Value::from(f64::from(*v)));
     }
-    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners, visual, patches) });
+    let root = json!({ "version": 1, "params": Value::Object(p), "extra": extra_json(scene, corners, visual, patches, Some(patch_corners)) });
     serde_json::to_vec(&root).unwrap_or_default()
 }
 
-fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>) -> Value {
+fn patch_corners_json(c: &PatchCorners) -> Value {
+    Value::Array(c.iter().map(|c| c.as_ref().map_or(Value::Null, |s| serde_json::to_value(**s).unwrap_or(Value::Null))).collect())
+}
+
+fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>, patches: Option<&PatchScene>, patch_corners: Option<&PatchCorners>) -> Value {
     let mut extra = json!({
         "scene": scene.to_json(),
         "corners": corners.iter().map(|c| c.as_ref().map_or(Value::Null, |s| serde_json::to_value(**s).unwrap_or(Value::Null))).collect::<Vec<_>>(),
@@ -247,8 +266,93 @@ fn extra_json(scene: &Scene, corners: &Corners, visual: Option<&str>, patches: O
         if let Some(t) = patches {
             map.insert("patches".into(), t.to_json());
         }
+        if let Some(c) = patch_corners.filter(|c| c.iter().any(Option::is_some)) {
+            map.insert("patch_corners".into(), patch_corners_json(c));
+        }
     }
     extra
+}
+
+/// The tonal morph corners a state blob holds (`None` where unset).
+pub fn parse_patch_corners(data: Option<&[u8]>) -> PatchCorners {
+    let mut out: PatchCorners = Default::default();
+    let Some(root) = data.and_then(|d| serde_json::from_slice::<Value>(d).ok()) else { return out };
+    if let Some(list) = root.get("extra").and_then(|e| e.get("patch_corners")).and_then(Value::as_array) {
+        for (slot, v) in out.iter_mut().zip(list) {
+            *slot = serde_json::from_value::<[Patch; SOUNDS]>(v.clone()).ok().map(Box::new);
+        }
+    }
+    out
+}
+
+/// `state` with tonal morph corner `k` (0..4 = A..D) set to `scene`'s
+/// sixteen patches, or cleared (`None`); everything else in the blob is
+/// kept. What the editor's corner buttons store for a tonal kind.
+pub fn set_patch_corner(state: Option<&[u8]>, k: usize, scene: Option<&PatchScene>) -> Vec<u8> {
+    let mut corners = parse_patch_corners(state);
+    tonal::set_corner(&mut corners, k, scene);
+    with_patch_corners(state, &corners)
+}
+
+/// `state` holding `corners` as its tonal morph corners (the key removed
+/// when none is set); everything else is kept.
+pub fn with_patch_corners(state: Option<&[u8]>, corners: &PatchCorners) -> Vec<u8> {
+    let mut root = match state.and_then(|d| serde_json::from_slice::<Value>(d).ok()) {
+        Some(Value::Object(m)) => m,
+        _ => {
+            let mut m = serde_json::Map::new();
+            m.insert("version".into(), Value::from(1));
+            m.insert("params".into(), json!({}));
+            m
+        }
+    };
+    let extra = root.entry("extra").or_insert_with(|| json!({}));
+    if !extra.is_object() {
+        *extra = json!({});
+    }
+    if let Some(map) = extra.as_object_mut() {
+        if corners.iter().any(Option::is_some) {
+            map.insert("patch_corners".into(), patch_corners_json(corners));
+        } else {
+            map.remove("patch_corners");
+        }
+    }
+    serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
+}
+
+/// `new` (a blob the editor rebuilt) with the tonal morph corners `old`
+/// held, so rewriting the scene does not drop them.
+pub fn keep_patch_corners(old: Option<&[u8]>, new: Vec<u8>) -> Vec<u8> {
+    let corners = parse_patch_corners(old);
+    if corners.iter().all(Option::is_none) || parse_patch_corners(Some(&new)).iter().any(Option::is_some) {
+        return new;
+    }
+    with_patch_corners(Some(&new), &corners)
+}
+
+/// The parameters (normalised, only those it sets) and the state blob of a
+/// Bloom playing pack member `m`: its Kind, Seed (the pack's for a tonal
+/// member, the drum seed for drums), Species, the selected cell, Kit mode
+/// for drums and Chromatic for tonal kinds, and its sounds in the state so
+/// the device plays them as grown.
+pub fn member_device(pack: &pack::Pack, m: &pack::Member) -> (std::collections::BTreeMap<u32, f32>, Vec<u8>) {
+    let infos = params();
+    let norm = |id: u32, plain: f32| infos.iter().find(|i| i.id == id).map_or(0.0, |i| i.to_normalized(plain));
+    let species = pack.character.species;
+    let mut params = std::collections::BTreeMap::new();
+    params.insert(p::KIND, norm(p::KIND, m.kind.index() as f32));
+    params.insert(p::SEED, norm(p::SEED, m.seed().min(MAX_SEED) as f32));
+    params.insert(p::SPECIES, norm(p::SPECIES, species.index() as f32));
+    params.insert(p::SELECTED, norm(p::SELECTED, m.selected.min(SOUNDS - 1) as f32));
+    params.insert(p::MODE, norm(p::MODE, if m.kind.is_tonal() { 1.0 } else { 0.0 }));
+    let state = match &m.sounds {
+        pack::Sounds::Drums(scene) => state_json(&params, scene, &Default::default()),
+        pack::Sounds::Tonal(patches) => {
+            let drums = generate(patches.seed, GrowOpts { species, spread: 1.0 });
+            state_json_full(&params, &drums, &Default::default(), None, Some(patches))
+        }
+    };
+    (params, state)
 }
 
 /// The visual's material a state blob names, if any.
@@ -279,6 +383,12 @@ pub fn parse_patches(data: Option<&[u8]>) -> Option<PatchScene> {
 
 struct Corner {
     sounds: [Genome; SOUNDS],
+    gains: [f32; SOUNDS],
+}
+
+/// A tonal morph corner: sixteen patches and their measured levels.
+struct TonalCorner {
+    patches: [Patch; SOUNDS],
     gains: [f32; SOUNDS],
 }
 
@@ -380,6 +490,12 @@ pub struct Bloom {
     synth_prev: f32,
     synth_dc: [tonal::DcBlock; 2],
     tonal_noise: f32,
+    /// Tonal morph corners (a corner of another kind is ignored).
+    patch_corners: [Option<Box<TonalCorner>>; 4],
+    /// Where the tonal morph is, gliding towards `morph`.
+    morph_now: (f32, f32),
+    /// The morph position the synth last received.
+    morph_applied: (f32, f32),
     // Where the block is, for Vary's seeds.
     block_pos: i64,
     playing: bool,
@@ -490,6 +606,9 @@ impl Bloom {
             synth_prev: 0.0,
             synth_dc: Default::default(),
             tonal_noise: 0.0,
+            patch_corners: Default::default(),
+            morph_now: (0.0, 0.0),
+            morph_applied: (0.0, 0.0),
             block_pos: 0,
             playing: false,
             seg: 0,
@@ -572,6 +691,82 @@ impl Bloom {
         &self.tonal_gains
     }
 
+    /// Where the tonal morph is (it glides towards Morph X/Y).
+    pub fn morph_position(&self) -> (f32, f32) {
+        self.morph_now
+    }
+
+    /// The selected tonal patch and its level as the device plays them now
+    /// (morphed between the stored corners; before the knobs).
+    pub fn playing_patch(&self) -> (Patch, f32) {
+        (self.selected_patch(), self.selected_gain())
+    }
+
+    /// Whether a tonal morph corner of the playing kind is stored.
+    fn morphing(&self) -> bool {
+        self.kind.is_tonal() && self.patch_corners.iter().any(|c| c.as_ref().is_some_and(|c| c.patches[0].kind == self.kind))
+    }
+
+    /// Cell `i` of corner `k`: the corner's patch and level when it holds
+    /// the playing kind, else the scene's.
+    fn corner(&self, k: usize, i: usize) -> (&Patch, f32) {
+        match &self.patch_corners[k] {
+            Some(c) if c.patches[i].kind == self.kind => (&c.patches[i], c.gains[i]),
+            _ => (&self.tonal.patches[i], self.tonal_gains[i]),
+        }
+    }
+
+    /// The selected tonal patch as it plays: morphed between the corners
+    /// at the gliding position. No allocation.
+    fn selected_patch(&self) -> Patch {
+        let i = self.selected;
+        if !self.morphing() {
+            return self.tonal.patches[i];
+        }
+        let c = [self.corner(0, i).0, self.corner(1, i).0, self.corner(2, i).0, self.corner(3, i).0];
+        tonal::morph4(c, self.morph_now.0, self.morph_now.1)
+    }
+
+    /// The level of [`Self::selected_patch`]: the corners' measured levels
+    /// interpolated in dB.
+    fn selected_gain(&self) -> f32 {
+        let i = self.selected;
+        if !self.morphing() {
+            return self.tonal_gains[i];
+        }
+        let g = [self.corner(0, i).1, self.corner(1, i).1, self.corner(2, i).1, self.corner(3, i).1];
+        tonal::morph_gain(g, self.morph_now.0, self.morph_now.1)
+    }
+
+    /// Glide the tonal morph one block towards Morph X/Y and send the synth
+    /// the new blend once it has moved [`MORPH_STEP`] (or arrived).
+    fn step_morph(&mut self, frames: usize) {
+        if !self.morphing() {
+            self.morph_now = self.morph;
+            self.morph_applied = self.morph;
+            return;
+        }
+        if self.morph_now == self.morph && self.morph_applied == self.morph {
+            return;
+        }
+        let k = 1.0 - (-(frames as f32) / (MORPH_GLIDE * self.sr)).exp();
+        let (tx, ty) = self.morph;
+        let (mut x, mut y) = self.morph_now;
+        x += (tx - x) * k;
+        y += (ty - y) * k;
+        if (tx - x).abs() < 1e-4 {
+            x = tx;
+        }
+        if (ty - y).abs() < 1e-4 {
+            y = ty;
+        }
+        self.morph_now = (x, y);
+        let moved = (x - self.morph_applied.0).abs() + (y - self.morph_applied.1).abs();
+        if moved >= MORPH_STEP || self.morph_now == self.morph {
+            self.apply_patch();
+        }
+    }
+
     fn target(&self) -> (u64, Species) {
         (seed_of(self.params.plain(p::SEED)), Species::from_index(self.params.choice(p::SPECIES)))
     }
@@ -627,8 +822,8 @@ impl Bloom {
     /// values that changed. No allocation.
     fn apply_patch(&mut self) {
         let knobs = Knobs { macros: self.macros, space: self.space_amt, velocity: self.vel_amount, attack: self.perform.attack, drop: self.perform.drop, motion: self.perform.motion, glide: self.glide };
-        let patch = &self.tonal.patches[self.selected];
-        let shaped = tonal::shape_knobs(patch, &knobs);
+        let patch = self.selected_patch();
+        let shaped = tonal::shape_knobs(&patch, &knobs);
         let l = patch::layout();
         for k in 0..l.len {
             let v = shaped.v[k];
@@ -637,8 +832,9 @@ impl Bloom {
                 self.applied[k] = v;
             }
         }
-        self.tonal_noise = tonal::noise_share(patch);
-        self.synth_gain = self.tonal_gains[self.selected];
+        self.tonal_noise = tonal::noise_share(&patch);
+        self.synth_gain = self.selected_gain();
+        self.morph_applied = self.morph_now;
     }
 
     /// Measure the next tonal patch still waiting (a chunk per block, the
@@ -656,7 +852,7 @@ impl Bloom {
             self.tonal_gains[i] = g;
             self.tonal_measured |= 1 << i;
             if i == self.selected {
-                self.synth_gain = g;
+                self.synth_gain = self.selected_gain();
             }
         }
     }
@@ -672,7 +868,7 @@ impl Bloom {
                 self.tonal_measured |= 1 << i;
             }
         }
-        self.synth_gain = self.tonal_gains[self.selected];
+        self.synth_gain = self.selected_gain();
     }
 
     /// Measure the level of the next sound still waiting (one per block).
@@ -1079,6 +1275,10 @@ impl Processor for Bloom {
         self.synth_prev = 0.0;
         self.synth_dc = Default::default();
         self.hit_count = 0;
+        if self.morph_now != self.morph {
+            self.morph_now = self.morph;
+            self.apply_patch_if_tonal();
+        }
         self.out.reset(self.width, self.drive_amt, self.filter_amt);
     }
 
@@ -1105,6 +1305,7 @@ impl Processor for Bloom {
             if self.params.take_dirty() {
                 self.update();
             }
+            self.step_morph(frames);
             self.measure_tonal();
             self.render_synth(ctx);
         } else {
@@ -1129,7 +1330,8 @@ impl Processor for Bloom {
     fn save_state(&self) -> Vec<u8> {
         let corners: Corners = std::array::from_fn(|k| self.corners[k].as_ref().map(|c| Box::new(c.sounds)));
         let patches = self.kind.is_tonal().then_some(&*self.tonal);
-        save_state(&self.params, extra_json(&self.scene, &corners, self.visual.as_deref(), patches))
+        let patch_corners: PatchCorners = std::array::from_fn(|k| self.patch_corners[k].as_ref().map(|c| Box::new(c.patches)));
+        save_state(&self.params, extra_json(&self.scene, &corners, self.visual.as_deref(), patches, Some(&patch_corners)))
     }
 
     fn load_state(&mut self, data: &[u8]) {
@@ -1146,6 +1348,12 @@ impl Processor for Bloom {
                 Box::new(Corner { sounds: *sounds, gains })
             });
         }
+        for (slot, c) in self.patch_corners.iter_mut().zip(parse_patch_corners(wrapped.as_deref())) {
+            *slot = c.map(|patches| {
+                let gains = std::array::from_fn(|i| self.leveler.measure(&patches[i]));
+                Box::new(TonalCorner { patches: *patches, gains })
+            });
+        }
         let kind = Kind::from_index(self.params.choice(p::KIND));
         if kind.is_tonal() {
             let stored = parse_patches(wrapped.as_deref());
@@ -1157,6 +1365,8 @@ impl Processor for Bloom {
         }
         self.params.mark_dirty();
         self.update();
+        self.morph_now = self.morph;
+        self.apply_patch_if_tonal();
         self.synth_gain_now = self.synth_gain;
     }
 
@@ -1606,6 +1816,105 @@ mod tests {
         assert_eq!(c.patches().patches[0], edited.patches[0]);
         // Drums store no patches.
         assert!(parse_patches(Some(&Bloom::new().save_state())).is_none());
+    }
+
+    /// A Pad with corner B (another seed's scene) and corner C (a Lead
+    /// scene, ignored by a Pad) stored.
+    fn morphing_pad() -> (Bloom, PatchScene) {
+        let mut a = tonal(Kind::Pad);
+        let _ = render_notes(&mut a, &[], 256);
+        let b = tonal::generate(77, Kind::Pad);
+        let blob = set_patch_corner(Some(&a.save_state()), 1, Some(&b));
+        let blob = set_patch_corner(Some(&blob), 2, Some(&tonal::generate(77, Kind::Lead)));
+        let mut d = Bloom::new();
+        d.load_state(&blob);
+        (d, b)
+    }
+
+    #[test]
+    fn tonal_morph_corners_blend_the_selected_patch() {
+        let (mut d, b) = morphing_pad();
+        assert_eq!(d.kind(), Kind::Pad);
+        let own = d.patches().patches[0];
+        assert_eq!(d.playing_patch().0, own.folded(), "X/Y at A plays the scene");
+        let note = [(0, 60, 0.8, true)];
+        let (at_a, _) = render_notes(&mut d, &note, 9_600);
+        set_plain(&mut d, p::MORPH_X, 1.0);
+        let (at_b, _) = render_notes(&mut d, &note, 9_600);
+        assert_eq!(d.morph_position(), (1.0, 0.0), "a render (prepare + reset) lands on the target");
+        assert_eq!(d.playing_patch().0, b.patches[0].folded(), "X at 1 plays corner B");
+        let gain_b = tonal::measure_gain(&b.patches[0]);
+        assert!((d.playing_patch().1 - gain_b).abs() < 1e-6, "at its own level");
+        assert!(at_a.iter().zip(&at_b).map(|(x, y)| (x - y).abs()).sum::<f32>() > 1.0);
+        // The Lead corner C stands in as the Pad scene.
+        set_plain(&mut d, p::MORPH_X, 0.0);
+        set_plain(&mut d, p::MORPH_Y, 1.0);
+        let _ = render_notes(&mut d, &[], 256);
+        assert_eq!(d.playing_patch().0, own.folded());
+        // Halfway, between both, and its level between theirs (in dB).
+        set_plain(&mut d, p::MORPH_Y, 0.0);
+        set_plain(&mut d, p::MORPH_X, 0.5);
+        let _ = render_notes(&mut d, &[], 256);
+        let (mid, g) = d.playing_patch();
+        assert!(mid.distance(&own) > 1e-3 && mid.distance(&b.patches[0]) > 1e-3);
+        let (ga, gb) = (d.patch_gains()[0], gain_b);
+        assert!(g >= ga.min(gb) - 1e-6 && g <= ga.max(gb) + 1e-6);
+        // The corners round-trip through the device's state; editor rewrites keep them.
+        let saved = d.save_state();
+        let corners = parse_patch_corners(Some(&saved));
+        assert!(corners[0].is_none() && corners[3].is_none());
+        assert_eq!(corners[1].as_deref(), Some(&b.patches));
+        let params: std::collections::BTreeMap<u32, f32> = [(p::SEED, d.get_param(p::SEED)), (p::KIND, d.get_param(p::KIND))].into();
+        let rebuilt = state_json_full(&params, d.scene(), &Default::default(), None, Some(d.patches()));
+        assert!(parse_patch_corners(Some(&rebuilt)).iter().all(Option::is_none));
+        let kept = keep_patch_corners(Some(&saved), rebuilt);
+        assert_eq!(parse_patch_corners(Some(&kept))[1].as_deref(), Some(&b.patches));
+        assert_eq!(parse_patches(Some(&kept)).as_ref(), Some(d.patches()));
+        let cleared = set_patch_corner(Some(&kept), 1, None);
+        let cleared = set_patch_corner(Some(&cleared), 2, None);
+        assert!(!String::from_utf8_lossy(&cleared).contains("patch_corners"));
+        // Drums keep their own corners and ignore the tonal ones.
+        assert!(parse_state(Some(&kept)).1.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn tonal_morph_automation_glides_without_steps() {
+        let (mut d, _) = morphing_pad();
+        d.prepare(SR, 128);
+        let infos = params();
+        let x_norm = |v: f32| infos.iter().find(|i| i.id == p::MORPH_X).unwrap().to_normalized(v);
+        let tr = Transport::default();
+        let mut buf = AudioBuffer::new(2, 128);
+        let mut out = Vec::new();
+        let mut run = |d: &mut Bloom, events: &[Event], out: &mut Vec<f32>| {
+            buf.set_frames(128);
+            buf.clear();
+            let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events, transport: &tr };
+            d.process(&mut ctx);
+            out.extend_from_slice(buf.channel(0));
+        };
+        run(&mut d, &[Event { offset: 0, kind: EventKind::NoteOn { channel: 0, key: 60, velocity: 0.8, note_id: 1 } }], &mut out);
+        for _ in 0..300 {
+            run(&mut d, &[], &mut out);
+        }
+        // Jump X to 1 in one event: the morph glides there over ~30 ms.
+        run(&mut d, &[Event { offset: 0, kind: EventKind::Param { id: p::MORPH_X, value: x_norm(1.0) } }], &mut out);
+        let first = d.morph_position().0;
+        assert!(first > 0.0 && first < 0.2, "one block moves a little: {first}");
+        let mut last = first;
+        for _ in 0..140 {
+            run(&mut d, &[], &mut out);
+            let x = d.morph_position().0;
+            assert!(x >= last && x - last < 0.2, "monotone, small steps");
+            last = x;
+        }
+        assert_eq!(d.morph_position().0, 1.0, "arrives");
+        assert!(out.iter().all(|v| v.is_finite()));
+        // No click: the sweep's largest sample step stays near the static sound's.
+        let step = |x: &[f32]| x.windows(2).fold(0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        let before = step(&out[20_000..300 * 128]);
+        let during = step(&out[300 * 128..out.len()]);
+        assert!(during < before * 2.5 + 1e-3, "a morph sweep steps {during} vs {before} at rest");
     }
 
     #[test]

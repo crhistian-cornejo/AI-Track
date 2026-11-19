@@ -503,11 +503,16 @@ impl Default for GrowOpts {
     }
 }
 
+/// The character the scene of `seed` and `species` is grown with (what
+/// [`generate`] draws first), without growing it.
+pub fn scene_character(seed: u64, species: Species) -> Character {
+    Character::of(species, &mut Rng::new(part(seed, 99, 0)))
+}
+
 /// The scene a seed grows: cores from the species, paths and distances
 /// from the seed.
 pub fn generate(seed: u64, opts: GrowOpts) -> Scene {
-    let mut r = Rng::new(part(seed, 99, 0));
-    let ch = Character::of(opts.species, &mut r);
+    let ch = scene_character(seed, opts.species);
     let layout = opts.species.layout();
     let mut cores = [Genome::default(); SOUNDS];
     let mut sounds = [Genome::default(); SOUNDS];

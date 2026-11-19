@@ -226,3 +226,59 @@ fn bloom_grows_and_plays_tonal_scenes_without_rt_heap_traffic() {
     });
     assert_eq!(n, 0, "kind change in the events: {n} heap operations");
 }
+
+#[test]
+fn bloom_morphs_tonal_corners_without_rt_heap_traffic() {
+    use aitrack_dsp::{Event, EventKind, Processor};
+    use aitrack_stock::instrument::bloom::patch::Kind;
+    use aitrack_stock::instrument::bloom::{self, Bloom, p, tonal};
+    let norm = |b: &Bloom, id: u32, plain: f32| b.info().params.iter().find(|i| i.id == id).unwrap().to_normalized(plain);
+    for kind in [Kind::Pad, Kind::Lead, Kind::Bass, Kind::Fx] {
+        // Corners are stored on the control side (a loaded state).
+        let mut a = Bloom::new();
+        a.set_param(p::KIND, norm(&a, p::KIND, kind.index() as f32));
+        a.prepare(SR, BLOCK);
+        let mut blob = a.save_state();
+        for (k, seed) in [(1usize, 77u64), (2, 1_234), (3, 99_999)] {
+            blob = bloom::set_patch_corner(Some(&blob), k, Some(&tonal::generate(seed, kind)));
+        }
+        let mut b = Bloom::new();
+        b.load_state(&blob);
+        b.prepare(SR, BLOCK);
+        let mut d = Driver::new();
+        // X/Y automated between blocks and inside them, with notes, a
+        // selection change and a seed change on the way.
+        let n = counted(|| {
+            for k in 0..220 {
+                let t = k as f32 / 220.0;
+                b.set_param(p::MORPH_X, norm(&b, p::MORPH_X, (t * 3.0).fract()));
+                if k % 7 == 3 {
+                    b.set_param(p::MORPH_Y, norm(&b, p::MORPH_Y, 1.0 - t));
+                }
+                if k == 120 {
+                    b.set_param(p::SELECTED, norm(&b, p::SELECTED, 6.0));
+                }
+                if k == 170 {
+                    b.set_param(p::SEED, norm(&b, p::SEED, 4_321.0));
+                }
+                d.block(&mut b, 0);
+            }
+        });
+        assert_eq!(n, 0, "{kind:?}: {n} heap operations while morphing");
+        let mut buf = aitrack_dsp::AudioBuffer::new(2, BLOCK);
+        let events = vec![
+            Event { offset: 0, kind: EventKind::NoteOn { channel: 0, key: 60, velocity: 0.9, note_id: 1 } },
+            Event { offset: 10, kind: EventKind::Param { id: p::MORPH_X, value: 0.9 } },
+            Event { offset: 70, kind: EventKind::Param { id: p::MORPH_Y, value: 0.2 } },
+            Event { offset: 100, kind: EventKind::NoteOff { channel: 0, key: 60, velocity: 0.0, note_id: 1 } },
+        ];
+        let tr = aitrack_dsp::Transport { playing: true, ..Default::default() };
+        let n = counted(|| {
+            for _ in 0..40 {
+                let mut ctx = aitrack_dsp::ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: None, events: &events, transport: &tr };
+                b.process(&mut ctx);
+            }
+        });
+        assert_eq!(n, 0, "{kind:?}: morph events inside blocks: {n} heap operations");
+    }
+}

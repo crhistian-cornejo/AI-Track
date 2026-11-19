@@ -9,12 +9,16 @@
 mod agent;
 /// The pattern engine writing a part into a draft (the external MCP tools use it too).
 pub(crate) use agent::generate_part;
+mod ask;
+pub mod history;
 mod markdown;
 pub(crate) mod midi_gen;
 mod mix;
 pub mod part;
+mod picker;
 pub mod slash;
 pub mod state;
+mod steps;
 
 use crate::bridge::ModelNotice;
 use crate::icons::{Icon, icon};
@@ -25,7 +29,7 @@ use crate::widgets::{self, badge, label, mono, text_button};
 use crate::workspace::{ChatEntry, PartCard, ProposalStatus, Workspace};
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, ExternalPaths, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, linear_color_stop, linear_gradient, prelude::FluentBuilder, px,
 };
 use state::{Backend, Item, PartAction, Placed, ReplyState};
 
@@ -38,6 +42,17 @@ pub fn wants_frames(_ws: &Workspace) -> bool {
 const HEADER_H: f32 = TAB_BAR_H + SP2;
 /// Inner width of a card in the log.
 const CARD_W: f32 = AI_PANEL_W - 2. * SP3;
+/// How far the log fades under the header and above the composer.
+const TOP_FADE: f32 = 20.;
+const BOTTOM_FADE: f32 = 28.;
+
+/// A band that fades the log out under the header (`down`) or above the composer.
+fn fade(down: bool, h: f32) -> impl IntoElement {
+    let bg = pane_bg(crate::appearance::Pane::Assistant);
+    let solid = linear_color_stop(bg, 0.);
+    let clear = linear_color_stop(with_alpha(bg, 0.), 1.);
+    div().absolute().left_0().right_0().h(px(h)).when(down, |d| d.top_0()).when(!down, |d| d.bottom_0()).bg(linear_gradient(if down { 180. } else { 0. }, solid, clear))
+}
 
 pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
@@ -45,33 +60,38 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     agent::init(ws, cx);
     let a = state::get(cx);
     let target = if ws.ai_open { AI_PANEL_W } else { 0. };
-    let (backend, streaming, items, attachments, scroll, input, sel, tab) = {
+    let (backend, streaming, items, attachments, scroll, input, sel, tab, history_open) = {
         let s = a.read(cx);
-        (s.backend, s.streaming(), s.items.clone(), s.attachments.clone(), s.scroll.clone(), s.input.clone(), s.slash_sel, s.slash_tab)
+        (s.backend, s.streaming(), s.items.clone(), s.attachments.clone(), s.scroll.clone(), s.input.clone(), s.slash_sel, s.slash_tab, s.history_open)
     };
     let streaming = streaming || agent::running(cx);
     let text = input.read(cx).text().to_owned();
+    let chats = state::all_chats(cx);
+    let chat_title = if items.is_empty() { "Assistant".to_owned() } else { history::title(&items) };
 
     let ready = agent::ready(cx);
     let header = div()
         .flex_none()
         .h(px(HEADER_H))
-        .px(px(SP3))
-        .gap(px(SP2))
+        .pl(px(SP3))
+        .pr(px(SP2))
+        .gap(px(SP1))
         .flex()
         .items_center()
-        .border_b_1()
-        .border_color(border())
-        .child(label("Assistant", TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD))
-        .child(div().flex_1())
-        .child(widgets::icon_button("new-chat", Icon::Add, false).tooltip(widgets::tip("New chat", None)).on_click(cx.listener(|ws, _, _, cx| state::choose(ws, slash::Action::ClearChat, cx))))
+        .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&chat_title, AI_PANEL_W - 120., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::SEMIBOLD)))
+        .child(
+            widgets::icon_button("chat-history", Icon::Clock, history_open)
+                .tooltip(widgets::tip("This project's chats", None))
+                .on_click(cx.listener(|_, _, _, cx| state::toggle_history(cx))),
+        )
+        .child(widgets::icon_button("new-chat", Icon::Add, false).tooltip(widgets::tip("New chat", None)).on_click(cx.listener(|ws, _, _, cx| state::new_chat(ws, cx))))
         .child(widgets::icon_button("close-ai", Icon::X, false).tooltip(widgets::tip("Close", Some("Ctrl+I"))).on_click(cx.listener(|this, _, _, cx| {
             this.ai_open = false;
             cx.notify();
         })));
 
     // The log: our items interleaved with the workspace's cards.
-    let mut log = div().flex().flex_col().gap(px(SP3)).p(px(SP3));
+    let mut log = div().flex().flex_col().gap(px(SP3)).px(px(SP3)).pt(px(SP4)).pb(px(BOTTOM_FADE));
     let entries = ws.chat_log.clone();
     let n_entries = entries.len();
     let mut rows: Vec<AnyElement> = Vec::new();
@@ -87,7 +107,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }
     }
     if rows.is_empty() {
-        rows.push(agent::welcome(ready, cx));
+        rows.push(steps::welcome(ready, cx));
     }
     let total = rows.len();
     for (i, el) in rows.into_iter().enumerate() {
@@ -103,6 +123,8 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
     }
 
     let slash_menu = slash::query(&text).map(|q| slash_menu(q, tab, sel, cx));
+    let question = ask::card(cx);
+    let asking = question.is_some();
 
     let chips = (!attachments.is_empty()).then(|| {
         let mut row = div().flex_none().px(px(SP2)).pt(px(SP2)).flex().flex_wrap().gap(px(SP1));
@@ -128,22 +150,26 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         row
     });
 
-    let send_or_stop = if streaming {
+    let send_or_stop = if streaming && !(asking && !text.trim().is_empty()) {
         widgets::icon_button("stop-chat", Icon::Stop, true).tooltip(widgets::tip("Stop", Some("Esc"))).on_click(cx.listener(|ws, _, _, cx| state::stop(ws, cx)))
     } else {
         let input = input.clone();
-        widgets::icon_button("send-chat", Icon::Send, !text.trim().is_empty()).tooltip(widgets::tip("Send", Some("Enter"))).on_click(cx.listener(move |ws, _, _, cx| {
+        widgets::icon_button("send-chat", Icon::Send, !text.trim().is_empty()).tooltip(widgets::tip(if asking { "Answer" } else { "Send" }, Some("Enter"))).on_click(cx.listener(move |ws, _, _, cx| {
             let text = input.read(cx).text().trim().to_owned();
             if text.is_empty() {
                 return;
             }
             input.update(cx, |i, cx| i.set_text("", cx));
-            if slash::query(&text).is_none() {
+            if agent::asking(cx) {
+                let picked = agent::agent(cx).pending.as_ref().map(|p| p.picked.clone()).unwrap_or_default();
+                agent::answer(&picked, &text, cx);
+            } else if slash::query(&text).is_none() {
                 state::submit_text(ws, text, cx);
             }
         }))
     };
     let menu_is_open = slash::query(&text).is_some();
+    let field_empty = text.is_empty();
     let input_field = div()
                 .id("chat-input")
                 .flex_1()
@@ -152,7 +178,13 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_key_down(cx.listener(move |ws, e: &KeyDownEvent, _, cx| {
                     let k = &e.keystroke;
+                    let digit = k.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d) && k.modifiers.number_of_modifiers() == 0);
                     let handled = match k.key.as_str() {
+                        // A question is open and nothing is typed: its numbers pick.
+                        _ if asking && field_empty && digit.is_some() => {
+                            agent::pick(digit.unwrap_or(1) - 1, cx);
+                            true
+                        }
                         "up" if menu_is_open => state::move_selection(ws, -1, cx),
                         "down" if menu_is_open => state::move_selection(ws, 1, cx),
                         "tab" if menu_is_open => {
@@ -162,6 +194,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                         }
                         "v" if k.modifiers.secondary() => {
                             state::paste(ws, cx);
+                            true
+                        }
+                        "escape" if agent::menu_open(cx) => {
+                            agent::close_menu(cx);
                             true
                         }
                         "escape" if state::get(cx).read(cx).streaming() || agent::running(cx) => {
@@ -183,10 +219,54 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .gap(px(2.))
         .child(widgets::sized_icon_button("attach-file", Icon::Add, false, 24., 14.).tooltip(widgets::tip("Attach a sample or a screenshot", None)).on_click(cx.listener(|_, _, _, cx| state::pick_files(cx))))
         .child(widgets::sized_icon_button("attach-sel", Icon::Link, false, 24., 14.).tooltip(widgets::tip("Attach the selected track and clip", None)).on_click(cx.listener(|ws, _, _, cx| state::attach_selection(ws, cx))))
-        .child(agent::model_pill(cx))
-        .child(agent::switches(cx))
+        .child(picker::pill(cx))
+        .child(auto_switch(cx))
         .child(div().flex_1())
         .child(send_or_stop);
+
+    // Scrolled up to read: a button brings the newest message back.
+    let away = !state::at_bottom(&scroll);
+    let jump = away.then(|| {
+        div().absolute().bottom(px(SP2)).left_0().right_0().flex().justify_center().child(
+            motion::rise_in(
+                "jump-latest-in",
+                div()
+                    .id("jump-latest")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(pal.raised)
+                    .border_1()
+                    .border_color(border_strong())
+                    .shadow_md()
+                    .hover(|s| s.bg(pal.surface))
+                    .child(icon(Icon::ChevronDown, 14., pal.text))
+                    .tooltip(widgets::tip("Jump to the latest message", None))
+                    .on_click(cx.listener(|_, _, _, cx| state::jump_to_latest(cx))),
+                4.,
+            ),
+        )
+    });
+    let log_area = div()
+        .relative()
+        .flex_1()
+        .min_h(px(0.))
+        .child(
+            div()
+                .id("chat-log")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&scroll)
+                // Redraw while scrolling so the jump button shows and hides.
+                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                .child(log),
+        )
+        .child(fade(true, TOP_FADE))
+        .child(fade(false, BOTTOM_FADE))
+        .children(jump);
 
     let body = div()
         .w(px(AI_PANEL_W))
@@ -195,8 +275,9 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         .flex()
         .flex_col()
         .child(header)
-        .child(div().id("chat-log").flex_1().min_h(px(0.)).overflow_y_scroll().track_scroll(&scroll).child(log))
+        .child(log_area)
         .children(slash_menu)
+        .children(question)
         .child(
             div()
                 .flex_none()
@@ -206,13 +287,13 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 .flex_col()
                 .rounded(px(r_lg()))
                 .border_1()
-                .border_color(if streaming { accent_alpha(0.4) } else { border() })
+                .border_color(if streaming || asking { accent_alpha(0.4) } else { border() })
                 .bg(content(0.03))
                 .children(chips)
                 .child(div().px(px(SP1)).pt(px(SP1)).child(input_field))
                 .child(toolbar),
         )
-        .children(agent::model_menu(ws, cx));
+        .children(history_open.then(|| history_menu(chats, cx)));
 
     div()
         .id("ai-panel")
@@ -229,6 +310,95 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
         }))
         .child(body)
         .with_spring("ai-panel-width", motion::spring(motion::PANEL_SPRING, target), |d, w| d.w(px(w.max(0.))))
+        .into_any_element()
+}
+
+/// Review / auto-apply, as one quiet toggle.
+fn auto_switch(cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let auto = agent::agent(cx).auto_apply;
+    div()
+        .id("agent-auto")
+        .h(px(24.))
+        .px(px(SP1))
+        .flex()
+        .items_center()
+        .rounded(px(r_md()))
+        .cursor_pointer()
+        .hover(|s| s.bg(content(0.08)))
+        .child(icon(if auto { Icon::Check } else { Icon::Eye }, 12., if auto { pal.accent } else { pal.faint }))
+        .tooltip(widgets::tip(if auto { "Auto-apply: edits land at once (one undo step); deletions still wait" } else { "Review: edits wait for you on a card" }, None))
+        .on_click(cx.listener(|_, _, _, cx| agent::toggle_auto(cx)))
+        .into_any_element()
+}
+
+/// The project's chats, newest first, under the header.
+fn history_menu(chats: Vec<history::Chat>, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let current = state::get(cx).read(cx).chat_id;
+    let now = history::now();
+    let mut list = div().id("chat-history-list").max_h(px(320.)).overflow_y_scroll().flex().flex_col();
+    if chats.is_empty() {
+        list = list.child(div().p(px(SP2)).child(label("No chats in this project yet. They are saved with the project file.", TEXT_SM, pal.faint)));
+    }
+    for (k, c) in chats.into_iter().enumerate() {
+        let id = c.id;
+        let on = id == current;
+        list = list.child(
+            div()
+                .id(("chat-row", k))
+                .group("chat-row")
+                .h(px(30.))
+                .pl(px(SP2))
+                .pr(px(SP1))
+                .gap(px(SP2))
+                .flex()
+                .items_center()
+                .rounded(px(r_md()))
+                .cursor_pointer()
+                .when(on, |d| d.bg(accent_alpha(0.12)))
+                .hover(|s| s.bg(hover()))
+                .child(icon(Icon::Chat, 12., if on { pal.accent } else { pal.faint }))
+                .child(label(crate::paint::fit(&c.title, 170., TEXT_SM), TEXT_SM, pal.text).flex_1().min_w(px(0.)))
+                .child(label(history::ago(c.updated, now), TEXT_XS, pal.faint))
+                .child(
+                    div().opacity(0.).group_hover("chat-row", |s| s.opacity(1.)).child(
+                        widgets::sized_icon_button(("chat-delete", k), Icon::Trash, false, 20., 11.).tooltip(widgets::tip("Delete this chat", None)).on_click(cx.listener(move |ws, _, _, cx| {
+                            cx.stop_propagation();
+                            state::delete_chat(ws, id, cx);
+                        })),
+                    ),
+                )
+                .on_click(cx.listener(move |ws, _, _, cx| state::open_chat(ws, id, cx))),
+        );
+    }
+    div()
+        .absolute()
+        .top(px(HEADER_H))
+        .right(px(SP2))
+        .occlude()
+        .on_mouse_down_out(cx.listener(|_, _, _, cx| state::close_history(cx)))
+        .child(motion::rise_in(
+            "chat-history-in",
+            widgets::menu_card("chat-history", AI_PANEL_W - 2. * SP2)
+                .child(div().flex().items_center().child(widgets::menu_header("This project's chats")).child(div().flex_1()).child(
+                    div()
+                        .id("history-new")
+                        .h(px(22.))
+                        .px(px(SP2))
+                        .flex()
+                        .items_center()
+                        .gap(px(SP1))
+                        .rounded(px(r_md()))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(hover()))
+                        .child(icon(Icon::Add, 10., pal.muted))
+                        .child(label("New chat", TEXT_XS, pal.muted))
+                        .on_click(cx.listener(|ws, _, _, cx| state::new_chat(ws, cx))),
+                ))
+                .child(list),
+            4.,
+        ))
         .into_any_element()
 }
 
@@ -380,7 +550,7 @@ fn item(i: usize, it: Item, cx: &mut Context<Workspace>) -> AnyElement {
             .child(div().size(px(24.)).flex_none().flex().items_center().justify_center().rounded(px(r_md())).bg(accent_alpha(0.14)).child(icon(ic, 12., pal.accent)))
             .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::MEDIUM)).child(label(crate::paint::fit(&detail, CARD_W - 64., TEXT_XS), TEXT_XS, pal.muted)))
             .into_any_element(),
-        Item::Agent(r) => agent::view(i, &r, cx),
+        Item::Agent(r) => steps::view(i, &r, cx),
         Item::Note(text) => reply_row(div().text_size(px(fs(TEXT_MD))).line_height(px(18.)).text_color(pal.muted).child(text).into_any_element()),
     }
 }

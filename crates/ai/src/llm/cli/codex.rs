@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use serde_json::{Value, json};
 
-use super::{CliEvent, ModelInfo, Provider, TurnSpec, call_tool, command, lines, resolve, write_json};
+use super::{CliEvent, ModelInfo, Proc, Provider, TurnSpec, call_tool, command, lines, resolve, write_json};
 use crate::CancelToken;
 use crate::llm::agent::Effort;
 
@@ -102,8 +102,22 @@ pub(super) fn tool_answer(text: &str, is_error: bool) -> Value {
     json!({ "success": !is_error, "contentItems": [{ "type": "inputText", "text": text }] })
 }
 
-pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Result<(), String> {
+/// Start `codex app-server` and send the handshake; the thread and the
+/// turn start once it is answered ([`run`]).
+pub(super) fn spawn(_spec: &TurnSpec) -> Result<Proc, String> {
     let path = resolve("codex").ok_or("Codex is not installed. Install it (npm i -g @openai/codex) and sign in with ChatGPT, then try again.")?;
+    let mut child = command(&path).arg("app-server").spawn().map_err(|e| format!("could not start Codex: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let lines = lines(child.stdout.take().ok_or("no stdout")?);
+    if let Err(e) = write_json(&mut stdin, &initialize()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok(Proc { child, stdin, lines })
+}
+
+pub(super) fn run(spec: &TurnSpec, p: &mut Proc, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Result<(), String> {
     // Screenshots go in as files.
     let dir = std::env::temp_dir().join("aitrack-assistant");
     let mut images = Vec::new();
@@ -114,11 +128,8 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
             images.push(p);
         }
     }
-    let mut child = command(&path).arg("app-server").spawn().map_err(|e| format!("could not start Codex: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    let rx = lines(child.stdout.take().ok_or("no stdout")?);
+    let (stdin, rx) = (&mut p.stdin, &p.lines);
     let result = (|| {
-        write_json(&mut stdin, &initialize())?;
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -134,9 +145,9 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
             }
             match v["id"].as_u64().filter(|_| v.get("method").is_none()) {
                 Some(1) => {
-                    write_json(&mut stdin, &json!({"method":"initialized"}))?;
+                    write_json(stdin, &json!({"method":"initialized"}))?;
                     write_json(
-                        &mut stdin,
+                        stdin,
                         &json!({"id":2,"method":"thread/start","params":{
                             "cwd": dir, "approvalPolicy": "never", "sandbox": "read-only", "ephemeral": true,
                             "model": spec.model, "developerInstructions": spec.system, "dynamicTools": dynamic_tools(&spec.tools),
@@ -147,7 +158,7 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
                     let thread = v["result"]["thread"]["id"].as_str().ok_or("Codex gave no thread")?.to_owned();
                     let mut input = vec![json!({ "type": "text", "text": spec.prompt, "text_elements": [] })];
                     input.extend(images.iter().map(|p| json!({ "type": "localImage", "path": p })));
-                    write_json(&mut stdin, &json!({"id":3,"method":"turn/start","params":{"threadId":thread,"input":input,"effort":effort(spec.effort)}}))?;
+                    write_json(stdin, &json!({"id":3,"method":"turn/start","params":{"threadId":thread,"input":input,"effort":effort(spec.effort)}}))?;
                 }
                 _ => {}
             }
@@ -163,11 +174,11 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
                     let name = p["tool"].as_str().unwrap_or_default();
                     let args = if p["arguments"].is_object() { p["arguments"].clone() } else { json!({}) };
                     let (text, err) = call_tool(tx, cancel, name, args).unwrap_or_else(|| ("Stopped by the user.".into(), true));
-                    write_json(&mut stdin, &json!({ "id": v["id"], "result": tool_answer(&text, err) }))?;
+                    write_json(stdin, &json!({ "id": v["id"], "result": tool_answer(&text, err) }))?;
                 }
                 // Codex's own shell and file edits are not part of this job.
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "execCommandApproval" | "applyPatchApproval" => {
-                    write_json(&mut stdin, &json!({ "id": v["id"], "result": { "decision": "decline" } }))?;
+                    write_json(stdin, &json!({ "id": v["id"], "result": { "decision": "decline" } }))?;
                 }
                 "turn/completed" => {
                     let turn = &p["turn"];
@@ -183,15 +194,12 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
                     }
                 }
                 m if !m.is_empty() && v.get("id").is_some() => {
-                    write_json(&mut stdin, &json!({ "id": v["id"], "error": { "code": -32601, "message": "unsupported" } }))?;
+                    write_json(stdin, &json!({ "id": v["id"], "error": { "code": -32601, "message": "unsupported" } }))?;
                 }
                 _ => {}
             }
         }
     })();
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
     for p in images {
         let _ = std::fs::remove_file(p);
     }

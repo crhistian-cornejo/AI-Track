@@ -1,9 +1,13 @@
-//! The assistant as an agent. Claude (API key or Claude subscription) or
-//! Codex (ChatGPT subscription) reads and edits the project with
-//! AI-Track's tools (`aitrack_ai::llm::tools`) until the request is done.
-//! Replies stream in as steps: thinking, one line per thing it does, and
-//! Markdown text. Every edit lands in a draft; when the turn ends the
-//! changes are offered as one proposal, or accepted at once in auto mode.
+//! The assistant as an agent on the user's own subscription: Claude Code
+//! (Claude) or Codex (ChatGPT) reads and edits the project with AI-Track's
+//! tools (`aitrack_ai::llm::tools`) until the request is done. Replies
+//! stream in as steps: thinking, one line per tool call (opened for its
+//! input and result), questions to the user, and Markdown text. Every edit
+//! lands in a draft; when the turn ends the changes are offered as one
+//! proposal, or accepted at once in auto mode.
+//!
+//! A CLI takes a second or two to start, so one is warmed up while the user
+//! types ([`prewarm`]) and the turn only has to send the message.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -12,39 +16,42 @@ use aitrack_ai::generate as gen_core;
 use aitrack_ai::generate::spec::Kind;
 use aitrack_ai::llm::agent::{self as api, AgentEvent, AgentRequest, AgentStream, Effort};
 use aitrack_ai::llm::cli::{self, CliEvent, CliTurn, ModelInfo, Provider, TurnSpec, Vendor};
-use aitrack_ai::llm::tools::{self, Outcome, Session};
+use aitrack_ai::llm::tools::{self, Outcome, Question, Session};
 use aitrack_ai::llm::{self, context::Focus};
 use aitrack_model::Origin;
-use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Div, FontWeight, Global, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Task, div,
-    prelude::FluentBuilder, px, svg,
-};
+use crossbeam_channel::Sender;
+use gpui::{Context, Global, Task};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::state::{self, Attachment, Backend, Item, KeyState, Placed, ReplyState};
-use super::{markdown, midi_gen};
+use super::midi_gen;
+use super::state::{self, Attachment, Backend, Item, Placed, ReplyState};
 use crate::bridge::AgentKind;
-use crate::icons::{Icon, icon};
-use crate::motion;
-use crate::theme::*;
-use crate::widgets::{self, label};
 use crate::workspace::{ChatEntry, ProposalStatus, Workspace};
 
 /// Tool rounds one request may take on the API before the agent stops.
 const MAX_ROUNDS: u32 = 40;
+/// How much of a tool's result a reply keeps (and the project file stores).
+const KEEP_RESULT: usize = 4_000;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToolState {
     Running,
     Done(String),
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Step {
     Thinking { text: String, done: bool },
     Text(String),
-    Tool { name: String, state: ToolState },
+    /// A tool call; `input` is `Null` until the model has written it.
+    Tool {
+        name: String,
+        #[serde(default)]
+        input: Value,
+        state: ToolState,
+    },
 }
 
 /// An agent reply in the chat.
@@ -77,29 +84,43 @@ pub struct Choice {
 }
 
 impl Choice {
-    fn of(m: &ModelInfo) -> Self {
+    pub(super) fn of(m: &ModelInfo) -> Self {
         Self { provider: m.provider, model: m.id.clone(), name: m.name.clone() }
     }
 
-    /// The preference string: `provider:model`.
-    fn pref(&self) -> String {
-        format!("{}:{}", self.provider.id(), self.model)
+    /// The preference string: `provider:model@effort`.
+    fn pref(&self, effort: Effort) -> String {
+        format!("{}:{}@{}", self.provider.id(), self.model, effort.id())
     }
 }
 
-/// Read a saved choice; older saves (an API model id, `agent:…`) still work.
-fn parse_pref(s: &str) -> Option<Choice> {
+/// The providers the picker offers: the user's own subscriptions.
+pub const PROVIDERS: [Provider; 2] = [Provider::ClaudeCode, Provider::Codex];
+
+fn parse_effort(s: &str) -> Option<Effort> {
+    Effort::ALL.into_iter().find(|e| e.id() == s)
+}
+
+/// Read a saved choice and its effort. Older saves (`provider:model`,
+/// `agent:…`) still work; an API model is no longer offered.
+fn parse_pref(s: &str) -> (Option<Choice>, Option<Effort>) {
+    let (s, effort) = match s.rsplit_once('@') {
+        Some((head, e)) if parse_effort(e).is_some() => (head, parse_effort(e)),
+        _ => (s, None),
+    };
     let find = |p: Provider, id: &str| cli::fallback(p).into_iter().find(|m| m.id == id).map(|m| Choice::of(&m));
-    if let Some((p, model)) = s.split_once(':')
+    let choice = if let Some((p, model)) = s.split_once(':')
         && let Some(p) = Provider::parse(p)
     {
-        return find(p, model).or_else(|| Some(Choice { provider: p, model: model.to_owned(), name: model.to_owned() }));
-    }
-    match s {
-        "agent:claude-code" => cli::fallback(Provider::ClaudeCode).first().map(Choice::of),
-        "agent:codex" => cli::fallback(Provider::Codex).first().map(Choice::of),
-        id => find(Provider::ClaudeApi, id),
-    }
+        find(p, model).or_else(|| Some(Choice { provider: p, model: model.to_owned(), name: model.to_owned() }))
+    } else {
+        match s {
+            "agent:claude-code" => cli::fallback(Provider::ClaudeCode).first().map(Choice::of),
+            "agent:codex" => cli::fallback(Provider::Codex).first().map(Choice::of),
+            _ => None,
+        }
+    };
+    (choice.filter(|c| PROVIDERS.contains(&c.provider)), effort)
 }
 
 enum Engine {
@@ -115,25 +136,42 @@ struct Turn {
     _poll: Task<()>,
 }
 
+/// A question the model asked; the turn waits for the answer.
+pub struct Pending {
+    pub item: usize,
+    pub step: usize,
+    pub question: Question,
+    /// Options picked so far (several when the question allows it).
+    pub picked: Vec<usize>,
+    reply: Sender<(String, bool)>,
+}
+
 /// The agent's state, kept as a global next to the assistant's.
 #[derive(Default)]
 pub struct Agent {
     turn: Option<Turn>,
     pub effort: Effort,
     pub auto_apply: bool,
-    /// Thinking steps the user opened: (item, step).
+    /// Steps the user opened (thinking, tool calls, lookup groups): (item, step).
     pub expanded: HashSet<(usize, usize)>,
     pub choice: Option<Choice>,
     /// Live model lists by provider (best first, at most four).
     pub catalogs: HashMap<Provider, Vec<ModelInfo>>,
     pub installed: HashMap<Provider, bool>,
     pub menu_open: bool,
-    fetching: bool,
+    /// When a click outside closed the menu (so the pill's own click does not reopen it).
+    pub menu_closed_at: Option<Instant>,
+    /// The model under the pointer in the picker: its card shows beside the list.
+    pub hover: Option<ModelInfo>,
+    pub pending: Option<Pending>,
+    pub(super) fetching: bool,
+    /// What the last warm-up was for, so typing does not ask again.
+    warmed: Option<(String, Instant)>,
 }
 
 impl Global for Agent {}
 
-fn agent<'a>(cx: &'a mut Context<Workspace>) -> &'a mut Agent {
+pub(super) fn agent<'a>(cx: &'a mut Context<Workspace>) -> &'a mut Agent {
     if !cx.has_global::<Agent>() {
         cx.set_global(Agent::default());
     }
@@ -146,16 +184,18 @@ pub fn init(ws: &mut Workspace, cx: &mut Context<Workspace>) {
         return;
     }
     let installed = detect(ws);
-    let saved = parse_pref(&ws.look.app.assistant_model);
-    let has_key = state::get(cx).read(cx).key != KeyState::Missing;
+    let (saved, effort) = parse_pref(&ws.look.app.assistant_model);
     let choice = saved.filter(|c| installed.get(&c.provider).copied().unwrap_or(false)).unwrap_or_else(|| {
-        // No saved choice that can run: a subscription if there is one, else the API.
-        let p = [Provider::ClaudeCode, Provider::Codex].into_iter().find(|p| installed[p]).filter(|_| !has_key).unwrap_or(Provider::ClaudeApi);
+        // No saved choice that can run: the first subscription that can.
+        let p = PROVIDERS.into_iter().find(|p| installed[p]).unwrap_or(Provider::ClaudeCode);
         Choice::of(&cli::fallback(p)[0])
     });
     let a = agent(cx);
     a.installed = installed;
     a.choice = Some(choice);
+    if let Some(e) = effort {
+        a.effort = e;
+    }
     refresh_catalogs(cx);
 }
 
@@ -169,9 +209,9 @@ fn detect(ws: &Workspace) -> HashMap<Provider, bool> {
             let by_bridge = match p {
                 Provider::ClaudeCode => found(AgentKind::ClaudeCode),
                 Provider::Codex => found(AgentKind::Codex),
-                Provider::ClaudeApi => true,
+                Provider::ClaudeApi => false,
             };
-            (p, cli::available(p) || by_bridge)
+            (p, p != Provider::ClaudeApi && (cli::available(p) || by_bridge))
         })
         .collect()
 }
@@ -183,7 +223,7 @@ pub fn refresh_catalogs(cx: &mut Context<Workspace>) {
         return;
     }
     a.fetching = true;
-    let wanted: Vec<Provider> = [Provider::ClaudeCode, Provider::Codex].into_iter().filter(|p| a.installed.get(p).copied().unwrap_or(false)).collect();
+    let wanted: Vec<Provider> = PROVIDERS.into_iter().filter(|p| a.installed.get(p).copied().unwrap_or(false)).collect();
     let task = cx.background_executor().spawn(async move { wanted.into_iter().map(|p| (p, cli::catalog(p))).collect::<Vec<_>>() });
     cx.spawn(async move |ws, cx| {
         let lists = task.await;
@@ -208,49 +248,50 @@ pub fn refresh_catalogs(cx: &mut Context<Workspace>) {
 }
 
 /// The models offered for `p`: the live list, else the built-in one.
-fn models(a: &Agent, p: Provider) -> Vec<ModelInfo> {
+pub(super) fn models(a: &Agent, p: Provider) -> Vec<ModelInfo> {
     a.catalogs.get(&p).cloned().unwrap_or_else(|| cli::fallback(p))
 }
 
 pub fn choice(cx: &mut Context<Workspace>) -> Choice {
-    agent(cx).choice.clone().unwrap_or_else(|| Choice::of(&cli::fallback(Provider::ClaudeApi)[0]))
+    agent(cx).choice.clone().unwrap_or_else(|| Choice::of(&cli::fallback(Provider::ClaudeCode)[0]))
 }
 
-pub fn choose(ws: &mut Workspace, m: ModelInfo, cx: &mut Context<Workspace>) {
+/// Pick a model (and its effort, when the card set one).
+pub fn choose(ws: &mut Workspace, m: ModelInfo, effort: Option<Effort>, close: bool, cx: &mut Context<Workspace>) {
     // Keep the older flows (/mix, parts) on a matching backend.
     let backend = match m.provider {
-        Provider::ClaudeApi => Backend::Claude(llm::MODELS.iter().position(|x| x.id == m.id).unwrap_or(0)),
-        Provider::ClaudeCode => Backend::Agent(AgentKind::ClaudeCode),
         Provider::Codex => Backend::Agent(AgentKind::Codex),
+        _ => Backend::Agent(AgentKind::ClaudeCode),
     };
     state::set_backend(ws, backend, cx);
     let c = Choice::of(&m);
-    ws.look.app.assistant_model = c.pref();
-    ws.look.app.save();
     let a = agent(cx);
+    if let Some(e) = effort {
+        a.effort = e;
+    }
+    ws.look.app.assistant_model = c.pref(a.effort);
+    ws.look.app.save();
+    if a.choice.as_ref() != Some(&c) {
+        cli::cool_down();
+        a.warmed = None;
+    }
     a.choice = Some(c);
-    a.menu_open = false;
+    if close {
+        a.menu_open = false;
+        a.hover = None;
+    }
     cx.notify();
 }
 
 /// Whether the chosen model can answer right now.
 pub fn ready(cx: &mut Context<Workspace>) -> bool {
     let c = choice(cx);
-    match c.provider {
-        Provider::ClaudeApi => state::get(cx).read(cx).key != KeyState::Missing,
-        p => agent(cx).installed.get(&p).copied().unwrap_or(false),
-    }
+    agent(cx).installed.get(&c.provider).copied().unwrap_or(false)
 }
 
 /// Whether a turn is running.
 pub fn running(cx: &mut Context<Workspace>) -> bool {
     agent(cx).turn.is_some()
-}
-
-pub fn cycle_effort(cx: &mut Context<Workspace>) {
-    let a = agent(cx);
-    a.effort = a.effort.next();
-    cx.notify();
 }
 
 pub fn toggle_auto(cx: &mut Context<Workspace>) {
@@ -261,22 +302,37 @@ pub fn toggle_auto(cx: &mut Context<Workspace>) {
 
 pub fn toggle_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) {
     let a = agent(cx);
+    // The press that closed it from outside landed on the pill: stay closed.
+    if !a.menu_open && a.menu_closed_at.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+        a.menu_closed_at = None;
+        return;
+    }
     a.menu_open = !a.menu_open;
+    a.hover = None;
     let open = a.menu_open;
     if open {
         ws.b.ai.refresh_agents();
         agent(cx).installed = detect(ws);
         refresh_catalogs(cx);
-        state::refresh_key(cx);
     }
     cx.notify();
+}
+
+pub fn close_menu(cx: &mut Context<Workspace>) {
+    let a = agent(cx);
+    if a.menu_open {
+        a.menu_open = false;
+        a.hover = None;
+        a.menu_closed_at = Some(Instant::now());
+        cx.notify();
+    }
 }
 
 pub fn menu_open(cx: &mut Context<Workspace>) -> bool {
     agent(cx).menu_open
 }
 
-fn toggle_expanded(key: (usize, usize), cx: &mut Context<Workspace>) {
+pub(super) fn toggle_expanded(key: (usize, usize), cx: &mut Context<Workspace>) {
     let a = agent(cx);
     if !a.expanded.remove(&key) {
         a.expanded.insert(key);
@@ -341,6 +397,29 @@ fn cli_prompt(turns: &[(bool, String)]) -> String {
     s
 }
 
+/// What a CLI turn for the current choice starts with. The instructions
+/// stay the same from turn to turn (the project goes in the message), so
+/// a process warmed up before the user sends can take the turn.
+fn cli_spec(c: &Choice, effort: Effort) -> TurnSpec {
+    TurnSpec { provider: c.provider, model: c.model.clone(), effort, system: tools::AGENT_PERSONA.to_owned(), prompt: String::new(), images: Vec::new(), tools: tools::agent_definitions() }
+}
+
+/// Boot the CLI for the next turn in the background (the user is typing).
+pub fn prewarm(cx: &mut Context<Workspace>) {
+    if running(cx) || !ready(cx) {
+        return;
+    }
+    let c = choice(cx);
+    let a = agent(cx);
+    let key = c.pref(a.effort);
+    if a.warmed.as_ref().is_some_and(|(k, at)| *k == key && at.elapsed() < Duration::from_secs(9 * 60)) {
+        return;
+    }
+    a.warmed = Some((key, Instant::now()));
+    let spec = cli_spec(&c, a.effort);
+    cx.background_executor().spawn(async move { cli::prewarm(&spec) }).detach();
+}
+
 /// Send `text` with the attachments to the chosen model as an agent turn.
 pub fn submit(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
     state::stop(ws, cx);
@@ -393,16 +472,14 @@ pub fn submit(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
             let stream = api::spawn(AgentRequest { model: c.model.clone(), system: system.clone(), messages: messages.clone(), tools: tools::definitions(), max_tokens: 64_000, effort });
             Engine::Api { system, messages, model: c.model.clone(), stream: Some(stream), rounds: 0 }
         }
-        p => Engine::Cli(cli::start(TurnSpec {
-            provider: p,
-            model: c.model.clone(),
-            effort,
-            system: format!("{}\n\n{project}", tools::AGENT_PERSONA),
-            prompt: cli_prompt(&turns),
-            images,
-            tools: tools::definitions(),
-        })),
+        _ => {
+            let mut spec = cli_spec(&c, effort);
+            spec.prompt = format!("{project}\n\n---\n\n{}", cli_prompt(&turns));
+            spec.images = images;
+            Engine::Cli(cli::start(spec))
+        }
     };
+    agent(cx).warmed = None;
     let item = a.update(cx, |a, _| {
         state::push(
             ws,
@@ -419,6 +496,7 @@ pub fn submit(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
         }
     });
     agent(cx).turn = Some(Turn { item, model_name: c.name, session: Session::new(&ws.s.project, selected), engine, _poll: poll });
+    state::chat_changed(cx);
     cx.notify();
 }
 
@@ -470,6 +548,32 @@ fn push_thinking(r: &mut Reply, t: &str) {
     }
 }
 
+/// A tool line the model started writing; its input comes later.
+fn start_tool(r: &mut Reply, name: &str) {
+    r.state = ReplyState::Streaming;
+    close_thinking(r);
+    r.steps.push(Step::Tool { name: name.to_owned(), input: Value::Null, state: ToolState::Running });
+}
+
+/// The line of a call with its input: the one started for it, else a new one.
+fn begin_tool(r: &mut Reply, name: &str, input: &Value) -> usize {
+    r.state = ReplyState::Streaming;
+    close_thinking(r);
+    let started = r.steps.iter().position(|s| matches!(s, Step::Tool { name: n, input: Value::Null, state: ToolState::Running } if n == name));
+    match started {
+        Some(j) => {
+            if let Step::Tool { input: slot, .. } = &mut r.steps[j] {
+                *slot = input.clone();
+            }
+            j
+        }
+        None => {
+            r.steps.push(Step::Tool { name: name.to_owned(), input: input.clone(), state: ToolState::Running });
+            r.steps.len() - 1
+        }
+    }
+}
+
 /// Run one tool on the draft: its result text and whether it worked.
 fn run_tool(s: &mut Session, name: &str, input: &Value) -> (String, bool) {
     match tools::execute(s, name, input) {
@@ -482,17 +586,22 @@ fn run_tool(s: &mut Session, name: &str, input: &Value) -> (String, bool) {
     }
 }
 
-/// Settle a tool's line: the first running one with its name, else a new one.
-fn settle_tool(item: usize, name: &str, text: &str, ok: bool, cx: &mut Context<Workspace>) {
-    let shown = if ok && tools::is_read_only(name) { String::new() } else { text.to_owned() };
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Settle the tool line at `step`.
+fn settle_tool(item: usize, step: usize, text: &str, ok: bool, cx: &mut Context<Workspace>) {
     with_reply(item, cx, |r| {
-        let st = if ok { ToolState::Done(shown) } else { ToolState::Failed(text.to_owned()) };
-        match r.steps.iter_mut().find(|s| matches!(s, Step::Tool { name: n, state: ToolState::Running } if n == name)) {
-            Some(Step::Tool { state, .. }) => *state = st,
-            _ => {
-                close_thinking(r);
-                r.steps.push(Step::Tool { name: name.to_owned(), state: st });
-            }
+        if let Some(Step::Tool { state, .. }) = r.steps.get_mut(step) {
+            *state = if ok { ToolState::Done(clip(text, KEEP_RESULT)) } else { ToolState::Failed(clip(text, KEEP_RESULT)) };
         }
     });
 }
@@ -500,32 +609,37 @@ fn settle_tool(item: usize, name: &str, text: &str, ok: bool, cx: &mut Context<W
 /// Drain the running turn; `false` once it is over.
 fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
     let Some(turn) = agent(cx).turn.as_ref() else { return false };
-    let keep = match &turn.engine {
+    let (keep, changed) = match &turn.engine {
         Engine::Api { .. } => poll_api(ws, cx),
         Engine::Cli(_) => poll_cli(ws, cx),
     };
-    if keep {
-        state::get(cx).update(cx, |a, _| a.scroll.scroll_to_bottom());
+    // Only redraw when something arrived: the loaders animate on their own.
+    if changed {
+        if keep {
+            state::follow(cx);
+        }
+        cx.notify();
     }
-    cx.notify();
     keep
 }
 
-fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
-    let Some(Turn { item, engine: Engine::Cli(t), .. }) = agent(cx).turn.as_ref() else { return false };
-    let item = *item;
+/// Events waiting on `rx`, and whether the sender is gone.
+fn drain<T>(rx: &crossbeam_channel::Receiver<T>) -> (Vec<T>, bool) {
     let mut events = Vec::new();
-    let mut gone = false;
     loop {
-        match t.events.try_recv() {
+        match rx.try_recv() {
             Ok(e) => events.push(e),
-            Err(crossbeam_channel::TryRecvError::Empty) => break,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                gone = true;
-                break;
-            }
+            Err(crossbeam_channel::TryRecvError::Empty) => return (events, false),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return (events, true),
         }
     }
+}
+
+fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
+    let Some(Turn { item, engine: Engine::Cli(t), .. }) = agent(cx).turn.as_ref() else { return (false, false) };
+    let item = *item;
+    let (events, gone) = drain(&t.events);
+    let changed = !events.is_empty() || gone;
     for e in events {
         match e {
             CliEvent::Text(t) => {
@@ -534,45 +648,50 @@ fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
             CliEvent::Thinking(t) => {
                 with_reply(item, cx, |r| push_thinking(r, &t));
             }
+            CliEvent::ToolStart(name) => {
+                with_reply(item, cx, |r| start_tool(r, &name));
+            }
             CliEvent::Tool { name, input, reply } => {
-                with_reply(item, cx, |r| {
-                    r.state = ReplyState::Streaming;
-                    close_thinking(r);
-                    r.steps.push(Step::Tool { name: name.clone(), state: ToolState::Running });
-                });
-                let Some(turn) = agent(cx).turn.as_mut() else { return false };
+                let Some(step) = with_reply(item, cx, |r| begin_tool(r, &name, &input)) else {
+                    let _ = reply.send(("The chat was cleared.".into(), true));
+                    continue;
+                };
+                if name == tools::ASK_USER {
+                    match Question::from_input(&input) {
+                        Ok(question) => {
+                            agent(cx).pending = Some(Pending { item, step, question, picked: Vec::new(), reply });
+                            state::get(cx).update(cx, |a, _| a.scroll.scroll_to_bottom());
+                        }
+                        Err(e) => {
+                            settle_tool(item, step, &e, false, cx);
+                            let _ = reply.send((e, true));
+                        }
+                    }
+                    continue;
+                }
+                let Some(turn) = agent(cx).turn.as_mut() else { return (false, true) };
                 let (text, ok) = run_tool(&mut turn.session, &name, &input);
-                settle_tool(item, &name, &text, ok, cx);
+                settle_tool(item, step, &text, ok, cx);
                 let _ = reply.send((text, !ok));
             }
             CliEvent::Done(r) => {
                 finish(ws, r.map_or_else(ReplyState::Failed, |()| ReplyState::Done), cx);
-                return false;
+                return (false, true);
             }
         }
     }
     if gone {
         finish(ws, ReplyState::Failed("The request ended without an answer.".into()), cx);
-        return false;
+        return (false, true);
     }
-    true
+    (true, changed)
 }
 
-fn poll_api(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
-    let Some(Turn { item, engine: Engine::Api { stream: Some(stream), .. }, .. }) = agent(cx).turn.as_ref() else { return true };
+fn poll_api(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
+    let Some(Turn { item, engine: Engine::Api { stream: Some(stream), .. }, .. }) = agent(cx).turn.as_ref() else { return (true, false) };
     let item = *item;
-    let mut events = Vec::new();
-    let mut gone = false;
-    loop {
-        match stream.events.try_recv() {
-            Ok(e) => events.push(e),
-            Err(crossbeam_channel::TryRecvError::Empty) => break,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                gone = true;
-                break;
-            }
-        }
-    }
+    let (events, gone) = drain(&stream.events);
+    let changed = !events.is_empty() || gone;
     for e in events {
         match e {
             AgentEvent::Text(t) => {
@@ -582,27 +701,23 @@ fn poll_api(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
                 with_reply(item, cx, |r| push_thinking(r, &t));
             }
             AgentEvent::ToolStart { name, .. } => {
-                with_reply(item, cx, |r| {
-                    r.state = ReplyState::Streaming;
-                    close_thinking(r);
-                    r.steps.push(Step::Tool { name, state: ToolState::Running });
-                });
+                with_reply(item, cx, |r| start_tool(r, &name));
             }
             AgentEvent::Done { stop_reason, content, calls } => {
                 step_done(ws, item, stop_reason, content, calls, cx);
-                return agent(cx).turn.is_some();
+                return (agent(cx).turn.is_some(), true);
             }
             AgentEvent::Error(m) => {
                 finish(ws, ReplyState::Failed(m), cx);
-                return false;
+                return (false, true);
             }
         }
     }
     if gone {
         finish(ws, ReplyState::Failed("The request ended without an answer.".into()), cx);
-        return false;
+        return (false, true);
     }
-    true
+    (true, changed)
 }
 
 /// One API step ended: run its tools and ask again, or end the turn.
@@ -626,11 +741,13 @@ fn step_done(ws: &mut Workspace, item: usize, stop_reason: Option<String>, conte
     }
     let mut results = Vec::new();
     for call in &calls {
+        let input = call.input.clone().unwrap_or(Value::Null);
+        let step = with_reply(item, cx, |r| begin_tool(r, &call.name, &input)).unwrap_or(usize::MAX);
         let (text, ok) = match &call.input {
             Err(raw) => (api::invalid_json(raw), false),
             Ok(input) => run_tool(&mut turn.session, &call.name, input),
         };
-        settle_tool(item, &call.name, &text, ok, cx);
+        settle_tool(item, step, &text, ok, cx);
         results.push((call.id.clone(), text, !ok));
     }
     let Engine::Api { system, messages, model, stream, rounds } = &mut turn.engine else { return };
@@ -643,6 +760,44 @@ fn step_done(ws: &mut Workspace, item: usize, stop_reason: Option<String>, conte
     let effort = agent(cx).effort;
     *stream = Some(api::spawn(AgentRequest { model: model.clone(), system: system.clone(), messages: messages.clone(), tools: tools::definitions(), max_tokens: 64_000, effort }));
     agent(cx).turn = Some(turn);
+}
+
+/// Answer the pending question: the picked options and/or the user's own
+/// words (none of either skips it).
+pub fn answer(picked: &[usize], own: &str, cx: &mut Context<Workspace>) {
+    let Some(p) = agent(cx).pending.take() else { return };
+    let text = p.question.answer(picked, own);
+    let mut shown: Vec<String> = picked.iter().filter_map(|i| p.question.options.get(*i)).map(|(l, _)| l.clone()).collect();
+    if !own.trim().is_empty() {
+        shown.push(own.trim().to_owned());
+    }
+    let shown = if shown.is_empty() { "Skipped".to_owned() } else { shown.join(", ") };
+    settle_tool(p.item, p.step, &shown, true, cx);
+    let _ = p.reply.send((text, false));
+    state::follow(cx);
+    cx.notify();
+}
+
+/// Pick option `i` of the pending question: answers at once unless several may be picked.
+pub fn pick(i: usize, cx: &mut Context<Workspace>) {
+    let Some(p) = agent(cx).pending.as_mut() else { return };
+    if i >= p.question.options.len() {
+        return;
+    }
+    if !p.question.multi {
+        return answer(&[i], "", cx);
+    }
+    if let Some(at) = p.picked.iter().position(|x| *x == i) {
+        p.picked.remove(at);
+    } else {
+        p.picked.push(i);
+    }
+    cx.notify();
+}
+
+/// Whether a question waits for the user.
+pub fn asking(cx: &mut Context<Workspace>) -> bool {
+    agent(cx).pending.is_some()
 }
 
 /// `generate_part`: the pattern engine writes the part into the draft.
@@ -677,6 +832,8 @@ fn seed() -> u64 {
 /// End the turn: settle the reply and offer what changed.
 fn finish(ws: &mut Workspace, end: ReplyState, cx: &mut Context<Workspace>) {
     let Some(turn) = agent(cx).turn.take() else { return };
+    // A question still open goes with the turn (its card closes).
+    agent(cx).pending = None;
     match &turn.engine {
         Engine::Api { stream: Some(s), .. } => s.cancel.cancel(),
         Engine::Cli(t) => t.cancel.cancel(),
@@ -697,7 +854,11 @@ fn finish(ws: &mut Workspace, end: ReplyState, cx: &mut Context<Workspace>) {
     if changes > 0 {
         offer(ws, turn.session, &turn.model_name, cx);
     }
-    state::get(cx).update(cx, |a, _| a.scroll.scroll_to_bottom());
+    state::follow(cx);
+    state::chat_changed(cx);
+    ws.save_chats_quietly(cx);
+    // The next message gets a warm process again.
+    prewarm(cx);
     cx.notify();
 }
 
@@ -723,349 +884,6 @@ pub fn stop(ws: &mut Workspace, cx: &mut Context<Workspace>) {
     if running(cx) {
         finish(ws, ReplyState::Stopped, cx);
     }
-}
-
-// ── View ──
-
-/// A vendor's logo on its brand tile.
-pub fn logo(vendor: Vendor, side: f32) -> Div {
-    let glyph = match vendor {
-        Vendor::Anthropic => Icon::LogoClaude,
-        Vendor::OpenAi => Icon::LogoOpenAi,
-    };
-    div()
-        .size(px(side))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px((side * 0.3).round()))
-        .bg(brand(vendor))
-        .child(svg().path(glyph.path()).size(px(side * 0.86)).text_color(gpui::white()))
-}
-
-/// What a finished tool line says: the result, without the ids the model needs.
-fn plain(result: &str) -> String {
-    let mut s = result.lines().next().unwrap_or_default().to_owned();
-    // Drop "(device #41)", "(clip #44, placement #45)" and ": track #40" style tails.
-    while let Some(open) = s.find(" (")
-        && let Some(close) = s[open..].find(')').map(|c| open + c)
-        && s[open..close].contains('#')
-    {
-        s.replace_range(open..=close, "");
-    }
-    for tail in [": track #", ": group #", " as device #"] {
-        if let Some(i) = s.find(tail) {
-            s.truncate(i);
-        }
-    }
-    s
-}
-
-fn shimmer(id: (usize, usize), el: impl IntoElement + 'static) -> AnyElement {
-    div()
-        .child(el)
-        .with_animation(("agent-shimmer", id.0 * 1024 + id.1), Animation::new(motion::NORMAL * 5).repeat(), |d, t| d.opacity(0.4 + 0.6 * (1. - (t * 2. - 1.).abs())))
-        .into_any_element()
-}
-
-fn thinking_line(i: usize, j: usize, text: &str, done: bool, open: bool, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let has_text = !text.trim().is_empty();
-    let head = div()
-        .id(("think", i * 1024 + j))
-        .h(px(20.))
-        .flex()
-        .items_center()
-        .gap(px(SP1))
-        .when(has_text, |d| d.cursor_pointer())
-        .child(label(if done { "Thought" } else { "Thinking…" }, TEXT_SM, pal.faint))
-        .when(has_text, |d| d.child(icon(if open { Icon::ChevronDown } else { Icon::ChevronRight }, 10., pal.faint)))
-        .on_click(cx.listener(move |_, _, _, cx| toggle_expanded((i, j), cx)));
-    let head: AnyElement = if done { head.into_any_element() } else { shimmer((i, j), head) };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(SP1))
-        .child(head)
-        .when(open && has_text, |d| {
-            d.child(div().pl(px(SP2)).border_l_1().border_color(border()).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.faint).child(text.trim().to_owned()))
-        })
-        .into_any_element()
-}
-
-fn tool_line(i: usize, j: usize, name: &str, st: &ToolState) -> AnyElement {
-    let pal = p();
-    let row = |ic: AnyElement, text: String, color| div().min_h(px(20.)).flex().items_center().gap(px(SP2)).child(ic).child(div().flex_1().min_w(px(0.)).text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(color).child(text));
-    match st {
-        ToolState::Running => shimmer((i, j), row(icon(Icon::Loader, 12., pal.accent).into_any_element(), format!("{}…", tools::title(name)), pal.text)),
-        ToolState::Done(t) => {
-            let text = if t.is_empty() { tools::title(name).to_owned() } else { plain(t) };
-            row(icon(Icon::Check, 12., pal.faint).into_any_element(), text, pal.muted).into_any_element()
-        }
-        ToolState::Failed(e) => div()
-            .flex()
-            .flex_col()
-            .child(row(icon(Icon::X, 12., pal.record).into_any_element(), tools::title(name).to_owned(), pal.muted))
-            .child(div().pl(px(20.)).text_size(px(fs(TEXT_XS))).line_height(px(14.)).text_color(with_alpha(pal.record, 0.8)).child(e.lines().next().unwrap_or_default().to_owned()))
-            .into_any_element(),
-    }
-}
-
-/// An agent reply: no avatar, its steps in order, a quiet footer.
-pub fn view(i: usize, r: &Reply, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let streaming = matches!(r.state, ReplyState::Waiting | ReplyState::Streaming);
-    let expanded = agent(cx).expanded.clone();
-    let mut col = div().flex().flex_col().gap(px(SP2));
-    let last = r.steps.len().saturating_sub(1);
-    let mut j = 0;
-    while j < r.steps.len() {
-        match &r.steps[j] {
-            Step::Thinking { text, done } => col = col.child(thinking_line(i, j, text, *done, expanded.contains(&(i, j)), cx)),
-            Step::Text(t) => col = col.child(markdown::view(i * 64 + j, t, streaming && j == last, cx)),
-            Step::Tool { name, state: st } => {
-                // A run of finished lookups reads as one quiet line.
-                let quiet = |s: &Step| matches!(s, Step::Tool { name, state: ToolState::Done(_) } if tools::is_read_only(name));
-                let run = r.steps[j..].iter().take_while(|s| quiet(s)).count();
-                if run > 1 {
-                    col = col.child(div().h(px(20.)).flex().items_center().gap(px(SP2)).child(icon(Icon::Search, 12., pal.faint)).child(label(format!("Looked through the project ({run})"), TEXT_SM, pal.faint)));
-                    j += run;
-                    continue;
-                }
-                col = col.child(tool_line(i, j, name, st));
-            }
-        }
-        j += 1;
-    }
-    // While nothing is visibly moving, say that it is working.
-    let idle = r.steps.last().is_none_or(|s| matches!(s, Step::Tool { state: ToolState::Done(_) | ToolState::Failed(_), .. } | Step::Thinking { done: true, .. }));
-    if streaming && idle {
-        col = col.child(shimmer((i, 999), label("Working…", TEXT_SM, pal.faint)));
-    }
-    let footer: Option<AnyElement> = match &r.state {
-        ReplyState::Waiting | ReplyState::Streaming => None,
-        ReplyState::Failed(m) => Some(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.record).child(if m.is_empty() { "No answer".to_owned() } else { m.clone() }).into_any_element()),
-        end => {
-            let text = r.text();
-            let mut parts = vec![r.model.clone()];
-            if let Some(d) = r.elapsed {
-                parts.push(format!("{} {:.0} s", if *end == ReplyState::Stopped { "stopped after" } else { "worked" }, d.as_secs_f32()));
-            }
-            if r.changes > 0 {
-                parts.push(format!("{} change{}", r.changes, if r.changes == 1 { "" } else { "s" }));
-            }
-            let mut row = div().h(px(20.)).flex().items_center().gap(px(SP2)).child(logo(r.vendor, 14.)).child(label(parts.join(" · "), TEXT_XS, pal.faint)).child(div().flex_1());
-            if !text.is_empty() {
-                row = row.child(widgets::sized_icon_button(("copy-reply", i), Icon::Copy, false, 20., 12.).tooltip(widgets::tip("Copy", None)).on_click(cx.listener(move |ws, _, _, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
-                    ws.toast("Copied", cx);
-                })));
-            }
-            Some(row.into_any_element())
-        }
-    };
-    col.children(footer).font_weight(FontWeight::NORMAL).into_any_element()
-}
-
-/// The composer's model button: logo and name.
-pub fn model_pill(cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let c = choice(cx);
-    let open = menu_open(cx);
-    div()
-        .id("agent-model")
-        .h(px(24.))
-        .pl(px(SP1))
-        .pr(px(SP2))
-        .gap(px(SP1))
-        .flex()
-        .items_center()
-        .rounded(px(r_md()))
-        .cursor_pointer()
-        .bg(if open { content(0.1) } else { gpui::transparent_black() })
-        .hover(|s| s.bg(content(0.08)))
-        .child(logo(c.provider.vendor(), 16.))
-        .child(label(crate::paint::fit(c.name.trim_start_matches("Claude "), 80., TEXT_XS), TEXT_XS, pal.text))
-        .child(icon(Icon::ChevronDown, 10., pal.faint))
-        .tooltip(widgets::tip("Model", None))
-        .on_click(cx.listener(|ws, _, _, cx| toggle_menu(ws, cx)))
-        .into_any_element()
-}
-
-/// Effort and review / auto-apply, as two quiet toggles.
-pub fn switches(cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let (effort, auto) = (agent(cx).effort, agent(cx).auto_apply);
-    let pill = |id: &'static str, ic: Icon, text: Option<&'static str>, on: bool| {
-        div()
-            .id(id)
-            .h(px(24.))
-            .px(px(SP1))
-            .gap(px(SP1))
-            .flex()
-            .items_center()
-            .rounded(px(r_md()))
-            .cursor_pointer()
-            .hover(|s| s.bg(content(0.08)))
-            .child(icon(ic, 12., if on { pal.accent } else { pal.faint }))
-            .children(text.map(|t| label(t, TEXT_XS, if on { pal.text } else { pal.muted })))
-    };
-    div()
-        .flex()
-        .items_center()
-        .child(pill("agent-effort", Icon::Gauge, Some(effort.label()), effort != Effort::Low).tooltip(widgets::tip("Thinking: Quick, Balanced, Deep, Max", None)).on_click(cx.listener(|_, _, _, cx| cycle_effort(cx))))
-        .child(
-            pill("agent-auto", if auto { Icon::Check } else { Icon::Eye }, None, auto)
-                .tooltip(widgets::tip(if auto { "Auto-apply: edits land at once (one undo step); deletions still wait" } else { "Review: edits wait for you on a card" }, None))
-                .on_click(cx.listener(|_, _, _, cx| toggle_auto(cx))),
-        )
-        .into_any_element()
-}
-
-/// The model picker: each provider's four newest models, with its logo.
-pub fn model_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
-    if !menu_open(cx) {
-        return None;
-    }
-    let pal = p();
-    let current = choice(cx);
-    let key = state::get(cx).read(cx).key;
-    let _ = ws;
-    // Scrolls when the lists are taller than the room above the composer.
-    let mut rows = div().id("agent-model-list").max_h(px(360.)).overflow_y_scroll().flex().flex_col();
-    for (k, provider) in Provider::ALL.into_iter().enumerate() {
-        let a = agent(cx);
-        let installed = a.installed.get(&provider).copied().unwrap_or(false);
-        let list = models(a, provider);
-        let live = a.catalogs.contains_key(&provider);
-        let fetching = a.fetching;
-        let (title, status) = match provider {
-            Provider::ClaudeCode => ("Claude", if installed { "Your subscription" } else { "Claude Code not installed" }),
-            Provider::Codex => ("ChatGPT", if installed { "Your subscription" } else { "Codex not installed" }),
-            Provider::ClaudeApi => ("Anthropic API", if key == KeyState::Missing { "No API key" } else { "Your API key" }),
-        };
-        let usable = match provider {
-            Provider::ClaudeApi => key != KeyState::Missing,
-            _ => installed,
-        };
-        rows = rows.child(
-            div()
-                .when(k > 0, |d| d.mt(px(SP1)).pt(px(SP2)).border_t_1().border_color(border()))
-                .px(px(SP2))
-                .pb(px(SP1))
-                .flex()
-                .items_center()
-                .gap(px(SP2))
-                .child(logo(provider.vendor(), 16.))
-                .child(label(title, TEXT_SM, pal.text).font_weight(FontWeight::SEMIBOLD))
-                .child(div().flex_1())
-                .child(label(if usable && installed && !live && fetching && provider != Provider::ClaudeApi { "Loading…" } else { status }, TEXT_XS, pal.faint)),
-        );
-        for (n, m) in list.into_iter().enumerate() {
-            let on = current.provider == provider && current.model == m.id;
-            let item = div()
-                .id(("agent-model-row", k * 16 + n))
-                .h(px(28.))
-                .px(px(SP2))
-                .flex()
-                .items_center()
-                .gap(px(SP2))
-                .rounded(px(r_md()))
-                .cursor_pointer()
-                .hover(|s| s.bg(hover()))
-                .when(!usable, |d| d.opacity(0.45))
-                .child(label(m.name.clone(), TEXT_SM, pal.text).flex_1().min_w(px(0.)))
-                .when(on, |d| d.child(icon(Icon::Check, 12., pal.accent)));
-            rows = rows.child(if usable {
-                item.on_click(cx.listener(move |ws, _, _, cx| choose(ws, m.clone(), cx)))
-            } else {
-                item.on_click(cx.listener(move |ws, _, _, cx| {
-                    let how = match provider {
-                        Provider::ClaudeCode => format!("{} Then open the model menu again.", AgentKind::ClaudeCode.setup()),
-                        Provider::Codex => format!("{} Then open the model menu again.", AgentKind::Codex.setup()),
-                        Provider::ClaudeApi => "Copy an Anthropic API key and choose \"Use API key from clipboard\" in the model menu.".to_owned(),
-                    };
-                    state::note(ws, how, cx);
-                    toggle_menu(ws, cx);
-                }))
-            });
-        }
-        if provider == Provider::ClaudeApi {
-            rows = rows.child(widgets::menu_item("agent-key-paste", Some(Icon::Paste), "Use API key from clipboard", None, false).on_click(cx.listener(|ws, _, _, cx| {
-                state::key_from_clipboard(ws, cx);
-                toggle_menu(ws, cx);
-            })));
-            if key == KeyState::Keychain {
-                rows = rows.child(widgets::menu_item("agent-key-forget", Some(Icon::Trash), "Forget the stored key", None, false).on_click(cx.listener(|ws, _, _, cx| {
-                    state::forget_key(cx);
-                    toggle_menu(ws, cx);
-                })));
-            }
-        }
-    }
-    Some(
-        div()
-            .id("agent-model-menu-wrap")
-            .absolute()
-            .bottom(px(112.))
-            .left(px(SP3))
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(motion::rise_in("agent-model-menu-in", widgets::menu_card("agent-model-menu", 240.).child(rows), 4.))
-            .into_any_element(),
-    )
-}
-
-/// What an empty chat offers: a few requests that show what the agent does.
-const SUGGESTIONS: [(Icon, &str, &str); 4] = [
-    (Icon::Piano, "Write a bassline that locks with the kick", "Create a bass track and write a rolling 4-bar bassline in the project key that locks with the kick, then loop it for 16 bars."),
-    (Icon::Mixer, "Mix the drums", "Balance and process the drum tracks: gain staging, EQ, compression, a drum bus and a shared reverb."),
-    (Icon::Timeline, "Turn this into an arrangement", "Turn what is here into an arrangement: 16-bar intro, build, drop, break and outro, with filter automation into the drop."),
-    (Icon::Gauge, "Master the song", "Master the song on the Main track for club playback: EQ, glue compression, saturation and a limiter at -1 dBTP."),
-];
-
-/// The empty chat.
-pub fn welcome(ready: bool, cx: &mut Context<Workspace>) -> AnyElement {
-    let pal = p();
-    let c = choice(cx);
-    let mut list = div().flex().flex_col().gap(px(SP1));
-    for (k, (ic, title, prompt)) in SUGGESTIONS.into_iter().enumerate() {
-        list = list.child(
-            div()
-                .id(("suggest", k))
-                .h(px(32.))
-                .px(px(SP2))
-                .gap(px(SP2))
-                .flex()
-                .items_center()
-                .rounded(px(r_md()))
-                .cursor_pointer()
-                .hover(|s| s.bg(hover()))
-                .child(icon(ic, 14., pal.faint))
-                .child(label(title, TEXT_SM, pal.muted))
-                .on_click(cx.listener(move |ws, _, _, cx| state::submit_text(ws, prompt.to_owned(), cx))),
-        );
-    }
-    div()
-        .pt(px(SP6))
-        .flex()
-        .flex_col()
-        .gap(px(SP4))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(SP2))
-                .child(logo(c.provider.vendor(), 28.))
-                .child(label("What are we making?", TEXT_LG, pal.text).font_weight(FontWeight::SEMIBOLD))
-                .child(div().text_size(px(fs(TEXT_SM))).line_height(px(16.)).text_color(pal.faint).child(if ready {
-                    "Tracks, parts, arrangement, sound design, mixing and mastering. Every change waits for your review."
-                } else {
-                    "Pick a model below: your Claude or ChatGPT subscription, or an Anthropic API key."
-                })),
-        )
-        .child(list)
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1105,20 +923,32 @@ mod tests {
 
     #[test]
     fn saved_choices_parse_old_and_new_forms() {
-        assert_eq!(parse_pref("claude-code:fable").unwrap().name, "Fable 5.2");
-        assert_eq!(parse_pref("codex:gpt-6-luna").unwrap().provider, Provider::Codex);
-        assert_eq!(parse_pref("claude-opus-5-5").unwrap().provider, Provider::ClaudeApi);
-        assert_eq!(parse_pref("agent:codex").unwrap().provider, Provider::Codex);
-        assert!(parse_pref("").is_none());
-        let c = parse_pref("codex:gpt-7").unwrap();
-        assert_eq!((c.model.as_str(), c.pref().as_str()), ("gpt-7", "codex:gpt-7"));
+        assert_eq!(parse_pref("claude-code:fable").0.unwrap().name, "Fable 5.2");
+        assert_eq!(parse_pref("codex:gpt-6-luna").0.unwrap().provider, Provider::Codex);
+        assert_eq!(parse_pref("agent:codex").0.unwrap().provider, Provider::Codex);
+        // The API is not offered any more: an old API choice falls back.
+        assert!(parse_pref("claude-opus-5-5").0.is_none());
+        assert!(parse_pref("api:claude-opus-5-5").0.is_none());
+        assert!(parse_pref("").0.is_none());
+        let (c, e) = parse_pref("codex:gpt-7@max");
+        let c = c.unwrap();
+        assert_eq!((c.model.as_str(), e), ("gpt-7", Some(Effort::Max)));
+        assert_eq!(c.pref(Effort::Low), "codex:gpt-7@low");
+        assert_eq!(parse_pref("claude-code:opus@nonsense").0.unwrap().model, "opus@nonsense");
     }
 
     #[test]
-    fn tool_lines_hide_ids() {
-        assert_eq!(plain("New MIDI track \"Bass\" with Acid 303 (device #41): track #40"), "New MIDI track \"Bass\" with Acid 303");
-        assert_eq!(plain("Bass: \"Rolling\", 28 notes, bars 1–5 (clip #44, placement #45)"), "Bass: \"Rolling\", 28 notes, bars 1–5");
-        assert_eq!(plain("Bass: add Compressor as device #46 at position 1"), "Bass: add Compressor");
-        assert_eq!(plain("Kick: fader -6.0 dB (gentle)"), "Kick: fader -6.0 dB (gentle)");
+    fn tool_lines_take_their_input_when_it_arrives() {
+        let mut r = Reply { model: "m".into(), vendor: Vendor::Anthropic, steps: vec![], state: ReplyState::Waiting, started: Instant::now(), elapsed: None, changes: 0 };
+        push_thinking(&mut r, "hm");
+        start_tool(&mut r, "create_track");
+        assert!(matches!(r.steps[0], Step::Thinking { done: true, .. }));
+        let j = begin_tool(&mut r, "create_track", &json!({ "name": "Bass" }));
+        assert_eq!(j, 1, "the started line is reused");
+        let k = begin_tool(&mut r, "get_project", &json!({}));
+        assert_eq!(k, 2, "a call that was not announced gets its own line");
+        assert!(matches!(&r.steps[1], Step::Tool { input, .. } if input["name"] == "Bass"));
+        assert_eq!(clip("abcdef", 3), "abc…");
+        assert_eq!(clip("añb", 2), "a…");
     }
 }

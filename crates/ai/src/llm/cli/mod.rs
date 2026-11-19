@@ -7,14 +7,19 @@
 //! A turn runs on its own thread. Text and thinking stream back as
 //! [`CliEvent`]s; a tool call arrives with a reply channel and the thread
 //! waits until the app (which owns the project draft) answers it.
+//!
+//! Starting a CLI takes a second or two, so the app [`prewarm`]s one while
+//! the user types: the process boots and gets its handshake, and the next
+//! [`start`] with the same model, effort and instructions picks it up and
+//! only has to send the message.
 
 mod claude_code;
 mod codex;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use serde_json::Value;
@@ -194,6 +199,9 @@ pub struct TurnSpec {
 pub enum CliEvent {
     Text(String),
     Thinking(String),
+    /// The model started writing a call to this tool (its input follows
+    /// with [`CliEvent::Tool`]); lets the panel show the line early.
+    ToolStart(String),
     /// The model asked for a tool. Answer on `reply` with the result text
     /// and whether it is an error; the turn waits for it.
     Tool { name: String, input: Value, reply: Sender<(String, bool)> },
@@ -206,17 +214,129 @@ pub struct CliTurn {
     pub cancel: CancelToken,
 }
 
-/// Start `spec` on a worker thread.
+/// A started CLI: the handshake is written, its answer may be waiting.
+struct Proc {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+}
+
+impl Proc {
+    fn end(mut self) {
+        drop(self.stdin);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// What a warm process was started for; a turn takes it only if all match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WarmKey {
+    provider: Provider,
+    model: String,
+    effort: Effort,
+    system: u64,
+}
+
+impl WarmKey {
+    fn of(spec: &TurnSpec) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        spec.system.hash(&mut h);
+        for t in &spec.tools {
+            t.to_string().hash(&mut h);
+        }
+        Self { provider: spec.provider, model: spec.model.clone(), effort: spec.effort, system: h.finish() }
+    }
+}
+
+struct Warm {
+    key: WarmKey,
+    proc: Proc,
+    born: Instant,
+}
+
+/// A warm process older than this is let go (the CLI may have refreshed
+/// its sign-in or settings meanwhile).
+const WARM_FOR: Duration = Duration::from_secs(10 * 60);
+
+static WARM: Mutex<Option<Warm>> = Mutex::new(None);
+
+fn spawn_proc(spec: &TurnSpec) -> Result<Proc, String> {
+    match spec.provider {
+        Provider::ClaudeCode => claude_code::spawn(spec),
+        Provider::Codex => codex::spawn(spec),
+        Provider::ClaudeApi => Err("the API runs in the app's own loop".into()),
+    }
+}
+
+/// Boot a CLI for a turn like `spec` (its prompt and images are ignored) in
+/// the background, unless one is already waiting for it.
+pub fn prewarm(spec: &TurnSpec) {
+    if spec.provider == Provider::ClaudeApi {
+        return;
+    }
+    let key = WarmKey::of(spec);
+    {
+        let mut slot = WARM.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = slot.as_mut()
+            && w.key == key
+            && w.born.elapsed() < WARM_FOR
+            && matches!(w.proc.child.try_wait(), Ok(None))
+        {
+            return;
+        }
+        if let Some(old) = slot.take() {
+            old.proc.end();
+        }
+    }
+    let spec = spec.clone();
+    let _ = std::thread::Builder::new().name("aitrack-cli-warm".into()).spawn(move || {
+        let Ok(proc) = spawn_proc(&spec) else { return };
+        let mut slot = WARM.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = slot.replace(Warm { key, proc, born: Instant::now() }) {
+            old.proc.end();
+        }
+    });
+}
+
+/// The warm process for `spec`, if one is ready and still alive.
+fn take_warm(spec: &TurnSpec) -> Option<Proc> {
+    let mut w = WARM.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    if w.key == WarmKey::of(spec) && w.born.elapsed() < WARM_FOR && matches!(w.proc.child.try_wait(), Ok(None)) {
+        Some(w.proc)
+    } else {
+        w.proc.end();
+        None
+    }
+}
+
+/// Let a warm process go (the user picked another model, or quits).
+pub fn cool_down() {
+    if let Some(w) = WARM.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        w.proc.end();
+    }
+}
+
+/// Start `spec` on a worker thread, on a warm process when one matches.
 pub fn start(spec: TurnSpec) -> CliTurn {
     let (tx, events) = unbounded();
     let cancel = CancelToken::new();
     let token = cancel.clone();
     let spawned = std::thread::Builder::new().name("aitrack-cli-turn".into()).spawn(move || {
-        let result = match spec.provider {
-            Provider::ClaudeCode => claude_code::run(&spec, &token, &tx),
-            Provider::Codex => codex::run(&spec, &token, &tx),
-            Provider::ClaudeApi => Err("the API runs in the app's own loop".into()),
+        let proc = match take_warm(&spec) {
+            Some(p) => Ok(p),
+            None => spawn_proc(&spec),
         };
+        let result = proc.and_then(|mut p| {
+            let r = match spec.provider {
+                Provider::ClaudeCode => claude_code::run(&spec, &mut p, &token, &tx),
+                Provider::Codex => codex::run(&spec, &mut p, &token, &tx),
+                Provider::ClaudeApi => Err("the API runs in the app's own loop".into()),
+            };
+            p.end();
+            r
+        });
         if !token.is_cancelled() {
             let _ = tx.send(CliEvent::Done(result));
         }
@@ -289,11 +409,9 @@ mod tests {
         assert!(available(Provider::ClaudeApi));
     }
 
-    /// A real turn on the user's subscription: the model must call our tool
-    /// and use its answer. `cargo test -p aitrack-ai live_ -- --ignored`.
-    fn live(provider: Provider, model: &str) {
+    fn live_spec(provider: Provider, model: &str) -> TurnSpec {
         let tool = serde_json::json!({ "name": "get_project", "description": "The open song: tempo and tracks. Call it to answer questions about the song.", "input_schema": { "type": "object", "properties": {} } });
-        let turn = start(TurnSpec {
+        TurnSpec {
             provider,
             model: model.into(),
             effort: Effort::Low,
@@ -301,14 +419,22 @@ mod tests {
             prompt: "What is the tempo of the open song? Call get_project, then answer with the number only.".into(),
             images: Vec::new(),
             tools: vec![tool],
-        });
+        }
+    }
+
+    /// A real turn on the user's subscription: the model must call our tool
+    /// and use its answer. `cargo test -p aitrack-ai live_ -- --ignored`.
+    fn live(provider: Provider, model: &str) {
+        let started = std::time::Instant::now();
+        let turn = start(live_spec(provider, model));
         let mut called = false;
         let mut text = String::new();
         loop {
             match turn.events.recv_timeout(Duration::from_secs(120)).expect("the turn timed out") {
                 CliEvent::Text(t) => text.push_str(&t),
-                CliEvent::Thinking(_) => {}
+                CliEvent::Thinking(_) | CliEvent::ToolStart(_) => {}
                 CliEvent::Tool { name, reply, .. } => {
+                    eprintln!("{provider:?}: first tool call after {:?}", started.elapsed());
                     assert_eq!(name, "get_project");
                     called = true;
                     reply.send(("Song \"Night\": 137 BPM, tracks: Kick, Bass".into(), false)).unwrap();
@@ -333,6 +459,22 @@ mod tests {
     #[ignore = "runs Codex on the user's subscription"]
     fn live_codex_calls_a_tool() {
         live(Provider::Codex, "gpt-6-luna");
+    }
+
+    /// A warmed process takes the turn and answers like a cold one.
+    #[test]
+    #[ignore = "runs Claude Code and Codex on the user's subscriptions"]
+    fn live_warm_processes_take_the_turn() {
+        for (p, model) in [(Provider::ClaudeCode, "haiku"), (Provider::Codex, "gpt-6-luna")] {
+            if !available(p) {
+                continue;
+            }
+            prewarm(&live_spec(p, model));
+            std::thread::sleep(Duration::from_secs(4));
+            assert!(WARM.lock().unwrap().as_ref().is_some_and(|w| w.key == WarmKey::of(&live_spec(p, model))), "{p:?} warmed up");
+            live(p, model);
+            assert!(WARM.lock().unwrap().is_none(), "the turn took the warm process");
+        }
     }
 
     #[test]

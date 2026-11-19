@@ -17,6 +17,7 @@ use aitrack_ai::llm::{self, context::Focus, mix::MixPlan};
 use aitrack_model::{ClipId, Origin, Source, TrackId};
 use gpui::{AppContext, ClipboardEntry, Context, Entity, Global, ImageFormat, ScrollHandle, Subscription, Task};
 
+use super::history::{self, Archive, Chat};
 use super::midi_gen::{self, Prepared};
 use super::part::{self, Session};
 use super::{mix, slash};
@@ -150,6 +151,15 @@ pub struct Assistant {
     next_part: u64,
     /// The part a model is writing right now.
     gen_job: Option<GenJob>,
+    /// The project's other chats (the open one is `items`).
+    pub chats: Vec<Chat>,
+    pub chat_id: u64,
+    /// Unix seconds of the open chat's last message.
+    pub chat_updated: u64,
+    /// The list of the project's chats is open.
+    pub history_open: bool,
+    /// When a click outside closed the list (so the button's own click does not reopen it).
+    history_closed_at: Option<std::time::Instant>,
     _subs: Vec<Subscription>,
 }
 
@@ -208,6 +218,11 @@ pub fn get(cx: &mut Context<Workspace>) -> Entity<Assistant> {
         parts: HashMap::new(),
         next_part: 0,
         gen_job: None,
+        chats: Vec::new(),
+        chat_id: 1,
+        chat_updated: 0,
+        history_open: false,
+        history_closed_at: None,
         _subs: vec![sub],
     });
     cx.set_global(Handle(entity.clone()));
@@ -240,9 +255,175 @@ fn anchor(ws: &Workspace) -> usize {
 }
 
 pub(super) fn push(ws: &Workspace, a: &mut Assistant, item: Item) -> usize {
+    // The user's own message always brings the end into view; the rest
+    // follows only a reader who is already at the end.
+    if matches!(item, Item::User { .. }) || at_bottom(&a.scroll) {
+        a.scroll.scroll_to_bottom();
+    }
     a.items.push(Placed { anchor: anchor(ws), item });
-    a.scroll.scroll_to_bottom();
+    a.chat_updated = history::now();
     a.items.len() - 1
+}
+
+/// Whether the log shows its end (or has nothing to scroll).
+pub fn at_bottom(h: &ScrollHandle) -> bool {
+    let max = h.max_offset().y;
+    max <= gpui::px(1.) || h.offset().y <= -max + gpui::px(24.)
+}
+
+/// Keep the newest text in view while the reader is at the end; one who
+/// scrolled up to read is left where they are.
+pub fn follow(cx: &mut Context<Workspace>) {
+    let a = get(cx);
+    a.update(cx, |a, _| {
+        if at_bottom(&a.scroll) {
+            a.scroll.scroll_to_bottom();
+        }
+    });
+}
+
+/// Scroll to the newest message (the "jump to latest" button).
+pub fn jump_to_latest(cx: &mut Context<Workspace>) {
+    get(cx).update(cx, |a, _| a.scroll.scroll_to_bottom());
+    cx.notify();
+}
+
+/// The open chat got a message: it is the newest.
+pub fn chat_changed(cx: &mut Context<Workspace>) {
+    get(cx).update(cx, |a, _| a.chat_updated = history::now());
+}
+
+// ── The project's chats ──
+
+fn current_chat(a: &Assistant) -> Option<Chat> {
+    let items: Vec<history::Saved> = a.items.iter().filter_map(|p| history::save(&p.item)).collect();
+    (!items.is_empty()).then(|| Chat { id: a.chat_id, title: history::title(&a.items), updated: a.chat_updated, items })
+}
+
+/// Every chat of the project, newest first, the open one included.
+pub fn all_chats(cx: &mut Context<Workspace>) -> Vec<Chat> {
+    let a = get(cx);
+    let a = a.read(cx);
+    let mut all: Vec<Chat> = current_chat(a).into_iter().chain(a.chats.iter().cloned()).collect();
+    all.sort_by_key(|c| std::cmp::Reverse(c.updated));
+    all
+}
+
+/// What the project file keeps under `"assistant"`; `None` with no chat at all.
+pub fn archive(cx: &mut Context<Workspace>) -> Option<serde_json::Value> {
+    let chats = all_chats(cx);
+    if chats.is_empty() {
+        return None;
+    }
+    let current = get(cx).read(cx).chat_id;
+    serde_json::to_value(Archive { current, chats }).ok()
+}
+
+/// Leave the open chat (kept in the list) for an empty one or `next`.
+fn leave_chat(ws: &mut Workspace, next: Option<Chat>, cx: &mut Context<Workspace>) {
+    stop(ws, cx);
+    let a = get(cx);
+    a.update(cx, |a, _| {
+        if let Some(c) = current_chat(a) {
+            a.chats.retain(|x| x.id != c.id);
+            a.chats.push(c);
+        }
+        a.items.clear();
+        a.attachments.clear();
+        a.history_open = false;
+        match next {
+            Some(c) => {
+                a.chats.retain(|x| x.id != c.id);
+                a.chat_id = c.id;
+                a.chat_updated = c.updated;
+                a.items = c.items.iter().map(|s| Placed { anchor: 0, item: history::restore(s) }).collect();
+            }
+            None => {
+                a.chat_id = a.chats.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+                a.chat_updated = history::now();
+            }
+        }
+        a.scroll.scroll_to_bottom();
+    });
+    // Keep cards still waiting for an answer (proposals, licences).
+    ws.chat_log.retain(|e| matches!(e, ChatEntry::Proposal { status: ProposalStatus::Pending, .. } | ChatEntry::License { status: ProposalStatus::Pending, .. }) || matches!(e, ChatEntry::Part(c) if matches!(c.status, part::Status::Pending | part::Status::Trying)));
+    super::agent::agent(cx).expanded.clear();
+    cx.notify();
+}
+
+pub fn new_chat(ws: &mut Workspace, cx: &mut Context<Workspace>) {
+    leave_chat(ws, None, cx);
+}
+
+pub fn open_chat(ws: &mut Workspace, id: u64, cx: &mut Context<Workspace>) {
+    if get(cx).read(cx).chat_id == id {
+        get(cx).update(cx, |a, _| a.history_open = false);
+        return cx.notify();
+    }
+    let next = get(cx).read(cx).chats.iter().find(|c| c.id == id).cloned();
+    if next.is_some() {
+        leave_chat(ws, next, cx);
+    }
+}
+
+pub fn delete_chat(ws: &mut Workspace, id: u64, cx: &mut Context<Workspace>) {
+    if get(cx).read(cx).chat_id == id {
+        stop(ws, cx);
+        get(cx).update(cx, |a, _| {
+            a.items.clear();
+            a.chat_id = a.chats.iter().map(|c| c.id).max().unwrap_or(a.chat_id) + 1;
+        });
+    }
+    get(cx).update(cx, |a, _| a.chats.retain(|c| c.id != id));
+    ws.save_chats_quietly(cx);
+    cx.notify();
+}
+
+pub fn toggle_history(cx: &mut Context<Workspace>) {
+    get(cx).update(cx, |a, _| {
+        let just_closed = a.history_closed_at.take().is_some_and(|t| t.elapsed() < Duration::from_millis(250));
+        a.history_open = !a.history_open && !just_closed;
+    });
+    cx.notify();
+}
+
+/// A click outside the list closes it.
+pub fn close_history(cx: &mut Context<Workspace>) {
+    get(cx).update(cx, |a, _| {
+        if a.history_open {
+            a.history_open = false;
+            a.history_closed_at = Some(std::time::Instant::now());
+        }
+    });
+    cx.notify();
+}
+
+/// A project was opened (or made): its own chats, the newest open.
+pub fn load_chats(ws: &mut Workspace, archive: Option<Archive>, cx: &mut Context<Workspace>) {
+    stop(ws, cx);
+    let mut archive = archive.unwrap_or_default();
+    let open = archive.chats.iter().position(|c| c.id == archive.current).or_else(|| (0..archive.chats.len()).max_by_key(|&i| archive.chats[i].updated)).map(|i| archive.chats.remove(i));
+    let a = get(cx);
+    a.update(cx, |a, _| {
+        a.items.clear();
+        a.attachments.clear();
+        a.history_open = false;
+        a.chats = archive.chats;
+        match open {
+            Some(c) => {
+                a.chat_id = c.id;
+                a.chat_updated = c.updated;
+                a.items = c.items.iter().map(|s| Placed { anchor: 0, item: history::restore(s) }).collect();
+            }
+            None => {
+                a.chat_id = a.chats.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+                a.chat_updated = 0;
+            }
+        }
+        a.scroll.scroll_to_bottom();
+    });
+    super::agent::agent(cx).expanded.clear();
+    cx.notify();
 }
 
 pub fn note(ws: &mut Workspace, text: impl Into<String>, cx: &mut Context<Workspace>) {
@@ -255,13 +436,24 @@ pub fn note(ws: &mut Workspace, text: impl Into<String>, cx: &mut Context<Worksp
 fn on_input(ws: &mut Workspace, e: &InputEvent, cx: &mut Context<Workspace>) {
     let a = get(cx);
     match e {
-        InputEvent::Changed(_) => {
+        InputEvent::Changed(text) => {
             a.update(cx, |a, _| a.slash_sel = 0);
+            // The user is writing: have the model's CLI ready when they send.
+            if !text.trim().is_empty() && slash::query(text).is_none() {
+                super::agent::prewarm(cx);
+            }
             cx.notify();
         }
         InputEvent::Submit(text) => {
             let text = text.trim().to_owned();
-            if let Some(q) = slash::query(&text) {
+            if super::agent::asking(cx) {
+                // A question is open: what was typed is the answer.
+                if !text.is_empty() {
+                    clear_input(&a, cx);
+                    let picked = super::agent::agent(cx).pending.as_ref().map(|p| p.picked.clone()).unwrap_or_default();
+                    super::agent::answer(&picked, &text, cx);
+                }
+            } else if let Some(q) = slash::query(&text) {
                 let (sel, tab) = a.read_with(cx, |a, _| (a.slash_sel, a.slash_tab));
                 let hits = slash::filter(q, tab);
                 if let Some(entry) = hits.get(sel.min(hits.len().saturating_sub(1))) {
@@ -378,16 +570,8 @@ fn run_with(ws: &mut Workspace, action: slash::Action, args: &str, cx: &mut Cont
         A::Generate(kind) => generate(ws, Some(kind), args, cx),
         A::AttachSelection => attach_selection(ws, cx),
         A::AttachFile => pick_files(cx),
-        A::Overview => send(ws, "Give me a quick overview of this project: what is there, what stands out, and three concrete things to try next.".into(), None, cx),
-        A::ClearChat => {
-            stop(ws, cx);
-            a.update(cx, |a, _| {
-                a.items.clear();
-                a.attachments.clear();
-            });
-            // Keep cards still waiting for an answer (proposals, licences).
-            ws.chat_log.retain(|e| matches!(e, ChatEntry::Proposal { status: ProposalStatus::Pending, .. } | ChatEntry::License { status: ProposalStatus::Pending, .. }) || matches!(e, ChatEntry::Part(c) if matches!(c.status, part::Status::Pending | part::Status::Trying)));
-        }
+        A::Overview => submit_text(ws, "Give me a quick overview of this project: what is there, what stands out, and three concrete things to try next.".into(), cx),
+        A::ClearChat => new_chat(ws, cx),
     }
     cx.notify();
 }
@@ -667,14 +851,16 @@ pub fn submit_text(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>
     if super::agent::ready(cx) {
         return super::agent::submit(ws, text, cx);
     }
+    // No subscription CLI here: a plain request for a part is still written
+    // by the rules; anything else says how to connect a model.
     let a = get(cx);
-    let (backend, key) = a.read_with(cx, |a, _| (a.backend, a.key));
-    let offline = matches!(backend, Backend::Claude(_)) && key == KeyState::Missing;
-    if offline && is_request_for_a_part(&text) {
-        a.update(cx, |a, _| push(ws, a, Item::User { text: text.clone(), chips: Vec::new() }));
+    a.update(cx, |a, _| push(ws, a, Item::User { text: text.clone(), chips: Vec::new() }));
+    if is_request_for_a_part(&text) {
         return generate(ws, None, &text, cx);
     }
-    send(ws, text, None, cx);
+    let c = super::agent::choice(cx);
+    let kind = if c.provider == aitrack_ai::llm::cli::Provider::Codex { AgentKind::Codex } else { AgentKind::ClaudeCode };
+    note(ws, format!("{} isn't installed on this computer, so nobody can answer yet. {}", kind.name(), kind.setup()), cx);
 }
 
 /// Whether `text` asks for a part rather than asking a question about one.
@@ -878,36 +1064,6 @@ pub fn paste(ws: &mut Workspace, cx: &mut Context<Workspace>) {
         }
     }
     cx.notify();
-}
-
-/// "Use API key from clipboard": store it in the keychain, never show it.
-pub fn key_from_clipboard(ws: &mut Workspace, cx: &mut Context<Workspace>) {
-    let Some(key) = cx.read_from_clipboard().and_then(|c| c.text()) else { return Workspace::toast(ws, "Copy your Anthropic API key first", cx) };
-    let key = key.trim().to_owned();
-    if !llm::keychain::looks_like_key(&key) {
-        return Workspace::toast(ws, "The clipboard does not hold an Anthropic API key (sk-ant-…)", cx);
-    }
-    let task = cx.background_executor().spawn(async move { llm::keychain::store(&key) });
-    cx.spawn(async move |ws, cx| {
-        let result = task.await;
-        let _ = ws.update(cx, |ws, cx| match result {
-            Ok(()) => {
-                note(ws, "API key saved in the system keychain. Claude answers from now on.", cx);
-                refresh_key(cx);
-            }
-            Err(e) => Workspace::toast(ws, e, cx),
-        });
-    })
-    .detach();
-}
-
-pub fn forget_key(cx: &mut Context<Workspace>) {
-    let task = cx.background_executor().spawn(async { llm::keychain::forget() });
-    cx.spawn(async move |ws, cx| {
-        task.await;
-        let _ = ws.update(cx, |_, cx| refresh_key(cx));
-    })
-    .detach();
 }
 
 pub fn set_backend(ws: &mut Workspace, backend: Backend, cx: &mut Context<Workspace>) {

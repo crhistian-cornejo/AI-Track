@@ -3027,6 +3027,9 @@ impl Workspace {
 
     /// Swap the open project for `project`, with a fresh undo history.
     pub fn replace_project(&mut self, project: Project, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        // A running assistant turn ends with the project it worked on (and
+        // its chats are kept in that project's file, not the next one's).
+        views::ai_panel::state::stop(self, cx);
         self.b.engine.stop();
         self.b.engine.locate(0);
         // The autosaved copy of the project being left stays: it goes when that
@@ -3037,10 +3040,13 @@ impl Workspace {
         self.project_epoch += 1;
         // An analysis of the old project's audio has nothing to apply to now.
         self.analysis_jobs.clear();
+        // The assistant opens this project's own chats (kept in its file).
+        let chats = path.as_deref().and_then(crate::project_io::read_assistant);
         self.project_path = path;
         self.drag = None;
         self.menu = None;
         self.chat_log.retain(|e| !matches!(e, ChatEntry::Proposal { .. } | ChatEntry::Part(_)));
+        views::ai_panel::state::load_chats(self, chats, cx);
         self.synced_revision = None;
         self.fx = views::device_ui::UiState::default();
         views::device_ui::modulator::set_map_mode(None);

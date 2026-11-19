@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use serde_json::{Value, json};
 
-use super::{CliEvent, ModelInfo, Provider, TurnSpec, call_tool, command, lines, resolve, write_json};
+use super::{CliEvent, ModelInfo, Proc, Provider, TurnSpec, call_tool, command, lines, resolve, write_json};
 use crate::CancelToken;
 use crate::llm::agent::Effort;
 
@@ -137,7 +137,9 @@ fn user_message(spec: &TurnSpec) -> Value {
     json!({ "type": "user", "message": { "role": "user", "content": content } })
 }
 
-pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Result<(), String> {
+/// Start Claude Code for `spec` and send the handshake; the user message
+/// goes in once it is answered ([`run`]).
+pub(super) fn spawn(spec: &TurnSpec) -> Result<Proc, String> {
     let path = resolve("claude").ok_or("Claude Code is not installed. Install it from claude.com/code and sign in, then try again.")?;
     let mcp_config = json!({ "mcpServers": { SERVER: { "type": "sdk", "name": SERVER } } }).to_string();
     let mut child = command(&path)
@@ -145,77 +147,89 @@ pub fn run(spec: &TurnSpec, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Resu
         .args(["--include-partial-messages", "--model", &spec.model, "--effort", effort(spec.effort)])
         .args(["--tools", "", "--strict-mcp-config", "--mcp-config", &mcp_config, "--allowedTools", &format!("mcp__{SERVER}")])
         .args(["--system-prompt", &spec.system])
+        // A question to the user waits for them: no tool timeout.
+        .env("MCP_TOOL_TIMEOUT", "86400000")
         .spawn()
         .map_err(|e| format!("could not start Claude Code: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    let rx = lines(child.stdout.take().ok_or("no stdout")?);
-    let result = (|| {
-        write_json(&mut stdin, &json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","sdkMcpServers":[SERVER]}}))?;
-        let mut sent = false;
-        loop {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            let line = match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(l) => l,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return Err("Claude Code stopped before it answered. Check that you are signed in (run `claude` once in a terminal).".into()),
-            };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-            match v["type"].as_str().unwrap_or_default() {
-                "control_response" if v["response"]["request_id"] == "init" => {
-                    if v["response"]["subtype"] != "success" {
-                        return Err(v["response"]["error"].as_str().unwrap_or("Claude Code refused to start").to_owned());
-                    }
-                    if !sent {
-                        sent = true;
-                        write_json(&mut stdin, &user_message(spec))?;
-                    }
-                }
-                "control_request" => {
-                    let rid = v["request_id"].clone();
-                    let req = &v["request"];
-                    let response = match req["subtype"].as_str() {
-                        Some("mcp_message") => {
-                            let mut call = |name: &str, input: Value| call_tool(tx, cancel, name, input);
-                            json!({ "mcp_response": mcp(&req["message"], &spec.tools, &mut call) })
-                        }
-                        // Only our tools are allowed; anything else asking is refused.
-                        Some("can_use_tool") => {
-                            let ours = req["tool_name"].as_str().is_some_and(|n| n.starts_with(&format!("mcp__{SERVER}__")));
-                            if ours { json!({ "behavior": "allow", "updatedInput": req["input"] }) } else { json!({ "behavior": "deny", "message": "Only AI-Track's tools are available here." }) }
-                        }
-                        _ => json!({}),
-                    };
-                    write_json(&mut stdin, &json!({ "type": "control_response", "response": { "subtype": "success", "request_id": rid, "response": response } }))?;
-                }
-                "stream_event" => {
-                    let e = &v["event"];
-                    if e["type"] == "content_block_delta" {
-                        let d = &e["delta"];
-                        match d["type"].as_str() {
-                            Some("text_delta") => {
-                                let _ = tx.send(CliEvent::Text(d["text"].as_str().unwrap_or_default().to_owned()));
-                            }
-                            Some("thinking_delta") => {
-                                let _ = tx.send(CliEvent::Thinking(d["thinking"].as_str().unwrap_or_default().to_owned()));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                "result" => {
-                    let failed = v["is_error"] == true || v["subtype"].as_str().is_some_and(|s| s != "success");
-                    return if failed { Err(v["result"].as_str().filter(|s| !s.is_empty()).unwrap_or("Claude Code could not finish the request").to_owned()) } else { Ok(()) };
-                }
-                _ => {}
-            }
+    let lines = lines(child.stdout.take().ok_or("no stdout")?);
+    if let Err(e) = write_json(&mut stdin, &json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","sdkMcpServers":[SERVER]}})) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok(Proc { child, stdin, lines })
+}
+
+pub(super) fn run(spec: &TurnSpec, p: &mut Proc, cancel: &CancelToken, tx: &Sender<CliEvent>) -> Result<(), String> {
+    let (stdin, rx) = (&mut p.stdin, &p.lines);
+    let prefix = format!("mcp__{SERVER}__");
+    let mut sent = false;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
         }
-    })();
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+        let line = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(l) => l,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Err("Claude Code stopped before it answered. Check that you are signed in (run `claude` once in a terminal).".into()),
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        match v["type"].as_str().unwrap_or_default() {
+            "control_response" if v["response"]["request_id"] == "init" => {
+                if v["response"]["subtype"] != "success" {
+                    return Err(v["response"]["error"].as_str().unwrap_or("Claude Code refused to start").to_owned());
+                }
+                if !sent {
+                    sent = true;
+                    write_json(stdin, &user_message(spec))?;
+                }
+            }
+            "control_request" => {
+                let rid = v["request_id"].clone();
+                let req = &v["request"];
+                let response = match req["subtype"].as_str() {
+                    Some("mcp_message") => {
+                        let mut call = |name: &str, input: Value| call_tool(tx, cancel, name, input);
+                        json!({ "mcp_response": mcp(&req["message"], &spec.tools, &mut call) })
+                    }
+                    // Only our tools are allowed; anything else asking is refused.
+                    Some("can_use_tool") => {
+                        let ours = req["tool_name"].as_str().is_some_and(|n| n.starts_with(&prefix));
+                        if ours { json!({ "behavior": "allow", "updatedInput": req["input"] }) } else { json!({ "behavior": "deny", "message": "Only AI-Track's tools are available here." }) }
+                    }
+                    _ => json!({}),
+                };
+                write_json(stdin, &json!({ "type": "control_response", "response": { "subtype": "success", "request_id": rid, "response": response } }))?;
+            }
+            "stream_event" => {
+                let e = &v["event"];
+                if e["type"] == "content_block_start"
+                    && e["content_block"]["type"] == "tool_use"
+                    && let Some(name) = e["content_block"]["name"].as_str().and_then(|n| n.strip_prefix(&prefix))
+                {
+                    let _ = tx.send(CliEvent::ToolStart(name.to_owned()));
+                }
+                if e["type"] == "content_block_delta" {
+                    let d = &e["delta"];
+                    match d["type"].as_str() {
+                        Some("text_delta") => {
+                            let _ = tx.send(CliEvent::Text(d["text"].as_str().unwrap_or_default().to_owned()));
+                        }
+                        Some("thinking_delta") => {
+                            let _ = tx.send(CliEvent::Thinking(d["thinking"].as_str().unwrap_or_default().to_owned()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "result" => {
+                let failed = v["is_error"] == true || v["subtype"].as_str().is_some_and(|s| s != "success");
+                return if failed { Err(v["result"].as_str().filter(|s| !s.is_empty()).unwrap_or("Claude Code could not finish the request").to_owned()) } else { Ok(()) };
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

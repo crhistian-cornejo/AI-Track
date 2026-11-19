@@ -154,13 +154,41 @@ fn relativize_owned(project: &Project, base: &Path) -> Project {
 /// Write `project` to `path` (atomically, keeping the previous file as `.bak`).
 /// The audio files inside the project's folder go in by relative path, so the
 /// folder can be moved or shared; files elsewhere keep their absolute path.
+#[cfg(test)]
 pub fn save(path: &Path, project: &Project) -> Result<(), String> {
+    save_with(path, project, None)
+}
+
+/// The key the assistant's chats are kept under in a project file.
+const ASSISTANT_KEY: &str = "assistant";
+
+/// [`save`], keeping `assistant` (the project's chats) in the same file
+/// under its own key, which the project's reader passes over.
+pub fn save_with(path: &Path, project: &Project, assistant: Option<&serde_json::Value>) -> Result<(), String> {
     let on_disk = match project_folder(path) {
         Some(base) => relativize_owned(project, &base),
         None => project.clone(),
     };
-    let json = on_disk.to_json().map_err(|e| format!("Could not encode the project: {e}"))?;
+    let mut json = on_disk.to_json().map_err(|e| format!("Could not encode the project: {e}"))?;
+    if let Some(chats) = assistant {
+        let text = serde_json::to_string(chats).map_err(|e| format!("Could not encode the chats: {e}"))?;
+        // The project is a JSON object: its last character closes it.
+        if let Some(end) = json.rfind('}') {
+            json.replace_range(end.., &format!(",\n  \"{ASSISTANT_KEY}\": {text}\n}}\n"));
+        }
+    }
     write_atomic(path, json.as_bytes(), true)
+}
+
+/// The chats kept in the project file at `path`, if any.
+pub fn read_assistant(path: &Path) -> Option<crate::views::ai_panel::history::Archive> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        assistant: Option<crate::views::ai_panel::history::Archive>,
+    }
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Peek>(&json).ok()?.assistant
 }
 
 pub fn load(path: &Path) -> Result<Project, String> {
@@ -436,7 +464,8 @@ impl Workspace {
         // Cmd+Z after saving still undoes the user's last edit).
         let states = self.b.engine.plugin_states();
         self.s.capture_plugin_states(states);
-        match save(path, &self.s.project) {
+        let chats = crate::views::ai_panel::state::archive(cx);
+        match save_with(path, &self.s.project, chats.as_ref()) {
             Ok(()) => {
                 self.s.history.mark_saved();
                 // Saved: the project may play the takes recorded so far, wherever they are.
@@ -454,6 +483,21 @@ impl Workspace {
                 self.toast(e, cx);
                 false
             }
+        }
+    }
+
+    /// Keep the chats in the project's file when nothing else is waiting to
+    /// be saved (the file then holds this very project), so a conversation
+    /// is not lost with an unchanged song. With unsaved edits the chats go
+    /// in with the next save.
+    pub fn save_chats_quietly(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.project_path.clone() else { return };
+        if self.s.history.is_dirty() || !path.is_file() {
+            return;
+        }
+        let chats = crate::views::ai_panel::state::archive(cx);
+        if let Err(e) = save_with(&path, &self.s.project, chats.as_ref()) {
+            log::warn!("could not keep the chats in {}: {e}", path.display());
         }
     }
 
@@ -746,6 +790,24 @@ pub(crate) fn safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chats_ride_in_the_project_file() {
+        use crate::views::ai_panel::history::{Archive, Chat, Saved};
+        let dir = std::env::temp_dir().join(format!("aitrack-io-chats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Song.aitrack");
+        let project = crate::demo::project();
+        save(&path, &project).unwrap();
+        assert!(read_assistant(&path).is_none(), "a project saved without chats has none");
+        let archive = Archive { current: 2, chats: vec![Chat { id: 2, title: "make a bass".into(), updated: 9, items: vec![Saved::Note { text: "hi".into() }] }] };
+        save_with(&path, &project, Some(&serde_json::to_value(&archive).unwrap())).unwrap();
+        // The project reads as before, the chats come back whole.
+        let back = load(&path).unwrap();
+        assert_eq!(back.tracks, project.tracks);
+        assert_eq!(read_assistant(&path), Some(archive));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn save_and_load_round_trip() {

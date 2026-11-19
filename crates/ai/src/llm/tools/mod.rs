@@ -120,6 +120,7 @@ pub fn title(name: &str) -> &'static str {
         "clear_bars" => "Clearing bars",
         "set_automation" => "Drawing automation",
         "generate_part" => "Generating a part",
+        ASK_USER => "Asking you",
         _ => "Working",
     }
 }
@@ -153,7 +154,81 @@ for club music, -14 LUFS for streaming), and an Analyzer to check.
 - Parameters are set in their own units by name (\"Threshold\": -18, \"Ratio\": 4, \"Freq\": 120) or by choice label \
 (\"Type\": \"Low Cut\"). Read the real names with get_device first.
 - You cannot hear the audio; reason from the project, the names and the user's description, and say so when it matters.
-- If a tool fails, read the error, fix the call and continue.";
+- If a tool fails, read the error, fix the call and continue.
+- When a request is open in a way that changes the result a lot (genre, key, which track, how long), and the project \
+does not answer it, ask once with ask_user: one short question and 2–4 concrete options. Do not ask about details you \
+can decide yourself, and never ask for permission to edit.";
+
+/// The tool the in-app assistant asks the user a question with. The app
+/// shows a card with the options and the turn waits for the answer.
+pub const ASK_USER: &str = "ask_user";
+
+/// A question from [`ASK_USER`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Question {
+    pub question: String,
+    /// Label and an optional line under it.
+    pub options: Vec<(String, String)>,
+    /// Several options may be picked.
+    pub multi: bool,
+}
+
+impl Question {
+    /// Read the tool's input; the error says what is wrong with the call.
+    pub fn from_input(input: &Value) -> Result<Self, String> {
+        let question = input.get("question").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
+        if question.is_empty() {
+            return Err("ask_user needs a question".into());
+        }
+        let options: Vec<(String, String)> = input
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|o| match o {
+                Value::String(s) => Some((s.trim().to_owned(), String::new())),
+                o => Some((o.get("label")?.as_str()?.trim().to_owned(), o.get("description").and_then(Value::as_str).unwrap_or_default().trim().to_owned())),
+            })
+            .filter(|(l, _)| !l.is_empty())
+            .take(6)
+            .collect();
+        let multi = input.get("multi_select").and_then(Value::as_bool).unwrap_or(false);
+        Ok(Self { question, options, multi })
+    }
+
+    /// The tool result for the picked options and/or the user's own words.
+    pub fn answer(&self, picked: &[usize], own: &str) -> String {
+        let mut parts: Vec<String> = picked.iter().filter_map(|i| self.options.get(*i)).map(|(l, _)| format!("\"{l}\"")).collect();
+        let own = own.trim();
+        if !own.is_empty() {
+            parts.push(format!("in their own words: \"{own}\""));
+        }
+        if parts.is_empty() { "The user skipped the question: decide yourself and say what you chose.".to_owned() } else { format!("The user answered {}.", parts.join(" and ")) }
+    }
+}
+
+/// [`ASK_USER`]'s definition.
+pub fn ask_user_definition() -> Value {
+    tool(
+        ASK_USER,
+        "Ask the user one short question with 2–4 options and wait for the answer. Only when the choice changes the result a lot and the project does not answer it; never for permission.",
+        obj(
+            json!({
+                "question": { "type": "string", "description": "One short question" },
+                "options": { "type": "array", "items": { "type": "object", "properties": { "label": { "type": "string", "description": "A few words" }, "description": { "type": "string", "description": "One short line on what it means" } }, "required": ["label"] } },
+                "multi_select": { "type": "boolean", "description": "Several options may be picked" },
+            }),
+            &["question", "options"],
+        ),
+    )
+}
+
+/// The tools of the in-app assistant: every project tool and [`ASK_USER`].
+pub fn agent_definitions() -> Vec<Value> {
+    let mut d = definitions();
+    d.push(ask_user_definition());
+    d
+}
 
 fn obj(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
@@ -250,6 +325,20 @@ mod tests {
     fn id_after(s: &str, word: &str) -> u64 {
         let i = s.find(word).unwrap_or_else(|| panic!("{word} in {s}")) + word.len();
         s[i..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap()
+    }
+
+    #[test]
+    fn questions_read_their_options_and_answer_in_words() {
+        let q = Question::from_input(&json!({ "question": " Which key? ", "options": [{ "label": "A minor", "description": "dark" }, "C major", { "label": "" }], "multi_select": true })).unwrap();
+        assert_eq!(q.question, "Which key?");
+        assert_eq!(q.options, vec![("A minor".to_owned(), "dark".to_owned()), ("C major".to_owned(), String::new())]);
+        assert!(q.multi);
+        assert_eq!(q.answer(&[1], ""), "The user answered \"C major\".");
+        assert!(q.answer(&[0], "but slower").contains("own words: \"but slower\""));
+        assert!(q.answer(&[], "").contains("skipped"));
+        assert!(Question::from_input(&json!({ "options": [] })).is_err());
+        assert!(agent_definitions().iter().any(|d| d["name"] == ASK_USER));
+        assert!(!definitions().iter().any(|d| d["name"] == ASK_USER), "the MCP server does not offer it");
     }
 
     #[test]

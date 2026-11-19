@@ -298,7 +298,10 @@ fn a_page_the_disk_has_not_delivered_is_silence_and_is_counted() {
     h.seek(target);
     proc_.process_planar(&mut buf);
     assert!(h.audio_health().stream_underruns >= 1, "the late page was counted");
-    assert_eq!((buf.channel(0)[0], buf.channel(1)[0]), (0.0, 0.0), "and played as silence");
+    // The very first read is the one that asks for the page, so it is silence.
+    // The right channel is read after the left one's whole block: on a fast
+    // disk the page can be there by then (it was on the Windows runner).
+    assert_eq!(buf.channel(0)[0], 0.0, "and played as silence");
     assert!(h.streams().wait_settled(Duration::from_secs(5)));
     let counted = h.audio_health().stream_underruns;
     for _ in 0..40 {

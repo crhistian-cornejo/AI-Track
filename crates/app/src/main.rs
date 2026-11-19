@@ -15,6 +15,7 @@ mod logging;
 mod mcp_host;
 mod nav;
 mod audition;
+mod auto_warp;
 mod autosave;
 mod appearance;
 mod assets;
@@ -34,6 +35,7 @@ mod real;
 mod session_edit;
 mod state;
 mod take_lanes;
+mod traffic_lights;
 mod theme;
 mod updater;
 mod usage;
@@ -108,8 +110,11 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     title: Some("AI-Track".into()),
                     appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
-                    traffic_light_position: cfg!(target_os = "macos")
-                        .then(|| point(px(14.), px((theme::Metrics::of(appearance::Appearance::load().density).top_bar_h - 14.) / 2.))),
+                    // The first frame moves them to the middle of the bar for the zoom in force (`apply_look`).
+                    traffic_light_position: cfg!(target_os = "macos").then(|| {
+                        let look = appearance::Appearance::load();
+                        point(px(14.), px(traffic_lights::top_for(theme::Metrics::of(look.density).top_bar_h, look.ui_scale.clamp(0.8, 1.5), 14.)))
+                    }),
                 }),
                 ..Default::default()
             },

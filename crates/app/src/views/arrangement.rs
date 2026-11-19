@@ -411,9 +411,10 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 Some(Source::Audio(file)) => {
                     // Decoded in the background: flat until the peaks arrive.
                     let wave = ws.waves.peaks(&file.path).map(|peaks| {
-                        let base = TimeBase { sample_rate: f64::from(peaks.sample_rate().max(1)), ..TimeBase::of(file, bpm) };
+                        let base = TimeBase::of(file, bpm).at_rate(f64::from(peaks.sample_rate().max(1)));
                         Wave {
-                            frames_per_tick: base.tick_to_frame(1.),
+                            frames_per_tick: base.frames_per_tick(),
+                            base,
                             ratio: file.warp.speed_ratio(),
                             reverse: file.warp.reverse,
                             peaks,

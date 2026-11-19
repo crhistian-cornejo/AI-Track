@@ -14,6 +14,7 @@
 
 use crate::grid::GridSpec;
 use aitrack_model::{AudioSource, AutomationPoint, Clip, ClipEnv, LoopRegion, PPQ, Tick, TimeSignature, curve_shape};
+use std::sync::Arc;
 
 /// Height of the ruler band at the top of the canvas.
 pub const RULER: f32 = 20.;
@@ -43,30 +44,72 @@ pub const PAD_PX: f32 = 12.;
 
 // ───────────────────────────── Time ─────────────────────────────
 
-/// A file's own time: where its frames fall in source ticks.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A file's own time: where its frames fall in source ticks. A warped file
+/// with warp markers does not run at one tempo: its frames follow the line
+/// between the markers around them, as playback does.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimeBase {
     pub ticks_per_second: f64,
     pub sample_rate: f64,
+    /// The warp markers that bend time (file frame at `file_rate`, source
+    /// tick), in order; empty when the file runs at one tempo.
+    anchors: Arc<[(u64, Tick)]>,
+    /// The rate the markers' frames are counted at (the file's own).
+    file_rate: f64,
 }
 
 impl TimeBase {
-    /// As [`AudioSource::length_ticks`]: a warped file runs at its own
-    /// tempo, any other at the project's.
+    /// As [`AudioSource::length_ticks`]: a warped file runs by its markers
+    /// or at its own tempo, any other at the project's.
     pub fn of(source: &AudioSource, project_bpm: f64) -> Self {
         let bpm = match source.warp.original_bpm {
             Some(original) if source.warp.enabled => original,
             _ => project_bpm,
         };
-        Self { ticks_per_second: bpm.max(1.) / 60. * PPQ as f64, sample_rate: f64::from(source.sample_rate.max(1)) }
+        let rate = f64::from(source.sample_rate.max(1));
+        let anchors = if source.warp.enabled { source.warp.anchors() } else { Vec::new() };
+        Self { ticks_per_second: bpm.max(1.) / 60. * PPQ as f64, sample_rate: rate, anchors: anchors.into(), file_rate: rate }
+    }
+
+    /// The same time for the file decoded at `rate` frames a second (peaks
+    /// are not always at the rate the project stores).
+    pub fn at_rate(&self, rate: f64) -> Self {
+        Self { sample_rate: rate.max(1.), ..self.clone() }
+    }
+
+    /// The warp markers as `(file frame, source tick)`, in order.
+    pub fn markers(&self) -> &[(u64, Tick)] {
+        &self.anchors
+    }
+
+    /// Frames in a tick at the file's tempo (between markers the real figure differs a little).
+    pub fn frames_per_tick(&self) -> f64 {
+        self.sample_rate / self.ticks_per_second
+    }
+
+    /// The two markers around position `at` (compared on `key`), for the line between them.
+    fn around(&self, at: f64, key: impl Fn(&(u64, Tick)) -> f64) -> ((f64, f64), (f64, f64)) {
+        let a = &self.anchors;
+        let k = a.windows(2).position(|w| at <= key(&w[1])).unwrap_or(a.len() - 2);
+        let scale = self.sample_rate / self.file_rate;
+        ((a[k].0 as f64 * scale, a[k].1 as f64), (a[k + 1].0 as f64 * scale, a[k + 1].1 as f64))
     }
 
     pub fn frame_to_tick(&self, frame: f64) -> f64 {
-        frame / self.sample_rate * self.ticks_per_second
+        if self.anchors.len() < 2 {
+            return frame / self.sample_rate * self.ticks_per_second;
+        }
+        let scale = self.sample_rate / self.file_rate;
+        let ((f0, t0), (f1, t1)) = self.around(frame, |m| m.0 as f64 * scale);
+        t0 + (t1 - t0) * (frame - f0) / (f1 - f0)
     }
 
     pub fn tick_to_frame(&self, tick: f64) -> f64 {
-        tick / self.ticks_per_second * self.sample_rate
+        if self.anchors.len() < 2 {
+            return tick / self.ticks_per_second * self.sample_rate;
+        }
+        let ((f0, t0), (f1, t1)) = self.around(tick, |m| m.1 as f64);
+        f0 + (f1 - f0) * (tick - t0) / (t1 - t0)
     }
 
     pub fn seconds(&self, ticks: f64) -> f64 {
@@ -284,6 +327,8 @@ pub enum Hit {
     LoopEnd,
     /// The loop brace between its ends.
     LoopBody,
+    /// A warp marker's handle on the ruler, by its index among the file's markers.
+    Warp(usize),
     /// The ruler band, away from the brace and the markers.
     Ruler,
     /// The waveform itself.
@@ -353,6 +398,27 @@ pub fn hit_test(l: &Layout, c: &Clip, x: f32, y: f32) -> Hit {
         return Hit::Segment(i);
     }
     Hit::Body
+}
+
+/// The warp marker whose handle is at `(x, y)`: on the ruler, within reach
+/// of its line. `markers` are `(file frame, source tick)`.
+pub fn warp_hit(l: &Layout, markers: &[(u64, Tick)], x: f32, y: f32) -> Option<usize> {
+    if y >= RULER {
+        return None;
+    }
+    markers.iter().enumerate().map(|(i, m)| (i, (x - l.x(m.1)).abs())).filter(|(_, d)| *d <= EDGE).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
+}
+
+/// [`hit_test`] with the file's warp markers. On the ruler a marker's handle
+/// comes after the ends of the loop brace and before everything else: the
+/// clip's start often sits on the first marker, and its own line can still
+/// be taken anywhere on the waveform below.
+pub fn hit_test_with(l: &Layout, c: &Clip, markers: &[(u64, Tick)], x: f32, y: f32) -> Hit {
+    let hit = hit_test(l, c, x, y);
+    if matches!(hit, Hit::LoopStart | Hit::LoopEnd) {
+        return hit;
+    }
+    warp_hit(l, markers, x, y).map_or(hit, Hit::Warp)
 }
 
 // ───────────────────────────── Snapping ─────────────────────────────
@@ -457,7 +523,7 @@ mod tests {
         assert_eq!(base.frame_to_tick(24_000.), BEAT as f64);
         assert_eq!(base.tick_to_frame(2. * BEAT as f64), 48_000.);
         assert_eq!(base.tick_to_frame(1.), 25.);
-        assert_eq!(TimeBase { sample_rate: 24_000., ..base }.tick_to_frame(1.), 12.5, "the same file decoded at half the rate");
+        assert_eq!(base.at_rate(24_000.).tick_to_frame(1.), 12.5, "the same file decoded at half the rate");
         assert_eq!(base.seconds(4. * BEAT as f64), 2.);
         // The whole file is as long as the model says.
         let src = source(96_000, 48_000);
@@ -664,6 +730,33 @@ mod tests {
         c.length = 3 * BEAT;
         assert_eq!(hit_test(&l, &c, 420., 5.), Hit::End);
         assert_eq!(hit_test(&l, &c, 320., 5.), Hit::LoopEnd);
+    }
+
+    #[test]
+    fn warp_markers_bend_the_file_s_time_and_are_taken_on_the_ruler() {
+        // A beat late at beat 2, back on time at beat 4: frames follow the line between two markers.
+        let mut src = source(120_000, 48_000);
+        src.warp = Warp { enabled: true, original_bpm: Some(120.), markers: vec![(0, 0), (60_000, 2 * BEAT), (96_000, 4 * BEAT)], ..Warp::default() };
+        let base = TimeBase::of(&src, 100.);
+        assert_eq!(base.markers().len(), 3);
+        assert_eq!(base.tick_to_frame(BEAT as f64), 30_000.);
+        assert_eq!(base.tick_to_frame(3. * BEAT as f64), 78_000.);
+        assert_eq!(base.frame_to_tick(78_000.), 3. * BEAT as f64);
+        assert_eq!(base.frame_to_tick(120_000.).round() as Tick, src.length_ticks(100.), "the file ends where the model says");
+        // Decoded at half the rate, the same ticks are half the frames.
+        assert_eq!(base.at_rate(24_000.).tick_to_frame(3. * BEAT as f64), 39_000.);
+        // With warp off the markers bend nothing.
+        src.warp.enabled = false;
+        assert!(TimeBase::of(&src, 120.).markers().is_empty());
+        // A handle is taken on the ruler within reach of its line, the nearest one first.
+        let l = layout();
+        let markers = [(0u64, 0 as Tick), (48_000, 2 * BEAT)];
+        let x = l.x(2 * BEAT);
+        assert_eq!(warp_hit(&l, &markers, x + 3., 6.), Some(1));
+        assert_eq!(warp_hit(&l, &markers, x + 3., RULER + 4.), None, "only on the ruler");
+        assert_eq!(warp_hit(&l, &markers, x + 20., 6.), None);
+        assert_eq!(hit_test_with(&l, &clip(), &markers, x + 3., 6.), Hit::Warp(1));
+        assert_eq!(hit_test_with(&l, &clip(), &[], x + 3., 6.), hit_test(&l, &clip(), x + 3., 6.));
     }
 
     #[test]

@@ -109,6 +109,7 @@ pub fn paint(s: &Scene, b: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         fade(&pen, true, window);
         fade(&pen, false, window);
         envelope(&pen, window);
+        warp_markers(&pen, window);
         brace(&pen, window);
         markers(&pen, window);
         if let Some(u) = s.cursor {
@@ -203,15 +204,16 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
     let (s, l) = (pen.s, &pen.l);
     let c = &s.clip;
     let (top, wave_h) = pen.wave();
-    let frames_per_tick = s.base.tick_to_frame(1.);
-    let frames_per_px = frames_per_tick / l.axis.px_per_tick();
+    // Where a position on the axis is in the file: along the warp markers when the file has them.
+    let frame_of = |u: f64| s.base.tick_to_frame(u);
+    let frames_per_px = s.base.frames_per_tick() / l.axis.px_per_tick();
     let clip_gain = geom::db_to_gain(c.gain_db);
     let gain = |u: f64| {
         let t = u - c.offset as f64;
         if t >= 0. && t <= c.length as f64 { c.gain_at(t.round() as Tick) * clip_gain } else { clip_gain }
     };
     // Without a loop there is nothing past the end of the file.
-    let file_end = peaks.frames() as f64 / frames_per_tick;
+    let file_end = s.base.frame_to_tick(peaks.frames() as f64);
     // Reversed, frame `f` of what plays is frame `n - 1 - f` of the file.
     let n = peaks.frames() as f64;
     let flip = |f: f64| if s.reverse { n - 1. - f } else { f };
@@ -232,12 +234,12 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
         let y = |v: f32, g: f32| mid - (v * g).clamp(-1., 1.) * half;
         if frames_per_px < 0.5 && peaks.has_samples() {
             // Close enough to see the samples themselves.
-            let (first, last) = ((l.axis.tick(0.) * frames_per_tick).floor() as i64 - 1, (l.axis.tick(l.w) * frames_per_tick).ceil() as i64 + 1);
+            let (first, last) = (frame_of(l.axis.tick(0.)).floor() as i64 - 1, frame_of(l.axis.tick(l.w)).ceil() as i64 + 1);
             let dots = 1. / frames_per_px >= DOT_PX;
             let mut run: Vec<Point<Pixels>> = Vec::with_capacity((last - first).max(0) as usize + 1);
             for n in first.max(0)..=last {
-                let u = n as f64 / frames_per_tick;
-                let frame = (geom::unroll(c.looping, u) * frames_per_tick).round();
+                let u = s.base.frame_to_tick(n as f64);
+                let frame = frame_of(geom::unroll(c.looping, u)).round();
                 match peaks
                     .sample(channel, flip(frame).max(0.) as u64)
                     .filter(|_| loops || u < file_end)
@@ -267,11 +269,13 @@ fn waveform(pen: &Pen, peaks: &Peaks, window: &mut Window) {
                 prev_edges = None;
                 continue;
             }
-            let a = geom::unroll(c.looping, u) * frames_per_tick;
+            // The frames this pixel column covers: more or fewer where a stretch between two markers is tighter or looser.
+            let a = frame_of(geom::unroll(c.looping, u));
+            let span = (frame_of(geom::unroll(c.looping, l.axis.tick(i as f32 + 1.))) - a).max(1e-6);
             let col = if s.reverse {
-                peaks.range(channel, n - a - frames_per_px, n - a)
+                peaks.range(channel, n - a - span, n - a)
             } else {
-                peaks.range(channel, a, a + frames_per_px)
+                peaks.range(channel, a, a + span)
             };
             let (lo, hi) = waveform::join(col, prev);
             prev = col;
@@ -443,6 +447,26 @@ fn brace(pen: &Pen, window: &mut Window) {
     }
 }
 
+/// The file's warp markers: a handle on the ruler and a faint line down the
+/// waveform, where a point of the file is pinned to a point in the music.
+fn warp_markers(pen: &Pen, window: &mut Window) {
+    let pal = p();
+    let (s, l) = (pen.s, &pen.l);
+    for (i, m) in s.base.markers().iter().enumerate() {
+        let x = l.x(m.1);
+        if x < -8. || x > l.w + 8. {
+            continue;
+        }
+        let hot = s.hot == Some(Hit::Warp(i));
+        let color = if hot { pal.solo } else { with_alpha(pal.solo, 0.8) };
+        window.paint_quad(paint::fill_rect(at(pen.o, x - if hot { 0.5 } else { 0. }, RULER, if hot { 2. } else { 1. }, l.h - RULER), with_alpha(pal.solo, if hot { 0.75 } else { 0.3 })));
+        // The handle: a small tab hanging from the ruler's lower edge, pointing at the audio it holds.
+        let (half, top) = (if hot { 5. } else { 4. }, RULER - 11.);
+        window.paint_quad(paint::rrect(at(pen.o, x - half + 0.5, top, 2. * half, 7.), 2., color));
+        paint::polygon(window, &[pen.pt(x - half + 0.5, top + 6.), pen.pt(x + half + 0.5, top + 6.), pen.pt(x + 0.5, RULER)], color);
+    }
+}
+
 /// The start and end markers of the played region.
 fn markers(pen: &Pen, window: &mut Window) {
     let pal = p();
@@ -484,6 +508,7 @@ fn readout(pen: &Pen, text: &str, hit: Hit, window: &mut Window, cx: &mut App) {
             })
         }
         Hit::LoopStart | Hit::LoopEnd | Hit::LoopBody => c.looping.map(|lp| (middle(lp.start, lp.end), RULER + GAIN_TOP)),
+        Hit::Warp(i) => s.base.markers().get(i).map(|m| (l.x(m.1), HANDLE_Y + 24.)),
         Hit::Ruler | Hit::Body => None,
     };
     let Some((x, y)) = anchor else { return };

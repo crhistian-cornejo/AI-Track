@@ -354,6 +354,8 @@ pub struct Workspace {
     rec_dir: Option<std::path::PathBuf>,
     /// Whether the File → Open Recent cascading submenu is expanded.
     pub file_recent_open: bool,
+    /// Whether the File → New from Template cascading submenu is expanded.
+    pub file_templates_open: bool,
     /// Hovered group and search box in the Add Device popup menu.
     pub device_menu_hover: Option<views::menus::DeviceMenuGroup>,
     pub device_menu_search: Entity<TextInput>,
@@ -541,6 +543,7 @@ impl Workspace {
             track_io_sent: Default::default(),
             rec_dir: None,
             file_recent_open: false,
+            file_templates_open: false,
             device_menu_hover: None,
             device_menu_search,
             bottom_h: theme::Metrics::of(look.app.density).dock_h,
@@ -1006,6 +1009,31 @@ impl Workspace {
                     self.s.edit("Add sample", cmds);
                     self.s.seal();
                 }
+                // Auto-warp the selected audio clip (`wav=…,audio` first): the beats are found in the background.
+                "autowarp" => {
+                    if let Some(clip) = self.s.selected_clip {
+                        self.auto_warp_clip(clip, cx);
+                    }
+                }
+                // Warp markers on the selected audio clip (`wav=…,audio` first): its ends pinned and its
+                // middle dragged a sixteenth late, so the editor shows handles and a bent waveform.
+                "markers" => {
+                    if let Some(clip) = self.s.selected_clip
+                        && let Some(Source::Audio(a)) = self.s.project.clips.get(&clip).and_then(|c| self.s.project.sources.get(&c.source)).cloned()
+                    {
+                        let mut warp = a.warp.clone();
+                        warp.enabled = true;
+                        warp.original_bpm = warp.original_bpm.or(Some(self.s.project.tempo.initial_bpm()));
+                        warp.markers.clear();
+                        let rate = f64::from(a.sample_rate.max(1));
+                        let middle = warp.tick_at(a.frames as f64 / 2., rate).unwrap_or(0.).round() as Tick;
+                        if let Some((pinned, index)) = views::sample_editor::warp::added(&warp, middle, rate, a.frames) {
+                            let bent = views::sample_editor::warp::moved(&pinned, index, middle + PPQ / 4, rate).unwrap_or(pinned);
+                            views::sample_editor::warp::apply(&mut self.s, clip, &bent);
+                            self.s.seal();
+                        }
+                    }
+                }
                 // A copy of the selected clip right after it, on the same sample.
                 "twin" => {
                     if let Some((track, placement)) = self.s.selected_placement
@@ -1124,6 +1152,11 @@ impl Workspace {
                         let kind = if word == "menu=launch" { MenuKind::ClipLaunch(c) } else { MenuKind::ClipQuantize(c) };
                         self.menu = Some(Menu { kind, at: gpui::point(gpui::px(90.), gpui::px(560.)), opened: 0 });
                     }
+                }
+                // The File menu, with its templates submenu out for `menu=templates`.
+                "menu=file" | "menu=templates" => {
+                    self.menu = Some(Menu { kind: MenuKind::File, at: gpui::point(gpui::px(100.), gpui::px(36.)), opened: 0 });
+                    self.file_templates_open = word == "menu=templates";
                 }
                 "menu=track" => {
                     if let Some(t) = self.s.selected_track {
@@ -1267,9 +1300,24 @@ impl Workspace {
                         }
                     }
                 }
+                // The arrangement at `zoom=<pixels per beat>`.
+                _ if word.starts_with("zoom=") => {
+                    if let Ok(px) = word["zoom=".len()..].parse::<f32>() {
+                        self.s.arrange.px_per_beat = px.clamp(2., 400.);
+                    }
+                }
                 _ if word.starts_with("palette=") => {
                     self.palette_pending = true;
+                    // `palette=vst3` / `palette=clap`: the Devices tab narrowed to that format.
+                    if let Some(format) = match &word["palette=".len()..] {
+                        "vst3" => Some(views::palette::devices::FormatFilter::Vst3),
+                        "clap" => Some(views::palette::devices::FormatFilter::Clap),
+                        _ => None,
+                    } {
+                        self.palette.device_format = format;
+                    }
                     self.palette.tab = match &word["palette=".len()..] {
+                        "vst3" | "clap" => views::palette::Tab::Devices,
                         "samples" => views::palette::Tab::Samples,
                         "key" => views::palette::Tab::InKey,
                         "splice" => views::palette::Tab::Splice,
@@ -1426,6 +1474,7 @@ impl Workspace {
 
     pub fn open_menu(&mut self, kind: MenuKind, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.file_recent_open = false;
+        self.file_templates_open = false;
         self.device_menu_hover = None;
         if self.menu.as_ref().is_some_and(|m| m.kind == kind) {
             self.menu = None;
@@ -1500,6 +1549,7 @@ impl Workspace {
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
         self.file_recent_open = false;
+        self.file_templates_open = false;
         self.device_menu_hover = None;
         if self.menu.take().is_some() {
             cx.notify();
@@ -2875,19 +2925,37 @@ impl Workspace {
         )
     }
 
+    /// The status bar. Left: the Sounds panel, undo and redo with what they
+    /// act on, whether the project is saved, and what is selected. Right: what
+    /// needs attention (proposals, faults, updates), the audio device (a
+    /// click opens its preferences), resource use and the interface zoom.
     fn render_status(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use views::status::{self, SaveState};
         let pal = p();
-        let undo = self.s.history.undo_label().map(|l| format!("Undo: {l}")).unwrap_or_else(|| "Nothing to undo".into());
+        let mac = cfg!(target_os = "macos");
+        let (undo, redo) = (self.s.history.undo_label().map(str::to_owned), self.s.history.redo_label().map(str::to_owned));
         let err = self.s.last_error.clone();
-        let tempo = self.s.project.tempo.initial_bpm();
-        let scale = self.s.project.scale.map_or("No key".into(), |s| s.display());
         let pending = self.s.history.proposals().len();
         let health = self.render_engine_health();
+        let selection = status::selection(&self.s);
+        let save = SaveState::of(self.project_path.is_some(), self.s.history.is_dirty());
+        let file = self.project_path.as_ref().map(|p| p.display().to_string());
+        let device = self.b.engine.status_label();
+        let device_text = crate::paint::fit(status::device_short(&device), 400., TEXT_SM);
+        // A text item that acts on click, lit on hover.
+        let item = |id: &'static str| div().id(id).flex_none().h(px(20.)).px(px(SP1)).flex().items_center().gap(px(SP1)).rounded(px(r_sm())).cursor_pointer().hover(|s| s.bg(hover()));
+        let step = |id: &'static str, ic: Icon, label: &Option<String>, verb: &'static str, keys: &'static str| {
+            let tip = match label {
+                Some(l) => format!("{verb}: {l}  ({keys})"),
+                None => format!("Nothing to {}", verb.to_lowercase()),
+            };
+            crate::widgets::sized_icon_button(id, ic, false, 20., 12.).when(label.is_none(), |d| d.opacity(0.45)).tooltip(crate::widgets::tip_owned(tip))
+        };
         div()
             .h(px(theme::m().status_bar_h))
             .flex_none()
-            .px(px(SP3))
-            .gap(px(SP4))
+            .px(px(SP2))
+            .gap(px(SP2))
             .flex()
             .items_center()
             .bg(pal.panel)
@@ -2900,8 +2968,44 @@ impl Workspace {
                     .tooltip(crate::widgets::tip("Sounds panel: search, hear sounds fitted to the song, drag them in", Some("Ctrl+Shift+K")))
                     .on_click(cx.listener(|this, _, _, cx| views::sounds::toggle(this, cx))),
             )
-            .child(crate::icons::icon(Icon::Undo, 12., pal.faint))
-            .child(crate::widgets::label(undo, TEXT_SM, pal.muted))
+            .child(crate::widgets::divider_v(12.))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(step("status-undo", Icon::Undo, &undo, "Undo", if mac { "⌘Z" } else { "Ctrl+Z" }).on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))))
+                    .child(step("status-redo", Icon::Redo, &redo, "Redo", if mac { "⇧⌘Z" } else { "Ctrl+Shift+Z" }).on_click(cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx))))
+                    .when_some(undo, |d, l| d.child(div().pl(px(SP1)).child(crate::widgets::label(crate::paint::fit(&l, 200., TEXT_SM), TEXT_SM, pal.muted)))),
+            )
+            .child(crate::widgets::divider_v(12.))
+            .child(
+                item("status-save")
+                    .child(match save {
+                        SaveState::Saved => crate::icons::icon(Icon::Check, 12., pal.faint).into_any_element(),
+                        _ => div().size(px(6.)).rounded_full().bg(pal.accent).into_any_element(),
+                    })
+                    .child(crate::widgets::label(save.label(), TEXT_SM, if save == SaveState::Saved { pal.faint } else { pal.text }))
+                    .tooltip(crate::widgets::tip_owned(match (&file, save) {
+                        (Some(f), SaveState::Saved) => format!("Saved in {f}"),
+                        (Some(f), _) => format!("Click to save to {f}"),
+                        (None, _) => "Not in a file yet: click to choose where to save it".to_owned(),
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.file_save(cx))),
+            )
+            .when_some(selection, |d, (color, text)| {
+                d.child(crate::widgets::divider_v(12.)).child(
+                    div()
+                        .flex_shrink(1.)
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .gap(px(SP2))
+                        .overflow_hidden()
+                        .child(div().flex_none().size(px(8.)).rounded_full().bg(theme::track_color(color)))
+                        .child(crate::widgets::label(text, TEXT_SM, pal.text).truncate()),
+                )
+            })
             .when_some(err, |d, e| {
                 d.child(
                     div()
@@ -2910,21 +3014,43 @@ impl Workspace {
                         .gap(px(SP1))
                         .items_center()
                         .cursor_pointer()
+                        .child(crate::icons::icon(Icon::Alert, 12., pal.record))
                         .child(crate::widgets::label(e, TEXT_SM, pal.record))
+                        .tooltip(crate::widgets::tip("Click to dismiss", None))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.s.last_error = None;
                             cx.notify();
                         })),
                 )
             })
+            .child(div().flex_1())
             .when_some(health, |d, h| d.child(h))
             .children(views::updates::status_item(self, cx))
             .children(views::mcp::status_item(self, cx))
-            .child(div().flex_1())
-            .when(pending > 0, |d| d.child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent)))
-            .child(crate::widgets::label(format!("{} · {tempo:.2} BPM · {scale}", self.s.project.name), TEXT_SM, pal.muted))
-            .child(crate::widgets::label(self.b.engine.status_label(), TEXT_SM, pal.faint))
+            .when(pending > 0, |d| {
+                d.child(
+                    div()
+                        .id("status-proposals")
+                        .flex_none()
+                        .cursor_pointer()
+                        .child(crate::widgets::badge(format!("{pending} proposal{}", if pending == 1 { "" } else { "s" }), pal.accent))
+                        .tooltip(crate::widgets::tip("Edits the assistant proposed and that wait for you: click to review them", None))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ai_open = true;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                item("status-audio")
+                    .child(crate::icons::icon(Icon::Volume, 12., pal.faint))
+                    .child(crate::widgets::label(device_text, TEXT_SM, pal.muted))
+                    .tooltip(crate::widgets::tip_owned(format!("{device}\nClick for the audio preferences: device, sample rate, buffer size")))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_modal(views::prefs::Modal::Preferences(views::prefs::PrefsPage::Audio), cx))),
+            )
+            .child(crate::widgets::divider_v(12.))
             .child(self.render_usage())
+            .child(crate::widgets::divider_v(12.))
             .child(self.render_zoom(cx))
             .into_any_element()
     }
@@ -2954,7 +3080,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap(px(SP1))
-                .child(crate::icons::icon(Icon::Gauge, 12., color))
+                .child(crate::icons::icon(Icon::Alert, 12., color))
                 .child(crate::widgets::label(label, TEXT_SM, color))
                 .tooltip(crate::widgets::tip_owned(lines.join("\n")))
                 .into_any_element(),
@@ -3352,7 +3478,7 @@ fn probe_audio(path: &std::path::Path) -> Option<AudioFacts> {
 /// How far clip `id` can run from each place it is on before the next clip of
 /// that track and lane starts (the least over its placements). `unbounded`
 /// when nothing follows it, `fallback` when a clip already starts at or under it.
-fn room_after(project: &Project, id: ClipId, fallback: Tick) -> Tick {
+pub(crate) fn room_after(project: &Project, id: ClipId, fallback: Tick) -> Tick {
     let mut room = Tick::MAX;
     for t in &project.tracks {
         for p in t.arrangement.iter().filter(|p| p.clip == id) {

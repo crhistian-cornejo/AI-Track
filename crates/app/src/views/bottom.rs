@@ -125,7 +125,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         ));
     }
     bar = bar.child(div().flex_1());
-    if clip_view && editor == ClipEditor::Piano && ws.bottom_open {
+    // The note tools act on a clip: without one the bar stays clear.
+    if clip_view && editor == ClipEditor::Piano && ws.bottom_open && clip_id.is_some() {
         bar = bar.child(piano_tools(ws, cx));
     }
     bar = bar.child(
@@ -354,7 +355,8 @@ pub(crate) fn edit_seg_bpm(s: &mut crate::state::AppState, clip: ClipId, edit: S
     s.seal();
     let changed = s.set_clip_warp("seg-bpm", clip, |w| {
         if let Some(b) = w.original_bpm {
-            w.original_bpm = Some(edit.apply(b));
+            // The markers count their beats at the new tempo, so the whole file follows it.
+            w.set_original_bpm(edit.apply(b));
         }
     });
     s.seal();
@@ -685,6 +687,7 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
             let gain = clip.gain_db;
             let warp = &src.warp;
             let (warp_on, warp_mode, reversed) = (warp.enabled, warp.mode, warp.reverse);
+            let markers = warp.anchors().len();
             let mode = warp_mode.label();
             let stretch = (aitrack_model::ops::stretch_factor(warp, ws.s.project.tempo.initial_bpm()) * 100.).round() / 100.;
             let sample_box = section("SAMPLE", Icon::Sample)
@@ -732,6 +735,19 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                                     cx.notify();
                                 })),
                         ),
+                ))
+                .child(row(
+                    "Beats",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SP2))
+                        .child(
+                            small_button(("auto-warp", n), "Auto-warp", true)
+                                .tooltip(widgets::tip("Listen for the beats: sets the tempo of the sample, puts warp markers where its tempo moves, and starts the clip on the bar", None))
+                                .on_click(cx.listener(move |this, _, _, cx| this.auto_warp_clip(id, cx))),
+                        )
+                        .when(markers > 0, |d| d.child(label(if markers == 1 { "1 marker".to_owned() } else { format!("{markers} markers") }, TEXT_XS, pal.faint))),
                 ))
                 .when_some(warp.original_bpm, |d, b| {
                     d.child(row(
@@ -959,8 +975,42 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
 
 // ───────────────────────────── Piano tools ─────────────────────────────
 
+/// A named control of the note editor's tool bar: icon, name (when there is
+/// room for it) and a chevron when it opens a menu. Lit while `on`.
+fn tool_button(id: &'static str, ic: Icon, text: Option<SharedString>, on: bool, menu: bool) -> Stateful<Div> {
+    let pal = p();
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(CONTROL_H))
+        .px(px(SP2))
+        .gap(px(SP1))
+        .flex()
+        .items_center()
+        .rounded(px(r_md()))
+        .cursor_pointer()
+        .bg(if on { accent_alpha(0.18) } else { content(0.0) })
+        .hover(move |s| s.bg(if on { accent_alpha(0.26) } else { hover() }))
+        .child(icon(ic, 14., if on { pal.accent } else { pal.muted }))
+        .when_some(text, |d, t| d.child(label(t, TEXT_SM, if on { pal.text } else { pal.muted })))
+        .when(menu, |d| d.child(icon(Icon::ChevronDown, 10., pal.faint)))
+}
+
+/// Window width from which the tool bar spells its controls out.
+const TOOL_NAMES_W: f32 = 1280.;
+
+/// Whether the tool bar has room for names next to its icons.
+fn tool_names(window_w: f32) -> bool {
+    window_w >= TOOL_NAMES_W
+}
+
+/// The note editor's tools, in the order of the work: hear (audition, the
+/// computer keyboard) · pointer (select or draw) · grid (snap, quantize) ·
+/// key (fold) · everything else in the Tools menu · zoom.
 fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let pal = p();
+    let names = tool_names(ws.window_w);
+    let name = |t: &'static str| names.then(|| SharedString::from(t));
     let weak = cx.entity().downgrade();
     let on_tool: widgets::OnSelect = Rc::new(move |i, _, cx| {
         let _ = weak.update(cx, |this, cx| {
@@ -968,10 +1018,12 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             cx.notify();
         });
     });
-    let has_scale = ws.s.clip_scale(ws.s.selected_clip).is_some();
+    let scale = ws.s.clip_scale(ws.s.selected_clip);
+    let has_scale = scale.is_some();
     let scale_fold_on = ws.s.scale_folded(ws.s.selected_clip).is_some();
-    let scale_name = ws.s.clip_scale(ws.s.selected_clip).map_or_else(|| "Scale".into(), |s| s.display());
-    div()
+    let fold_name: SharedString = scale.map_or_else(|| "Fold to key".into(), |s| format!("Fold · {}", s.display()).into());
+    let keyboard = ws.piano_keyboard;
+    let hear = div()
         .flex()
         .items_center()
         .gap(px(SP1))
@@ -987,7 +1039,7 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 })),
         )
         .child(
-            widgets::icon_button("pr-keyboard", Icon::Keyboard, ws.piano_keyboard)
+            widgets::icon_button("pr-keyboard", Icon::Keyboard, keyboard)
                 .tooltip(widgets::tip("Computer MIDI Keyboard: A–P notes, Z/X octave, C/V velocity", Some("M")))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.toggle_computer_keyboard(cx);
@@ -996,28 +1048,44 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     }
                 })),
         )
-        .child(
-            widgets::icon_button("pr-octave-down", Icon::Minus, false)
-                .tooltip(widgets::tip("Lower keyboard octave", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.release_audition(cx);
-                    this.piano_octave = this.piano_octave.saturating_sub(1);
-                    cx.notify();
-                })),
-        )
-        .child(label(format!("C{}", ws.piano_octave), TEXT_SM, pal.text))
-        .child(
-            widgets::icon_button("pr-octave-up", Icon::Add, false)
-                .tooltip(widgets::tip("Raise keyboard octave", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.release_audition(cx);
-                    this.piano_octave = (this.piano_octave + 1).min(9);
-                    cx.notify();
-                })),
-        )
-        .child(widgets::divider_v(16.))
-        .child(widgets::segmented("pr-tool", &[(Some(Icon::Cursor), ""), (Some(Icon::Pencil), "")], if ws.s.tool == Tool::Select { 0 } else { 1 }, 32., on_tool))
-        .child(div().w(px(SP1)))
+        // The octave only matters while the computer keyboard plays notes.
+        .when(keyboard, |d| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .rounded(px(r_md()))
+                    .bg(content(0.05))
+                    .child(
+                        widgets::sized_icon_button("pr-octave-down", Icon::Minus, false, 20., 10.)
+                            .tooltip(widgets::tip("Lower keyboard octave", Some("Z")))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.release_audition(cx);
+                                this.piano_octave = this.piano_octave.saturating_sub(1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().w(px(24.)).flex().justify_center().child(mono(format!("C{}", ws.piano_octave), TEXT_SM, pal.text)))
+                    .child(
+                        widgets::sized_icon_button("pr-octave-up", Icon::Add, false, 20., 10.)
+                            .tooltip(widgets::tip("Raise keyboard octave", Some("X")))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.release_audition(cx);
+                                this.piano_octave = (this.piano_octave + 1).min(9);
+                                cx.notify();
+                            })),
+                    ),
+            )
+        });
+    let pointer = if names {
+        widgets::segmented("pr-tool", &[(Some(Icon::Cursor), "Select"), (Some(Icon::Pencil), "Draw")], if ws.s.tool == Tool::Select { 0 } else { 1 }, 68., on_tool)
+    } else {
+        widgets::segmented("pr-tool", &[(Some(Icon::Cursor), ""), (Some(Icon::Pencil), "")], if ws.s.tool == Tool::Select { 0 } else { 1 }, 32., on_tool)
+    };
+    let grid = div()
+        .flex()
+        .items_center()
+        .gap(px(SP1))
         .child(
             div()
                 .id("pr-snap")
@@ -1029,75 +1097,42 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .rounded(px(r_md()))
                 .cursor_pointer()
                 .hover(|s| s.bg(hover()))
-                .tooltip(widgets::tip("Snap grid", None))
+                .tooltip(widgets::tip("Snap grid: what notes and edits snap to", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
                     this.open_menu(MenuKind::Snap, point(at.x - px(16.), at.y - px(300.)), cx);
                 }))
                 .child(icon(Icon::Magnet, 14., if ws.s.snap == Snap::Off { pal.faint } else { pal.accent }))
-                .child(label(ws.s.snap_label(crate::editing::GridView::Piano), TEXT_SM, pal.text)),
-        )
-        .child(widgets::icon_button("pr-quantize", Icon::Quantize, false).tooltip(widgets::tip("Quantize to grid", None)).on_click(cx.listener(|this, _, _, cx| this.quantize_clip(cx))))
-        .child(
-            div()
-                .id("pr-scale-fold")
-                .h(px(CONTROL_H))
-                .px(px(SP2))
-                .gap(px(SP1))
-                .flex()
-                .items_center()
-                .rounded(px(r_md()))
-                .cursor_pointer()
-                .bg(if scale_fold_on { accent_alpha(0.18) } else { content(0.0) })
-                .hover(|s| s.bg(if scale_fold_on { accent_alpha(0.26) } else { hover() }))
-                .when(!has_scale, |d| d.opacity(0.45))
-                .tooltip(widgets::tip("Scale mode (Ableton): show only in-scale keys in piano roll & transpose in key", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.s.clip_scale(this.s.selected_clip).is_none() {
-                        this.s.set_scale(Some(aitrack_model::Scale::new(aitrack_model::Key(0), aitrack_model::ScaleKind::Minor)));
-                        this.s.piano_scale_fold = true;
-                    } else {
-                        this.s.piano_scale_fold = !this.s.piano_scale_fold;
-                    }
-                    this.s.piano.scroll_y = 0.;
-                    cx.notify();
-                }))
-                .child(icon(Icon::ScaleSnap, 13., if scale_fold_on { pal.accent } else { pal.muted }))
-                .child(label(scale_name, TEXT_XS, if scale_fold_on { pal.text } else { pal.muted })),
+                .child(label(ws.s.snap_label(crate::editing::GridView::Piano), TEXT_SM, pal.text))
+                .child(icon(Icon::ChevronDown, 10., pal.faint)),
         )
         .child(
-            widgets::icon_button("pr-scale", Icon::ScaleSnap, false)
-                .when(!has_scale, |d| d.opacity(0.4))
-                .tooltip(widgets::tip("Snap notes to the key", None))
-                .on_click(cx.listener(|this, _, _, cx| this.scale_snap_clip(cx))),
-        )
-        .child(
-            widgets::icon_button("pr-chords", Icon::Piano, false)
-                .tooltip(widgets::tip("Build triad chord in key", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(c) = this.s.selected_clip {
-                        let n = this.s.build_chord(c, crate::state::ChordKind::Triad);
-                        this.toast(if n == 0 { "Select or add notes first".into() } else { format!("Built chord (+{n} notes)") }, cx);
-                    }
-                    cx.notify();
-                })),
-        )
-        .child(
-            widgets::icon_button("pr-arp", Icon::Arpeggio, false)
-                .tooltip(widgets::tip("Arpeggiate selection / clip in key", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(c) = this.s.selected_clip {
-                        let n = this.s.arpeggiate(c, crate::state::ArpPattern::Up);
-                        this.toast(if n == 0 { "Add notes first".into() } else { format!("Arpeggiated ({n} notes)") }, cx);
-                    }
-                    cx.notify();
-                })),
-        )
-        .child(widgets::icon_button("pr-tools", Icon::Wand, false).tooltip(widgets::tip("Scale tools: Chords, Arpeggiate, Strum, Chop, Randomize", None)).on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
+            tool_button("pr-quantize", Icon::Quantize, name("Quantize"), false, false)
+                .tooltip(widgets::tip("Quantize the selected notes (or the clip) to the grid", Some(if cfg!(target_os = "macos") { "⌘U" } else { "Ctrl+U" })))
+                .on_click(cx.listener(|this, _, _, cx| this.quantize_clip(cx))),
+        );
+    let key = tool_button("pr-scale-fold", Icon::Fold, names.then_some(fold_name), scale_fold_on, false)
+        .when(!has_scale, |d| d.opacity(0.55))
+        .tooltip(widgets::tip("Fold: show only the keys of the clip's scale, and transpose inside it. With no key set, it starts from C minor.", None))
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.s.clip_scale(this.s.selected_clip).is_none() {
+                this.s.set_scale(Some(aitrack_model::Scale::new(aitrack_model::Key(0), aitrack_model::ScaleKind::Minor)));
+                this.s.piano_scale_fold = true;
+            } else {
+                this.s.piano_scale_fold = !this.s.piano_scale_fold;
+            }
+            this.s.piano.scroll_y = 0.;
+            cx.notify();
+        }));
+    let tools = tool_button("pr-tools", Icon::Wand, name("Tools"), false, true)
+        .tooltip(widgets::tip("Note tools: snap to key, chords, inversions, arpeggios, strum, chop, randomize", None))
+        .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
             let at = e.position();
             this.open_menu(MenuKind::PianoTools, point(at.x - px(200.), at.y - px(380.)), cx);
-        })))
-        .child(widgets::divider_v(16.))
+        }));
+    let zoom = div()
+        .flex()
+        .items_center()
         .child(widgets::icon_button("pr-zoom-out", Icon::ZoomOut, false).tooltip(widgets::tip("Zoom out (Cmd + scroll or pinch)", None)).on_click(cx.listener(|this, _, _, cx| {
             this.s.piano.px_per_beat = (this.s.piano.px_per_beat / 1.25).max(12.);
             cx.notify();
@@ -1105,8 +1140,23 @@ fn piano_tools(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .child(widgets::icon_button("pr-zoom-in", Icon::ZoomIn, false).tooltip(widgets::tip("Zoom in (Cmd + scroll or pinch)", None)).on_click(cx.listener(|this, _, _, cx| {
             this.s.piano.px_per_beat = (this.s.piano.px_per_beat * 1.25).min(320.);
             cx.notify();
-        })))
-        .child(widgets::divider_v(16.))
+        })));
+    let rule = || widgets::divider_v(16.).mx(px(SP1));
+    div()
+        .flex()
+        .items_center()
+        .gap(px(SP1))
+        .child(hear)
+        .child(rule())
+        .child(pointer)
+        .child(rule())
+        .child(grid)
+        .child(rule())
+        .child(key)
+        .child(tools)
+        .child(rule())
+        .child(zoom)
+        .child(rule())
         .into_any_element()
 }
 
@@ -1205,6 +1255,12 @@ mod tests {
         assert!(set_clip_start(&mut s, clip, 1_000_000_000));
         let file = aitrack_model::ops::source_len(&s.project, clip).unwrap();
         assert!(s.project.clips[&clip].offset < file);
+    }
+
+    #[test]
+    fn the_tool_bar_names_its_controls_from_1280_px() {
+        assert!(!tool_names(1024.) && !tool_names(1279.));
+        assert!(tool_names(1280.) && tool_names(1480.));
     }
 
     #[test]

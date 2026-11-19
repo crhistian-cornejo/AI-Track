@@ -150,6 +150,8 @@ impl Workspace {
         self.look.effective = appearance::apply(&self.look.app, &self.look.lib, system_dark, animate);
         self.s.color_prefs = crate::state::ColorPrefs { auto_track: self.look.app.auto_track_colors, clips_take_track: self.look.app.clips_take_track_color };
         window.set_content_zoom(self.look.app.ui_scale.clamp(0.8, 1.5), cx);
+        // The window buttons keep their size: put them back at the middle of the zoomed bar.
+        crate::traffic_lights::centre(window, theme::m().top_bar_h);
         cx.set_reduce_motion(self.look.app.reduced_motion || self.look.app.low_power);
         match self.look.app.background.clone().filter(|b| !b.path.as_os_str().is_empty()) {
             Some(bg) => {
@@ -876,8 +878,8 @@ fn plugin_report_block(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEl
     }
     // Found: on request.
     let found = ws.b.plugins.external_plugins();
-    let grouped = group_found(found);
-    let n = grouped.len();
+    let builds = crate::views::palette::devices::by_format(found.iter());
+    let n = builds.len();
     box_ = box_.child(
         div().pt(px(SP2)).child(
             text_button("plug-found-toggle", if open { format!("Hide the {n} found") } else { format!("Show the {n} found") }, None, false).on_click(cx.listener(|_, _, _, cx| {
@@ -888,15 +890,21 @@ fn plugin_report_block(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEl
         ),
     );
     if open {
-        for (name, vendor, formats) in grouped {
+        // One line per build, the VST3s then the CLAPs, each in alphabetical order.
+        let mut shown = None;
+        for b in builds {
+            if shown != Some(b.format) {
+                shown = Some(b.format);
+                let of_format = found.iter().filter(|f| f.format == b.format).count();
+                box_ = box_.child(div().pt(px(SP2)).flex().items_center().gap(px(SP2)).child(label(plugin_format_name(b.format), TEXT_XS, pal.muted).font_weight(gpui::FontWeight::SEMIBOLD)).child(mono(of_format.to_string(), TEXT_XS, pal.faint)));
+            }
             box_ = box_.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(SP2))
-                    .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&name, 220., TEXT_SM), TEXT_SM, pal.text)))
-                    .child(label(crate::paint::fit(&vendor, 160., TEXT_XS), TEXT_XS, pal.faint))
-                    .children(formats.into_iter().map(|f| widgets::badge(f, pal.muted))),
+                    .child(div().flex_1().min_w(px(0.)).child(label(crate::paint::fit(&b.name, 220., TEXT_SM), TEXT_SM, pal.text)))
+                    .child(label(crate::paint::fit(&b.vendor, 160., TEXT_XS), TEXT_XS, pal.faint)),
             );
         }
     }
@@ -975,14 +983,6 @@ fn semantic_section(ws: &mut Workspace, cx: &mut Context<Workspace>) -> Div {
         .children(progress.map(|f| {
             div().h(px(4.)).w_full().rounded(px(r_sm())).bg(pal.well).child(div().h_full().w(gpui::relative(f.clamp(0., 1.))).rounded(px(r_sm())).bg(pal.accent))
         }))
-}
-
-/// The plugins found, one line per plugin whatever its formats: name, maker, formats.
-fn group_found(found: &[crate::bridge::ExternalPlugin]) -> Vec<(String, String, Vec<&'static str>)> {
-    crate::views::palette::devices::group_plugins(found.iter())
-        .into_iter()
-        .map(|g| (g.name().to_owned(), g.vendor().to_owned(), g.formats().into_iter().map(plugin_format_name).collect()))
-        .collect()
 }
 
 /// Text that wraps onto several lines.

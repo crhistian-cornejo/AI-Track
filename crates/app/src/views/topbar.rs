@@ -21,10 +21,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Room for the traffic lights (three 14 px buttons from x = 14, 6 px apart).
-#[cfg(target_os = "macos")]
-const LEFT_INSET: f32 = 76.;
-#[cfg(not(target_os = "macos"))]
+/// Room for the macOS window buttons at 100 % zoom, for sizing the bar; the
+/// width actually left is measured each frame (`traffic_lights::inset`).
+#[cfg(all(test, target_os = "macos"))]
+const LEFT_INSET: f32 = 80.;
+#[cfg(all(test, not(target_os = "macos")))]
 const LEFT_INSET: f32 = SP2;
 
 #[cfg(target_os = "windows")]
@@ -279,7 +280,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         .flex()
         .items_center()
         .gap(px(SP1))
-        .child(drag_area().flex_none().w(px(LEFT_INSET)))
+        .child(drag_area().flex_none().w(px(crate::traffic_lights::inset(window))))
         .child(
             toggle("search", Icon::Search, ws.palette.open, pal.accent)
                 .tooltip(widgets::tip("Search sounds, devices and actions", Some("Ctrl+K")))
@@ -287,7 +288,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         )
         .child(
             toggle("file-menu", Icon::Folder, false, pal.accent)
-                .tooltip(widgets::tip("File: new, open, save, templates", None))
+                .tooltip(widgets::tip("Project: new, open, save, export", None))
                 .on_click(cx.listener(|this, e: &gpui::ClickEvent, _, cx| {
                     let at = e.position();
                     this.open_menu(MenuKind::File, point(at.x - px(12.), px(menu_y())), cx);
@@ -496,7 +497,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 })),
         )
         .child(
-            toggle("back-to-arrangement", Icon::Timeline, following_session, pal.record)
+            toggle("back-to-arrangement", Icon::ArrangeReturn, following_session, pal.record)
                 .tooltip(widgets::tip("Back to Arrangement: stop the Session clips and follow the arrangement again", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.b.engine.back_to_arrangement();

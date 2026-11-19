@@ -27,6 +27,8 @@ pub struct Wave {
     pub peaks: Arc<Peaks>,
     /// Frames of `peaks` per source tick.
     pub frames_per_tick: f64,
+    /// The file's time at the rate of `peaks`: its warp markers, when it has any, bend the waveform as they bend playback.
+    pub base: crate::views::sample_editor::geom::TimeBase,
     /// Transpose and detune as a speed (Re-Pitch), and whether it plays reversed.
     pub ratio: f64,
     pub reverse: bool,
@@ -72,7 +74,8 @@ pub fn wave(window: &mut Window, o: Point<Pixels>, bx: &ClipBox, clip: &Clip, wa
     let rows: &[(Option<usize>, f32, f32)] =
         if split { &[(Some(0), top + h * 0.25, h * 0.25 - 1.), (Some(1), top + h * 0.75, h * 0.25 - 1.)] } else { &[(None, top + h * 0.5, h * 0.5 - 1.)] };
     let map = WaveMap::of(clip, wave.frames_per_tick, f64::from(bx.px_per_tick))
-        .pitched(wave.ratio, wave.reverse.then(|| wave.peaks.frames() as f64));
+        .pitched(wave.ratio, wave.reverse.then(|| wave.peaks.frames() as f64))
+        .along(&wave.base);
     let t0 = f64::from(xa - bx.x) * map.ticks_per_px;
     let count = (xb - xa) as usize;
     let outline = style().waveform == WaveformStyle::Outline;

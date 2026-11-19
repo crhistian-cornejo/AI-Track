@@ -22,6 +22,7 @@ pub mod prefs;
 pub mod sample_editor;
 pub mod session;
 pub mod sounds;
+pub mod status;
 pub mod steps;
 pub mod topbar;
 pub mod updates;

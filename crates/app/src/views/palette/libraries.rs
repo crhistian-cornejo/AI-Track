@@ -1,13 +1,13 @@
 //! The user's own libraries in the palette.
 //!
-//! - **Add library…** sits on top of the All, Samples and Packs tabs. It
-//!   opens a picker: "Local folder…" (the folder dialog) and every cloud
-//!   provider — iCloud Drive, Dropbox, OneDrive, Google Drive — with the
-//!   folders of it found on this computer as one-click choices, greyed when
-//!   the provider is not installed.
-//! - **Your libraries** (Packs tab) lists the folders added, with their
+//! - **Your libraries** opens the Packs tab: the folders added, with their
 //!   sample count, how many are online-only, the scan's progress, and
-//!   Rescan / Remove.
+//!   Rescan / Remove. Its **Add library…** button opens a picker: "Local
+//!   folder…" (the folder dialog) and every cloud provider — iCloud Drive,
+//!   Dropbox, OneDrive, Google Drive — with the folders of it found on this
+//!   computer as one-click choices, greyed when the provider is not installed.
+//! - Until a first library is added, the All and Samples tabs show one slim
+//!   line that leads there; after that they are all results.
 //!
 //! Adding goes through the library bridge (it scans in the background);
 //! counts and removal use their own connection on a worker thread, so the
@@ -199,13 +199,10 @@ fn badge(provider: Option<Provider>, dim: bool) -> AnyElement {
     div().flex_none().when(dim, |d| d.opacity(0.4)).child(el).into_any_element()
 }
 
-/// Whether the "Add library…" bar shows on the current tab.
+/// Whether the "add your own folders" line shows on the current tab: only
+/// on the sample lists, with nothing typed, until a first library exists.
 pub fn bar_shown(ws: &Workspace) -> bool {
-    match ws.palette.tab {
-        super::Tab::Packs | super::Tab::Samples => true,
-        super::Tab::All => ws.palette.query.trim().is_empty(),
-        _ => false,
-    }
+    matches!(ws.palette.tab, super::Tab::Samples | super::Tab::All) && ws.palette.libraries.roots.is_empty() && ws.palette.query.trim().is_empty()
 }
 
 fn scan_line(ws: &Workspace) -> Option<Div> {
@@ -214,50 +211,35 @@ fn scan_line(ws: &Workspace) -> Option<Div> {
     st.running.then(|| div().flex().items_center().gap(px(SP2)).child(label(crate::paint::fit(&st.message, 220., TEXT_XS), TEXT_XS, pal.muted)).child(widgets::hbar(st.fraction, 80., 3., pal.accent)))
 }
 
-/// "Add library…" and, when open, the picker under it.
+/// One slim line on the sample lists while the user has no library of their own.
 pub fn add_bar(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     if !bar_shown(ws) {
         return None;
     }
     let pal = p();
-    let lib = &ws.palette.libraries;
-    let (samples, online) = lib.total();
-    let summary = match lib.roots.len() {
-        0 => "Index your own sample folders, on this computer or in the cloud".to_string(),
-        n => {
-            let online = if online > 0 { format!(" · {online} online only") } else { String::new() };
-            format!("{n} {} · {samples} samples{online}", if n == 1 { "library" } else { "libraries" })
-        }
-    };
-    let open = lib.picker;
-    let bar = div()
-        .flex()
-        .items_center()
-        .gap(px(SP3))
-        .child(
-            widgets::text_button("lib-add-open", "Add library…", Some(Icon::Add), true)
-                .tooltip(widgets::tip("A folder on this computer, or Google Drive, Dropbox, OneDrive or iCloud Drive", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.palette.libraries.picker = !this.palette.libraries.picker;
-                    cx.notify();
-                })),
-        )
-        .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(label(summary, TEXT_XS, pal.faint)))
-        .children(scan_line(ws))
-        .child(icon(if open { Icon::ChevronUp } else { Icon::ChevronDown }, 12., pal.faint));
     Some(
         div()
-            .px(px(SP3))
-            .py(px(SP2))
+            .id("lib-add-hint")
+            .h(px(32.))
+            .flex_none()
+            .mx(px(SP1))
             .mb(px(SP1))
+            .px(px(SP2))
             .flex()
-            .flex_col()
+            .items_center()
             .gap(px(SP2))
-            .border_b_1()
-            .border_color(border())
-            .child(bar)
-            .when(open, |d| d.child(picker(ws, cx)))
+            .rounded(px(r_md()))
+            .cursor_pointer()
+            .hover(|s| s.bg(hover()))
+            .child(icon(Icon::FolderAdd, 14., pal.accent))
+            .child(label("Add your own sample folders", TEXT_SM, pal.text))
+            .child(label("on this computer or in the cloud; they are searched with everything else", TEXT_XS, pal.faint).flex_1().min_w(px(0.)).truncate())
+            .child(icon(Icon::ChevronRight, 12., pal.faint))
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                super::open_add_library(this, window, cx);
+                cx.notify();
+            }))
             .into_any_element(),
     )
 }
@@ -322,12 +304,46 @@ fn picker(ws: &Workspace, cx: &mut Context<Workspace>) -> Div {
     list
 }
 
-/// "Your libraries" on the Packs tab.
+/// A block's caption on the Packs tab: its name, a note, and controls at the right.
+pub fn caption(title: &'static str, note: String) -> Div {
+    let pal = p();
+    div()
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .gap(px(SP2))
+        .child(label(title, TEXT_XS, pal.muted).font_weight(gpui::FontWeight::SEMIBOLD))
+        .child(label(note, TEXT_XS, pal.faint).flex_1().min_w(px(0.)).truncate())
+}
+
+/// "Your libraries", the first block of the Packs tab: the folders added and
+/// the button that adds one (with its picker under it while open).
 pub fn list_section(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
-    if ws.palette.tab != super::Tab::Packs || ws.palette.libraries.roots.is_empty() {
+    if ws.palette.tab != super::Tab::Packs {
         return None;
     }
     let pal = p();
+    let lib = &ws.palette.libraries;
+    let (samples, online) = lib.total();
+    let note = match lib.roots.len() {
+        0 => "Index your own sample folders, on this computer or in the cloud".to_string(),
+        n => {
+            let online = if online > 0 { format!(" · {online} online only") } else { String::new() };
+            format!("{n} {} · {samples} samples{online} · listed under “Yours” in All and Samples", if n == 1 { "folder" } else { "folders" })
+        }
+    };
+    let open = lib.picker;
+    let head = caption("YOUR LIBRARIES", note).children(scan_line(ws)).child(
+        widgets::text_button("lib-add-open", if open { "Close" } else { "Add library…" }, Some(if open { Icon::X } else { Icon::FolderAdd }), lib.roots.is_empty() && !open)
+            .h(px(24.))
+            .px(px(SP2))
+            .tooltip(widgets::tip("A folder on this computer, or Google Drive, Dropbox, OneDrive or iCloud Drive", None))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.palette.libraries.picker = !this.palette.libraries.picker;
+                cx.notify();
+            })),
+    );
     let mut list = div().flex().flex_col().gap(px(SP1));
     for (i, row) in ws.palette.libraries.roots.iter().enumerate() {
         let path = row.path.to_string_lossy().into_owned();
@@ -368,15 +384,17 @@ pub fn list_section(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyEl
     Some(
         div()
             .px(px(SP3))
-            .py(px(SP2))
+            .pt(px(SP1))
+            .pb(px(SP2))
             .mb(px(SP1))
             .flex()
             .flex_col()
-            .gap(px(SP2))
+            .gap(px(SP1))
             .border_b_1()
             .border_color(border())
-            .child(div().flex().items_center().gap(px(SP2)).child(label("Your libraries", TEXT_SM, pal.muted)).child(label("Their samples show under “Yours” in All and Samples", TEXT_XS, pal.faint)).child(div().flex_1()).children(scan_line(ws)))
-            .child(list)
+            .child(head)
+            .when(open, |d| d.child(picker(ws, cx)))
+            .when(!ws.palette.libraries.roots.is_empty(), |d| d.child(list))
             .into_any_element(),
     )
 }

@@ -8,7 +8,7 @@
 //! timeline. The source position that plays there is `offset + clip time`,
 //! wrapped into the loop as playback does (`sample_editor::geom::unroll`).
 
-use crate::views::sample_editor::geom::{db_to_gain, unroll};
+use crate::views::sample_editor::geom::{TimeBase, db_to_gain, unroll};
 use crate::waveform::{self, Peaks};
 use aitrack_model::{Clip, Fade, LoopRegion, Tick, curve_shape};
 
@@ -192,7 +192,7 @@ pub fn topmost(boxes: &[ClipBox], x: f32, y: f32) -> Option<(usize, Zone)> {
 
 /// Clip time → source frames of one clip at one zoom.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WaveMap {
+pub struct WaveMap<'a> {
     /// Where in the source the clip starts, and its loop.
     pub offset: Tick,
     pub looping: Option<LoopRegion>,
@@ -205,9 +205,12 @@ pub struct WaveMap {
     pub ratio: f64,
     /// Frames of the file when it plays reversed: frames are mirrored.
     pub mirror: Option<f64>,
+    /// The file's time when its warp markers bend it: source ticks then
+    /// follow the line between two markers instead of `frames_per_tick`.
+    pub bent: Option<&'a TimeBase>,
 }
 
-impl WaveMap {
+impl<'a> WaveMap<'a> {
     pub fn of(clip: &Clip, frames_per_tick: f64, px_per_tick: f64) -> Self {
         Self {
             offset: clip.offset,
@@ -216,6 +219,21 @@ impl WaveMap {
             ticks_per_px: 1. / px_per_tick.max(1e-9),
             ratio: 1.,
             mirror: None,
+            bent: None,
+        }
+    }
+
+    /// Along the warp markers of `base` (the file's time at the rate of the
+    /// peaks), when it has any: the waveform is drawn as the clip plays it.
+    pub fn along(self, base: &'a TimeBase) -> Self {
+        Self { bent: (!base.markers().is_empty()).then_some(base), ..self }
+    }
+
+    /// The frame of the file at source tick `u`.
+    fn frame(&self, u: f64) -> f64 {
+        match self.bent {
+            Some(base) => base.tick_to_frame(u),
+            None => u * self.frames_per_tick,
         }
     }
 
@@ -245,11 +263,16 @@ impl WaveMap {
     /// that is wider than the whole loop shows all of it.
     pub fn frames(&self, t: f64) -> (f64, f64) {
         let u = self.offset as f64 + t * self.ratio;
-        let width = self.ticks_per_px * self.ratio * self.frames_per_tick;
-        let from = unroll(self.looping, u) * self.frames_per_tick;
+        let at = unroll(self.looping, u);
+        let from = self.frame(at);
+        // Between two markers a pixel column covers more or fewer frames than at the file's tempo.
+        let width = match self.bent {
+            Some(_) => (self.frame(at + self.ticks_per_px * self.ratio) - from).max(1e-6),
+            None => self.ticks_per_px * self.ratio * self.frames_per_tick,
+        };
         match self.looping.filter(|l| l.end > l.start) {
             Some(l) => {
-                let (start, end) = (l.start as f64 * self.frames_per_tick, l.end as f64 * self.frames_per_tick);
+                let (start, end) = (self.frame(l.start as f64), self.frame(l.end as f64));
                 if u >= l.end as f64 && width >= end - start { (start, end) } else { (from, (from + width).min(end).max(from + width.min(1.))) }
             }
             None => (from, from + width),
@@ -400,6 +423,33 @@ mod tests {
         // Reversed, the same columns come from the far end of the file.
         let back = WaveMap::of(&clip, 100., 0.1).pitched(1., Some(100_000.));
         assert_eq!(back.file_frames(0.), (79_000., 80_000.));
+    }
+
+    #[test]
+    fn a_file_with_warp_markers_is_drawn_as_it_plays() {
+        use aitrack_model::{AudioSource, Warp};
+        // 48 kHz at 120 BPM (25 frames a tick), beat 2 played a beat's worth of frames late: its
+        // first two beats take 60 000 frames, the next two 36 000.
+        let warp = Warp { enabled: true, original_bpm: Some(120.), markers: vec![(0, 0), (60_000, 2 * BEAT), (96_000, 4 * BEAT)], ..Warp::default() };
+        let file = AudioSource { path: "a.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 120_000, warp, key: None };
+        let base = TimeBase::of(&file, 120.);
+        let clip = Clip::new("c", Color(0), SourceId(1), 4 * BEAT);
+        // 10 ticks a pixel.
+        let map = WaveMap::of(&clip, base.frames_per_tick(), 0.1).along(&base);
+        // In the slow stretch a column covers 312.5 frames, in the fast one 187.5; plain, it would be 250.
+        assert_eq!(map.frames(0.), (0., 312.5));
+        assert_eq!(map.frames(BEAT as f64), (30_000., 30_312.5));
+        assert_eq!(map.frames(3. * BEAT as f64), (78_000., 78_187.5));
+        // The column across the marker runs from one stretch into the other without a gap.
+        let (from, to) = map.frames(2. * BEAT as f64 - 5.);
+        assert_eq!((from, to), (59_843.75, 60_093.75));
+        // Inside a loop the ends are the loop's own frames on the map.
+        let looped = Clip { looping: Some(LoopRegion { start: BEAT, end: 3 * BEAT }), ..clip.clone() };
+        let map = WaveMap::of(&looped, base.frames_per_tick(), 0.1).along(&base);
+        assert_eq!(map.frames(3. * BEAT as f64).0, 30_000., "the repeat starts at the loop's first frame");
+        // A file without markers keeps the plain map.
+        let plain = TimeBase::of(&AudioSource { warp: Warp { markers: Vec::new(), ..file.warp.clone() }, ..file }, 120.);
+        assert_eq!(WaveMap::of(&clip, plain.frames_per_tick(), 0.1).along(&plain), WaveMap::of(&clip, 25., 0.1));
     }
 
     #[test]

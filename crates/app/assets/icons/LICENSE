@@ -2,12 +2,14 @@ Icons in this folder
 ====================
 
 Files copied from Hugeicons (Stroke Rounded set), via monoBOT:
-  add-01, bot, chatting, check, chevron-down-2, chevron-up, clock,
-  cursor-magic, dashboard, eye, file, folder-01, folder-open, folder-tree,
-  gauge, globe, help-circle, keyboard, list-bullet, loader, mic-01,
+  add-01, alert-circle, bot, chatting, check, chevron-down-2, chevron-up,
+  clock, cursor-magic, dashboard, eye, file, file-add, fold-vertical,
+  folder-01, folder-add, folder-open, folder-tree, gauge, globe,
+  help-circle, keyboard, list-bullet, loader, mic-01,
   minus-sign, more-horizontal, package, panel-bottom, panel-left,
   panel-right, pencil-edit, play, refresh-cw, search-01, sliders, sparkles,
-  square-fill, star, trash, undo, wand, window-maximize, window-restore, x
+  square-fill, star, terminal, trash, undo, wand, window-maximize,
+  window-restore, x
 
 They are distributed under the MIT License:
 

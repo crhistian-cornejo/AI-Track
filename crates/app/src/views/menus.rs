@@ -62,65 +62,119 @@ fn clamp_submenu_top(desired_top: f32, card_y: f32, sub_h: f32, vh: f32) -> f32 
     desired_top.clamp(min_top, max_top)
 }
 
-/// File: new from a template, open, open recent, save, export.
+/// Which cascading submenu of the File menu is out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileSub {
+    Templates,
+    Recent,
+}
+
+/// Rows of the File card, for placing its submenus: a header, eleven items and three dividers.
+const FILE_CARD_H: f32 = 24. + 11. * ROW_H + 3. * (1. + 2. * SP1) + 2. * SP1 + 2.;
+
+/// File: new, new from a template, open, open recent · save · export · help.
 fn file_menu(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     use crate::project_io::Template;
     let pal = p();
     let mac = cfg!(target_os = "macos");
     let key = |win: &'static str, mac_key: &'static str| Some(if mac { mac_key } else { win });
-    let close_recent = |el: gpui::Stateful<gpui::Div>, cx: &mut Context<Workspace>| {
+    let open_sub = if ws.file_templates_open {
+        Some(FileSub::Templates)
+    } else if ws.file_recent_open {
+        Some(FileSub::Recent)
+    } else {
+        None
+    };
+    // Hovering a plain row folds whichever submenu is out.
+    let plain = |el: gpui::Stateful<gpui::Div>, cx: &mut Context<Workspace>| {
         el.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-            if *hovered && this.file_recent_open {
+            if *hovered && (this.file_recent_open || this.file_templates_open) {
                 this.file_recent_open = false;
+                this.file_templates_open = false;
                 cx.notify();
             }
         }))
     };
-    let file = ws.project_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
-    let mut card = widgets::menu_card("file-menu", 320.).child(menu_header("NEW"));
-    for (i, t) in Template::ALL.into_iter().enumerate() {
-        let item = close_recent(
-            menu_item(("file-new", i), Some(if t == Template::Empty { Icon::File } else { Icon::Layers }), t.label(), if t == Template::Empty { key("Ctrl+N", "⌘N") } else { None }, false)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.close_menu(cx);
-                    this.file_new(t, window, cx);
-                })),
-            cx,
-        );
-        card = card.child(
-            div()
-                .child(item)
-                .child(div().pl(px(SP6 + SP2)).pr(px(SP2)).pb(px(SP1)).child(label(t.hint(), TEXT_XS, pal.faint))),
-        );
-    }
-
-    let open_recent_trigger = div()
-        .id("file-open-recent")
-        .h(px(ROW_H))
-        .px(px(SP2))
-        .gap(px(SP2))
-        .flex()
-        .items_center()
-        .rounded(px(r_md()))
-        .cursor_pointer()
-        .when(ws.file_recent_open, |d| d.bg(hover()))
-        .hover(|s| s.bg(hover()))
-        .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(crate::icons::icon(Icon::Clock, 14., if ws.file_recent_open { pal.accent } else { pal.muted })))
-        .child(label("Open Recent", TEXT_MD, pal.text).flex_1())
-        .child(crate::icons::icon(Icon::ChevronRight, 14., if ws.file_recent_open { pal.accent } else { pal.faint }))
-        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-            if *hovered && !this.file_recent_open {
-                this.file_recent_open = true;
+    // A row that opens a submenu on hover or click.
+    let trigger = |id: &'static str, ic: Icon, text: &'static str, sub: FileSub, cx: &mut Context<Workspace>| {
+        let on = open_sub == Some(sub);
+        let set = move |this: &mut Workspace, open: bool| {
+            this.file_templates_open = open && sub == FileSub::Templates;
+            this.file_recent_open = open && sub == FileSub::Recent;
+        };
+        div()
+            .id(id)
+            .h(px(ROW_H))
+            .px(px(SP2))
+            .gap(px(SP2))
+            .flex()
+            .items_center()
+            .rounded(px(r_md()))
+            .cursor_pointer()
+            .when(on, |d| d.bg(hover()))
+            .hover(|s| s.bg(hover()))
+            .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(crate::icons::icon(ic, 14., if on { pal.accent } else { pal.muted })))
+            .child(label(text, TEXT_MD, pal.text).flex_1())
+            .child(crate::icons::icon(Icon::ChevronRight, 14., if on { pal.accent } else { pal.faint }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let now = if sub == FileSub::Templates { this.file_templates_open } else { this.file_recent_open };
+                if *hovered && !now {
+                    set(this, true);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let now = if sub == FileSub::Templates { this.file_templates_open } else { this.file_recent_open };
+                set(this, !now);
                 cx.notify();
-            }
-        }))
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.file_recent_open = !this.file_recent_open;
-            cx.notify();
-        }));
+            }))
+    };
+    let vh = f32::from(window.viewport_size().height);
+    let raw_y = ws.menu.as_ref().map_or(SP2, |m| f32::from(m.at.y));
+    let card_y = snapped_menu_y(raw_y, FILE_CARD_H, vh);
+    // A submenu card beside its row, kept inside the window.
+    let beside = |id: &'static str, card: gpui::Div, card_h: f32| {
+        div().id(id).occlude().absolute().left_full().top(px(clamp_submenu_top(-SP1 - 1., card_y, card_h, vh))).pl(px(4.)).child(card)
+    };
 
-    let recent_submenu = ws.file_recent_open.then(|| {
-        let vh = f32::from(window.viewport_size().height);
+    let templates_submenu = (open_sub == Some(FileSub::Templates)).then(|| {
+        let mut card = widgets::menu_card("file-templates-card", 360.).child(menu_header("TEMPLATES"));
+        let templates: Vec<Template> = Template::ALL.into_iter().filter(|t| *t != Template::Empty).collect();
+        let n = templates.len();
+        for (i, t) in templates.into_iter().enumerate() {
+            card = card.child(
+                div()
+                    .id(("file-template", i))
+                    .h(px(44.))
+                    .px(px(SP2))
+                    .gap(px(SP2))
+                    .flex()
+                    .items_center()
+                    .rounded(px(r_md()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover()))
+                    .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(crate::icons::icon(if t == Template::Demo { Icon::MusicNote } else { Icon::Layers }, 14., pal.muted)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(label(t.label(), TEXT_MD, pal.text).truncate())
+                            .child(label(t.hint(), TEXT_XS, pal.faint).truncate()),
+                    )
+                    .tooltip(widgets::tip(t.hint(), None))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_menu(cx);
+                        this.file_new(t, window, cx);
+                    })),
+            );
+        }
+        beside("file-templates-submenu", card, 34. + n as f32 * 44.)
+    });
+
+    let recent_submenu = (open_sub == Some(FileSub::Recent)).then(|| {
         let sub_list_max_h = (vh - 2. * SP2 - 34.).clamp(160., 360.);
         let mut sub_list = div()
             .id("file-recent-list")
@@ -181,76 +235,80 @@ fn file_menu(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace
             ws.recent_projects.len() as f32 * 36. + 1. + ROW_H
         };
         let exact_sub_h = (34. + sub_content_h.min(sub_list_max_h)).min(vh - 2. * SP2);
-        let raw_y = ws.menu.as_ref().map_or(SP2, |m| f32::from(m.at.y));
-        // Template rows (3 * 48) + headers (2 * 24) + 6 action rows (6 * 28) + card chrome (10) ≈ 370 px.
-        let est_card_h = 370.;
-        let card_y = snapped_menu_y(raw_y, est_card_h, vh);
-        let sub_top = clamp_submenu_top(-SP1 - 1., card_y, exact_sub_h, vh);
-        div()
-            .id("file-recent-submenu")
-            .occlude()
-            .absolute()
-            .left_full()
-            .top(px(sub_top))
-            .pl(px(4.))
-            .child(widgets::menu_card("file-recent-card", 300.).child(menu_header("RECENT PROJECTS")).child(sub_list))
+        beside("file-recent-submenu", widgets::menu_card("file-recent-card", 300.).child(menu_header("RECENT PROJECTS")).child(sub_list), exact_sub_h)
     });
 
-    card.child(menu_header(file.map_or("PROJECT".to_owned(), |f| f.to_uppercase())))
-        .child(close_recent(
+    let file = ws.project_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    let rule = || div().py(px(SP1)).child(widgets::divider_h());
+    widgets::menu_card("file-menu", 264.)
+        .child(menu_header(file.map_or("PROJECT".to_owned(), |f| f.to_uppercase())))
+        .child(plain(
+            menu_item("file-new", Some(Icon::FileAdd), "New Project", key("Ctrl+N", "⌘N"), false).on_click(cx.listener(|this, _, window, cx| {
+                this.close_menu(cx);
+                this.file_new(Template::Empty, window, cx);
+            })),
+            cx,
+        ))
+        .child(div().relative().child(trigger("file-new-template", Icon::Template, "New from Template", FileSub::Templates, cx)).children(templates_submenu))
+        .child(plain(
             menu_item("file-open", Some(Icon::FolderOpen), "Open…", key("Ctrl+O", "⌘O"), false).on_click(cx.listener(|this, _, window, cx| {
                 this.close_menu(cx);
                 this.file_open(window, cx);
             })),
             cx,
         ))
-        .child(div().relative().child(open_recent_trigger).children(recent_submenu))
-        .child(close_recent(
-            menu_item("file-save", Some(Icon::Check), "Save", key("Ctrl+S", "⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
+        .child(div().relative().child(trigger("file-open-recent", Icon::Clock, "Open Recent", FileSub::Recent, cx)).children(recent_submenu))
+        .child(rule())
+        .child(plain(
+            menu_item("file-save", Some(Icon::Save), "Save", key("Ctrl+S", "⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
                 this.file_save(cx);
             })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-save-as", Some(Icon::File), "Save as…", key("Ctrl+Shift+S", "⇧⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
+        .child(plain(
+            menu_item("file-save-as", Some(Icon::Copy), "Save As…", key("Ctrl+Shift+S", "⇧⌘S"), false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
                 this.file_save_as(None, cx);
             })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-collect", Some(Icon::Package), "Collect all and save", None, false).on_click(cx.listener(|this, _, _, cx| {
-                this.close_menu(cx);
-                this.collect_and_save(cx);
-            })),
+        .child(plain(
+            menu_item("file-collect", Some(Icon::Package), "Collect All and Save", None, false)
+                .tooltip(widgets::tip("Copy every audio file the project uses into its folder, then save", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_menu(cx);
+                    this.collect_and_save(cx);
+                })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-find-missing", Some(Icon::Search), "Find missing files…", None, false).on_click(cx.listener(|this, _, _, cx| {
+        .child(plain(
+            menu_item("file-find-missing", Some(Icon::Search), "Find Missing Files…", None, false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
                 this.find_missing_files(cx);
             })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-updates", Some(Icon::Download), "Check for updates…", None, false).on_click(cx.listener(|this, _, _, cx| {
+        .child(rule())
+        .child(plain(
+            menu_item("file-export", Some(Icon::Export), "Export Audio…", key("Ctrl+Shift+E", "⇧⌘E"), false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
-                this.check_for_updates(cx);
+                this.open_export(cx);
             })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-shortcuts", Some(Icon::Keyboard), "Keyboard shortcuts…", key("Ctrl+/", "⌘/"), false).on_click(cx.listener(|this, _, window, cx| {
+        .child(rule())
+        .child(plain(
+            menu_item("file-shortcuts", Some(Icon::Keyboard), "Keyboard Shortcuts…", key("Ctrl+/", "⌘/"), false).on_click(cx.listener(|this, _, window, cx| {
                 this.close_menu(cx);
                 crate::commands::run(this, crate::keys::Cmd::Shortcuts, window, cx);
             })),
             cx,
         ))
-        .child(close_recent(
-            menu_item("file-export", Some(Icon::Send), "Export audio…", key("Ctrl+Shift+E", "⇧⌘E"), false).on_click(cx.listener(|this, _, _, cx| {
+        .child(plain(
+            menu_item("file-updates", Some(Icon::Refresh), "Check for Updates…", None, false).on_click(cx.listener(|this, _, _, cx| {
                 this.close_menu(cx);
-                this.open_export(cx);
+                this.check_for_updates(cx);
             })),
             cx,
         ))
@@ -362,7 +420,7 @@ fn tools_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     use crate::state::{ArpPattern, ChordKind};
     let scale_label = ws.s.clip_scale(ws.s.selected_clip).map(|s| s.display()).unwrap_or_else(|| "Chromatic".into());
     let chord_btn = |id: &'static str, title: &'static str, kind: ChordKind| {
-        menu_item(id, Some(Icon::Piano), title, Some("in scale"), false).on_click(cx.listener(move |this, _, _, cx| {
+        menu_item(id, Some(Icon::Chord), title, Some("in scale"), false).on_click(cx.listener(move |this, _, _, cx| {
             this.menu = None;
             if let Some(c) = this.s.selected_clip {
                 let n = this.s.build_chord(c, kind);
@@ -373,7 +431,7 @@ fn tools_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     };
     widgets::menu_card("tools-menu", 244.)
         .child(menu_header(format!("SCALE TOOLS · {scale_label}")))
-        .child(menu_item("t-scale-fold", Some(Icon::ScaleSnap), "Fold piano roll to key", None, ws.s.piano_scale_fold).on_click(cx.listener(|this, _, _, cx| {
+        .child(menu_item("t-scale-fold", Some(Icon::Fold), "Fold piano roll to key", None, ws.s.piano_scale_fold).on_click(cx.listener(|this, _, _, cx| {
             this.s.piano_scale_fold = !this.s.piano_scale_fold;
             this.menu = None;
             cx.notify();
@@ -382,7 +440,7 @@ fn tools_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             this.menu = None;
             this.quantize_clip(cx);
         })))
-        .child(menu_item("t-scale", Some(Icon::ScaleSnap), "Snap notes to scale", None, false).on_click(cx.listener(|this, _, _, cx| {
+        .child(menu_item("t-scale", Some(Icon::KeySnap), "Snap notes to scale", None, false).on_click(cx.listener(|this, _, _, cx| {
             this.menu = None;
             this.scale_snap_clip(cx);
         })))

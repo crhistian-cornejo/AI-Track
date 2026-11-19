@@ -19,6 +19,7 @@
 mod draw;
 pub mod edit;
 pub mod geom;
+pub mod warp;
 
 use crate::actions::{ArrangeFit, ArrangeZoomIn, ArrangeZoomOut, DeleteSelection, Escape, SelectAll, SplitClip, ToggleDrawTool};
 use crate::bridge::SlotState;
@@ -115,6 +116,8 @@ struct Drag {
     /// Whether the project changed (Escape then undoes it).
     applied: bool,
     readout: Option<String>,
+    /// The file's warp when a warp marker was taken: every move of the drag starts from it.
+    warp: Option<aitrack_model::Warp>,
 }
 
 /// The clip and its file as the handlers and the painter see them this frame.
@@ -339,7 +342,8 @@ fn begin(ws: &mut Workspace, id: ClipId, kind: DragKind, home: (f32, f32), e: &M
     ws.s.seal();
     let (x, y) = local(ws, e.position);
     let snapshot = Snapshot::take(&ws.s, id);
-    ws.sample.drag = Some(Drag { kind, snapshot, from: e.position, grab: (x - home.0, y - home.1), anchor: 0, moved: false, applied: false, readout: None });
+    let warp = matches!(kind, DragKind::Handle(Hit::Warp(_))).then(|| Frame::of(ws).map(|f| f.source.warp)).flatten();
+    ws.sample.drag = Some(Drag { kind, snapshot, from: e.position, grab: (x - home.0, y - home.1), anchor: 0, moved: false, applied: false, readout: None, warp });
     cx.notify();
 }
 
@@ -352,7 +356,7 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
     let Some(f) = Frame::of(ws) else { return };
     let (x, y) = local(ws, e.position);
     let (l, c) = (&f.layout, &f.clip);
-    let hit = geom::hit_test(l, c, x, y);
+    let hit = geom::hit_test_with(l, c, f.base.markers(), x, y);
     let (alt, double) = (e.modifiers.alt, e.click_count >= 2);
     let handle = |ws: &mut Workspace, hit: Hit, home: (f32, f32), cx: &mut Context<Workspace>| begin(ws, f.id, DragKind::Handle(hit), home, e, cx);
     ws.sample.picked = None;
@@ -391,6 +395,16 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
                 handle(ws, hit, home, cx);
             }
         }
+        Hit::Warp(i) => {
+            if double {
+                // Double-click a warp marker to remove it (as a breakpoint).
+                remove_marker(ws, &f, i, cx);
+            } else if let Some(m) = f.base.markers().get(i) {
+                handle(ws, hit, (l.x(m.1), y), cx);
+            }
+        }
+        // Double-click the ruler: a warp marker on the audio under the pointer.
+        Hit::Ruler if double => add_marker(ws, &f, l.axis.tick(x).round() as Tick, cx),
         Hit::Start => handle(ws, hit, (l.x(c.offset), y), cx),
         Hit::End => handle(ws, hit, (l.x(geom::end_u(c)), y), cx),
         Hit::LoopStart | Hit::LoopEnd | Hit::LoopBody => {
@@ -416,10 +430,10 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
                     let grab = (x - l.x(u), 0.);
                     ws.sample.picked = Some(index);
                     ws.sample.drag =
-                        Some(Drag { kind: DragKind::Handle(Hit::Point(index)), snapshot, from: e.position, grab, anchor: 0, moved: false, applied: true, readout: None });
+                        Some(Drag { kind: DragKind::Handle(Hit::Point(index)), snapshot, from: e.position, grab, anchor: 0, moved: false, applied: true, readout: None, warp: None });
                 }
             } else {
-                ws.sample.drag = Some(Drag { kind: DragKind::Select, snapshot: None, from: e.position, grab: (0., 0.), anchor: u, moved: false, applied: false, readout: None });
+                ws.sample.drag = Some(Drag { kind: DragKind::Select, snapshot: None, from: e.position, grab: (0., 0.), anchor: u, moved: false, applied: false, readout: None, warp: None });
             }
         }
     }
@@ -429,13 +443,52 @@ fn canvas_down(ws: &mut Workspace, e: &MouseDownEvent, window: &mut Window, cx: 
 fn canvas_right_down(ws: &mut Workspace, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Workspace>) {
     let Some(f) = Frame::of(ws) else { return };
     let (x, y) = local(ws, e.position);
-    // Right-click a breakpoint to delete it.
-    if let Hit::Point(i) = geom::hit_test(&f.layout, &f.clip, x, y) {
-        cx.stop_propagation();
-        edit::delete_point(&mut ws.s, f.id, f.layout.env, i);
-        ws.sample.hover = None;
-        ws.sample.picked = None;
-        cx.notify();
+    // Right-click a breakpoint or a warp marker to delete it.
+    match geom::hit_test_with(&f.layout, &f.clip, f.base.markers(), x, y) {
+        Hit::Point(i) => {
+            cx.stop_propagation();
+            edit::delete_point(&mut ws.s, f.id, f.layout.env, i);
+            ws.sample.hover = None;
+            ws.sample.picked = None;
+            cx.notify();
+        }
+        Hit::Warp(i) => {
+            cx.stop_propagation();
+            remove_marker(ws, &f, i, cx);
+            cx.notify();
+        }
+        _ => {}
+    }
+}
+
+/// A warp marker at axis position `u`, pinning the audio that plays there now.
+fn add_marker(ws: &mut Workspace, f: &Frame, u: Tick, cx: &mut Context<Workspace>) {
+    if !f.source.warp.enabled {
+        ws.toast("Turn Warp on (or Auto-warp the clip) to add warp markers", cx);
+        return;
+    }
+    // A looping clip shows its repeats: the marker goes on the audio they play.
+    let at = geom::unroll(f.clip.looping, u as f64).round() as Tick;
+    match warp::added(&f.source.warp, at, f.base.sample_rate, f.source.frames) {
+        Some((w, index)) => {
+            ws.s.seal();
+            warp::apply(&mut ws.s, f.id, &w);
+            ws.s.seal();
+            ws.sample.hover = Some(Hit::Warp(index));
+        }
+        None => ws.toast("No room for a warp marker here: there is one next to it, or the file ends before", cx),
+    }
+}
+
+fn remove_marker(ws: &mut Workspace, f: &Frame, index: usize, cx: &mut Context<Workspace>) {
+    match warp::removed(&f.source.warp, index) {
+        Some(w) => {
+            ws.s.seal();
+            warp::apply(&mut ws.s, f.id, &w);
+            ws.s.seal();
+            ws.sample.hover = None;
+        }
+        None => ws.toast("A warped file keeps two warp markers: the line its audio follows", cx),
     }
 }
 
@@ -445,7 +498,7 @@ fn canvas_hover(ws: &mut Workspace, e: &MouseMoveEvent, _: &mut Window, cx: &mut
     }
     let Some(f) = Frame::of(ws) else { return };
     let (x, y) = local(ws, e.position);
-    let hit = match geom::hit_test(&f.layout, &f.clip, x, y) {
+    let hit = match geom::hit_test_with(&f.layout, &f.clip, f.base.markers(), x, y) {
         // The line is only a target while Alt would bend it.
         Hit::Segment(_) if !e.modifiers.alt => Hit::Body,
         hit => hit,
@@ -492,6 +545,14 @@ fn drag_move(ws: &mut Workspace, e: &MouseMoveEvent, cx: &mut Context<Workspace>
             Hit::LoopStart => Some(Gesture::LoopStart(u)),
             Hit::LoopEnd => Some(Gesture::LoopEnd(u)),
             Hit::LoopBody => Some(Gesture::LoopMove(u)),
+            Hit::Warp(index) => {
+                // The audio under the marker goes where the pointer is; back at its place it is as it was.
+                if let Some(from) = &drag.warp {
+                    let to = warp::moved(from, index, u, f.base.sample_rate);
+                    drag.applied |= warp::apply(&mut ws.s, f.id, to.as_ref().unwrap_or(from));
+                }
+                None
+            }
             Hit::Ruler | Hit::Body => None,
         },
         DragKind::Select => {
@@ -533,6 +594,10 @@ fn readout(ws: &Workspace, f: &Frame, kind: DragKind) -> Option<String> {
             let lp = c.looping?;
             format!("Loop {}", geom::format_length(lp.end - lp.start, f.sig))
         }
+        Hit::Warp(i) => match ws.s.project.sources.get(&c.source) {
+            Some(Source::Audio(a)) => warp::readout(&a.warp, i, f64::from(a.sample_rate.max(1)))?,
+            _ => return None,
+        },
         Hit::Ruler | Hit::Body => return None,
     })
 }
@@ -634,7 +699,7 @@ fn focus_handle(ws: &mut Workspace, cx: &mut Context<Workspace>) -> FocusHandle 
 /// The pointer over a target, or holding it.
 fn cursor_for(hit: Option<Hit>, dragging: bool, pencil: bool) -> CursorStyle {
     match hit {
-        Some(Hit::Start | Hit::End | Hit::LoopStart | Hit::LoopEnd | Hit::FadeIn | Hit::FadeOut) => CursorStyle::ResizeLeftRight,
+        Some(Hit::Start | Hit::End | Hit::LoopStart | Hit::LoopEnd | Hit::FadeIn | Hit::FadeOut | Hit::Warp(_)) => CursorStyle::ResizeLeftRight,
         Some(Hit::FadeInCurve | Hit::FadeOutCurve | Hit::Segment(_)) => CursorStyle::ResizeUpDown,
         Some(Hit::Point(_) | Hit::LoopBody) => {
             if dragging {
@@ -756,8 +821,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
         Status::Idle | Status::Loading => Some("Reading the waveform…".to_owned()),
     };
     // The file's time at the rate it was decoded at (normally the one the project stores).
-    let decoded = TimeBase { sample_rate: peaks.as_ref().map_or(f.base.sample_rate, |p| f64::from(p.sample_rate().max(1))), ..f.base };
-    let frames_per_beat = decoded.tick_to_frame(PPQ as f64);
+    let decoded = f.base.at_rate(peaks.as_ref().map_or(f.base.sample_rate, |p| f64::from(p.sample_rate().max(1))));
+    let frames_per_beat = decoded.frames_per_tick() * PPQ as f64;
     ws.sample.max_zoom = frames_per_beat / peaks.as_ref().map_or(16., |p| if p.has_samples() { 1. / SAMPLE_PX } else { p.finest() });
     let file_len = peaks.as_ref().map(|p| decoded.frame_to_tick(p.frames() as f64).round() as Tick);
     if f.source_len == 0 && ws.sample.file_len != file_len {
@@ -788,7 +853,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let scene = draw::Scene {
         clip: c.clone(),
         axis: f.layout.axis,
-        base: decoded,
+        base: decoded.clone(),
         origin: f.origin,
         rate: f.rate,
         grid: f.grid,
@@ -837,7 +902,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     if let Some(u) = ws.sample.cursor {
         // Where the cursor is in the file: time, and the sample itself once zoomed that far in.
         let at = geom::unroll(c.looping, u as f64).max(0.);
-        let frame = if f.layout.axis.px_per_tick() * decoded.frame_to_tick(1.) >= 1. { format!("  #{:.0}", decoded.tick_to_frame(at)) } else { String::new() };
+        let frame = if f.layout.axis.px_per_tick() / decoded.frames_per_tick() >= 1. { format!("  #{:.0}", decoded.tick_to_frame(at)) } else { String::new() };
         info = info.child(mono(format!("{}{frame}", geom::format_seconds(decoded.seconds(at))), TEXT_SM, pal.text));
     }
     let channels = match f.source.channels {

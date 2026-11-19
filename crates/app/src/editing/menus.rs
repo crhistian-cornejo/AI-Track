@@ -128,6 +128,12 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
         .child(action("clip-active", Icon::Power, if muted { "Activate" } else { "Deactivate" }, keys::action_hint("ToggleActive"), false, cx, |this, _, _| {
             this.s.toggle_clips_active();
         }));
+    // One audio clip: listen for its beats and put it on the grid.
+    let warpable = (clips.len() == 1).then(|| clips[0].1.clip).filter(|c| ws.s.project.clips.get(c).is_some_and(|c| matches!(ws.s.project.sources.get(&c.source), Some(aitrack_model::Source::Audio(_)))));
+    let card = match warpable {
+        Some(clip) => card.child(action("clip-auto-warp", Icon::Metronome, "Auto-Warp", None, false, cx, move |this, _, cx| this.auto_warp_clip(clip, cx))),
+        None => card,
+    };
     let sliceable = crate::editing::slice::target(&ws.s);
     let card = match sliceable {
         Some((track, placement)) if clips.len() == 1 => card.child(widgets::divider_h()).child(

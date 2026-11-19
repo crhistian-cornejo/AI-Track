@@ -436,54 +436,7 @@ fn match_metadata_token(tok: &str, is_instrument: bool) -> Option<DeviceGroup> {
     }
 }
 
-// ───────────────────────────── One row per plugin ─────────────────────────────
-
-/// Words a maker adds to a file name that are not part of the plugin's name.
-const NAME_NOISE: &[&str] = &["vst3", "vst", "clap", "x64", "x86", "64bit", "64-bit", "(vst3)", "(clap)", "(x64)", "(64-bit)", "[vst3]", "[clap]"];
-
-/// A plugin's name as two formats of it would agree on: folded, without
-/// "(VST3)" or "x64" tags, single-spaced.
-pub fn plugin_name_key(name: &str) -> String {
-    fold(name).split_whitespace().filter(|w| !NAME_NOISE.contains(w)).collect::<Vec<_>>().join(" ")
-}
-
-/// Two makers' names that are the same one: equal when folded, or one is
-/// the start of the other ("Xfer" and "Xfer Records"), or one is not known.
-fn same_vendor(a: &str, b: &str) -> bool {
-    let (a, b) = (fold(a), fold(b));
-    let (a, b) = (a.trim(), b.trim());
-    a.is_empty() || b.is_empty() || a == b || a.starts_with(b) || b.starts_with(a)
-}
-
-/// The VST3 and CLAP builds of one plugin, which the palette shows as a single row.
-#[derive(Clone, Debug)]
-pub struct PluginGroup<'a> {
-    /// Preferred format first (VST3, then CLAP).
-    members: Vec<&'a ExternalPlugin>,
-}
-
-impl<'a> PluginGroup<'a> {
-    pub fn preferred(&self) -> &'a ExternalPlugin {
-        self.members[0]
-    }
-
-    pub fn members(&self) -> &[&'a ExternalPlugin] {
-        &self.members
-    }
-
-    pub fn name(&self) -> &'a str {
-        &self.preferred().name
-    }
-
-    /// The maker, from the first build that names one.
-    pub fn vendor(&self) -> &'a str {
-        self.members.iter().map(|m| m.vendor.as_str()).find(|v| !v.trim().is_empty()).unwrap_or("")
-    }
-
-    pub fn formats(&self) -> Vec<PluginFormat> {
-        self.members.iter().map(|m| m.format).collect()
-    }
-}
+// ───────────────────────────── One row per build ─────────────────────────────
 
 fn format_rank(f: PluginFormat) -> u8 {
     match f {
@@ -492,23 +445,20 @@ fn format_rank(f: PluginFormat) -> u8 {
     }
 }
 
-/// Group plugins that are the same one in other formats. Two builds of one
-/// format are never merged (they are different plugins that share a name).
-/// The order of first appearance is kept.
-pub fn group_plugins<'a>(plugins: impl IntoIterator<Item = &'a ExternalPlugin>) -> Vec<PluginGroup<'a>> {
-    let mut groups: Vec<(String, PluginGroup<'a>)> = Vec::new();
+/// Every installed build as a row of its own: the VST3s, then the CLAPs,
+/// each format in alphabetical order (case and accents folded; the maker
+/// settles two plugins of one name). A plugin installed in both formats shows
+/// under each of them and is never merged by its name. One build found in
+/// two folders (the same format and id) shows once.
+pub fn by_format<'a>(plugins: impl IntoIterator<Item = &'a ExternalPlugin>) -> Vec<&'a ExternalPlugin> {
+    let mut out: Vec<&'a ExternalPlugin> = Vec::new();
     for p in plugins {
-        let key = plugin_name_key(&p.name);
-        let hit = groups.iter_mut().find(|(k, g)| *k == key && g.members.iter().all(|m| m.format != p.format) && g.members.iter().any(|m| same_vendor(&m.vendor, &p.vendor)));
-        match hit {
-            Some((_, g)) => {
-                g.members.push(p);
-                g.members.sort_by_key(|m| format_rank(m.format));
-            }
-            None => groups.push((key, PluginGroup { members: vec![p] })),
+        if !out.iter().any(|o| o.format == p.format && o.uid == p.uid) {
+            out.push(p);
         }
     }
-    groups.into_iter().map(|(_, g)| g).collect()
+    out.sort_by(|a, b| format_rank(a.format).cmp(&format_rank(b.format)).then_with(|| fold(&a.name).cmp(&fold(&b.name))).then_with(|| fold(&a.vendor).cmp(&fold(&b.vendor))));
+    out
 }
 
 /// Which builds the Devices tab shows.
@@ -526,7 +476,7 @@ impl FormatFilter {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "Any format",
+            Self::All => "All formats",
             Self::Stock => "Stock",
             Self::Vst3 => "VST3",
             Self::Clap => "CLAP",
@@ -561,28 +511,6 @@ pub fn vendor_counts<'a>(vendors: impl IntoIterator<Item = &'a str>) -> Vec<(Str
     let mut out: Vec<(String, usize)> = counts.into_iter().map(|(_, v, n)| (v, n)).collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| fold(&a.0).cmp(&fold(&b.0))));
     out
-}
-
-/// `true` when the row is a favourite under any of its builds' keys.
-pub fn is_favorite(prefs: &PluginPrefs, keys: &[String]) -> bool {
-    keys.iter().any(|k| prefs.is_favorite(k))
-}
-
-/// Star or unstar a row under all its builds' keys, so a plugin starred as
-/// CLAP is still starred when it shows as one row with its VST3.
-pub fn toggle_favorite(prefs: &mut PluginPrefs, keys: &[String]) -> bool {
-    if is_favorite(prefs, keys) {
-        let starred: Vec<&String> = keys.iter().filter(|k| prefs.is_favorite(k)).collect();
-        for k in starred {
-            prefs.toggle_favorite(k);
-        }
-        false
-    } else {
-        if let Some(k) = keys.first() {
-            prefs.toggle_favorite(k);
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -657,45 +585,45 @@ mod tests {
     }
 
     #[test]
-    fn the_same_plugin_in_two_formats_is_one_row_with_both_badges() {
+    fn each_format_is_its_own_alphabetical_run_and_names_are_never_merged() {
         let list = [
             ext("Surge XT", "Surge Synth Team", PluginFormat::Clap),
-            ext("Dexed", "Digital Suburban", PluginFormat::Vst3),
+            ext("dexed", "Digital Suburban", PluginFormat::Vst3),
             ext("Surge XT", "Surge Synth Team", PluginFormat::Vst3),
             ext("Dexed", "Digital Suburban", PluginFormat::Clap),
             ext("OTT", "Xfer Records", PluginFormat::Vst3),
+            ext("Ábaco", "Maker", PluginFormat::Vst3),
         ];
-        let g = group_plugins(list.iter());
-        assert_eq!(g.len(), 3, "five files, three plugins");
-        let surge = &g[0];
-        assert_eq!(surge.formats(), vec![PluginFormat::Vst3, PluginFormat::Clap], "VST3 first, it is the one that opens");
-        assert_eq!(surge.preferred().format, PluginFormat::Vst3);
-        assert_eq!(surge.members().len(), 2);
-        assert_eq!(g[2].formats(), vec![PluginFormat::Vst3]);
+        let rows = by_format(list.iter());
+        assert_eq!(rows.len(), 6, "a plugin in two formats is two rows");
+        let shown: Vec<(&str, PluginFormat)> = rows.iter().map(|p| (p.name.as_str(), p.format)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("Ábaco", PluginFormat::Vst3),
+                ("dexed", PluginFormat::Vst3),
+                ("OTT", PluginFormat::Vst3),
+                ("Surge XT", PluginFormat::Vst3),
+                ("Dexed", PluginFormat::Clap),
+                ("Surge XT", PluginFormat::Clap),
+            ],
+            "VST3 first, then CLAP; case and accents do not change the order"
+        );
     }
 
     #[test]
-    fn tags_in_the_name_and_a_shortened_maker_still_match() {
-        let list = [ext("Vital (VST3)", "Vital Audio", PluginFormat::Vst3), ext("Vital x64", "", PluginFormat::Clap), ext("Pro Thing", "Xfer", PluginFormat::Vst3), ext("pro  thing", "Xfer Records", PluginFormat::Clap)];
-        let g = group_plugins(list.iter());
-        assert_eq!(g.len(), 2, "{g:?}");
-        assert_eq!(g[0].vendor(), "Vital Audio", "the maker from the build that has one");
-    }
-
-    #[test]
-    fn two_builds_of_one_format_or_two_makers_stay_apart() {
-        let list = [
-            ext("Delay", "Maker A", PluginFormat::Vst3),
-            ext("Delay", "Maker B", PluginFormat::Vst3),
-            ext("Delay", "Maker B", PluginFormat::Clap),
-            ext("Reverb", "Maker A", PluginFormat::Clap),
-            ext("Reverb", "Other Co", PluginFormat::Vst3),
-        ];
-        let g = group_plugins(list.iter());
-        assert_eq!(g.len(), 4, "{g:?}");
-        // The CLAP Delay joins the VST3 of its own maker, not the first one with the name.
-        let delay_b = g.iter().find(|x| x.vendor() == "Maker B").unwrap();
-        assert_eq!(delay_b.formats().len(), 2);
+    fn one_build_found_twice_shows_once_and_same_names_of_two_makers_stay() {
+        let mut twice = ext("Delay", "Maker A", PluginFormat::Vst3);
+        twice.path = "/Library/Audio/Plug-Ins/VST3/Delay.vst3".into();
+        let mut copy = twice.clone();
+        copy.path = "/Users/me/Library/Audio/Plug-Ins/VST3/Delay.vst3".into();
+        let mut other = ext("Delay", "Maker B", PluginFormat::Vst3);
+        other.uid = "other-delay".into();
+        let list = [twice.clone(), copy, other];
+        let rows = by_format(list.iter());
+        assert_eq!(rows.len(), 2, "the copy in the second folder is the same build");
+        assert_eq!(rows[0].path, twice.path, "the first one found stays");
+        assert_eq!((rows[0].vendor.as_str(), rows[1].vendor.as_str()), ("Maker A", "Maker B"));
     }
 
     #[test]
@@ -707,15 +635,5 @@ mod tests {
         let v = vendor_counts(["Xfer Records", "xfer records", "Valhalla DSP", "", "Xfer Records", "Zynaptiq"]);
         assert_eq!(v[0], ("Xfer Records".to_owned(), 3));
         assert_eq!(v.len(), 3, "no empty maker");
-    }
-
-    #[test]
-    fn a_favourite_in_one_format_is_a_favourite_of_the_row() {
-        let mut prefs = PluginPrefs::default();
-        let keys = vec!["ext:vst3:x".to_owned(), "ext:clap:x".to_owned()];
-        assert!(!is_favorite(&prefs, &keys));
-        // (Not toggled here: that saves the user's file.)
-        prefs.favorites.push("ext:clap:x".into());
-        assert!(is_favorite(&prefs, &keys));
     }
 }

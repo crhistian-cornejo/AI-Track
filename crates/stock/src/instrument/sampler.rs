@@ -961,8 +961,17 @@ mod tests {
 
         // Streamed zone D4 (62): plays preroll and seamlessly reads past preroll via background page streaming.
         let (ls, _) = render_notes(&mut s, &[(0, 62, 0.9, true)], 32_000);
-        // Wait briefly for lookahead page & render tail block if background reader was mid-page:
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        // The tail block reads frames 32 000 to 33 024, across two pages. A read that finds no
+        // page asks the reader thread for it: ask as the audio thread does and wait until both
+        // are there. (A fixed 15 ms pause was not enough on a busy machine: the Windows runner.)
+        {
+            let audio = s.zones[3].audio.clone();
+            let heard = |from: usize| (0..64).any(|k| audio.read(0, (from + k) as f64 + 0.5).abs() > 1e-3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !(heard(32_000) && heard(33_000)) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         let mut tail_buf = aitrack_dsp::AudioBuffer::new(2, 1024);
         let tr = aitrack_dsp::Transport::default();
         let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut tail_buf, sidechain: None, events: &[], transport: &tr };

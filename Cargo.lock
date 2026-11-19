@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-ai"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-app"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-ai",
  "aitrack-dsp",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-dsp"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "realfft",
  "signalsmith-stretch",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-engine"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-host"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-library"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-ai",
  "aitrack-model",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-mcp"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-ai",
  "aitrack-model",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-model"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-splice"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-stock"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-dsp",
  "aitrack-model",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "aitrack-update"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "flate2",
  "log",
@@ -8038,7 +8038,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "aitrack-library",
  "anyhow",

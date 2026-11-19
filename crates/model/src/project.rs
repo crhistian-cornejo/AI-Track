@@ -827,11 +827,14 @@ pub struct AudioSource {
 
 impl AudioSource {
     /// Natural length of the file on the source-tick timeline the engine
-    /// plays it on: at `warp.original_bpm` when warped, else at `bpm`.
-    /// 0 when the file's length is unknown.
+    /// plays it on: by its warp markers or at `warp.original_bpm` when
+    /// warped, else at `bpm`. 0 when the file's length is unknown.
     pub fn length_ticks(&self, bpm: f64) -> Tick {
         if self.frames == 0 || self.sample_rate == 0 {
             return 0;
+        }
+        if self.warp.enabled && !self.warp.anchors().is_empty() {
+            return self.warp.tick_at(self.frames as f64, self.sample_rate as f64).map_or(0, |t| t.round().max(0.0) as Tick);
         }
         let bpm = match self.warp.original_bpm {
             Some(original) if self.warp.enabled => original,
@@ -876,6 +879,71 @@ impl Warp {
     /// Warp is off or set to `Re-Pitch`.
     pub fn speed_ratio(&self) -> f64 {
         if !self.enabled || self.mode == WarpMode::Repitch { self.pitch_ratio() } else { 1.0 }
+    }
+
+    /// The markers that bend time, in order: each later in the file and later
+    /// in the music than the one before (any that is not is left out). Fewer
+    /// than two bend nothing, and the result is empty: the file then plays at
+    /// one tempo, [`original_bpm`](Self::original_bpm).
+    pub fn anchors(&self) -> Vec<(u64, Tick)> {
+        let mut sorted = self.markers.clone();
+        sorted.sort_unstable();
+        let mut out: Vec<(u64, Tick)> = Vec::with_capacity(sorted.len());
+        for m in sorted {
+            if out.last().is_none_or(|l| m.0 > l.0 && m.1 > l.1) {
+                out.push(m);
+            }
+        }
+        if out.len() < 2 {
+            out.clear();
+        }
+        out
+    }
+
+    /// Frame of a file at `rate` that source tick `tick` plays: along the
+    /// line between the two markers around it, and beyond the first and last
+    /// marker at the pace of the stretch next to them. Without markers (see
+    /// [`anchors`](Self::anchors)) the file runs at `original_bpm` from its
+    /// first frame; `None` when that is not known either.
+    pub fn frame_at(&self, tick: f64, rate: f64) -> Option<f64> {
+        let a = self.anchors();
+        if a.is_empty() {
+            let bpm = self.original_bpm.filter(|b| *b > 0.0)?;
+            return Some(tick * rate * 60.0 / (bpm * PPQ as f64));
+        }
+        let k = a.windows(2).position(|w| tick <= w[1].1 as f64).unwrap_or(a.len() - 2);
+        let ((f0, t0), (f1, t1)) = (a[k], a[k + 1]);
+        Some(f0 as f64 + (f1 - f0) as f64 * (tick - t0 as f64) / (t1 - t0) as f64)
+    }
+
+    /// The source tick that `frame` of a file at `rate` plays at: the inverse
+    /// of [`frame_at`](Self::frame_at).
+    pub fn tick_at(&self, frame: f64, rate: f64) -> Option<f64> {
+        let a = self.anchors();
+        if a.is_empty() {
+            let bpm = self.original_bpm.filter(|b| *b > 0.0)?;
+            return (rate > 0.0).then(|| frame * bpm * PPQ as f64 / (rate * 60.0));
+        }
+        let k = a.windows(2).position(|w| frame <= w[1].0 as f64).unwrap_or(a.len() - 2);
+        let ((f0, t0), (f1, t1)) = (a[k], a[k + 1]);
+        Some(t0 as f64 + (t1 - t0) as f64 * (frame - f0 as f64) / (f1 - f0) as f64)
+    }
+
+    /// Give the file a new tempo. The markers keep their frames and count
+    /// their beats at the new tempo, so a file with markers is stretched as a
+    /// whole (twice the tempo: the same audio is twice as many beats), as one
+    /// without them is.
+    pub fn set_original_bpm(&mut self, bpm: f64) {
+        if !(bpm.is_finite() && bpm > 0.0) {
+            return;
+        }
+        if let Some(old) = self.original_bpm.filter(|b| *b > 0.0) {
+            let k = bpm / old;
+            for m in &mut self.markers {
+                m.1 = (m.1 as f64 * k).round() as Tick;
+            }
+        }
+        self.original_bpm = Some(bpm);
     }
 }
 
@@ -1361,6 +1429,47 @@ mod opt_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warp_markers_map_ticks_to_frames_and_back() {
+        // No markers: one tempo from the first frame. 120 BPM at 48 kHz is 24 000 frames a beat.
+        let plain = Warp { original_bpm: Some(120.0), ..Warp::default() };
+        assert_eq!(plain.frame_at(PPQ as f64, 48_000.0), Some(24_000.0));
+        assert_eq!(plain.tick_at(48_000.0, 48_000.0), Some(2.0 * PPQ as f64));
+        assert_eq!(Warp::default().frame_at(0.0, 48_000.0), None, "no tempo, no map");
+        // One marker bends nothing.
+        let one = Warp { markers: vec![(1_000, PPQ)], ..plain.clone() };
+        assert!(one.anchors().is_empty());
+        assert_eq!(one.frame_at(PPQ as f64, 48_000.0), Some(24_000.0));
+        // A beat played late and the next one early: the line between the markers, and its pace beyond them.
+        let bent = Warp { markers: vec![(48_000, 2 * PPQ), (24_500, PPQ), (71_000, 3 * PPQ)], ..plain };
+        assert_eq!(bent.anchors(), vec![(24_500, PPQ), (48_000, 2 * PPQ), (71_000, 3 * PPQ)], "kept in order");
+        assert_eq!(bent.frame_at(1.5 * PPQ as f64, 48_000.0), Some(36_250.0));
+        assert_eq!(bent.frame_at(0.0, 48_000.0), Some(1_000.0), "before the first marker at the first stretch's pace");
+        assert_eq!(bent.frame_at(4.0 * PPQ as f64, 48_000.0), Some(94_000.0), "after the last at the last one's");
+        for frame in [0.0, 10_000.0, 24_500.0, 40_000.0, 60_000.0, 90_000.0] {
+            let tick = bent.tick_at(frame, 48_000.0).unwrap();
+            assert!((bent.frame_at(tick, 48_000.0).unwrap() - frame).abs() < 1e-6, "{frame}");
+        }
+        // A marker that goes back in the music is not an anchor.
+        let odd = Warp { markers: vec![(100, 10), (200, 5), (300, 20)], ..Warp::default() };
+        assert_eq!(odd.anchors(), vec![(100, 10), (300, 20)]);
+    }
+
+    #[test]
+    fn a_new_tempo_takes_the_markers_with_it() {
+        let mut w = Warp { original_bpm: Some(100.0), markers: vec![(0, 0), (48_000, 2 * PPQ)], ..Warp::default() };
+        let frame = w.frame_at(PPQ as f64, 48_000.0);
+        w.set_original_bpm(200.0);
+        assert_eq!(w.markers, vec![(0, 0), (48_000, 4 * PPQ)], "the same audio is twice as many beats");
+        assert_eq!(w.frame_at(2.0 * PPQ as f64, 48_000.0), frame, "and every frame keeps its place in it");
+        w.set_original_bpm(f64::NAN);
+        w.set_original_bpm(0.0);
+        assert_eq!(w.original_bpm, Some(200.0));
+        let mut fresh = Warp { markers: vec![(0, 0), (10, 10)], ..Warp::default() };
+        fresh.set_original_bpm(90.0);
+        assert_eq!((fresh.original_bpm, fresh.markers.len()), (Some(90.0), 2), "a first tempo scales nothing");
+    }
 
     #[test]
     fn rack_chain_device_params_round_trip() {

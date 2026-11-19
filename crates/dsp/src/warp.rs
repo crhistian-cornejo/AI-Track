@@ -796,6 +796,130 @@ pub fn warp_audio_with(
     }
 }
 
+// ───────────────────────────── Warp along markers ─────────────────────────────
+
+/// How far before a marker its stretch ends, seconds. Markers sit on beats,
+/// and so on attacks: the cut between two stretches goes in the quiet just
+/// before the hit, where the cross-fade cannot double it.
+const MARKER_LEAD: f64 = 0.012;
+/// Half the cross-fade between two stretches, seconds.
+const MARKER_FADE: f64 = 0.004;
+/// Audio rendered around each stretch so its edges have their surroundings, frames.
+const MARKER_CONTEXT: usize = 4096;
+
+/// The anchors of a time map in order: each later in the file and later in
+/// the render than the one before, none past the end of the file.
+fn clean_anchors(anchors: &[(usize, usize)], in_len: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(anchors.len());
+    for &(i, o) in anchors {
+        if i > in_len {
+            continue;
+        }
+        if out.last().is_none_or(|l| i > l.0 && o > l.1) {
+            out.push((i, o));
+        }
+    }
+    out
+}
+
+/// Offline warp along a time map: frame `anchors[k].0` of the input lands on
+/// frame `anchors[k].1` of the output, and the audio between two anchors is
+/// stretched to fit (each stretch by its own factor, so a tempo that drifts
+/// comes out straight). The output is as long as the last anchor says; before
+/// the first one it is silent. `pitch_ratio` transposes the whole as in
+/// [`warp_audio`].
+///
+/// One factor throughout is a single [`warp_audio`] of the span. Re-Pitch
+/// reads every output frame at its place on the map. The other modes render
+/// each stretch with its surroundings and join them with a short cross-fade
+/// placed just before the anchor's attack.
+pub fn warp_audio_mapped(channels: &[&[f32]], sample_rate: u32, algo: WarpAlgorithm, anchors: &[(usize, usize)], pitch_ratio: f64, stretcher: Stretcher) -> Vec<Vec<f32>> {
+    let in_len = channels.first().map_or(0, |c| c.len());
+    let pts = clean_anchors(anchors, in_len);
+    if in_len == 0 || sample_rate == 0 || pts.len() < 2 {
+        return channels.iter().map(|_| Vec::new()).collect();
+    }
+    let (first, last) = (pts[0], pts[pts.len() - 1]);
+    let out_len = last.1;
+    let mut out: Vec<Vec<f32>> = channels.iter().map(|_| vec![0.0f32; out_len]).collect();
+    let place = |out: &mut [Vec<f32>], piece: &[Vec<f32>], at: usize, len: usize| {
+        for (dst, src) in out.iter_mut().zip(piece) {
+            let n = len.min(src.len()).min(dst.len().saturating_sub(at));
+            dst[at..at + n].copy_from_slice(&src[..n]);
+        }
+    };
+    let overall = (last.1 - first.1) as f64 / (last.0 - first.0) as f64;
+    let straight = pts.iter().all(|&(i, o)| ((first.1 as f64 + (i - first.0) as f64 * overall) - o as f64).abs() <= 1.0);
+    if straight {
+        let span: Vec<&[f32]> = channels.iter().map(|c| &c[first.0..last.0]).collect();
+        let piece = warp_audio_with(&span, sample_rate, algo, overall, pitch_ratio, None, stretcher);
+        place(&mut out, &piece, first.1, last.1 - first.1);
+        return out;
+    }
+    if algo == WarpAlgorithm::Repitch {
+        for w in pts.windows(2) {
+            let ((i0, o0), (i1, o1)) = (w[0], w[1]);
+            let step = (i1 - i0) as f64 / (o1 - o0) as f64;
+            for (dst, src) in out.iter_mut().zip(channels) {
+                for (k, v) in dst[o0..o1].iter_mut().enumerate() {
+                    *v = read_cubic(src, i0 as f64 + k as f64 * step);
+                }
+            }
+        }
+        return out;
+    }
+
+    // Where one stretch hands over to the next: a little before each inner anchor.
+    let lead = (MARKER_LEAD * sample_rate as f64) as usize;
+    let fade = ((MARKER_FADE * sample_rate as f64) as usize).max(1);
+    let mut cuts = Vec::with_capacity(pts.len());
+    cuts.push(first);
+    for k in 1..pts.len() - 1 {
+        let (prev, here, next) = (pts[k - 1], pts[k], pts[k + 1]);
+        let scale_next = (next.1 - here.1) as f64 / (next.0 - here.0) as f64;
+        // Never further back than a third of the stretch it is taken from.
+        let back = lead.min((here.0 - prev.0) / 3);
+        let cut = (here.0 - back, here.1.saturating_sub((back as f64 * scale_next).round() as usize));
+        let before = cuts[cuts.len() - 1];
+        if cut.0 > before.0 && cut.1 > before.1 {
+            cuts.push(cut);
+        }
+    }
+    let before = cuts[cuts.len() - 1];
+    if last.0 > before.0 && last.1 > before.1 {
+        cuts.push(last);
+    }
+    let n = cuts.len() - 1;
+    for k in 0..n {
+        let ((i0, o0), (i1, o1)) = (cuts[k], cuts[k + 1]);
+        let (want, scale) = (o1 - o0, (o1 - o0) as f64 / (i1 - i0) as f64);
+        let (pre, post) = (MARKER_CONTEXT.min(i0), MARKER_CONTEXT.min(in_len - i1));
+        let chunk: Vec<&[f32]> = channels.iter().map(|c| &c[i0 - pre..i1 + post]).collect();
+        let piece = warp_audio_with(&chunk, sample_rate, algo, scale, pitch_ratio, None, stretcher);
+        let core = (pre as f64 * scale).round() as isize;
+        // The cross-fade reaches `fade` frames either side of a cut, where both stretches have audio.
+        let f = fade.min(want / 2) as isize;
+        let (head, tail) = (if k > 0 { f } else { 0 }, if k + 1 < n { f } else { 0 });
+        for (dst, src) in out.iter_mut().zip(&piece) {
+            for o in -head..want as isize + tail {
+                let (from, to) = (core + o, o0 as isize + o);
+                if from < 0 || from as usize >= src.len() || to < 0 || to as usize >= dst.len() {
+                    continue;
+                }
+                let gain = if o < head {
+                    (o + head) as f32 / (2 * head) as f32
+                } else if o >= want as isize - tail {
+                    1.0 - (o - (want as isize - tail)) as f32 / (2 * tail) as f32
+                } else {
+                    1.0
+                };
+                dst[to as usize] += src[from as usize] * gain;
+            }
+        }
+    }
+    out
+}
+
 // ───────────────────── Allocation-Free Real-Time Warp Readers ─────────────────────
 
 /// Stateless, zero-allocation transient-slice reader for dynamic live BPM changes
@@ -896,6 +1020,86 @@ pub fn sample_warped_grain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short decaying burst at each of `at` (frames): something every mode keeps as an attack.
+    fn hits(at: &[usize], len: usize, sr: u32) -> Vec<f32> {
+        let mut x = vec![0.0f32; len];
+        for &a in at {
+            for i in 0..(sr as usize / 20).min(len.saturating_sub(a)) {
+                let t = i as f32 / sr as f32;
+                x[a + i] += (TAU * 180.0 * t).sin() * (-t * 60.0).exp() * 0.8;
+            }
+        }
+        x
+    }
+
+    /// Where each attack of `x` is: the first frame of every burst above a tenth of the peak.
+    fn attacks(x: &[f32], sr: u32) -> Vec<usize> {
+        let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let gap = sr as usize / 8;
+        let mut out: Vec<usize> = Vec::new();
+        for (i, v) in x.iter().enumerate() {
+            if v.abs() > 0.25 * peak && out.last().is_none_or(|l| i > l + gap) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_drifting_file_comes_out_straight_in_every_mode() {
+        let sr = 48_000u32;
+        // Eight beats that slow down: 0.50 s apart at first, 0.60 s at the end.
+        let mut at = vec![2_400usize];
+        for k in 0..8 {
+            at.push(at[k] + ((0.50 + 0.0125 * k as f64) * sr as f64) as usize);
+        }
+        let len = at[8] + sr as usize / 2;
+        let x = hits(&at, len, sr);
+        // Each beat is wanted exactly half a second after the one before.
+        let anchors: Vec<(usize, usize)> = at.iter().enumerate().map(|(k, &a)| (a, 2_400 + k * 24_000)).collect();
+        for algo in [WarpAlgorithm::Repitch, WarpAlgorithm::Beats, WarpAlgorithm::Tones, WarpAlgorithm::Complex] {
+            let out = warp_audio_mapped(&[&x], sr, algo, &anchors, 1.0, Stretcher::default());
+            assert_eq!(out[0].len(), anchors[8].1, "{algo:?}: as long as the last anchor says");
+            let found = attacks(&out[0], sr);
+            assert!(found.len() >= 8, "{algo:?}: {} attacks", found.len());
+            for (k, want) in anchors.iter().take(8).map(|a| a.1).enumerate() {
+                let off = found.iter().map(|f| (*f as i64 - want as i64).abs()).min().unwrap();
+                // Tones (WSOLA) sets each grain within its search window, 7 ms, in a plain stretch too.
+                let limit_ms = if algo == WarpAlgorithm::Tones { 10 } else { 6 };
+                assert!(off < sr as i64 * limit_ms / 1000, "{algo:?}: beat {k} is {} ms off", off as f64 * 1000.0 / sr as f64);
+            }
+            // The cross-fades leave no hole and no bump: the level between two beats stays that of a decaying hit.
+            assert!(out[0].iter().all(|v| v.is_finite() && v.abs() < 1.2), "{algo:?}");
+        }
+    }
+
+    #[test]
+    fn a_straight_map_is_the_plain_stretch_of_its_span() {
+        let sr = 48_000u32;
+        let x = sine(sr, 220.0, 2.0);
+        // Two anchors: the second half of the file, at 80 % of its length, from frame 1000 of the render.
+        let anchors = [(48_000usize, 1_000usize), (96_000, 39_400)];
+        let out = warp_audio_mapped(&[&x], sr, WarpAlgorithm::Tones, &anchors, 1.0, Stretcher::default());
+        assert_eq!(out[0].len(), 39_400);
+        assert!(out[0][..1_000].iter().all(|v| *v == 0.0), "silent before the first anchor");
+        let plain = warp_audio(&[&x[48_000..]], sr, WarpAlgorithm::Tones, 0.8, 1.0, None);
+        assert_eq!(&out[0][1_000..], &plain[0][..38_400]);
+        // Three anchors on one line are still one stretch.
+        let three = [(48_000usize, 1_000usize), (72_000, 20_200), (96_000, 39_400)];
+        assert_eq!(warp_audio_mapped(&[&x], sr, WarpAlgorithm::Tones, &three, 1.0, Stretcher::default()), out);
+    }
+
+    #[test]
+    fn anchors_out_of_order_or_too_few_are_handled() {
+        let sr = 48_000u32;
+        let x = sine(sr, 220.0, 1.0);
+        assert!(warp_audio_mapped(&[&x], sr, WarpAlgorithm::Beats, &[(0, 0)], 1.0, Stretcher::default())[0].is_empty());
+        // The anchor that goes back and the one past the end of the file are left out.
+        assert_eq!(clean_anchors(&[(0, 0), (20_000, 30_000), (10_000, 40_000), (30_000, 45_000), (99_999, 60_000)], 48_000), vec![(0, 0), (20_000, 30_000), (30_000, 45_000)]);
+        let out = warp_audio_mapped(&[&x], sr, WarpAlgorithm::Repitch, &[(0, 0), (24_000, 30_000), (48_000, 48_000)], 1.0, Stretcher::default());
+        assert_eq!(out[0].len(), 48_000);
+    }
 
     fn sine(sr: u32, hz: f32, secs: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;

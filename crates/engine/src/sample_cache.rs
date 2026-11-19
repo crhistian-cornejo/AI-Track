@@ -9,7 +9,7 @@
 //! ([`interpolate`] over a [`FrameSource`]), so a streamed file sounds
 //! bit-identical to the same file in RAM.
 
-use aitrack_dsp::warp::{detect_transients, warp_audio, WarpAlgorithm};
+use aitrack_dsp::warp::{detect_transients, warp_audio, warp_audio_mapped, Stretcher, WarpAlgorithm};
 use aitrack_model::WarpMode;
 use crossbeam_channel::{unbounded, Sender};
 use std::collections::HashMap;
@@ -432,15 +432,27 @@ enum WarpState {
     Failed,
 }
 
+/// A time map for a render: `(frame of the source, frame of the render)`
+/// anchors, rising. The audio between two anchors is stretched to fit.
+pub(crate) type WarpMap = Arc<[(usize, usize)]>;
+
+/// How a render's time follows its source's: one factor for the whole file,
+/// or anchors (a file with warp markers).
+#[derive(Clone, PartialEq)]
+enum Shape {
+    /// The bits of the exact factor: a render made for a nearby one would drift.
+    Scale(u64),
+    Map(WarpMap),
+}
+
 /// One stretched render. The source is told apart by its allocation, not by
 /// its content: the weak handle keeps that allocation (not the samples)
-/// alive, so no other file can ever take its address. The stretch is the
-/// exact factor: a render made for a nearby one would drift.
+/// alive, so no other file can ever take its address.
 struct WarpEntry {
     src: Weak<DecodedAudio>,
     mode: WarpMode,
     pitch_cents: i32,
-    time_scale_bits: u64,
+    shape: Shape,
     state: WarpState,
 }
 
@@ -449,8 +461,8 @@ impl WarpEntry {
         std::ptr::eq(self.src.as_ptr(), src) && self.mode == mode && self.pitch_cents == pitch_cents
     }
 
-    fn is_for(&self, src: *const DecodedAudio, mode: WarpMode, pitch_cents: i32, time_scale_bits: u64) -> bool {
-        self.same_source(src, mode, pitch_cents) && self.time_scale_bits == time_scale_bits
+    fn is_for(&self, src: *const DecodedAudio, mode: WarpMode, pitch_cents: i32, shape: &Shape) -> bool {
+        self.same_source(src, mode, pitch_cents) && self.shape == *shape
     }
 
     fn bytes(&self) -> usize {
@@ -553,27 +565,25 @@ fn warp_algo(mode: WarpMode) -> WarpAlgorithm {
     }
 }
 
-/// Stretch and pitch-shift a whole file. Slow (whole seconds for a long
-/// file): never on the control or the audio thread when a loader is running.
-fn render_warp(src: &DecodedAudio, mode: WarpMode, time_scale: f64, pitch_ratio: f64) -> Warped {
-    // A streamed source is read whole for the render (the render is kept in
-    // RAM, as for any other file); the copy goes when it is done.
-    let whole;
-    let src = match &src.stream {
+/// `src` with its samples in memory: a streamed source is read whole for the
+/// render (the render is kept in RAM, as for any other file); the copy goes
+/// when the render is done.
+fn in_memory<R>(src: &DecodedAudio, render: impl FnOnce(&DecodedAudio) -> R) -> R {
+    match &src.stream {
         Some(f) => {
             let channels = f.read_all().unwrap_or_else(|e| {
                 log::warn!("time-stretching {}: {e}", f.path().display());
                 vec![vec![0.0; f.frames()]; f.channels()]
             });
-            whole = DecodedAudio { source_rate: src.source_rate, ..DecodedAudio::from_planar(channels, src.sample_rate) };
-            &whole
+            render(&DecodedAudio { source_rate: src.source_rate, ..DecodedAudio::from_planar(channels, src.sample_rate) })
         }
-        None => src,
-    };
-    let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
-    let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
-    let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
-    let mut warped_audio = DecodedAudio::from_planar(warped_channels, src.sample_rate);
+        None => render(src),
+    }
+}
+
+/// A finished render as the cache keeps it, with the transients Beats mode plays by.
+fn finish_warp(channels: Vec<Vec<f32>>, src: &DecodedAudio, mode: WarpMode) -> Warped {
+    let mut warped_audio = DecodedAudio::from_planar(channels, src.sample_rate);
     warped_audio.source_rate = src.source_rate;
     let warped_arc = Arc::new(warped_audio);
     let transients: Arc<[usize]> = Arc::from(if mode == WarpMode::Beats {
@@ -585,14 +595,42 @@ fn render_warp(src: &DecodedAudio, mode: WarpMode, time_scale: f64, pitch_ratio:
     (warped_arc, transients)
 }
 
+/// Stretch and pitch-shift a whole file. Slow (whole seconds for a long
+/// file): never on the control or the audio thread when a loader is running.
+fn render_warp(src: &DecodedAudio, mode: WarpMode, time_scale: f64, pitch_ratio: f64) -> Warped {
+    in_memory(src, |src| {
+        let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
+        let trans_vec = if mode == WarpMode::Beats { detect_transients(&refs, src.sample_rate) } else { Vec::new() };
+        let warped_channels = warp_audio(&refs, src.sample_rate, warp_algo(mode), time_scale, pitch_ratio, (!trans_vec.is_empty()).then_some(trans_vec.as_slice()));
+        finish_warp(warped_channels, src, mode)
+    })
+}
+
+/// [`render_warp`] along a time map: the file's warp markers, each stretch by its own factor.
+fn render_warp_mapped(src: &DecodedAudio, mode: WarpMode, map: &[(usize, usize)], pitch_ratio: f64) -> Warped {
+    in_memory(src, |src| {
+        let refs: Vec<&[f32]> = src.channels.iter().map(Vec::as_slice).collect();
+        finish_warp(warp_audio_mapped(&refs, src.sample_rate, warp_algo(mode), map, pitch_ratio, Stretcher::default()), src, mode)
+    })
+}
+
 /// A stretch waiting for the warp worker. It holds its source, so the file
 /// cannot go away mid-render.
 struct WarpJob {
     src: Arc<DecodedAudio>,
     mode: WarpMode,
-    time_scale: f64,
+    shape: Shape,
     pitch_ratio: f64,
     pitch_cents: i32,
+}
+
+/// Render `shape` of `src`: one factor goes through `warper` (swapped out in
+/// tests), a time map through the mapped render.
+fn render_shape(warper: &Warper, src: &DecodedAudio, mode: WarpMode, shape: &Shape, pitch_ratio: f64) -> Warped {
+    match shape {
+        Shape::Scale(bits) => warper(src, mode, f64::from_bits(*bits), pitch_ratio),
+        Shape::Map(map) => render_warp_mapped(src, mode, map, pitch_ratio),
+    }
 }
 
 /// Shared cache of decoded files keyed by `(path, rate)` and of their
@@ -663,16 +701,15 @@ impl SampleCache {
         let budget_bg = budget.clone();
         let spawned = std::thread::Builder::new().name("aitrack-warp-worker".into()).spawn(move || {
             while let Ok(job) = warp_rx.recv() {
-                let bits = job.time_scale.to_bits();
                 let src_ptr = Arc::as_ptr(&job.src);
                 let wanted = |st: &CacheState| {
-                    st.warps.iter().any(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, bits) && matches!(w.state, WarpState::Computing))
+                    st.warps.iter().any(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, &job.shape) && matches!(w.state, WarpState::Computing))
                 };
                 // A newer stretch of the same clip replaced this one while it waited.
                 if !wanted(&map.lock().unwrap_or_else(|p| p.into_inner())) {
                     continue;
                 }
-                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(&job.src, job.mode, job.time_scale, job.pitch_ratio)));
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_shape(&render, &job.src, job.mode, &job.shape, job.pitch_ratio)));
                 {
                     let mut st = map.lock().unwrap_or_else(|p| p.into_inner());
                     st.clock = st.clock.saturating_add(1);
@@ -685,7 +722,7 @@ impl SampleCache {
                             WarpState::Failed
                         }
                     };
-                    if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, bits) && matches!(w.state, WarpState::Computing)) {
+                    if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(src_ptr, job.mode, job.pitch_cents, &job.shape) && matches!(w.state, WarpState::Computing)) {
                         w.state = state;
                     }
                     let limit = budget_bg.load(std::sync::atomic::Ordering::Relaxed);
@@ -777,13 +814,23 @@ impl SampleCache {
         if (time_scale - 1.0).abs() < 1e-4 && (pitch_ratio - 1.0).abs() < 1e-4 {
             return Some((src.clone(), Arc::from([])));
         }
-        let bits = time_scale.to_bits();
+        self.warped_as(src, mode, Shape::Scale(time_scale.to_bits()), pitch_ratio, pitch_cents)
+    }
+
+    /// [`warped`](Self::warped) along a time map (see [`WarpMap`]): the render
+    /// of a file with warp markers, each stretch between two of them by its
+    /// own factor. Cached and rendered in the background like any other.
+    pub(crate) fn warped_mapped(&self, src: &Arc<DecodedAudio>, mode: WarpMode, map: WarpMap, pitch_ratio: f64, pitch_cents: i32) -> Option<Warped> {
+        self.warped_as(src, mode, Shape::Map(map), pitch_ratio, pitch_cents)
+    }
+
+    fn warped_as(&self, src: &Arc<DecodedAudio>, mode: WarpMode, shape: Shape, pitch_ratio: f64, pitch_cents: i32) -> Option<Warped> {
         let ptr = Arc::as_ptr(src);
         {
             let mut st = self.lock();
             st.clock = st.clock.saturating_add(1);
             let now = st.clock;
-            if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(ptr, mode, pitch_cents, bits)) {
+            if let Some(w) = st.warps.iter_mut().find(|w| w.is_for(ptr, mode, pitch_cents, &shape)) {
                 return match &mut w.state {
                     WarpState::Ready { audio, transients, used } => {
                         *used = now;
@@ -796,15 +843,15 @@ impl SampleCache {
                 // Only the latest stretch of a clip is worth rendering: drop
                 // the ones still waiting for the same source and mode.
                 st.warps.retain(|w| !(w.same_source(ptr, mode, pitch_cents) && matches!(w.state, WarpState::Computing)));
-                let state = match tx.send(WarpJob { src: src.clone(), mode, time_scale, pitch_ratio, pitch_cents }) {
+                let state = match tx.send(WarpJob { src: src.clone(), mode, shape: shape.clone(), pitch_ratio, pitch_cents }) {
                     Ok(()) => WarpState::Computing,
                     Err(_) => WarpState::Failed,
                 };
-                st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, time_scale_bits: bits, state });
+                st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, shape, state });
                 return None;
             }
         }
-        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.warper)(src, mode, time_scale, pitch_ratio)));
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_shape(&self.warper, src, mode, &shape, pitch_ratio)));
         let mut st = self.lock();
         st.clock = st.clock.saturating_add(1);
         let used = st.clock;
@@ -815,7 +862,7 @@ impl SampleCache {
                 (WarpState::Failed, None)
             }
         };
-        st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, time_scale_bits: bits, state });
+        st.warps.push(WarpEntry { src: Arc::downgrade(src), mode, pitch_cents, shape, state });
         let limit = self.budget_bytes();
         st.trim(limit);
         out

@@ -135,7 +135,7 @@ fn rel(a: f32, b: f32) -> f32 {
 }
 
 /// Raw signal tempo and confidence.
-fn signal_bpm(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
+pub(crate) fn signal_bpm(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
     let x = if sample_rate == ANALYSIS_RATE {
         samples.to_vec()
     } else {

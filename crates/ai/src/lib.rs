@@ -15,6 +15,7 @@
 
 pub mod analysis;
 pub mod audio;
+pub mod beats;
 pub mod chords;
 pub mod clap;
 pub mod classify;
@@ -36,6 +37,7 @@ pub mod theory;
 pub mod worker;
 
 pub use analysis::{RootNote, SampleAnalysis, analyze, analyze_audio};
+pub use beats::{AutoWarp, BeatGrid, BeatOptions, auto_warp, auto_warp_file, track_beats};
 pub use chords::{ChordSegment, detect_chords};
 pub use clap::{CLAP_EMBEDDING_DIM, CLAP_EMBEDDING_ID, CLAP_EMBEDDING_VERSION, Clap};
 pub use classify::SampleCategory;

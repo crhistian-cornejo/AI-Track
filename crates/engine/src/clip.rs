@@ -312,7 +312,51 @@ impl AudioClipData {
         // Only the very same tempo: any difference, however small, drifts
         // when the file is read frame by frame instead of by the grid.
         let at_tempo = warped && project_bpm > 0.0 && original_bpm == project_bpm;
+        // Warp markers: the file does not run at one tempo. It is rendered
+        // along them so that it does, and from there on plays like any other.
+        let anchors = if warped { warp.anchors() } else { Vec::new() };
+        if !anchors.is_empty()
+            && let Some(ref src) = audio
+            && src.frames > 0
+            && project_bpm > 0.0
+        {
+            if pitch_preserving {
+                // One pass: straight and at the project tempo, transposed.
+                let map = time_map(&anchors, src, project_bpm);
+                let pitch_cents = (warp.pitch() * 100.0).round() as i32;
+                if let Some((warped_audio, transients)) = warps.warped_mapped(src, warp.mode, map, warp.pitch_ratio(), pitch_cents) {
+                    return Self {
+                        audio: Some(warped_audio),
+                        warped: true,
+                        original_bpm: project_bpm,
+                        ratio: 1.0,
+                        mode: warp.mode,
+                        pitch_preserving: true,
+                        transients,
+                        reverse: warp.reverse,
+                        unity: false,
+                        stream: None,
+                    };
+                }
+                // Still rendering: Re-Pitch at the file's tempo below, markers ignored meanwhile.
+            } else if let Some((straight, _)) = warps.warped_mapped(src, WarpMode::Repitch, time_map(&anchors, src, original_bpm), 1.0, 0) {
+                // Re-Pitch: the file resampled onto its own tempo, then read by the grid as ever.
+                return Self {
+                    audio: Some(straight),
+                    warped: true,
+                    original_bpm,
+                    ratio: warp.pitch_ratio(),
+                    mode: warp.mode,
+                    pitch_preserving: false,
+                    transients: Arc::from([]),
+                    reverse: warp.reverse,
+                    unity: false,
+                    stream: None,
+                };
+            }
+        }
         if pitch_preserving
+            && anchors.is_empty()
             && let Some(ref src) = audio
             && src.frames > 0
             && project_bpm > 0.0
@@ -438,6 +482,35 @@ impl AudioClipData {
             source_tick * unwarped_spt
         }
     }
+}
+
+/// The time map that renders `src` straight at `bpm` from its warp markers
+/// (`anchors`: file frame and source tick, see [`aitrack_model::Warp::anchors`]):
+/// every marker's frame, in the decoded file's own rate, against the frame its
+/// tick has at `bpm`. The render starts at source tick 0 and ends where the
+/// file does; before the first marker and after the last the file keeps the
+/// pace of the stretch next to it.
+pub(crate) fn time_map(anchors: &[(u64, aitrack_model::Tick)], src: &DecodedAudio, bpm: f64) -> crate::sample_cache::WarpMap {
+    let to_decoded = src.sample_rate as f64 / src.source_rate.max(1) as f64;
+    let frames_per_tick = src.sample_rate as f64 * 60.0 / (bpm * PPQ as f64);
+    let mut pts: Vec<(f64, f64)> = anchors.iter().filter(|a| a.1 >= 0).map(|&(frame, tick)| (frame as f64 * to_decoded, tick as f64 * frames_per_tick)).collect();
+    if pts.len() >= 2 {
+        let (a, b) = (pts[0], pts[1]);
+        let pace = (b.1 - a.1) / (b.0 - a.0);
+        // Source tick 0 is the render's first frame: the file frame that lands there, or silence up to its first one.
+        let at_zero = a.0 - a.1 / pace;
+        let head = if at_zero >= 0.0 { (at_zero, 0.0) } else { (0.0, a.1 - a.0 * pace) };
+        if head.0 < a.0 - 0.5 && head.1 < a.1 - 0.5 {
+            pts.insert(0, head);
+        }
+        let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+        let pace = (b.1 - a.1) / (b.0 - a.0);
+        let end = src.frames as f64;
+        if end > b.0 + 0.5 {
+            pts.push((end, b.1 + (end - b.0) * pace));
+        }
+    }
+    pts.into_iter().map(|(i, o)| (i.round().max(0.0) as usize, o.round().max(0.0) as usize)).collect()
 }
 
 /// Interpolation of clips read faster than the file's own speed.
@@ -1558,6 +1631,81 @@ mod tests {
             assert!((hz - 880.0).abs() < 45.0, "{mode:?} +12 st expected ~880 Hz, got {hz}");
             assert!(out.iter().all(|v| v.is_finite()));
         }
+    }
+
+    /// A file whose beats slow down, with a warp marker on each: warped, every
+    /// beat plays on the grid, in Re-Pitch and in the stretch modes alike.
+    #[test]
+    fn warp_markers_put_a_drifting_file_on_the_grid() {
+        use aitrack_model::Warp;
+        // Nine hits, 0.50 s apart at first and 0.60 s at the end, the first 50 ms into the file.
+        let mut at = vec![2_400usize];
+        for k in 0..8 {
+            at.push(at[k] + ((0.50 + 0.0125 * k as f64) * 48_000.0) as usize);
+        }
+        let mut data = vec![0.0f32; at[8] + 24_000];
+        for &a in &at {
+            for i in 0..2_400 {
+                let t = i as f32 / 48_000.0;
+                data[a + i] += (std::f32::consts::TAU * 180.0 * t).sin() * (-t * 60.0).exp() * 0.8;
+            }
+        }
+        let audio = Arc::new(DecodedAudio::from_planar(vec![data], 48_000));
+        // At 120 BPM a beat is 24 000 frames: hit k belongs at source tick 96 + k beats (96 ticks are its 50 ms).
+        let markers: Vec<(u64, Tick)> = at.iter().enumerate().map(|(k, &a)| (a as u64, 96 + k as Tick * PPQ)).collect();
+        let attacks = |x: &[f32]| -> Vec<usize> {
+            let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let mut out: Vec<usize> = Vec::new();
+            for (i, v) in x.iter().enumerate() {
+                if v.abs() > 0.25 * peak && out.last().is_none_or(|l| i > l + 6_000) {
+                    out.push(i);
+                }
+            }
+            out
+        };
+        let c = clip(0, 10 * PPQ, None);
+        for mode in [WarpMode::Repitch, WarpMode::Beats, WarpMode::Complex] {
+            let warp = Warp { enabled: true, mode, original_bpm: Some(120.0), markers: markers.clone(), ..Warp::default() };
+            let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&warp, Some(audio.clone()), 120.0));
+            let out = play(&compiled, 120.0, 0, Some(10 * PPQ), 9 * 24_000);
+            let found = attacks(&out);
+            for k in 0..8 {
+                let want = 2_400 + k as i64 * 24_000;
+                let off = found.iter().map(|f| (*f as i64 - want).abs()).min().unwrap_or(i64::MAX);
+                assert!(off < 300, "{mode:?}: beat {k} is {} ms off the grid", off as f64 / 48.0);
+            }
+            // Without the markers the same file drifts: its last beat is some 350 ms late.
+            let plain = Warp { markers: Vec::new(), ..warp };
+            let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&plain, Some(audio.clone()), 120.0));
+            let late = attacks(&play(&compiled, 120.0, 0, Some(10 * PPQ), 9 * 24_000));
+            assert!(late.iter().all(|f| (*f as i64 - (2_400 + 7 * 24_000)).abs() > 4_800), "{mode:?}: the unmarked file is not on the grid");
+        }
+        // At another project tempo the grid moves and the beats with it: 100 BPM is 28 800 frames a beat.
+        let warp = Warp { enabled: true, mode: WarpMode::Beats, original_bpm: Some(120.0), markers, ..Warp::default() };
+        let compiled = CompiledClip::audio(ClipId(1), &c, AudioClipData::of_bpm(&warp, Some(audio), 100.0));
+        let found = attacks(&play(&compiled, 100.0, 0, Some(10 * PPQ), 9 * 28_800));
+        for k in 0..8 {
+            let want = 2_880 + k as i64 * 28_800;
+            let off = found.iter().map(|f| (*f as i64 - want).abs()).min().unwrap_or(i64::MAX);
+            assert!(off < 300, "100 BPM: beat {k} is {} ms off the grid", off as f64 / 48.0);
+        }
+    }
+
+    #[test]
+    fn a_time_map_starts_at_tick_zero_and_ends_with_the_file() {
+        let audio = DecodedAudio::from_planar(vec![vec![0.0; 100_000]], 48_000);
+        // Two markers a beat apart, the file a little slow: 25 000 frames for a beat that is 24 000 at 120 BPM.
+        let map = time_map(&[(10_000, PPQ), (35_000, 2 * PPQ)], &audio, 120.0);
+        // Tick 0 is a beat before the first marker at that pace: the file would have to start 15 000 frames early, so the render waits for it.
+        assert_eq!(map.to_vec(), vec![(0, 14_400), (10_000, 24_000), (35_000, 48_000), (100_000, 110_400)]);
+        // A marker late enough has file to spare before tick 0: the render starts inside the file.
+        let map = time_map(&[(40_000, PPQ), (65_000, 2 * PPQ)], &audio, 120.0);
+        assert_eq!((map[0], map[1]), ((15_000, 0), (40_000, 24_000)));
+        // A file decoded at another rate than its own: marker frames are the file's.
+        let mut resampled = DecodedAudio::from_planar(vec![vec![0.0; 50_000]], 48_000);
+        resampled.source_rate = 96_000;
+        let map = time_map(&[(0, 0), (48_000, PPQ)], &resampled, 120.0);
+        assert_eq!(map.to_vec(), vec![(0, 0), (24_000, 24_000), (50_000, 50_000)]);
     }
 
     #[test]

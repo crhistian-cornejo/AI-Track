@@ -49,9 +49,6 @@ impl Reply {
     }
 }
 
-/// Runs the tools the broker does not know (`generate_part` needs the app's pattern engine).
-pub type Delegate<'a> = dyn FnMut(&mut Session, &Value) -> Result<String, String> + 'a;
-
 struct Live {
     session: Session,
     proposal: u64,
@@ -92,16 +89,11 @@ impl Broker {
     }
 
     /// Run `name` for `client` on the open project.
-    #[allow(clippy::too_many_arguments)]
-    pub fn call(&mut self, project: &mut Project, history: &mut History, selected: Option<TrackId>, client: &str, name: &str, input: &Value, delegate: &mut Delegate<'_>) -> Reply {
+    pub fn call(&mut self, project: &mut Project, history: &mut History, selected: Option<TrackId>, client: &str, name: &str, input: &Value) -> Reply {
         self.settle(history);
-        let run = |s: &mut Session, delegate: &mut Delegate<'_>| match tools::execute(s, name, input) {
+        let run = |s: &mut Session| match tools::execute(s, name, input) {
             Outcome::Ok(t) => (t, false),
             Outcome::Err(e) => (e, true),
-            Outcome::Delegate => match delegate(s, input) {
-                Ok(t) => (t, false),
-                Err(e) => (e, true),
-            },
         };
 
         if tools::is_read(name) {
@@ -109,12 +101,12 @@ impl Broker {
             return match &mut self.live {
                 Some(l) => {
                     l.session.selected = selected;
-                    let (t, e) = run(&mut l.session, delegate);
+                    let (t, e) = run(&mut l.session);
                     Reply::read(t, e)
                 }
                 None => {
                     let mut s = Session::new(project, selected);
-                    let (t, e) = run(&mut s, delegate);
+                    let (t, e) = run(&mut s);
                     Reply::read(t, e)
                 }
             };
@@ -126,7 +118,7 @@ impl Broker {
         };
         session.0.selected = selected;
         let before = session.0.commands.len();
-        let (text, is_error) = run(&mut session.0, delegate);
+        let (text, is_error) = run(&mut session.0);
         let (draft, kept) = session;
         if is_error || draft.commands.len() == before {
             // Nothing changed: put the draft back as it was.
@@ -196,16 +188,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn no_delegate(_: &mut Session, _: &Value) -> Result<String, String> {
-        Err("no pattern engine in tests".into())
-    }
-
     fn setup() -> (Project, History, Broker) {
         (Project::new("t"), History::new(100), Broker::default())
     }
 
     fn call(b: &mut Broker, p: &mut Project, h: &mut History, name: &str, input: Value) -> Reply {
-        b.call(p, h, None, "Claude Desktop", name, &input, &mut no_delegate)
+        b.call(p, h, None, "Claude Desktop", name, &input)
     }
 
     #[test]
@@ -291,6 +279,16 @@ mod tests {
         assert!(o.destructive);
         assert!(p.tracks.iter().any(|t| t.name == "Bass"), "still there");
         assert!(r.text.contains("approval"));
+    }
+
+    #[test]
+    fn generate_part_runs_in_the_broker_itself() {
+        let (mut p, mut h, mut b) = setup();
+        call(&mut b, &mut p, &mut h, "create_track", json!({ "name": "Bass" }));
+        let r = call(&mut b, &mut p, &mut h, "generate_part", json!({ "kind": "bass", "track": "Bass" }));
+        assert!(!r.is_error, "{}", r.text);
+        let Effect::Offered(o) = r.effect else { panic!("{:?}", r.effect) };
+        assert_eq!(o.summary.len(), 2);
     }
 
     #[test]

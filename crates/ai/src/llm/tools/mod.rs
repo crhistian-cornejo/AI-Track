@@ -6,6 +6,7 @@
 
 mod edit;
 mod inspect;
+mod part;
 pub mod refs;
 
 use std::sync::OnceLock;
@@ -52,12 +53,7 @@ impl Session {
 pub enum Outcome {
     Ok(String),
     Err(String),
-    /// A tool the app runs itself (`generate_part`).
-    Delegate,
 }
-
-/// The tools the app runs itself.
-pub const DELEGATED: &[&str] = &["generate_part"];
 
 /// Run `name` with `input` on the session.
 pub fn execute(s: &mut Session, name: &str, input: &Value) -> Outcome {
@@ -80,11 +76,11 @@ pub fn execute(s: &mut Session, name: &str, input: &Value) -> Outcome {
         "set_sidechain" => edit::set_sidechain(s, input),
         "set_song" => edit::set_song(s, input),
         "write_clip" => edit::write_clip(s, input),
+        "generate_part" => part::generate_part(s, input),
         "copy_clip" => edit::copy_clip(s, input),
         "move_clip" => edit::move_clip(s, input),
         "clear_bars" => edit::clear_bars(s, input),
         "set_automation" => edit::set_automation(s, input),
-        n if DELEGATED.contains(&n) => return Outcome::Delegate,
         other => Err(format!("unknown tool \"{other}\"")),
     };
     match r {
@@ -442,7 +438,18 @@ mod tests {
         assert!(matches!(execute(&mut s, "set_send", &json!({ "track": "Bass", "to": "Kick", "level_db": -10 })), Outcome::Err(_)));
         assert!(matches!(execute(&mut s, "add_device", &json!({ "track": "Nope", "plugin": "EQ" })), Outcome::Err(e) if e.contains("no track")));
         assert_eq!(s.commands.len(), before);
-        assert_eq!(execute(&mut s, "generate_part", &json!({ "kind": "bass" })), Outcome::Delegate);
+    }
+
+    #[test]
+    fn generate_part_writes_into_the_draft() {
+        let mut s = Session::new(&Project::new("t"), None);
+        ok(execute(&mut s, "create_track", &json!({ "name": "Bass" })));
+        let out = ok(execute(&mut s, "generate_part", &json!({ "kind": "bass", "description": "rolling, 2 bars", "track": "Bass" })));
+        assert!(out.starts_with("Bass part, 2 bars"), "{out}");
+        let bass = s.draft.tracks.iter().find(|t| t.name == "Bass").unwrap();
+        assert_eq!(bass.arrangement.len(), 1);
+        assert_eq!(s.changes.len(), 2);
+        assert!(matches!(execute(&mut s, "generate_part", &json!({ "kind": "beat" })), Outcome::Err(e) if e.contains("drum rack")));
     }
 
     #[test]

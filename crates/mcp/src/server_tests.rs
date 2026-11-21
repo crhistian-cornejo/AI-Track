@@ -23,7 +23,7 @@ impl AppGateway for Fake {
         self.clients.lock().push(client.to_owned());
         let mut g = self.state.lock();
         let (p, h, b) = &mut *g;
-        let r = b.call(p, h, None, client, name, &args, &mut |_, _| Err("no pattern engine".into()));
+        let r = b.call(p, h, None, client, name, &args);
         ToolReply { text: r.text, is_error: r.is_error }
     }
 
@@ -32,7 +32,6 @@ impl AppGateway for Fake {
         match uri {
             resources::PROJECT => match aitrack_ai::llm::tools::execute(&mut Session::new(&g.0, None), "get_project", &json!({})) {
                 Outcome::Ok(t) | Outcome::Err(t) => Ok(t),
-                Outcome::Delegate => Err("?".into()),
             },
             resources::PENDING => Ok(g.2.describe_pending(&g.1)),
             _ => Err("no such resource".into()),

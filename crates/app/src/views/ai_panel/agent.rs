@@ -12,8 +12,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use aitrack_ai::generate as gen_core;
-use aitrack_ai::generate::spec::Kind;
 use aitrack_ai::llm::agent::{self as api, AgentEvent, AgentRequest, AgentStream, Effort};
 use aitrack_ai::llm::cli::{self, CliEvent, CliTurn, ModelInfo, Provider, TurnSpec, Vendor};
 use aitrack_ai::llm::tools::{self, Outcome, Question, Session};
@@ -573,18 +571,6 @@ fn begin_tool(r: &mut Reply, name: &str, input: &Value) -> usize {
     }
 }
 
-/// Run one tool on the draft: its result text and whether it worked.
-fn run_tool(s: &mut Session, name: &str, input: &Value) -> (String, bool) {
-    match tools::execute(s, name, input) {
-        Outcome::Ok(t) => (t, true),
-        Outcome::Err(e) => (e, false),
-        Outcome::Delegate => match generate_part(s, input) {
-            Ok(t) => (t, true),
-            Err(e) => (e, false),
-        },
-    }
-}
-
 fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
@@ -669,7 +655,10 @@ fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
                     continue;
                 }
                 let Some(turn) = agent(cx).turn.as_mut() else { return (false, true) };
-                let (text, ok) = run_tool(&mut turn.session, &name, &input);
+                let (text, ok) = match tools::execute(&mut turn.session, &name, &input) {
+                    Outcome::Ok(t) => (t, true),
+                    Outcome::Err(e) => (e, false),
+                };
                 settle_tool(item, step, &text, ok, cx);
                 let _ = reply.send((text, !ok));
             }
@@ -744,7 +733,10 @@ fn step_done(ws: &mut Workspace, item: usize, stop_reason: Option<String>, conte
         let step = with_reply(item, cx, |r| begin_tool(r, &call.name, &input)).unwrap_or(usize::MAX);
         let (text, ok) = match &call.input {
             Err(raw) => (api::invalid_json(raw), false),
-            Ok(input) => run_tool(&mut turn.session, &call.name, input),
+            Ok(input) => match tools::execute(&mut turn.session, &call.name, input) {
+                Outcome::Ok(t) => (t, true),
+                Outcome::Err(e) => (e, false),
+            },
         };
         settle_tool(item, step, &text, ok, cx);
         results.push((call.id.clone(), text, !ok));
@@ -797,35 +789,6 @@ pub fn pick(i: usize, cx: &mut Context<Workspace>) {
 /// Whether a question waits for the user.
 pub fn asking(cx: &mut Context<Workspace>) -> bool {
     agent(cx).pending.is_some()
-}
-
-/// `generate_part`: the pattern engine writes the part into the draft.
-pub(crate) fn generate_part(s: &mut Session, input: &Value) -> Result<String, String> {
-    let kind_s = input.get("kind").and_then(Value::as_str).unwrap_or("bass").to_lowercase();
-    let kind = match kind_s.as_str() {
-        "beat" | "drums" => Kind::Drums,
-        other => Kind::ALL.into_iter().find(|k| k.label().to_lowercase() == other).unwrap_or_default(),
-    };
-    let text = input.get("description").and_then(Value::as_str).unwrap_or_default();
-    let track = match input.get("track").filter(|v| !v.is_null()) {
-        Some(v) => Some(tools::refs::track(&s.draft, v, s.selected)?),
-        None => s.selected,
-    };
-    let prepared = gen_core::part::prepare(&s.draft, track, None, Some(kind), text)?;
-    let seed = prepared.req.seed.unwrap_or_else(seed);
-    let g = gen_core::generate(&prepared.req, &prepared.ctx, seed);
-    if g.draft.notes.is_empty() {
-        return Err("the pattern engine wrote no notes for that; try other words or write_clip".into());
-    }
-    let (cmds, lines) = gen_core::part::commands(&mut s.draft, &g, prepared.dest, prepared.start);
-    let label = format!("{} part, {} bars", prepared.req.kind.label(), prepared.req.bars);
-    s.apply(&label, cmds)?;
-    Ok(format!("{label}. {}", lines.join("; ")))
-}
-
-fn seed() -> u64 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-    gen_core::rng::splitmix64(now)
 }
 
 /// End the turn: settle the reply and offer what changed.

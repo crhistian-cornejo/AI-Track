@@ -45,7 +45,7 @@ impl Workspace {
         match &req.ask {
             Ask::Tool { name, args } => {
                 let s = &mut self.s;
-                let r = self.mcp.broker.call(&mut s.project, &mut s.history, selected, &req.client, name, args, &mut |sess, input| crate::views::ai_panel::generate_part(sess, input));
+                let r = self.mcp.broker.call(&mut s.project, &mut s.history, selected, &req.client, name, args);
                 match r.effect {
                     Effect::Offered(o) => self.mcp_show_offer(o, cx),
                     Effect::Applied { label, origin } => {
@@ -60,7 +60,6 @@ impl Workspace {
                 resources::PROJECT => match tools::execute(&mut Session::new(&self.s.project, selected), "get_project", &serde_json::json!({})) {
                     Outcome::Ok(t) => ToolReply::ok(t),
                     Outcome::Err(e) => ToolReply::err(e),
-                    Outcome::Delegate => ToolReply::err("not available"),
                 },
                 resources::PENDING => ToolReply::ok(self.mcp.broker.describe_pending(&self.s.history)),
                 other => ToolReply::err(format!("no resource {other}")),

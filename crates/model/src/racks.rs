@@ -6,6 +6,12 @@
 //! A rack built by grouping has one chain holding the grouped devices in
 //! their order. It is an instrument rack when one of them is an instrument,
 //! a MIDI Effect Rack when all of them are MIDI effects, an audio rack otherwise.
+//!
+//! Both directions *move* the devices (`Command::MoveDevice`) instead of
+//! taking them out and adding copies back: a move keeps every macro and
+//! modulator mapping that still holds after it (those of a rack the devices
+//! stay inside, and those of modulators on the same track), where a removal
+//! would drop them.
 
 use crate::command::{Command, DeviceSlot};
 use crate::ids::DeviceId;
@@ -89,6 +95,9 @@ pub fn chain(p: &Project, c: Container) -> Option<&[Device]> {
 /// The commands that put `ids` in a new rack `rack` (Cmd+G on devices).
 /// The devices must all sit in one chain; the rack takes the place of the
 /// first of them and keeps their order. `None` when nothing can be grouped.
+///
+/// The rack is added with an empty chain, named after the first device, and
+/// each device is then moved into it.
 pub fn group_commands(p: &Project, ids: &[DeviceId], rack: DeviceId) -> Option<Vec<Command>> {
     let mut picked: Vec<(usize, DeviceId)> = Vec::new();
     let mut home = None;
@@ -105,10 +114,10 @@ pub fn group_commands(p: &Project, ids: &[DeviceId], rack: DeviceId) -> Option<V
     }
     let home = home?;
     picked.sort();
-    let devices: Vec<Device> = picked.iter().map(|&(_, id)| p.device(id).cloned()).collect::<Option<_>>()?;
+    let devices: Vec<&Device> = picked.iter().map(|&(_, id)| p.device(id)).collect::<Option<_>>()?;
     let first = devices.first()?;
     let all_midi = devices.iter().all(|d| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi.")));
-    let kind = if devices.iter().any(Device::is_instrument) {
+    let kind = if devices.iter().any(|d| d.is_instrument()) {
         RackKind::Instrument
     } else if all_midi {
         RackKind::Midi
@@ -116,18 +125,15 @@ pub fn group_commands(p: &Project, ids: &[DeviceId], rack: DeviceId) -> Option<V
         RackKind::Audio
     };
     let mut r = Rack::new(kind);
-    let mut chain = Chain::new(first.name.clone(), Color::palette(0));
-    chain.devices = devices;
-    r.chains.push(chain);
+    r.chains.push(Chain::new(first.name.clone(), Color::palette(0)));
     let (name, plugin_id) = match kind {
         RackKind::Instrument => ("Instrument Rack", "rack.instrument"),
         RackKind::Midi => ("MIDI Effect Rack", "rack.midi"),
         _ => ("Audio Effect Rack", "rack.audio"),
     };
     let device = Device { kind: DeviceKind::Rack(r), ..Device::stock(rack, plugin_id, name) };
-    // Removed from the back so the indices before them hold.
-    let mut cmds: Vec<Command> = picked.iter().rev().map(|&(_, id)| Command::RemoveDevice { id }).collect();
-    cmds.push(Command::AddDevice { slot: home.slot(picked[0].0), device: Box::new(device) });
+    let mut cmds = vec![Command::AddDevice { slot: home.slot(picked[0].0), device: Box::new(device) }];
+    cmds.extend(picked.iter().enumerate().map(|(k, &(_, id))| Command::MoveDevice { id, to: DeviceSlot::Rack { rack, chain: 0, index: k } }));
     Some(cmds)
 }
 
@@ -138,6 +144,8 @@ pub fn can_ungroup(p: &Project, id: DeviceId) -> bool {
 }
 
 /// The commands that dissolve rack `id`: its chain's devices take its place.
+/// Each one is moved to the chain the rack sits in, behind the rack, and the
+/// rack, now empty, is removed.
 pub fn ungroup_commands(p: &Project, id: DeviceId) -> Option<Vec<Command>> {
     if !can_ungroup(p, id) {
         return None;
@@ -146,11 +154,9 @@ pub fn ungroup_commands(p: &Project, id: DeviceId) -> Option<Vec<Command>> {
     let DeviceKind::Rack(r) = &p.device(id)?.kind else { return None };
     let at = index_of(slot);
     let home = Container::of(slot);
-    let mut cmds = vec![Command::RemoveDevice { id }];
     let inner = r.chains.first().map(|c| c.devices.as_slice()).unwrap_or_default();
-    for (i, d) in inner.iter().enumerate() {
-        cmds.push(Command::AddDevice { slot: home.slot(at + i), device: Box::new(d.clone()) });
-    }
+    let mut cmds: Vec<Command> = inner.iter().enumerate().map(|(k, d)| Command::MoveDevice { id: d.id, to: home.slot(at + 1 + k) }).collect();
+    cmds.push(Command::RemoveDevice { id });
     Some(cmds)
 }
 
@@ -211,6 +217,63 @@ mod tests {
         run(&mut p, cmds);
         assert_eq!(names(&p, t), ["EQ", "Comp", "Reverb", "Limiter"]);
         assert!(!can_ungroup(&p, ids[0]));
+    }
+
+    #[test]
+    fn grouping_and_ungrouping_inside_a_rack_keep_the_macro_and_modulator_links() {
+        let (mut p, t, ids) = project(); // EQ, Comp, Reverb, Limiter
+        let outer = p.alloc_device_id();
+        let cmds = group_commands(&p, &[ids[1], ids[2]], outer).unwrap();
+        run(&mut p, cmds);
+        Command::AddMapping { rack: outer, macro_index: 0, index: 0, mapping: MacroMapping { device: ids[1], param: 1, min: 0.2, max: 0.8 } }.apply(&mut p).unwrap();
+        let lfo = p.alloc_device_id();
+        Command::AddDevice { slot: DeviceSlot::Track { track: t, index: 0 }, device: Box::new(Device::stock(lfo, "mod.lfo", "LFO")) }.apply(&mut p).unwrap();
+        Command::AddModMapping { device: lfo, index: 0, mapping: ModMapping::bipolar(ModTarget::Param { device: ids[2], param: 2 }, 0.3) }.apply(&mut p).unwrap();
+        let before = p.clone();
+        let macro_links = |p: &Project| match &p.device(outer).unwrap().kind {
+            DeviceKind::Rack(r) => r.macros[0].mappings.clone(),
+            _ => unreachable!(),
+        };
+        // Group Comp + Reverb into a rack nested in `outer`.
+        let inner = p.alloc_device_id();
+        let cmds = group_commands(&p, &[ids[2], ids[1]], inner).unwrap();
+        let undo = run(&mut p, cmds);
+        assert_eq!(device_slot(&p, inner), Some(DeviceSlot::Rack { rack: outer, chain: 0, index: 0 }));
+        assert_eq!(device_slot(&p, ids[2]), Some(DeviceSlot::Rack { rack: inner, chain: 0, index: 1 }), "signal order kept");
+        assert_eq!(macro_links(&p), macro_links(&before), "the outer macro still drives the Comp");
+        assert_eq!(p.device(lfo).unwrap().mods, before.device(lfo).unwrap().mods, "the LFO still drives the Reverb");
+        // Undo of the grouping is exact.
+        let mut q = p.clone();
+        for c in undo.into_iter().rev() {
+            c.apply(&mut q).unwrap();
+        }
+        q.ids = before.ids.clone();
+        assert_eq!(q, before);
+        // Ungroup puts them back where the rack was, links and all.
+        let cmds = ungroup_commands(&p, inner).unwrap();
+        run(&mut p, cmds);
+        assert_eq!(chain(&p, Container::Rack { rack: outer, chain: 0 }).unwrap().iter().map(|d| d.id).collect::<Vec<_>>(), vec![ids[1], ids[2]]);
+        assert_eq!(macro_links(&p), macro_links(&before));
+        assert_eq!(p.device(lfo).unwrap().mods, before.device(lfo).unwrap().mods);
+        assert_eq!(p.device(inner), None);
+    }
+
+    #[test]
+    fn ungrouping_drops_only_the_dissolved_racks_own_macros_and_undo_restores_them() {
+        let (mut p, t, ids) = project();
+        let rack = p.alloc_device_id();
+        let cmds = group_commands(&p, &[ids[1]], rack).unwrap();
+        run(&mut p, cmds);
+        Command::AddMapping { rack, macro_index: 3, index: 0, mapping: MacroMapping { device: ids[1], param: 0, min: 0.0, max: 1.0 } }.apply(&mut p).unwrap();
+        let before = p.clone();
+        let cmds = ungroup_commands(&p, rack).unwrap();
+        let undo = run(&mut p, cmds);
+        assert_eq!(names(&p, t), ["EQ", "Comp", "Reverb", "Limiter"]);
+        for c in undo.into_iter().rev() {
+            c.apply(&mut p).unwrap();
+        }
+        p.ids = before.ids.clone();
+        assert_eq!(p, before, "undo brings the rack back with its macro mapping");
     }
 
     #[test]

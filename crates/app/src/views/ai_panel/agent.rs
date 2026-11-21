@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use aitrack_ai::llm::agent::{self as api, AgentEvent, AgentRequest, AgentStream, Effort};
+use aitrack_ai::llm::agent::Effort;
 use aitrack_ai::llm::cli::{self, CliEvent, CliTurn, ModelInfo, Provider, TurnSpec, Vendor};
 use aitrack_ai::llm::tools::{self, Outcome, Question, Session};
 use aitrack_ai::llm::{self, context::Focus};
@@ -20,14 +20,12 @@ use aitrack_model::Origin;
 use crossbeam_channel::Sender;
 use gpui::{Context, Global, Task};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::state::{self, Attachment, Backend, Item, Placed, ReplyState};
 use crate::bridge::AgentKind;
 use crate::workspace::{ChatEntry, ProposalStatus, Workspace};
 
-/// Tool rounds one request may take on the API before the agent stops.
-const MAX_ROUNDS: u32 = 40;
 /// How much of a tool's result a reply keeps (and the project file stores).
 const KEEP_RESULT: usize = 4_000;
 
@@ -120,16 +118,11 @@ fn parse_pref(s: &str) -> (Option<Choice>, Option<Effort>) {
     (choice.filter(|c| PROVIDERS.contains(&c.provider)), effort)
 }
 
-enum Engine {
-    Api { system: Vec<String>, messages: Vec<Value>, model: String, stream: Option<AgentStream>, rounds: u32 },
-    Cli(CliTurn),
-}
-
 struct Turn {
     item: usize,
     model_name: String,
     session: Session,
-    engine: Engine,
+    cli: CliTurn,
     _poll: Task<()>,
 }
 
@@ -372,11 +365,6 @@ fn history(items: &[Placed]) -> Vec<(bool, String)> {
     out
 }
 
-/// The conversation as API messages.
-fn api_messages(turns: &[(bool, String)]) -> Vec<Value> {
-    turns.iter().map(|(u, t)| json!({ "role": if *u { "user" } else { "assistant" }, "content": [{ "type": "text", "text": t }] })).collect()
-}
-
 /// The conversation as one prompt for a CLI (each turn starts fresh).
 fn cli_prompt(turns: &[(bool, String)]) -> String {
     let Some(((_, last), earlier)) = turns.split_last() else { return String::new() };
@@ -451,31 +439,10 @@ pub fn submit(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
     let turns = a.read_with(cx, |a, _| history(&a.items));
     let effort = agent(cx).effort;
 
-    let engine = match c.provider {
-        Provider::ClaudeApi => {
-            let mut messages = api_messages(&turns);
-            // The newest user turn gets the screenshots before its text.
-            if let Some(last) = messages.last_mut().filter(|m| m["role"] == "user")
-                && let Some(content) = last["content"].as_array_mut()
-            {
-                let mut all: Vec<Value> = images
-                    .iter()
-                    .map(|(mime, d)| json!({ "type": "image", "source": { "type": "base64", "media_type": mime, "data": base64(d) } }))
-                    .collect();
-                all.append(content);
-                *content = all;
-            }
-            let system = vec![tools::AGENT_PERSONA.to_owned(), project];
-            let stream = api::spawn(AgentRequest { model: c.model.clone(), system: system.clone(), messages: messages.clone(), tools: tools::definitions(), max_tokens: 64_000, effort });
-            Engine::Api { system, messages, model: c.model.clone(), stream: Some(stream), rounds: 0 }
-        }
-        _ => {
-            let mut spec = cli_spec(&c, effort);
-            spec.prompt = format!("{project}\n\n---\n\n{}", cli_prompt(&turns));
-            spec.images = images;
-            Engine::Cli(cli::start(spec))
-        }
-    };
+    let mut spec = cli_spec(&c, effort);
+    spec.prompt = format!("{project}\n\n---\n\n{}", cli_prompt(&turns));
+    spec.images = images;
+    let cli = cli::start(spec);
     agent(cx).warmed = None;
     let item = a.update(cx, |a, _| {
         state::push(
@@ -492,21 +459,9 @@ pub fn submit(ws: &mut Workspace, text: String, cx: &mut Context<Workspace>) {
             }
         }
     });
-    agent(cx).turn = Some(Turn { item, model_name: c.name, session: Session::new(&ws.s.project, selected), engine, _poll: poll });
+    agent(cx).turn = Some(Turn { item, model_name: c.name, session: Session::new(&ws.s.project, selected), cli, _poll: poll });
     state::chat_changed(cx);
     cx.notify();
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
 }
 
 /// Edit the reply of item `item`.
@@ -593,11 +548,10 @@ fn settle_tool(item: usize, step: usize, text: &str, ok: bool, cx: &mut Context<
 
 /// Drain the running turn; `false` once it is over.
 fn poll(ws: &mut Workspace, cx: &mut Context<Workspace>) -> bool {
-    let Some(turn) = agent(cx).turn.as_ref() else { return false };
-    let (keep, changed) = match &turn.engine {
-        Engine::Api { .. } => poll_api(ws, cx),
-        Engine::Cli(_) => poll_cli(ws, cx),
-    };
+    if agent(cx).turn.is_none() {
+        return false;
+    }
+    let (keep, changed) = poll_cli(ws, cx);
     // Only redraw when something arrived: the loaders animate on their own.
     if changed {
         if keep {
@@ -621,7 +575,7 @@ fn drain<T>(rx: &crossbeam_channel::Receiver<T>) -> (Vec<T>, bool) {
 }
 
 fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
-    let Some(Turn { item, engine: Engine::Cli(t), .. }) = agent(cx).turn.as_ref() else { return (false, false) };
+    let Some(Turn { item, cli: t, .. }) = agent(cx).turn.as_ref() else { return (false, false) };
     let item = *item;
     let (events, gone) = drain(&t.events);
     let changed = !events.is_empty() || gone;
@@ -675,84 +629,6 @@ fn poll_cli(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
     (true, changed)
 }
 
-fn poll_api(ws: &mut Workspace, cx: &mut Context<Workspace>) -> (bool, bool) {
-    let Some(Turn { item, engine: Engine::Api { stream: Some(stream), .. }, .. }) = agent(cx).turn.as_ref() else { return (true, false) };
-    let item = *item;
-    let (events, gone) = drain(&stream.events);
-    let changed = !events.is_empty() || gone;
-    for e in events {
-        match e {
-            AgentEvent::Text(t) => {
-                with_reply(item, cx, |r| push_text(r, &t));
-            }
-            AgentEvent::Thinking(t) => {
-                with_reply(item, cx, |r| push_thinking(r, &t));
-            }
-            AgentEvent::ToolStart { name, .. } => {
-                with_reply(item, cx, |r| start_tool(r, &name));
-            }
-            AgentEvent::Done { stop_reason, content, calls } => {
-                step_done(ws, item, stop_reason, content, calls, cx);
-                return (agent(cx).turn.is_some(), true);
-            }
-            AgentEvent::Error(m) => {
-                finish(ws, ReplyState::Failed(m), cx);
-                return (false, true);
-            }
-        }
-    }
-    if gone {
-        finish(ws, ReplyState::Failed("The request ended without an answer.".into()), cx);
-        return (false, true);
-    }
-    (true, changed)
-}
-
-/// One API step ended: run its tools and ask again, or end the turn.
-fn step_done(ws: &mut Workspace, item: usize, stop_reason: Option<String>, content: Vec<Value>, calls: Vec<api::ToolCall>, cx: &mut Context<Workspace>) {
-    with_reply(item, cx, close_thinking);
-    let end = match stop_reason.as_deref() {
-        Some("tool_use") if !calls.is_empty() => None,
-        Some("refusal") => Some(ReplyState::Failed("The model declined to continue with that request.".into())),
-        Some("max_tokens") => Some(ReplyState::Failed("The reply ran out of room before it finished.".into())),
-        _ => Some(ReplyState::Done),
-    };
-    let Some(mut turn) = agent(cx).turn.take() else { return };
-    let Engine::Api { messages, stream, .. } = &mut turn.engine else { return };
-    *stream = None;
-    if !content.is_empty() {
-        messages.push(json!({ "role": "assistant", "content": content }));
-    }
-    if let Some(end) = end {
-        agent(cx).turn = Some(turn);
-        return finish(ws, end, cx);
-    }
-    let mut results = Vec::new();
-    for call in &calls {
-        let input = call.input.clone().unwrap_or(Value::Null);
-        let step = with_reply(item, cx, |r| begin_tool(r, &call.name, &input)).unwrap_or(usize::MAX);
-        let (text, ok) = match &call.input {
-            Err(raw) => (api::invalid_json(raw), false),
-            Ok(input) => match tools::execute(&mut turn.session, &call.name, input) {
-                Outcome::Ok(t) => (t, true),
-                Outcome::Err(e) => (e, false),
-            },
-        };
-        settle_tool(item, step, &text, ok, cx);
-        results.push((call.id.clone(), text, !ok));
-    }
-    let Engine::Api { system, messages, model, stream, rounds } = &mut turn.engine else { return };
-    messages.push(api::tool_results(&results));
-    *rounds += 1;
-    if *rounds >= MAX_ROUNDS {
-        agent(cx).turn = Some(turn);
-        return finish(ws, ReplyState::Failed(format!("Stopped after {MAX_ROUNDS} tool rounds; ask again to continue.")), cx);
-    }
-    let effort = agent(cx).effort;
-    *stream = Some(api::spawn(AgentRequest { model: model.clone(), system: system.clone(), messages: messages.clone(), tools: tools::definitions(), max_tokens: 64_000, effort }));
-    agent(cx).turn = Some(turn);
-}
-
 /// Answer the pending question: the picked options and/or the user's own
 /// words (none of either skips it).
 pub fn answer(picked: &[usize], own: &str, cx: &mut Context<Workspace>) {
@@ -796,11 +672,7 @@ fn finish(ws: &mut Workspace, end: ReplyState, cx: &mut Context<Workspace>) {
     let Some(turn) = agent(cx).turn.take() else { return };
     // A question still open goes with the turn (its card closes).
     agent(cx).pending = None;
-    match &turn.engine {
-        Engine::Api { stream: Some(s), .. } => s.cancel.cancel(),
-        Engine::Cli(t) => t.cancel.cancel(),
-        _ => {}
-    }
+    turn.cli.cancel.cancel();
     let changes = turn.session.changes.len();
     with_reply(turn.item, cx, |r| {
         close_thinking(r);
@@ -851,14 +723,7 @@ pub fn stop(ws: &mut Workspace, cx: &mut Context<Workspace>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_the_standard_alphabet() {
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b""), "");
-    }
+    use serde_json::json;
 
     #[test]
     fn history_keeps_user_and_answers_in_turns() {
@@ -875,9 +740,8 @@ mod tests {
         let items = vec![mk(Item::Note("hi".into())), mk(Item::User { text: "make a bass".into(), chips: vec![] }), mk(Item::Agent(reply)), mk(Item::User { text: "louder".into(), chips: vec![] })];
         let h = history(&items);
         assert_eq!(h.len(), 3);
-        let m = api_messages(&h);
-        assert_eq!(m[0]["role"], "user");
-        assert!(m[1]["content"][0]["text"].as_str().unwrap().contains("2 change(s)"));
+        assert!(!h[0].1.is_empty() && h[0].0);
+        assert!(h[1].1.contains("2 change(s)"));
         let p = cli_prompt(&h);
         assert!(p.starts_with("The conversation so far") && p.ends_with("louder"), "{p}");
         assert_eq!(cli_prompt(&h[..1]), "make a bass");

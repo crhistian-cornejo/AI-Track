@@ -178,10 +178,6 @@ fn drum_pads_of(t: &Track) -> Vec<(String, u8)> {
         .unwrap_or_default()
 }
 
-fn is_drum_track(t: &Track) -> bool {
-    t.devices.iter().any(|d| matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Drum))
-}
-
 /// Notes of `clip` on the timeline, `at` the tick where it starts, within
 /// `[from, to)`. Notes live from tick 0 of the clip (the piano roll ignores
 /// the clip offset), so that is how they are read here.
@@ -248,7 +244,7 @@ pub fn digest(p: &Project, target: Option<TrackId>, region_start: Tick, bars: u3
     });
     if let Some(t) = t {
         let pads = drum_pads_of(t);
-        let drums = is_drum_track(t);
+        let drums = t.is_drum();
         ctx.target = Target { track: Some(t.id), name: t.name.clone(), kind: if drums { TargetKind::Drums } else { TargetKind::Melodic }, pads: if drums { PadMap::from_pads(&pads) } else { PadMap::gm() } };
     }
 
@@ -266,7 +262,7 @@ pub fn digest(p: &Project, target: Option<TrackId>, region_start: Tick, bars: u3
         if ctx.others.len() < 6 {
             ctx.others.push(part);
         }
-        let kick_note = if is_drum_track(other) { PadMap::from_pads(&drum_pads_of(other)).kick.or(Some(36)) } else { None };
+        let kick_note = if other.is_drum() { PadMap::from_pads(&drum_pads_of(other)).kick.or(Some(36)) } else { None };
         let all_kick = kick_like(&other.name);
         let mut found_kick = false;
         for h in &heard {
@@ -282,7 +278,7 @@ pub fn digest(p: &Project, target: Option<TrackId>, region_start: Tick, bars: u3
             any_kick = true;
             ctx.follows.push(format!("{} (kick)", other.name));
         }
-        if is_drum_track(other) || all_kick {
+        if other.is_drum() || all_kick {
             continue;
         }
         let bassy = bass_like(&other.name);
@@ -346,7 +342,7 @@ fn rhythm_of(heard: &[Heard], region_start: Tick, bar_ticks: Tick) -> String {
 }
 
 fn other_part(t: &Track, heard: &[Heard], region_start: Tick, bar_ticks: Tick, bars: u32) -> OtherPart {
-    let drums = is_drum_track(t);
+    let drums = t.is_drum();
     let kick = kick_like(&t.name);
     let bass = bass_like(&t.name);
     let mut chords = Vec::new();

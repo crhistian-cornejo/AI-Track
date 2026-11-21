@@ -443,6 +443,11 @@ impl Track {
     pub fn can_freeze(&self) -> bool {
         self.kind.has_clips()
     }
+
+    /// Whether the track holds a Drum Rack (a kit with one chain per pad).
+    pub fn is_drum(&self) -> bool {
+        self.devices.iter().any(|d| matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Drum))
+    }
 }
 
 /// The audio input a track records from.
@@ -1612,5 +1617,18 @@ mod tests {
         let parsed: Track = serde_json::from_value(val).unwrap();
         assert_eq!(parsed.scale, None);
         assert!(!parsed.keyboard_input);
+    }
+
+    #[test]
+    fn a_track_is_a_drum_track_when_it_holds_a_drum_rack() {
+        let mut t = Track::new(TrackId(1), TrackKind::Instrument, "Drums", Color(0));
+        assert!(!t.is_drum());
+        let mut d = Device::stock(DeviceId(2), "rack.instrument", "Instrument Rack");
+        d.kind = DeviceKind::Rack(Rack::new(RackKind::Instrument));
+        t.devices.push(d.clone());
+        assert!(!t.is_drum(), "an instrument rack is not a kit");
+        d.kind = DeviceKind::Rack(Rack::new(RackKind::Drum));
+        t.devices.push(d);
+        assert!(t.is_drum());
     }
 }

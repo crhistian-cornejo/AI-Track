@@ -92,6 +92,17 @@ pub fn chain(p: &Project, c: Container) -> Option<&[Device]> {
     }
 }
 
+/// A rack as it comes from the Add Device menu: one empty chain, "Chain 1",
+/// so it takes devices at once. A Drum Rack has no pads yet (`Rack::new`,
+/// which grouping and the tests use as it is).
+pub fn fresh_rack(kind: RackKind) -> Rack {
+    let mut r = Rack::new(kind);
+    if kind != RackKind::Drum {
+        r.chains.push(Chain::new("Chain 1", Color::palette(0)));
+    }
+    r
+}
+
 /// The commands that put `ids` in a new rack `rack` (Cmd+G on devices).
 /// The devices must all sit in one chain; the rack takes the place of the
 /// first of them and keeps their order. `None` when nothing can be grouped.
@@ -274,6 +285,15 @@ mod tests {
         }
         p.ids = before.ids.clone();
         assert_eq!(p, before, "undo brings the rack back with its macro mapping");
+    }
+
+    #[test]
+    fn a_fresh_rack_has_one_empty_chain_but_a_drum_rack_has_no_pads() {
+        for kind in [RackKind::Audio, RackKind::Instrument, RackKind::Midi] {
+            let r = fresh_rack(kind);
+            assert_eq!((r.kind, r.chains.len(), r.chains[0].devices.len(), r.chains[0].name.as_str()), (kind, 1, 0, "Chain 1"));
+        }
+        assert!(fresh_rack(RackKind::Drum).chains.is_empty());
     }
 
     #[test]

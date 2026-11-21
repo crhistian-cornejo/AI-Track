@@ -21,6 +21,7 @@ pub mod ops;
 pub mod paths;
 pub mod pitch;
 pub mod project;
+pub mod rack_preset;
 pub mod racks;
 pub mod routing;
 pub mod slice;

@@ -8,11 +8,10 @@
 //! transport.
 
 use aitrack_ai::generate::lock::{self, Locks};
+use aitrack_ai::generate::part::{self as gen_part, Dest, Prepared};
 use aitrack_ai::generate::spec::{MidiSpec, Role};
 use aitrack_ai::generate::{GenContext, GenRequest, Generated};
 use aitrack_model::{Command, History, Origin, Project, Tick};
-
-use super::midi_gen::{self, Dest, Prepared};
 
 /// Where the card stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +77,7 @@ impl Session {
 
     /// The commands for the current part, and the card lines.
     fn build(&mut self, p: &mut Project) -> Vec<Command> {
-        let (cmds, summary) = midi_gen::commands(p, &self.generated, self.dest, self.start);
+        let (cmds, summary) = gen_part::commands(p, &self.generated, self.dest, self.start);
         self.destructive = cmds.iter().any(Command::is_destructive);
         self.summary = summary;
         cmds
@@ -243,7 +242,7 @@ mod tests {
     }
 
     fn session(p: &Project, track: TrackId, kind: Kind, seed: u64) -> Session {
-        let prep = midi_gen::prepare(p, Some(track), None, Some(kind), "2 bars").unwrap();
+        let prep = gen_part::prepare(p, Some(track), None, Some(kind), "2 bars").unwrap();
         let g = generate(&prep.req, &prep.ctx, seed);
         Session::new(prep, g, "Rules")
     }

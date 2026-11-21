@@ -214,7 +214,7 @@ pub fn to_clip(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>
     let slot = (ws.s.view == crate::state::MainView::Session && ws.s.selected_track == Some(track)).then(|| ws.s.session_scene()).flatten().filter(|s| ws.s.slot_clip(track, *s).is_none());
     let bar = ws.s.project.tempo.signature_at(0).bar_ticks().max(1);
     let playhead = crate::state::Snap::Bar.floor(ws.b.engine.transport().position.max(0));
-    let start = crate::views::ai_panel::midi_gen::free_start(&ws.s.project, Some(track), playhead / bar * bar, phrase.ticks());
+    let start = aitrack_ai::generate::part::free_start(&ws.s.project, Some(track), playhead / bar * bar, phrase.ticks());
     let color = ws.s.project.track(track).map_or(aitrack_model::Color::palette(0), |t| ws.s.clip_color_for(t.color));
     let (_, cmds) = clip_commands(&mut ws.s.project, track, &phrase, "Acid phrase", color, start, slot);
     ws.s.seal();

@@ -436,7 +436,7 @@ impl AppState {
             .project
             .tracks
             .iter()
-            .filter(|t| t.kind == TrackKind::Instrument && !is_drum_track(t))
+            .filter(|t| t.kind == TrackKind::Instrument && !t.is_drum())
             .filter_map(|t| {
                 let clip = *t.session_slots.values().next()?;
                 Some((s.clip_notes(clip).map_or(0, |(_, n)| n.notes.len()), t.id, clip))
@@ -855,7 +855,7 @@ impl AppState {
             .and_then(|c| self.clip_track(c))
             .or(self.selected_track)
             .and_then(|id| self.project.track(id))
-            .is_some_and(is_drum_track);
+            .is_some_and(Track::is_drum);
         (!drum).then_some(scale)
     }
 
@@ -874,7 +874,7 @@ impl AppState {
         let own = self.clip_track(clip);
         let mut out = Vec::new();
         for t in &self.project.tracks {
-            if Some(t.id) == own || is_drum_track(t) {
+            if Some(t.id) == own || t.is_drum() {
                 continue;
             }
             let Some(other) = t.session_slots.get(&scene) else { continue };
@@ -892,10 +892,10 @@ impl AppState {
     /// track, else the first clip of the first drum-rack track.
     pub fn step_clip(&self) -> Option<(TrackId, ClipId)> {
         if let (Some(clip), Some(track)) = (self.selected_clip, self.selected_clip.and_then(|c| self.clip_track(c)))
-            && self.project.track(track).is_some_and(is_drum_track) {
+            && self.project.track(track).is_some_and(Track::is_drum) {
                 return Some((track, clip));
             }
-        let t = self.project.tracks.iter().find(|t| is_drum_track(t))?;
+        let t = self.project.tracks.iter().find(|t| t.is_drum())?;
         let clip = t.session_slots.values().next().copied().or_else(|| t.arrangement.first().map(|p| p.clip))?;
         Some((t.id, clip))
     }
@@ -2841,10 +2841,6 @@ pub fn probability_delta(originals: &[Note], delta: f32) -> f32 {
     let lower = originals.iter().map(|n| 0. - n.probability).fold(f32::NEG_INFINITY, f32::max);
     let upper = originals.iter().map(|n| 1. - n.probability).fold(f32::INFINITY, f32::min);
     delta.clamp(lower, upper)
-}
-
-pub fn is_drum_track(t: &Track) -> bool {
-    t.devices.iter().any(|d| matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Drum))
 }
 
 /// The drum rack's pads (name, colour, note) on a track.

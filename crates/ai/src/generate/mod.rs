@@ -16,8 +16,8 @@
 //! through the same two functions.
 //!
 //! Everything here is a pure function of (spec, context, seed, version): no
-//! I/O, no clock, no globals. It never edits a `Project`; the app turns a
-//! [`Generated`] into commands.
+//! I/O, no clock, no globals. It never edits a `Project`; [`part`] turns a
+//! [`Generated`] into commands and only reserves ids on the project it gets.
 
 pub mod acid;
 pub mod bloom;
@@ -28,6 +28,7 @@ pub mod grid;
 pub mod harmony;
 pub mod lock;
 pub mod pack;
+pub mod part;
 pub mod patterns;
 pub mod realize;
 pub mod request;

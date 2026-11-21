@@ -4,7 +4,6 @@
 use crate::bridge::SlotState;
 use crate::icons::{Icon, icon};
 use crate::paint;
-use crate::state::is_drum_track;
 use crate::theme::*;
 use crate::views::browser::kind_icon;
 use crate::widgets::{self, chip, label, mono};
@@ -244,7 +243,7 @@ fn track_column(ws: &mut Workspace, tid: TrackId, scenes: &[(SceneId, String)], 
             cx.notify();
         }))
         .child(div().w(px(3.)).h(px(16.)).rounded(px(2.)).bg(color))
-        .child(icon(if is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted))
+        .child(icon(if t.is_drum() { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted))
         .child(label(paint::fit(&t.name, SESSION_COL_W - 64., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM).flex_1())
         .child(widgets::meter(meter, 6., 16.));
 

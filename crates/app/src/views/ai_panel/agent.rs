@@ -24,7 +24,6 @@ use gpui::{Context, Global, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::midi_gen;
 use super::state::{self, Attachment, Backend, Item, Placed, ReplyState};
 use crate::bridge::AgentKind;
 use crate::workspace::{ChatEntry, ProposalStatus, Workspace};
@@ -812,13 +811,13 @@ pub(crate) fn generate_part(s: &mut Session, input: &Value) -> Result<String, St
         Some(v) => Some(tools::refs::track(&s.draft, v, s.selected)?),
         None => s.selected,
     };
-    let prepared = midi_gen::prepare(&s.draft, track, None, Some(kind), text)?;
+    let prepared = gen_core::part::prepare(&s.draft, track, None, Some(kind), text)?;
     let seed = prepared.req.seed.unwrap_or_else(seed);
     let g = gen_core::generate(&prepared.req, &prepared.ctx, seed);
     if g.draft.notes.is_empty() {
         return Err("the pattern engine wrote no notes for that; try other words or write_clip".into());
     }
-    let (cmds, lines) = midi_gen::commands(&mut s.draft, &g, prepared.dest, prepared.start);
+    let (cmds, lines) = gen_core::part::commands(&mut s.draft, &g, prepared.dest, prepared.start);
     let label = format!("{} part, {} bars", prepared.req.kind.label(), prepared.req.bars);
     s.apply(&label, cmds)?;
     Ok(format!("{label}. {}", lines.join("; ")))

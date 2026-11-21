@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitrack_ai::generate::spec::{Kind, Role};
+use aitrack_ai::generate::part::Prepared;
 use aitrack_ai::generate::{self as gen_core, Source as SpecSource};
 use aitrack_ai::llm::{self, context::Focus, mix::MixPlan};
 use aitrack_model::{ClipId, Origin, Source, TrackId};
 use gpui::{AppContext, ClipboardEntry, Context, Entity, Global, ImageFormat, ScrollHandle, Subscription, Task};
 
 use super::history::{self, Archive, Chat};
-use super::midi_gen::{self, Prepared};
 use super::part::{self, Session};
 use super::{mix, slash};
 use crate::bridge::{AgentKind, LibraryItem};
@@ -592,7 +592,7 @@ fn model_choice(a: &Entity<Assistant>, cx: &mut Context<Workspace>) -> Option<us
 pub fn generate(ws: &mut Workspace, kind: Option<Kind>, text: &str, cx: &mut Context<Workspace>) {
     let a = get(cx);
     let selected = target_track(ws, a.read(cx));
-    let prepared = match midi_gen::prepare(&ws.s.project, selected, ws.s.selected_clip, kind, text) {
+    let prepared = match gen_core::part::prepare(&ws.s.project, selected, ws.s.selected_clip, kind, text) {
         Ok(p) => p,
         Err(e) => return note(ws, e, cx),
     };

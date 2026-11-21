@@ -2,14 +2,14 @@
 //! tick 0, one clip over it and its placement on a MIDI track (an existing
 //! one, or a new track with a synth when none fits). The result goes to
 //! `History::propose`, never straight to the project, so accepting it is one
-//! undo step. The musical work is in `aitrack_ai::generate`; this file only
-//! picks the target, finds free room on the timeline and builds the commands.
+//! undo step. The musical work is in the rest of [`crate::generate`]; this
+//! module only picks the target, finds free room on the timeline and builds
+//! the commands.
 
-use aitrack_ai::generate::spec::Kind;
-use aitrack_ai::generate::{GenContext, GenRequest, Generated, TargetKind, digest, request};
 use aitrack_model::{Clip, ClipId, Color, Command, Device, Key, Note, NoteSource, Placement, Project, Source, Tick, Track, TrackId, TrackKind};
 
-use crate::state::is_drum_track;
+use super::spec::Kind;
+use super::{DraftNote, GenContext, GenRequest, Generated, TargetKind, digest, request};
 
 /// Where the part goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +42,12 @@ pub fn pick_target(p: &Project, selected: Option<TrackId>, kind: Kind) -> Result
     let midi = |t: &&Track| t.kind == TrackKind::Instrument;
     let sel = selected.and_then(|id| p.track(id)).filter(midi);
     if matches!(kind, Kind::Drums | Kind::Perc) {
-        return sel.filter(|t| is_drum_track(t)).or_else(|| p.tracks.iter().filter(midi).find(|t| is_drum_track(t))).map(|t| Dest::Existing(t.id)).ok_or("Select a drum rack track (or add one with a kit) and run that again.");
+        return sel.filter(|t| t.is_drum()).or_else(|| p.tracks.iter().filter(midi).find(|t| t.is_drum())).map(|t| Dest::Existing(t.id)).ok_or("Select a drum rack track (or add one with a kit) and run that again.");
     }
     if let Some(t) = sel {
-        return Ok(if is_drum_track(t) { Dest::NewTrack } else { Dest::Existing(t.id) });
+        return Ok(if t.is_drum() { Dest::NewTrack } else { Dest::Existing(t.id) });
     }
-    let named = (kind == Kind::Bass).then(|| p.tracks.iter().filter(midi).find(|t| !is_drum_track(t) && bass_like(&t.name))).flatten();
+    let named = (kind == Kind::Bass).then(|| p.tracks.iter().filter(midi).find(|t| !t.is_drum() && bass_like(&t.name))).flatten();
     Ok(named.map_or(Dest::NewTrack, |t| Dest::Existing(t.id)))
 }
 
@@ -133,7 +133,7 @@ pub fn commands(p: &mut Project, g: &Generated, dest: Dest, start: Tick) -> (Vec
     let drums = matches!(g.spec.kind, Kind::Drums | Kind::Perc);
     let bar_ticks = p.tempo.signature_at(start).bar_ticks().max(1);
     let mut lines = Vec::new();
-    let new_note = |p: &mut Project, n: &aitrack_ai::generate::DraftNote| {
+    let new_note = |p: &mut Project, n: &DraftNote| {
         let mut note = Note::new(p.alloc_note_id(), n.key, n.start, n.length, n.velocity);
         note.slide = n.slide;
         note
@@ -225,7 +225,7 @@ pub fn commands(p: &mut Project, g: &Generated, dest: Dest, start: Tick) -> (Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aitrack_ai::generate::generate;
+    use crate::generate::generate;
     use aitrack_model::{Chain, History, NoteId, Origin, PPQ, Rack, RackKind, Scale, ScaleKind, SourceId};
 
     struct Planned {

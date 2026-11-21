@@ -1328,7 +1328,7 @@ fn track_header(ws: &mut Workspace, r: &LaneRow, cx: &mut Context<Workspace>) ->
                         .items_center()
                         .gap(if single { px(SP1) } else { px(SP2) })
                         .children(fold)
-                        .when(!single && !frozen, |d| d.child(icon(if crate::state::is_drum_track(&t) { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted)))
+                        .when(!single && !frozen, |d| d.child(icon(if t.is_drum() { Icon::Drum } else { kind_icon(t.kind) }, 14., pal.muted)))
                         .when(frozen, |d| d.child(div().id(("arr-frozen", id.0 as usize)).child(icon(Icon::Snowflake, 14., pal.frozen)).tooltip(widgets::tip("Frozen: the track plays its rendered audio and runs no devices. Unfreeze to edit it.", None))))
                         .child(
                             label(paint::fit(&shown_name, name_w, TEXT_MD), TEXT_MD, if selected { pal.text } else { with_alpha(pal.text, 0.92) })

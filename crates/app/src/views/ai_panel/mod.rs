@@ -12,7 +12,6 @@ pub(crate) use agent::generate_part;
 mod ask;
 pub mod history;
 mod markdown;
-pub(crate) mod midi_gen;
 mod mix;
 pub mod part;
 mod picker;

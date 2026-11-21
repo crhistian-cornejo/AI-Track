@@ -8,8 +8,12 @@ mod edit;
 mod inspect;
 pub mod refs;
 
+use std::sync::OnceLock;
+
 use aitrack_model::{Command, Project, TrackId};
 use serde_json::{Value, json};
+
+use super::runtime::{ToolDef, ToolKind};
 
 /// The draft a turn edits, and what it changed.
 pub struct Session {
@@ -89,40 +93,41 @@ pub fn execute(s: &mut Session, name: &str, input: &Value) -> Outcome {
     }
 }
 
-/// Whether `name` only reads.
-pub fn is_read_only(name: &str) -> bool {
-    name.starts_with("get_") || name.starts_with("list_")
+/// Every tool with its kind and title, built once: the project tools in a
+/// stable order and [`ASK_USER`].
+struct Registry {
+    project: Vec<ToolDef>,
+    ask: ToolDef,
+}
+
+fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Registry { project: project_defs(), ask: ask_def() })
+}
+
+fn lookup(name: &str) -> Option<&'static ToolDef> {
+    let r = registry();
+    r.project.iter().chain(std::iter::once(&r.ask)).find(|d| d.name == name)
+}
+
+/// The project tools, in the order the models see them.
+pub fn defs() -> Vec<ToolDef> {
+    registry().project.clone()
+}
+
+/// What `name` does; `None` when it is no tool.
+pub fn kind(name: &str) -> Option<ToolKind> {
+    lookup(name).map(|d| d.kind)
+}
+
+/// Whether `name` only reads. A question or an unknown name does not.
+pub fn is_read(name: &str) -> bool {
+    kind(name) == Some(ToolKind::Read)
 }
 
 /// What the panel shows on a tool's card while it runs and after.
 pub fn title(name: &str) -> &'static str {
-    match name {
-        "get_project" => "Reading the project",
-        "get_track" => "Inspecting a track",
-        "get_device" => "Reading a device",
-        "get_notes" => "Reading notes",
-        "list_plugins" => "Browsing devices",
-        "list_presets" => "Browsing presets",
-        "create_track" => "Creating a track",
-        "update_track" => "Adjusting a track",
-        "delete_track" => "Deleting a track",
-        "group_tracks" => "Grouping tracks",
-        "add_device" => "Adding a device",
-        "set_params" => "Setting parameters",
-        "load_preset" => "Loading a preset",
-        "remove_device" => "Removing a device",
-        "set_send" => "Routing a send",
-        "set_sidechain" => "Routing a sidechain",
-        "set_song" => "Song settings",
-        "write_clip" => "Writing notes",
-        "copy_clip" => "Arranging clips",
-        "move_clip" => "Moving a clip",
-        "clear_bars" => "Clearing bars",
-        "set_automation" => "Drawing automation",
-        "generate_part" => "Generating a part",
-        ASK_USER => "Asking you",
-        _ => "Working",
-    }
+    lookup(name).map_or("Working", |d| d.title)
 }
 
 /// How the assistant works, for the system prompt (stable, cached).
@@ -208,11 +213,18 @@ impl Question {
 }
 
 /// [`ASK_USER`]'s definition.
-pub fn ask_user_definition() -> Value {
-    tool(
-        ASK_USER,
-        "Ask the user one short question with 2–4 options and wait for the answer. Only when the choice changes the result a lot and the project does not answer it; never for permission.",
-        obj(
+pub fn ask_user_def() -> ToolDef {
+    registry().ask.clone()
+}
+
+fn ask_def() -> ToolDef {
+    ToolDef {
+        name: ASK_USER,
+        title: "Asking you",
+        kind: ToolKind::Ask,
+        destructive: false,
+        description: "Ask the user one short question with 2–4 options and wait for the answer. Only when the choice changes the result a lot and the project does not answer it; never for permission.",
+        schema: obj(
             json!({
                 "question": { "type": "string", "description": "One short question" },
                 "options": { "type": "array", "items": { "type": "object", "properties": { "label": { "type": "string", "description": "A few words" }, "description": { "type": "string", "description": "One short line on what it means" } }, "required": ["label"] } },
@@ -220,13 +232,13 @@ pub fn ask_user_definition() -> Value {
             }),
             &["question", "options"],
         ),
-    )
+    }
 }
 
 /// The tools of the in-app assistant: every project tool and [`ASK_USER`].
 pub fn agent_definitions() -> Vec<Value> {
     let mut d = definitions();
-    d.push(ask_user_definition());
+    d.push(ask_user_def().to_json());
     d
 }
 
@@ -234,23 +246,24 @@ fn obj(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
-fn tool(name: &str, description: &str, schema: Value) -> Value {
-    json!({ "name": name, "description": description, "input_schema": schema })
-}
-
 /// The tool definitions sent with every request (stable order: cached).
 pub fn definitions() -> Vec<Value> {
+    registry().project.iter().map(ToolDef::to_json).collect()
+}
+
+/// The project tools in the order the model sees them (stable: the warm CLI process is keyed by a hash of them).
+fn project_defs() -> Vec<ToolDef> {
     let track = json!({ "description": "Track id (number) or exact name; \"selected\" or \"main\" also work", "type": ["integer", "string"] });
     let device = json!({ "description": "Device id from get_track or create_track", "type": "integer" });
     let params = json!({ "type": "object", "description": "Parameter name (from get_device) → value in its own units, or a choice label for stepped parameters", "additionalProperties": { "type": ["number", "string", "boolean"] } });
     vec![
-        tool("get_project", "The song (tempo, key, signature, loop, length) and every track with its id, level, routing, devices and timeline span. Call this first in a turn that edits, and whenever you need ids.", obj(json!({}), &[])),
-        tool("get_track", "One track in full: devices with ids and the parameters that differ from default, every clip on the timeline (placement id, clip id, bar, length) and automation lanes. Call before editing a track.", obj(json!({ "track": track }), &["track"])),
-        tool("get_device", "Every parameter of a device with its current value, range, units and choices. Call before set_params on a device you have not read.", obj(json!({ "device": device }), &["device"])),
-        tool("get_notes", "The notes of a MIDI clip (pitch, start beat, length, velocity).", obj(json!({ "clip": { "type": "integer", "description": "Clip id from get_track" } }), &["clip"])),
-        tool("list_plugins", "The stock instruments, effects and MIDI effects you can add, with ids, tags and how many factory presets each has.", obj(json!({ "category": { "type": "string", "enum": ["instrument", "effect", "midi", "utility", "analyzer", "any"] } }), &[])),
-        tool("list_presets", "Factory presets of a stock device, filtered by a word (\"bass\", \"pad\", \"plate\"). Use to pick sounds.", obj(json!({ "plugin": { "type": "string", "description": "Plugin id or name" }, "query": { "type": "string" } }), &["plugin"])),
-        tool("create_track", "Add a track. MIDI tracks get an instrument (default the Wavetable Synth), optionally with a factory preset and parameters. Return tracks hold shared reverbs and delays.", obj(json!({
+        ToolDef::read("get_project", "Reading the project", "The song (tempo, key, signature, loop, length) and every track with its id, level, routing, devices and timeline span. Call this first in a turn that edits, and whenever you need ids.", obj(json!({}), &[])),
+        ToolDef::read("get_track", "Inspecting a track", "One track in full: devices with ids and the parameters that differ from default, every clip on the timeline (placement id, clip id, bar, length) and automation lanes. Call before editing a track.", obj(json!({ "track": track }), &["track"])),
+        ToolDef::read("get_device", "Reading a device", "Every parameter of a device with its current value, range, units and choices. Call before set_params on a device you have not read.", obj(json!({ "device": device }), &["device"])),
+        ToolDef::read("get_notes", "Reading notes", "The notes of a MIDI clip (pitch, start beat, length, velocity).", obj(json!({ "clip": { "type": "integer", "description": "Clip id from get_track" } }), &["clip"])),
+        ToolDef::read("list_plugins", "Browsing devices", "The stock instruments, effects and MIDI effects you can add, with ids, tags and how many factory presets each has.", obj(json!({ "category": { "type": "string", "enum": ["instrument", "effect", "midi", "utility", "analyzer", "any"] } }), &[])),
+        ToolDef::read("list_presets", "Browsing presets", "Factory presets of a stock device, filtered by a word (\"bass\", \"pad\", \"plate\"). Use to pick sounds.", obj(json!({ "plugin": { "type": "string", "description": "Plugin id or name" }, "query": { "type": "string" } }), &["plugin"])),
+        ToolDef::edit("create_track", "Creating a track", "Add a track. MIDI tracks get an instrument (default the Wavetable Synth), optionally with a factory preset and parameters. Return tracks hold shared reverbs and delays.", obj(json!({
             "name": { "type": "string" },
             "kind": { "type": "string", "enum": ["midi", "audio", "group", "return"] },
             "instrument": { "type": "string", "description": "Stock instrument id or name for MIDI tracks (instrument.wavetable, instrument.vault, instrument.acid303, instrument.kick808, instrument.drum, instrument.sampler)" },
@@ -261,28 +274,28 @@ pub fn definitions() -> Vec<Value> {
             "color": { "type": "integer", "description": "Palette index 0–15" },
             "after": { "description": "Put it after this track", "type": ["integer", "string"] },
         }), &["name"])),
-        tool("update_track", "Change a track's name, fader, pan, mute, solo, colour or output (route it into a group).", obj(json!({
+        ToolDef::edit("update_track", "Adjusting a track", "Change a track's name, fader, pan, mute, solo, colour or output (route it into a group).", obj(json!({
             "track": track, "name": { "type": "string" }, "volume_db": { "type": "number", "description": "-70 … +6" },
             "pan": { "type": "number" }, "mute": { "type": "boolean" }, "solo": { "type": "boolean" }, "color": { "type": "integer" },
             "output": { "description": "Group track or \"main\"", "type": ["integer", "string"] },
         }), &["track"])),
-        tool("delete_track", "Delete a track and its clips. Only when the user asks for it.", obj(json!({ "track": track }), &["track"])),
-        tool("group_tracks", "Put tracks in a new group bus (drums, synths, vocals) to process them together.", obj(json!({ "tracks": { "type": "array", "items": { "type": ["integer", "string"] } }, "name": { "type": "string" } }), &["tracks"])),
-        tool("add_device", "Add a stock device to a track's chain (end by default): EQ, Compressor, Bus Compressor, Limiter, Saturator, Reverb, Delay, Filter, Shaper, Chorus, Utility, MIDI effects… Optionally with a preset and parameters.", obj(json!({
+        ToolDef { destructive: true, ..ToolDef::edit("delete_track", "Deleting a track", "Delete a track and its clips. Only when the user asks for it.", obj(json!({ "track": track }), &["track"])) },
+        ToolDef::edit("group_tracks", "Grouping tracks", "Put tracks in a new group bus (drums, synths, vocals) to process them together.", obj(json!({ "tracks": { "type": "array", "items": { "type": ["integer", "string"] } }, "name": { "type": "string" } }), &["tracks"])),
+        ToolDef::edit("add_device", "Adding a device", "Add a stock device to a track's chain (end by default): EQ, Compressor, Bus Compressor, Limiter, Saturator, Reverb, Delay, Filter, Shaper, Chorus, Utility, MIDI effects… Optionally with a preset and parameters.", obj(json!({
             "track": track, "plugin": { "type": "string", "description": "Plugin id (fx.eq) or name" },
             "preset": { "type": "string" }, "params": params, "position": { "type": "integer", "description": "0 = first in the chain" },
         }), &["track", "plugin"])),
-        tool("set_params", "Set parameters of a device by name in their own units, and/or bypass it.", obj(json!({ "device": device, "params": params, "enabled": { "type": "boolean" } }), &["device"])),
-        tool("load_preset", "Load a factory preset on a stock device.", obj(json!({ "device": device, "preset": { "type": "string" } }), &["device", "preset"])),
-        tool("remove_device", "Remove a device from its chain.", obj(json!({ "device": device }), &["device"])),
-        tool("set_send", "Set a track's send level to a return track (creates the send; -70 dB removes it).", obj(json!({ "track": track, "to": { "description": "Return track", "type": ["integer", "string"] }, "level_db": { "type": "number" }, "pre_fader": { "type": "boolean" } }), &["track", "to", "level_db"])),
-        tool("set_sidechain", "Feed a track into a device's sidechain input (duck the bass with a Compressor keyed by the kick). null disconnects.", obj(json!({ "device": device, "source": { "description": "Track that keys it, or null", "type": ["integer", "string", "null"] } }), &["device"])),
-        tool("set_song", "Tempo, key and scale, loop region or the project's name.", obj(json!({
+        ToolDef::edit("set_params", "Setting parameters", "Set parameters of a device by name in their own units, and/or bypass it.", obj(json!({ "device": device, "params": params, "enabled": { "type": "boolean" } }), &["device"])),
+        ToolDef::edit("load_preset", "Loading a preset", "Load a factory preset on a stock device.", obj(json!({ "device": device, "preset": { "type": "string" } }), &["device", "preset"])),
+        ToolDef { destructive: true, ..ToolDef::edit("remove_device", "Removing a device", "Remove a device from its chain.", obj(json!({ "device": device }), &["device"])) },
+        ToolDef::edit("set_send", "Routing a send", "Set a track's send level to a return track (creates the send; -70 dB removes it).", obj(json!({ "track": track, "to": { "description": "Return track", "type": ["integer", "string"] }, "level_db": { "type": "number" }, "pre_fader": { "type": "boolean" } }), &["track", "to", "level_db"])),
+        ToolDef::edit("set_sidechain", "Routing a sidechain", "Feed a track into a device's sidechain input (duck the bass with a Compressor keyed by the kick). null disconnects.", obj(json!({ "device": device, "source": { "description": "Track that keys it, or null", "type": ["integer", "string", "null"] } }), &["device"])),
+        ToolDef::edit("set_song", "Song settings", "Tempo, key and scale, loop region or the project's name.", obj(json!({
             "bpm": { "type": "number" }, "key": { "type": "string", "description": "Root: C, C#, Db, … B" },
             "scale": { "type": "string", "description": "major, minor, harmonic minor, melodic minor, dorian, phrygian, lydian, mixolydian, locrian, major pentatonic, minor pentatonic, blues, chromatic" },
             "loop_start_bar": { "type": "number" }, "loop_end_bar": { "type": "number" }, "name": { "type": "string" },
         }), &[])),
-        tool("write_clip", "Write a MIDI clip on a MIDI track's timeline with exactly these notes (you compose them). Replaces clips overlapping that range unless replace is false.", obj(json!({
+        ToolDef::edit("write_clip", "Writing notes", "Write a MIDI clip on a MIDI track's timeline with exactly these notes (you compose them). Replaces clips overlapping that range unless replace is false.", obj(json!({
             "track": track, "start_bar": { "type": "number", "description": "1 = song start" }, "length_bars": { "type": "number" },
             "name": { "type": "string" }, "replace": { "type": "boolean" },
             "notes": { "type": "array", "items": { "type": "object", "properties": {
@@ -292,17 +305,17 @@ pub fn definitions() -> Vec<Value> {
                 "velocity": { "type": "number", "description": "0–1" },
             }, "required": ["pitch", "start", "length"] } },
         }), &["track", "length_bars", "notes"])),
-        tool("generate_part", "Have AI-Track's pattern engine write a part in the project key (bass, chords, beat, arp, melody, perc) from a short description such as \"rolling bass, 4 bars\" or \"minimal house beat\". Good for quick drafts; use write_clip when you want exact notes.", obj(json!({
+        ToolDef::edit("generate_part", "Generating a part", "Have AI-Track's pattern engine write a part in the project key (bass, chords, beat, arp, melody, perc) from a short description such as \"rolling bass, 4 bars\" or \"minimal house beat\". Good for quick drafts; use write_clip when you want exact notes.", obj(json!({
             "kind": { "type": "string", "enum": ["bass", "chords", "beat", "arp", "melody", "perc"] },
             "description": { "type": "string" }, "track": { "description": "Existing MIDI track, else a new one", "type": ["integer", "string"] },
         }), &["kind"])),
-        tool("copy_clip", "Place an existing clip again (linked) at a bar, repeated `times` back to back: loop a 4-bar pattern over a 16-bar section.", obj(json!({
+        ToolDef::edit("copy_clip", "Arranging clips", "Place an existing clip again (linked) at a bar, repeated `times` back to back: loop a 4-bar pattern over a 16-bar section.", obj(json!({
             "clip": { "type": "integer" }, "track": { "description": "Defaults to the clip's own track", "type": ["integer", "string"] },
             "start_bar": { "type": "number" }, "times": { "type": "integer" },
         }), &["clip", "start_bar"])),
-        tool("move_clip", "Move a clip on the timeline (and to another track).", obj(json!({ "track": track, "placement": { "type": "integer" }, "start_bar": { "type": "number" }, "to_track": { "type": ["integer", "string"] } }), &["track", "placement", "start_bar"])),
-        tool("clear_bars", "Remove the clips that start between two bars on one or more tracks (drop the drums in a break).", obj(json!({ "track": track, "tracks": { "type": "array", "items": { "type": ["integer", "string"] } }, "start_bar": { "type": "number" }, "end_bar": { "type": "number" } }), &["start_bar", "end_bar"])),
-        tool("set_automation", "Draw automation from points (bar, value) on a track's volume (dB), pan (-1…1) or a device parameter (its own units, e.g. a Filter cutoff sweep in Hz). curve -1…1 bends the segment after a point. Replaces the lane unless replace is false.", obj(json!({
+        ToolDef::edit("move_clip", "Moving a clip", "Move a clip on the timeline (and to another track).", obj(json!({ "track": track, "placement": { "type": "integer" }, "start_bar": { "type": "number" }, "to_track": { "type": ["integer", "string"] } }), &["track", "placement", "start_bar"])),
+        ToolDef { destructive: true, ..ToolDef::edit("clear_bars", "Clearing bars", "Remove the clips that start between two bars on one or more tracks (drop the drums in a break).", obj(json!({ "track": track, "tracks": { "type": "array", "items": { "type": ["integer", "string"] } }, "start_bar": { "type": "number" }, "end_bar": { "type": "number" } }), &["start_bar", "end_bar"])) },
+        ToolDef::edit("set_automation", "Drawing automation", "Draw automation from points (bar, value) on a track's volume (dB), pan (-1…1) or a device parameter (its own units, e.g. a Filter cutoff sweep in Hz). curve -1…1 bends the segment after a point. Replaces the lane unless replace is false.", obj(json!({
             "track": track, "target": { "type": "string", "enum": ["volume", "pan", "param"] }, "device": device, "param": { "type": "string" },
             "replace": { "type": "boolean" },
             "points": { "type": "array", "items": { "type": "object", "properties": { "bar": { "type": "number" }, "value": { "type": "number" }, "curve": { "type": "number" } }, "required": ["bar", "value"] } },
@@ -339,6 +352,26 @@ mod tests {
         assert!(Question::from_input(&json!({ "options": [] })).is_err());
         assert!(agent_definitions().iter().any(|d| d["name"] == ASK_USER));
         assert!(!definitions().iter().any(|d| d["name"] == ASK_USER), "the MCP server does not offer it");
+    }
+
+    #[test]
+    fn the_registry_keeps_names_order_kinds_and_titles() {
+        let names: Vec<&str> = defs().iter().map(|d| d.name).collect();
+        assert_eq!(names, ["get_project", "get_track", "get_device", "get_notes", "list_plugins", "list_presets", "create_track", "update_track", "delete_track", "group_tracks", "add_device", "set_params", "load_preset", "remove_device", "set_send", "set_sidechain", "set_song", "write_clip", "generate_part", "copy_clip", "move_clip", "clear_bars", "set_automation"]);
+        for d in defs().iter().chain([ask_user_def()].iter()) {
+            assert!(!d.title.is_empty() && d.title != "Working", "{}", d.name);
+            let j = d.to_json();
+            assert_eq!(j.as_object().unwrap().len(), 3, "{}", d.name);
+            assert_eq!(j["input_schema"]["type"], "object");
+        }
+        assert_eq!(kind("list_plugins"), Some(ToolKind::Read));
+        assert_eq!(kind("generate_part"), Some(ToolKind::Edit));
+        assert_eq!(kind(ASK_USER), Some(ToolKind::Ask));
+        assert!(!is_read(ASK_USER), "the panel never folds a question into the lookups");
+        assert_eq!(title("get_project"), "Reading the project");
+        assert_eq!(title("nope"), "Working");
+        let destructive: Vec<&str> = defs().iter().filter(|d| d.destructive).map(|d| d.name).collect();
+        assert_eq!(destructive, ["delete_track", "remove_device", "clear_bars"]);
     }
 
     #[test]

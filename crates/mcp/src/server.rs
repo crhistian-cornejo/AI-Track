@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use aitrack_ai::llm::runtime::ToolKind;
 use aitrack_ai::llm::tools;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
@@ -287,18 +288,15 @@ and reads show the draft. Start with get_project for ids; read the aitrack://gui
 
 /// The tools, as MCP lists them: the in-app assistant's definitions, with hints.
 pub fn tool_list() -> Vec<Value> {
-    tools::definitions()
-        .into_iter()
+    tools::defs()
+        .iter()
         .map(|d| {
-            let name = d["name"].as_str().unwrap_or_default().to_owned();
-            let read_only = tools::is_read_only(&name);
-            let destructive = matches!(name.as_str(), "delete_track" | "clear_bars" | "remove_device");
             json!({
-                "name": name,
-                "title": tools::title(&name),
-                "description": d["description"],
-                "inputSchema": d["input_schema"],
-                "annotations": { "readOnlyHint": read_only, "destructiveHint": destructive, "openWorldHint": false },
+                "name": d.name,
+                "title": d.title,
+                "description": d.description,
+                "inputSchema": d.schema,
+                "annotations": { "readOnlyHint": d.kind == ToolKind::Read, "destructiveHint": d.destructive, "openWorldHint": false },
             })
         })
         .collect()

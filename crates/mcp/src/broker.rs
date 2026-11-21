@@ -104,7 +104,7 @@ impl Broker {
             },
         };
 
-        if tools::is_read_only(name) {
+        if tools::is_read(name) {
             // Reads see the draft when there is one, else the project itself.
             return match &mut self.live {
                 Some(l) => {

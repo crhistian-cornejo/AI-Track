@@ -59,7 +59,7 @@ pub(super) fn plain(result: &str) -> String {
 fn tool_icon(name: &str) -> Icon {
     match name {
         n if n == tools::ASK_USER => Icon::Help,
-        n if tools::is_read_only(n) => Icon::Search,
+        n if tools::is_read(n) => Icon::Search,
         "create_track" | "update_track" | "delete_track" | "group_tracks" => Icon::Layers,
         "add_device" | "remove_device" | "set_params" | "load_preset" => Icon::Sliders,
         "set_send" | "set_sidechain" => Icon::Plug,
@@ -211,14 +211,14 @@ fn tool_line(i: usize, j: usize, name: &str, input: &Value, st: &ToolState, open
         ToolState::Running => (tool_icon(name), pal.accent, tools::title(name).to_owned(), pal.text),
         ToolState::Done(t) if asking => (Icon::Help, pal.faint, format!("Answered: {t}"), pal.muted),
         ToolState::Done(t) => {
-            let shown = if tools::is_read_only(name) || t.is_empty() { tools::title(name).to_owned() } else { plain(t) };
+            let shown = if tools::is_read(name) || t.is_empty() { tools::title(name).to_owned() } else { plain(t) };
             (tool_icon(name), pal.faint, shown, pal.muted)
         }
         ToolState::Failed(_) => (Icon::X, pal.record, tools::title(name).to_owned(), pal.muted),
     };
     // A finished edit already says what it did; a lookup or a running call says on what.
     let tail = match st {
-        ToolState::Done(_) if !tools::is_read_only(name) && !asking => String::new(),
+        ToolState::Done(_) if !tools::is_read(name) && !asking => String::new(),
         _ => what,
     };
     let can_open = !asking && (input.as_object().is_some_and(|o| !o.is_empty()) || !matches!(st, ToolState::Running));
@@ -324,7 +324,7 @@ pub(super) fn work_summary(run: &[Step]) -> (Icon, String, bool) {
                     continue;
                 }
                 tools_n += 1;
-                if tools::is_read_only(name) {
+                if tools::is_read(name) {
                     read_only_n += 1;
                 }
                 if matches!(state, ToolState::Failed(_)) {
@@ -381,7 +381,7 @@ fn render_run_steps(i: usize, base: usize, run: &[Step], expanded: &std::collect
         match &run[k] {
             Step::Thinking { text, done } => out.push(thinking_line(i, j, text, *done, expanded.contains(&(i, j)), cx)),
             Step::Tool { name, input, state: st } => {
-                let quiet = |s: &Step| matches!(s, Step::Tool { name, state: ToolState::Done(_), .. } if tools::is_read_only(name));
+                let quiet = |s: &Step| matches!(s, Step::Tool { name, state: ToolState::Done(_), .. } if tools::is_read(name));
                 let r = run[k..].iter().take_while(|s| quiet(s)).count();
                 if r > 1 {
                     out.push(lookups(i, j, &run[k..k + r], expanded.contains(&(i, j)), expanded, cx));

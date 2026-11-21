@@ -16,6 +16,7 @@ pub mod keychain;
 pub mod markdown;
 pub mod midigen;
 pub mod mix;
+pub mod runtime;
 pub mod sse;
 pub mod tools;
 

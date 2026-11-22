@@ -146,7 +146,7 @@ impl ClipCopier {
 
 /// Copies of `devices` with new ids (racks included, all the way down);
 /// `map` collects old id → new id.
-fn copy_devices(p: &mut Project, devices: &[Device], map: &mut HashMap<DeviceId, DeviceId>) -> Vec<Device> {
+pub(crate) fn copy_devices(p: &mut Project, devices: &[Device], map: &mut HashMap<DeviceId, DeviceId>) -> Vec<Device> {
     devices
         .iter()
         .map(|d| {
@@ -165,7 +165,7 @@ fn copy_devices(p: &mut Project, devices: &[Device], map: &mut HashMap<DeviceId,
 
 /// Point what the copies refer to at the copies: rack macros and modulator
 /// targets at the copied devices, sidechains at the copied tracks (when the source was copied too).
-fn relink_devices(devices: &mut [Device], map: &HashMap<DeviceId, DeviceId>, track: &impl Fn(TrackId) -> TrackId) {
+pub(crate) fn relink_devices(devices: &mut [Device], map: &HashMap<DeviceId, DeviceId>, track: &impl Fn(TrackId) -> TrackId) {
     for d in devices {
         d.sidechain = d.sidechain.map(track);
         for m in &mut d.mods {

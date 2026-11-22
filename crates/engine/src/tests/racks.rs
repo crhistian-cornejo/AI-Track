@@ -569,3 +569,89 @@ fn a_chain_waking_from_sleep_plays_nothing_from_before() {
     }
     assert!(heard < 1e-6, "audio from before the sleep came out: peak {heard}");
 }
+
+// ───────────────────────────── Empty chains, racks with no chains ─────────────────────────────
+
+/// A DC probe at 0.5 on the track, then `rack`.
+fn dc_then(kind: TrackKind, rack: Rack) -> B {
+    let mut b = B::new(kind);
+    let dc = b.device(DC, &[(0, 0.5)]);
+    b.p.track_mut(b.track).unwrap().devices.push(dc);
+    b.rack(rack);
+    b
+}
+
+fn last(b: &B) -> f32 {
+    let out = b.render(&Probes::default(), PPQ);
+    out.channel(0)[out.frames() - 1]
+}
+
+#[test]
+fn an_empty_chain_passes_audio_but_an_instrument_or_drum_chain_without_an_instrument_is_silent() {
+    for (kind, want) in [(RackKind::Audio, 0.5), (RackKind::Instrument, 0.0), (RackKind::Drum, 0.0)] {
+        let mut rack = Rack::new(kind);
+        let mut c = Chain::new("Chain 1", Color(0));
+        c.note = (kind == RackKind::Drum).then_some(36);
+        rack.chains.push(c);
+        let b = dc_then(TrackKind::Instrument, rack);
+        assert!((last(&b) - want).abs() < 1e-4, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_rack_without_chains_is_transparent_for_audio_and_midi_and_mute_for_instruments() {
+    assert!((last(&dc_then(TrackKind::Audio, Rack::new(RackKind::Audio))) - 0.5).abs() < 1e-4);
+    assert_eq!(last(&dc_then(TrackKind::Instrument, Rack::new(RackKind::Instrument))), 0.0);
+    for chains in [0, 1] {
+        let mut b = B::new(TrackKind::Instrument);
+        let mut rack = Rack::new(RackKind::Midi);
+        rack.chains.extend((0..chains).map(|_| Chain::new("Chain 1", Color(0))));
+        b.rack(rack);
+        let keys = b.device(KEYS, &[]);
+        let k = keys.id;
+        b.p.track_mut(b.track).unwrap().devices.push(keys);
+        b.notes(&[(60, 0, PPQ / 2)]);
+        let f = Probes::default();
+        b.render(&f, PPQ);
+        assert!(f.notes(k).iter().any(|n| n.0 && n.1 == 60), "{chains} chains: the note reaches the device after the rack");
+    }
+}
+
+#[test]
+fn the_empty_rack_paths_never_allocate() {
+    use crate::alloc_counter::count_allocs;
+    // A synth with, after it, a rack that holds nothing: the Audio Rack lets
+    // it through, a MIDI Rack lets its notes through, and an Instrument Rack
+    // whose chain has no instrument is silent.
+    for (what, heard) in [("audio rack without chains", true), ("midi rack without chains", true), ("instrument rack with an empty chain", false)] {
+        let mut b = B::new(TrackKind::Instrument);
+        let synth = sine_pad(&mut b);
+        b.p.track_mut(b.track).unwrap().devices.push(synth);
+        let mut rack = Rack::new(match what {
+            "audio rack without chains" => RackKind::Audio,
+            "midi rack without chains" => RackKind::Midi,
+            _ => RackKind::Instrument,
+        });
+        if !heard {
+            rack.chains.push(Chain::new("Chain 1", Color(0)));
+        }
+        b.rack(rack);
+        let track = b.track;
+        let (h, mut proc_) = start(&b.p, Arc::new(FallbackFactory));
+        h.send_midi_to(track, MidiMessage::note_on(0, 60, 100));
+        for _ in 0..6 {
+            block(&mut proc_);
+        }
+        let mut buf = AudioBuffer::new(2, BLOCK);
+        let (loudest, allocs) = count_allocs(|| {
+            let mut loudest = 0.0f32;
+            for _ in 0..40 {
+                proc_.process_planar(&mut buf);
+                loudest = loudest.max(peak(buf.channel(0)));
+            }
+            loudest
+        });
+        assert_eq!(allocs, 0, "{what}");
+        assert_eq!(loudest > 0.05, heard, "{what}: peak {loudest}");
+    }
+}

@@ -365,6 +365,13 @@ pub(crate) struct ChainNode {
     pub sends: Vec<f32>,
     /// The return this chain's output goes to instead of the rack output.
     pub to_return: Option<usize>,
+    /// Whether the chain starts from the rack's input (every chain does, but
+    /// one of an Instrument or Drum Rack that holds nothing that sounds by
+    /// itself, no instrument and no nested instrument rack: it starts from
+    /// silence, so an empty chain, or one of effects alone, makes no sound).
+    /// Worked out when the graph is compiled. Returns are fed by the sends
+    /// and ignore it.
+    pub feeds_input: bool,
     pub buf: AudioBuffer,
     pub events: EventList,
     /// Aligns chains of different latency before they are summed.
@@ -630,6 +637,13 @@ impl RackNode {
     /// note-offs of the notes it has, so nothing hangs.
     fn run_midi(&mut self, cur: &[Event], tr: &Transport, sr: f64, frames: usize) {
         self.out.clear();
+        if self.chains.is_empty() {
+            // No chain to route to: the rack lets the notes through.
+            for e in cur {
+                self.out.push(e.offset, e.kind);
+            }
+            return;
+        }
         let selector = self.selector as f32;
         for c in &mut self.chains {
             c.events.clear();
@@ -718,6 +732,10 @@ impl RackNode {
 
     #[allow(clippy::too_many_arguments)]
     fn process(&mut self, buf: &mut AudioBuffer, events: &[Event], tr: &Transport, sr: f64, side: &mut SideIn<'_>, win: (usize, usize), allow_sleep: bool) {
+        if self.kind == RackKind::Audio && self.chains.is_empty() && self.returns.is_empty() {
+            // An Audio Rack with nothing in it lets the signal through.
+            return;
+        }
         let n = buf.frames();
         self.input.set_frames(n);
         self.input.copy_from(buf);
@@ -772,7 +790,11 @@ impl RackNode {
                 c.primed = true;
             }
             c.buf.set_frames(n);
-            c.buf.copy_from(&self.input);
+            if c.feeds_input {
+                c.buf.copy_from(&self.input);
+            } else {
+                c.buf.clear();
+            }
             process_devices(&mut c.devices, &mut c.buf, &c.events.events, tr, sr, side, win, allow_sleep);
             c.delay.process(&mut c.buf);
             let was_silent = c.cur_gain == [0.0, 0.0];

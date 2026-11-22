@@ -955,7 +955,7 @@ impl Answer { /// The server is off: the right shape for `ask`.
 
 ### Fase 3b · Baterías con one-shots
 - **Objetivo:** `build_drum_kit` crea o amplía un Drum Rack con pads `instrument.sampler` de un disparo, notas GM según `role`, hats con el mismo *choke*.
-- **Ficheros:** ayudante público del estado del Sampler en `crates/stock` (`{"version":1,"params":{},"extra":{"path":…}}`, junto a `common.rs:115`) **y su inverso** (leer la ruta, ver D11); herramienta en `crates/ai/src/llm/tools/` (o `SampleTools`); persona.
+- **Ficheros:** ayudante público del estado del Sampler en `crates/stock` (`{"version":1,"params":{},"extra":{"path":…}}`, junto a `common.rs:115`) **y su inverso** (leer la ruta, ver D11). **Cambio de ubicación (plan de racks, D7, 2026-11-21): el ayudante y su inverso viven en `aitrack-model` (`crates/model/src/slice.rs:176`, `sampler_state`), no en `aitrack-stock`, porque el modelo no depende de stock y los pads de los racks (B2) lo reutilizan.** Además: herramienta en `crates/ai/src/llm/tools/` (o `SampleTools`); persona.
 - **Depende de:** fase 3 (`probe_for_placement`).
 - **Verifica:** ida y vuelta (kit → ruta de cada pad → `Track::is_drum()` → `generate_part` escribe sobre las notas de los pads); muestra solo en la nube rechazada; captura oculta del Drum Rack con `AITRACK_DEMO=1 AITRACK_DEV_HIDDEN=1 AITRACK_STUBS=1`.
 

@@ -541,7 +541,7 @@ pub fn rebase_notes(p: &mut Project, clip: ClipId) -> Option<Vec<Command>> {
     let notes = kept.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
     let looping = old.looping.map(|l| LoopRegion { start: l.start - old.offset, end: l.end - old.offset });
     let mut cmds = vec![
-        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) },
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) },
         Command::UpdateClip { id: clip, clip: Box::new(Clip { source, offset: 0, looping, ..old.clone() }) },
     ];
     if !p.clips.iter().any(|(id, c)| *id != clip && c.source == old.source) {
@@ -591,7 +591,7 @@ pub fn consolidate_notes(p: &mut Project, track: TrackId, parts: &[PlacementId],
     let first = &placed[0].1;
     let source = p.alloc_source_id();
     let joined = Clip { scale: first.scale, gain_db: first.gain_db, muted: first.muted, ..Clip::new(first.name.clone(), first.color, source, end - start) };
-    Some(replace(p, track, &placed, Source::Notes(NoteSource { notes }), source, joined, start))
+    Some(replace(p, track, &placed, Source::Notes(NoteSource { notes, ..Default::default() }), source, joined, start))
 }
 
 /// Ctrl+J on audio clips, once their sound is rendered to `file` (from
@@ -791,7 +791,7 @@ fn own_trimmed_notes(p: &mut Project, clip: &mut Clip, cmds: &mut Vec<Command>) 
     };
     let id = p.alloc_source_id();
     let notes = notes.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
-    cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes })) });
+    cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) });
     clip.source = id;
 }
 
@@ -800,7 +800,7 @@ fn own_notes(p: &mut Project, clip: &mut Clip, cmds: &mut Vec<Command>) {
     let Some(Source::Notes(src)) = p.sources.get(&clip.source).cloned() else { return };
     let id = p.alloc_source_id();
     let notes = src.notes.into_iter().map(|n| Note { id: p.alloc_note_id(), ..n }).collect();
-    cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes })) });
+    cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes, pattern: src.pattern })) });
     clip.source = id;
 }
 
@@ -839,7 +839,7 @@ mod tests {
             }),
             None => {
                 let notes = (0..4).map(|i| Note::new(p.alloc_note_id(), 60 + i as u8, i * BEAT, BEAT / 2, 0.8)).collect();
-                Source::Notes(NoteSource { notes })
+                Source::Notes(NoteSource { notes, ..Default::default() })
             }
         };
         p.sources.insert(source, content);

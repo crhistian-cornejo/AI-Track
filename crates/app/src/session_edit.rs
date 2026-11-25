@@ -201,7 +201,7 @@ impl AppState {
         if let Some(Source::Notes(src)) = self.project.sources.get(&copy.source).cloned() {
             let id = self.project.alloc_source_id();
             let notes = src.notes.into_iter().map(|n| Note { id: self.project.alloc_note_id(), ..n }).collect();
-            cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes })) });
+            cmds.push(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes, pattern: src.pattern })) });
             copy.source = id;
         }
         let id = self.project.alloc_clip_id();

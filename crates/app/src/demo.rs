@@ -86,7 +86,7 @@ impl Builder {
             .iter()
             .map(|&(k, s, l, v)| Note::new(self.p.alloc_note_id(), k, s, l, v))
             .collect();
-        let mut source = NoteSource { notes };
+        let mut source = NoteSource { notes, ..Default::default() };
         source.sort();
         self.run(Command::AddSource { id: src, source: Box::new(Source::Notes(source)) });
         self.clip(name, color, src, length, loop_len)

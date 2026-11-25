@@ -29,7 +29,7 @@ fn midi_clip(s: &mut AppState, track: TrackId, start: Tick, length: Tick, notes:
     let (source, clip, id) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
     let notes = notes.iter().map(|&(k, at, len)| Note::new(s.project.alloc_note_id(), k, at, len, 0.8)).collect();
     assert!(s.edit("Add clip", vec![
-        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) },
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) },
         Command::AddClip { id: clip, clip: Box::new(Clip::new("Riff", Color::palette(1), source, length)) },
         Command::PlaceClip { track, placement: Placement { id, clip, start, lane: 0 } },
     ]));
@@ -532,7 +532,7 @@ fn insert_silence_moves_take_lanes_and_comp_with_the_main_lane() {
     assert!(s.edit("Add take lane", vec![Command::AddTakeLane { track: midi, index: 0, name: "Take 1".into() }]));
     let (source, clip, id) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
     assert!(s.edit("Add take", vec![
-        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new() })) },
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new(), ..Default::default() })) },
         Command::AddClip { id: clip, clip: Box::new(Clip::new("Take", Color::palette(1), source, 4 * BEAT)) },
         Command::PlaceClip { track: midi, placement: Placement { id, clip, start: 0, lane: 1 } },
         Command::SetComp { track: midi, spans: vec![CompSpan { lane: 1, start: BEAT / 2, end: 3 * BEAT }] },
@@ -1423,7 +1423,7 @@ fn an_edit_that_lands_nothing_trims_nothing() {
     let (source, clip, id) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
     s.history
         .apply(&mut s.project, "Old overlap", aitrack_model::Origin::User, vec![
-            Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new() })) },
+            Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: Vec::new(), ..Default::default() })) },
             Command::AddClip { id: clip, clip: Box::new(Clip::new("Old", Color::palette(1), source, 4 * BEAT)) },
             Command::PlaceClip { track: midi, placement: Placement { id, clip, start: 2 * BEAT, lane: 0 } },
         ])

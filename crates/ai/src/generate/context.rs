@@ -461,7 +461,7 @@ mod tests {
         let src: SourceId = p.alloc_source_id();
         let clip = p.alloc_clip_id();
         let notes: Vec<Note> = notes.iter().map(|&(k, s, l)| Note::new(NoteId(p.ids.next_raw()), k, s, l, 0.8)).collect();
-        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) }.apply(p).unwrap();
+        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) }.apply(p).unwrap();
         Command::AddClip { id: clip, clip: Box::new(Clip::new(name, Color(0), src, length)) }.apply(p).unwrap();
         let id = p.alloc_placement_id();
         Command::PlaceClip { track, placement: Placement { id, clip, start, lane: 0 } }.apply(p).unwrap();

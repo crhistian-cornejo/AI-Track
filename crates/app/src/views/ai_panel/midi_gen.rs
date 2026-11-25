@@ -195,7 +195,7 @@ pub fn commands(p: &mut Project, g: &Generated, dest: Dest, start: Tick) -> (Vec
             if stamped {
                 clip.scale = Some(g.scale());
             }
-            cmds.push(Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) });
+            cmds.push(Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) });
             cmds.push(Command::AddClip { id: clip_id, clip: Box::new(clip) });
             cmds.push(Command::PlaceClip { track, placement: Placement { id: placement, clip: clip_id, start, lane: 0 } });
             let line = if new { format!("On a new track: {name} · bar {}", start / bar_ticks + 1) } else { format!("On {name} · bar {}", start / bar_ticks + 1) };
@@ -254,7 +254,7 @@ mod tests {
         let src: SourceId = p.alloc_source_id();
         let clip = p.alloc_clip_id();
         let notes: Vec<Note> = keys.iter().enumerate().map(|(i, k)| Note::new(NoteId(p.ids.next_raw()), *k, i as i64 * 480, 240, 0.7)).collect();
-        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) }.apply(p).unwrap();
+        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) }.apply(p).unwrap();
         Command::AddClip { id: clip, clip: Box::new(Clip::new("Idea", Color(0), src, bars * 4 * PPQ)) }.apply(p).unwrap();
         let pl = p.alloc_placement_id();
         Command::PlaceClip { track, placement: Placement { id: pl, clip, start: 4 * PPQ, lane: 0 } }.apply(p).unwrap();
@@ -365,7 +365,7 @@ mod tests {
         let src = p.alloc_source_id();
         let clip = p.alloc_clip_id();
         let notes: Vec<Note> = [57u8, 60, 64, 67].iter().map(|k| Note::new(p.alloc_note_id(), *k, 0, 4 * PPQ * 4, 0.8)).collect();
-        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) }.apply(&mut p).unwrap();
+        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) }.apply(&mut p).unwrap();
         Command::AddClip { id: clip, clip: Box::new(Clip::new("Am7", Color(0), src, 4 * PPQ * 4)) }.apply(&mut p).unwrap();
         let pl = p.alloc_placement_id();
         Command::PlaceClip { track: keys, placement: Placement { id: pl, clip, start: 0, lane: 0 } }.apply(&mut p).unwrap();

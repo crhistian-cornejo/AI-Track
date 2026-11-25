@@ -1529,7 +1529,7 @@ mod tests {
                 notes.push(Note::new(nid, 48 + ((step + i) % 24) as u8, step as i64 * (PPQ / 2), PPQ / 4, 0.8));
             }
             let nsid = p.alloc_source_id();
-            p.sources.insert(nsid, Source::Notes(NoteSource { notes }));
+            p.sources.insert(nsid, Source::Notes(NoteSource { notes, ..Default::default() }));
             let cid = p.alloc_clip_id();
             p.clips.insert(cid, Clip::new(format!("Pattern {i}"), Color::palette(i), nsid, 20 * PPQ));
             let pid = p.alloc_placement_id();

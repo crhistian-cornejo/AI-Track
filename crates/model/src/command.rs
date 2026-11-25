@@ -161,6 +161,11 @@ pub enum Command {
     /// lane (what the arrangement highlights).
     SetComp { track: TrackId, spans: Vec<CompSpan> },
 
+    /// Set or clear the step pattern of a notes source (see [`crate::steps`]).
+    /// With a pattern, the source's notes become the rendered pattern: `notes`
+    /// when given (what undo and redo carry), else a fresh render. With no
+    /// pattern the notes are `notes`, or stay as they are (convert to notes).
+    SetStepPattern { source: SourceId, pattern: Option<Box<crate::steps::StepPattern>>, notes: Option<Vec<Note>> },
     AddNotes { source: SourceId, notes: Vec<Note> },
     RemoveNotes { source: SourceId, ids: Vec<NoteId> },
     /// Replace notes with the same ids (move, resize, velocity…).
@@ -315,6 +320,8 @@ impl Command {
             RenameTakeLane { .. } => "Rename take lane",
             MoveTakeLane { .. } => "Move take lane",
             SetComp { .. } => "Comp",
+            SetStepPattern { pattern: Some(_), .. } => "Edit steps",
+            SetStepPattern { pattern: None, .. } => "Convert to notes",
             AddNotes { .. } => "Add notes",
             RemoveNotes { .. } => "Delete notes",
             UpdateNotes { .. } => "Edit notes",
@@ -381,7 +388,7 @@ impl Command {
             MovePlacement { track, to_track, .. } => frozen(*track).or_else(|| frozen(*to_track)),
             UpdateClip { id, .. } => clip_track(*id),
             SetClipGroove { clip, .. } => clip_track(*clip),
-            AddNotes { source, .. } | RemoveNotes { source, .. } | UpdateNotes { source, .. } | SetWarp { source, .. } => source_track(*source),
+            AddNotes { source, .. } | RemoveNotes { source, .. } | UpdateNotes { source, .. } | SetStepPattern { source, .. } | SetWarp { source, .. } => source_track(*source),
             AddDevice { slot, .. } | MoveDevice { to: slot, .. } => match slot {
                 DeviceSlot::Track { track, .. } => frozen(*track),
                 DeviceSlot::Rack { rack, .. } | DeviceSlot::Return { rack, .. } => device(*rack),
@@ -691,18 +698,42 @@ impl Command {
                 Ok(SetSessionSlot { track, scene, clip: old })
             }
 
+            SetStepPattern { source, pattern, notes } => {
+                if let Some(pat) = &pattern
+                    && (pat.span <= 0 || pat.rows.len() > crate::steps::MAX_ROWS)
+                {
+                    return Err(CommandError::Invalid("step pattern needs a positive span and at most 32 rows".into()));
+                }
+                note_source(p, source)?;
+                let notes = match (&pattern, notes) {
+                    (_, Some(n)) => Some(n),
+                    (Some(pat), None) => Some(crate::steps::render_notes(p, pat)),
+                    (None, None) => None,
+                };
+                for n in notes.iter().flatten() {
+                    p.ids.observe(n.id.0);
+                }
+                let src = note_source(p, source)?;
+                let old_pattern = std::mem::replace(&mut src.pattern, pattern.map(|b| *b));
+                let old_notes = match notes {
+                    Some(new) => std::mem::replace(&mut src.notes, new),
+                    None => src.notes.clone(),
+                };
+                src.sort();
+                Ok(SetStepPattern { source, pattern: old_pattern.map(Box::new), notes: Some(old_notes) })
+            }
             AddNotes { source, notes } => {
                 for n in &notes {
                     p.ids.observe(n.id.0);
                 }
-                let src = note_source(p, source)?;
+                let src = note_source_free(p, source)?;
                 let ids = notes.iter().map(|n| n.id).collect();
                 src.notes.extend(notes);
                 src.sort();
                 Ok(RemoveNotes { source, ids })
             }
             RemoveNotes { source, ids } => {
-                let src = note_source(p, source)?;
+                let src = note_source_free(p, source)?;
                 let mut removed = Vec::with_capacity(ids.len());
                 src.notes.retain(|n| {
                     if ids.contains(&n.id) {
@@ -715,7 +746,7 @@ impl Command {
                 Ok(AddNotes { source, notes: removed })
             }
             UpdateNotes { source, notes } => {
-                let src = note_source(p, source)?;
+                let src = note_source_free(p, source)?;
                 let mut old = Vec::with_capacity(notes.len());
                 for new in notes {
                     if let Some(slot) = src.notes.iter_mut().find(|n| n.id == new.id) {
@@ -1385,6 +1416,16 @@ fn note_source(p: &mut Project, id: SourceId) -> Result<&mut NoteSource, Command
     }
 }
 
+/// [`note_source`] for edits of single notes: a step clip's notes come from
+/// its pattern, so those edits go through `SetStepPattern`.
+fn note_source_free(p: &mut Project, id: SourceId) -> Result<&mut NoteSource, CommandError> {
+    let src = note_source(p, id)?;
+    if src.pattern.is_some() {
+        return Err(CommandError::Invalid("a step clip's notes come from its pattern: edit the steps or convert it to notes".into()));
+    }
+    Ok(src)
+}
+
 fn rack_ref(p: &Project, id: DeviceId) -> Result<&Rack, CommandError> {
     match p.device(id) {
         Some(Device { kind: DeviceKind::Rack(r), .. }) => Ok(r),
@@ -1853,7 +1894,7 @@ mod tests {
         let mut p = fresh();
         Command::AddScene { scene: Scene { id: SceneId(1200), name: "x".into(), tempo: None }, index: 0 }.apply(&mut p).unwrap();
         check(&mut p, 1200, "AddScene");
-        Command::AddSource { id: SourceId(1300), source: Box::new(Source::Notes(NoteSource { notes: vec![Note::new(NoteId(1350), 60, 0, 1, 1.0)] })) }.apply(&mut p).unwrap();
+        Command::AddSource { id: SourceId(1300), source: Box::new(Source::Notes(NoteSource { notes: vec![Note::new(NoteId(1350), 60, 0, 1, 1.0)], ..Default::default() })) }.apply(&mut p).unwrap();
         check(&mut p, 1350, "AddSource");
         Command::AddClip { id: ClipId(1400), clip: Box::new(Clip::new("c", Color(0), SourceId(1300), 10)) }.apply(&mut p).unwrap();
         check(&mut p, 1400, "AddClip");

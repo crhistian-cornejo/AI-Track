@@ -152,7 +152,7 @@ pub fn pack_commands(p: &mut Project, opts: &PackOpts, seed: u64) -> Grown {
         if stamp && m.kind.is_tonal() {
             clip.scale = Some(scale);
         }
-        clip_cmds.push(Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) });
+        clip_cmds.push(Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) });
         clip_cmds.push(Command::AddClip { id: clip_id, clip: Box::new(clip) });
         clip_cmds.push(Command::PlaceClip { track: id, placement: Placement { id: placement, clip: clip_id, start, lane: 0 } });
         tracks.push(id);

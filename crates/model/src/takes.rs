@@ -591,7 +591,7 @@ mod tests {
         Command::AddTakeLane { track, index: 0, name: "Take 1".into() }.apply(&mut p).unwrap();
         let source = p.alloc_source_id();
         let notes = (0..8).map(|i| Note::new(p.alloc_note_id(), 60 + i as u8, i * PPQ, PPQ, 0.8)).collect();
-        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) }.apply(&mut p).unwrap();
+        Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) }.apply(&mut p).unwrap();
         let (clip, pid) = (p.alloc_clip_id(), p.alloc_placement_id());
         Command::AddClip { id: clip, clip: Box::new(Clip::new("t", Color(1), source, 8 * PPQ)) }.apply(&mut p).unwrap();
         Command::PlaceClip { track, placement: Placement { id: pid, clip, start: 0, lane: 1 } }.apply(&mut p).unwrap();

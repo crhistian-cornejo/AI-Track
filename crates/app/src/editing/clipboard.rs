@@ -129,7 +129,7 @@ impl Plan {
             Source::Notes(n) => {
                 let id = self.p.alloc_source_id();
                 let notes = n.notes.iter().map(|x| Note { id: self.p.alloc_note_id(), ..x.clone() }).collect();
-                self.run(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes })) });
+                self.run(Command::AddSource { id, source: Box::new(Source::Notes(NoteSource { notes, pattern: n.pattern.clone() })) });
                 clip.source = id;
             }
             Source::Audio(a) => {

@@ -62,6 +62,7 @@ enum Slot {
     Chain(crate::DeviceId, usize, bool, std::mem::Discriminant<ChainProp>, usize),
     Mapping(crate::DeviceId, usize, usize),
     Selector(crate::DeviceId),
+    Steps(crate::SourceId),
     Tempo,
     Loop,
     Clip(crate::ClipId),
@@ -78,6 +79,7 @@ enum Slot {
 /// moves relative to the current place, batches…).
 fn slot(c: &Command) -> Option<Slot> {
     Some(match c {
+        Command::SetStepPattern { source, .. } => Slot::Steps(*source),
         Command::UpdateNotes { source, notes } => Slot::Notes(*source, notes.iter().map(|n| n.id).collect()),
         Command::SetTrack { id, change } => Slot::Track(*id, std::mem::discriminant(change)),
         Command::SetParam { device, param, .. } => Slot::Param(*device, *param),
@@ -360,7 +362,7 @@ mod tests {
         let source = p.alloc_source_id();
         let notes: Vec<Note> = (0..500i64).map(|i| Note::new(p.alloc_note_id(), 60, i * 10, 5, 0.8)).collect();
         let mut h = History::default();
-        h.apply(&mut p, "Add", Origin::User, vec![Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: notes.clone() })) }]).unwrap();
+        h.apply(&mut p, "Add", Origin::User, vec![Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes: notes.clone(), ..Default::default() })) }]).unwrap();
         for frame in 1..=120i64 {
             let moved: Vec<Note> = notes.iter().map(|n| Note { start: n.start + frame * 3, ..n.clone() }).collect();
             h.apply_coalesced(&mut p, "notes-move", "Move notes", vec![Command::UpdateNotes { source, notes: moved }]).unwrap();

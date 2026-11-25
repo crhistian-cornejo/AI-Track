@@ -147,7 +147,7 @@ pub fn clip_commands(p: &mut Project, track: TrackId, phrase: &Phrase, name: &st
     let notes: Vec<Note> = phrase.notes(BASE_KEY).into_iter().map(|n| Note::new(p.alloc_note_id(), n.key, n.start, n.length, n.velocity)).collect();
     let (src, clip) = (p.alloc_source_id(), p.alloc_clip_id());
     let mut cmds = vec![
-        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) },
+        Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) },
         Command::AddClip { id: clip, clip: Box::new(Clip::new(name, color, src, phrase.ticks())) },
     ];
     match slot {

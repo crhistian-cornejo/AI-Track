@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     fn notes() -> NoteSource {
-        NoteSource { notes: (0..4).map(|i| Note::new(NoteId(i as u64 + 10), 60 + i, i as Tick * PPQ, PPQ / 2, 1.0)).collect() }
+        NoteSource { notes: (0..4).map(|i| Note::new(NoteId(i as u64 + 10), 60 + i, i as Tick * PPQ, PPQ / 2, 1.0)).collect(), ..Default::default() }
     }
 
     fn collect(c: &CompiledClip, start: Tick, limit: Option<Tick>, total: i64) -> Vec<(i64, u8)> {
@@ -1379,7 +1379,7 @@ mod tests {
     /// stop. A note-on is only emitted when its note-off is certain to fit.
     #[test]
     fn every_note_on_gets_its_note_off_when_the_event_list_is_short() {
-        let many = NoteSource { notes: (0..3000).map(|i| Note::new(NoteId(i as u64 + 1), (i % 128) as u8, 0, PPQ / 4, 1.0)).collect() };
+        let many = NoteSource { notes: (0..3000).map(|i| Note::new(NoteId(i as u64 + 1), (i % 128) as u8, 0, PPQ / 4, 1.0)).collect(), ..Default::default() };
         let c = CompiledClip::midi(ClipId(1), &clip(0, PPQ, None), &many);
         let (ons, offs, active, dropped) = run_notes(&c, PPQ, 2048, 20);
         assert!(!ons.is_empty());

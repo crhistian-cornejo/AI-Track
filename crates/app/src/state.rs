@@ -1578,9 +1578,9 @@ impl AppState {
             .and_then(|id| self.project.track_index(id))
             .filter(|i| *i < buses)
             .map_or(buses, |i| {
-                // After a group, skip the tracks inside it.
+                // After a group, skip the tracks inside it (nested groups' too).
                 let id = self.project.tracks[i].id;
-                let inside = self.project.tracks[i + 1..buses].iter().take_while(|t| t.parent == Some(id)).count();
+                let inside = self.project.tracks[i + 1..buses].iter().take_while(|t| aitrack_model::groups::within(&self.project, t.id, id)).count();
                 i + 1 + inside
             })
     }

@@ -40,6 +40,8 @@ use std::time::Duration;
 pub(crate) const REC_CHUNK: usize = 256;
 /// Most tracks recorded audio at once.
 pub(crate) const MAX_REC_TRACKS: usize = 64;
+/// How often the writer updates the headers of the files of a take in progress.
+const FLUSH_EVERY: Duration = Duration::from_secs(1);
 /// Capacity of the MIDI queue (events).
 pub(crate) const MIDI_QUEUE: usize = 8192;
 /// Capacity of the audio queue (chunks), shared by every recorded track:
@@ -333,12 +335,25 @@ fn writer_loop(ctl: Receiver<WriterMsg>, results: Arc<Mutex<Vec<AudioTake>>>) {
     // Distinguishes the files of this run from an earlier one.
     let engine = ENGINES.fetch_add(1, Ordering::Relaxed);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut flushed = std::time::Instant::now();
     loop {
         let mut idle = true;
         if let Some(c) = rx.as_mut() {
             while let Ok(chunk) = c.pop() {
                 idle = false;
                 write_chunk(&mut files, &dir, stamp, engine, &results, &chunk);
+            }
+        }
+        // Keep the headers of open files current, so a crash mid-take
+        // leaves a WAV that holds what was recorded until now.
+        if flushed.elapsed() >= FLUSH_EVERY {
+            flushed = std::time::Instant::now();
+            for f in &mut files {
+                if let Some(w) = f.writer.as_mut()
+                    && let Err(e) = w.flush()
+                {
+                    f.error.get_or_insert(e.to_string());
+                }
             }
         }
         let wait = if idle { Duration::from_millis(2) } else { Duration::ZERO };
@@ -833,6 +848,32 @@ mod tests {
         let second = results.lock().unwrap().pop().unwrap();
         assert_ne!(second.path, take.path);
         assert_eq!(hound::WavReader::open(&take.path).unwrap().len(), 400, "the first file is intact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_take_in_progress_is_a_readable_wav_on_disk() {
+        // What a crash mid-take leaves behind must hold what was recorded so far.
+        let dir = std::env::temp_dir().join(format!("aitrack-writer-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Recorder::spawn().unwrap();
+        rec.set_dir(dir.clone());
+        let (mut tx, rx) = RingBuffer::<RecChunk>::new(8);
+        rec.attach(rx);
+        let mut c = RecChunk::new(5, 1, 48_000, 2, 0, 0.0);
+        c.frames = 200;
+        c.l[..200].fill(0.25);
+        c.r[..200].fill(-0.25);
+        assert!(tx.push(c).is_ok());
+        let deadline = std::time::Instant::now() + FLUSH_EVERY * 4;
+        let mut seen = 0;
+        while std::time::Instant::now() < deadline && seen < 200 {
+            std::thread::sleep(Duration::from_millis(20));
+            let file = std::fs::read_dir(&dir).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| e.path());
+            seen = file.and_then(|p| hound::WavReader::open(p).ok()).map_or(0, |r| r.duration());
+        }
+        assert_eq!(seen, 200, "the open file's header counts the frames written so far");
+        drop(rec);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

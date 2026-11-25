@@ -139,13 +139,21 @@ const OWN_FOLDERS: [&str; 2] = ["Samples", "Recordings"];
 /// path. The folder of the file itself is not the project's: saving into
 /// `~/Music` must not make everything under it "inside the project".
 fn relativize_owned(project: &Project, base: &Path) -> Project {
+    let owned = |path: &Path| aitrack_model::paths::relative_path(path, base).filter(|rel| rel.components().next().is_some_and(|c| OWN_FOLDERS.iter().any(|f| c.as_os_str() == *f)));
     let mut out = project.clone();
     for source in out.sources.values_mut() {
         if let aitrack_model::Source::Audio(a) = source
-            && let Some(rel) = aitrack_model::paths::relative_path(&a.path, base)
-            && rel.components().next().is_some_and(|c| OWN_FOLDERS.iter().any(|f| c.as_os_str() == *f))
+            && let Some(rel) = owned(&a.path)
         {
             a.path = rel;
+        }
+    }
+    // A frozen track's render lives in `Samples/Frozen` and moves with the folder too.
+    for t in &mut out.tracks {
+        if let Some(f) = &mut t.freeze
+            && let Some(rel) = owned(&f.file.path)
+        {
+            f.file.path = rel;
         }
     }
     out
@@ -949,6 +957,31 @@ mod tests {
         assert!(paths.contains(&outside), "a file elsewhere keeps its path");
         // The project in memory is never touched by saving.
         assert!(audio_paths(&project).contains(&inside));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_frozen_tracks_render_moves_with_the_project_folder() {
+        let root = std::env::temp_dir().join(format!("aitrack-io-move-frozen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("song");
+        let path = home.join("Song.aitrack");
+        let render = crate::freeze::fresh_frozen(&crate::freeze::freeze_folder(Some(&path)), "Lead", &[]);
+        std::fs::create_dir_all(render.parent().unwrap()).unwrap();
+        std::fs::write(&render, b"RIFF").unwrap();
+        let mut project = Project::new("Song");
+        let mut track = aitrack_model::Track::new(project.alloc_track_id(), aitrack_model::TrackKind::Instrument, "Lead", aitrack_model::Color(0x808080));
+        let file = aitrack_model::AudioSource { path: render.clone(), hash: None, sample_rate: 48_000, channels: 2, frames: 48_000, warp: aitrack_model::Warp::default(), key: None };
+        track.freeze = Some(aitrack_model::Freeze { file });
+        project.tracks.push(track);
+        save(&path, &project).unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(&home, &moved).unwrap();
+        let back = load(&moved.join("Song.aitrack")).unwrap();
+        let frozen = back.tracks.iter().find_map(|t| t.freeze.as_ref()).expect("still frozen");
+        let expected = moved.join(render.strip_prefix(&home).unwrap());
+        assert_eq!(frozen.file.path, expected, "the render inside the project folder is found in its new place");
+        assert!(frozen.file.path.is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 

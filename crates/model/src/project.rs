@@ -769,8 +769,12 @@ pub enum Source {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NoteSource {
-    /// Kept sorted by `start`, then `key`.
+    /// Kept sorted by `start`, then `key`. For a step clip these are the
+    /// rendered pattern (see [`crate::steps`]).
     pub notes: Vec<Note>,
+    /// The step pattern the notes come from; `None` for a plain notes clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<crate::steps::StepPattern>,
 }
 
 impl NoteSource {

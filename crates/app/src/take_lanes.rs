@@ -195,7 +195,7 @@ impl AppState {
                 })
                 .collect();
             let (source, clip, placement) = (self.project.alloc_source_id(), self.project.alloc_clip_id(), self.project.alloc_placement_id());
-            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
+            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) });
             cmds.push(Command::AddClip { id: clip, clip: Box::new(Clip::new(format!("Take {}", take + 1), color, source, 4 * bar)) });
             place.push(Command::PlaceClip { track, placement: Placement { id: placement, clip, start: at, lane: take as u16 + 1 } });
         }
@@ -275,7 +275,7 @@ impl AppState {
             let (source, clip, placement) = (this.project.alloc_source_id(), this.project.alloc_clip_id(), this.project.alloc_placement_id());
             let notes = notes.iter().map(|n| Note { id: this.project.alloc_note_id(), ..n.clone() }).collect();
             vec![
-                Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) },
+                Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) },
                 Command::AddClip { id: clip, clip: Box::new(Clip::new(name, color, source, length)) },
                 Command::PlaceClip { track, placement: Placement { id: placement, clip, start, lane } },
             ]

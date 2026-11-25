@@ -677,7 +677,7 @@ impl AppState {
             let (source, clip, placement) = (self.project.alloc_source_id(), self.project.alloc_clip_id(), self.project.alloc_placement_id());
             let mut c = Clip::new("Recorded", color, source, len);
             c.looping = None;
-            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes })) });
+            cmds.push(Command::AddSource { id: source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) });
             cmds.push(Command::AddClip { id: clip, clip: Box::new(c) });
             cmds.push(Command::PlaceClip { track, placement: Placement { id: placement, clip, start, lane: 0 } });
         }
@@ -2816,7 +2816,7 @@ impl AppState {
         t.devices.push(Device::stock(dev, "instrument.wavetable", "Wavetable Synth"));
         let mut commands = vec![
             Command::AddTrack { track: Box::new(t), index },
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) },
             Command::AddClip {
                 id: clip,
                 clip: Box::new(Clip::new(name, color, src, length)),
@@ -3126,7 +3126,7 @@ mod tests {
         let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
         let note = Note::new(s.project.alloc_note_id(), 60, 0, PPQ, 0.8);
         s.edit("clip", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![note] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![note], ..Default::default() })) },
             Command::AddClip { id: clip, clip: Box::new(Clip::new("riff", Color::palette(1), src, PPQ)) },
             Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
         ]);
@@ -3371,7 +3371,7 @@ mod tests {
         let t = armed_keys(&mut s);
         let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
         s.edit("old", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![], ..Default::default() })) },
             Command::AddClip { id: clip, clip: Box::new(Clip::new("old", Color::palette(1), src, 8 * PPQ)) },
             Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
         ]);
@@ -3488,7 +3488,7 @@ mod tests {
         let t = audio_track_with_input(&mut s);
         let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
         s.edit("old", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![], ..Default::default() })) },
             Command::AddClip { id: clip, clip: Box::new(Clip::new("old", Color::palette(1), src, 16 * PPQ)) },
             Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 0, lane: 0 } },
         ]);
@@ -3599,7 +3599,7 @@ mod tests {
         // Something after the loop that the recording must not touch.
         let (src, clip, pl) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
         s.edit("later", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![], ..Default::default() })) },
             Command::AddClip { id: clip, clip: Box::new(Clip::new("later", Color::palette(1), src, 4 * bar)) },
             Command::PlaceClip { track: t, placement: Placement { id: pl, clip, start: 2 * bar, lane: 0 } },
         ]);
@@ -3656,7 +3656,7 @@ mod tests {
         let hand = Color::palette(9);
         assert_ne!(hand, old);
         s.edit("clips", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![], ..Default::default() })) },
             Command::AddClip { id: c1, clip: Box::new(Clip::new("one", old, src, PPQ)) },
             Command::AddClip { id: c2, clip: Box::new(Clip::new("two", hand, src, PPQ)) },
             Command::PlaceClip { track: t, placement: Placement { id: p1, clip: c1, start: 0, lane: 0 } },
@@ -3684,7 +3684,7 @@ mod tests {
         let (src, c1, p1) = (s.project.alloc_source_id(), s.project.alloc_clip_id(), s.project.alloc_placement_id());
         let hand = Color::grid(2, 4);
         s.edit("clips", vec![
-            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![] })) },
+            Command::AddSource { id: src, source: Box::new(Source::Notes(NoteSource { notes: vec![], ..Default::default() })) },
             Command::AddClip { id: c1, clip: Box::new(Clip::new("one", hand, src, PPQ)) },
             Command::PlaceClip { track: t, placement: Placement { id: p1, clip: c1, start: 0, lane: 0 } },
         ]);

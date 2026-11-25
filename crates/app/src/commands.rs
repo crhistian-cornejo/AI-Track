@@ -193,6 +193,17 @@ pub fn run(ws: &mut Workspace, cmd: Cmd, window: &mut Window, cx: &mut Context<W
                 ws.toast("Select a MIDI track to insert a clip", cx);
             }
         }
+        Cmd::InsertStepClip => {
+            if ws.s.insert_step_clip().is_none() {
+                ws.toast("Select a MIDI track to insert a step sequencer clip", cx);
+            }
+        }
+        Cmd::ConvertStepClip => {
+            let done = ws.s.selected_clip.is_some_and(|c| if ws.s.clip_pattern(c).is_some() { ws.s.convert_to_notes(c) } else { ws.s.convert_to_steps(c) });
+            if !done {
+                ws.toast("Select a MIDI clip to convert", cx);
+            }
+        }
         Cmd::NarrowGrid | Cmd::WidenGrid => {
             ws.s.step_grid(if cmd == Cmd::NarrowGrid { -1 } else { 1 });
             ws.toast(format!("Grid: {}", grid_label(ws)), cx);

@@ -125,13 +125,13 @@ impl ClipCopier {
             return Some(new);
         }
         let mut clip = p.clips.get(&old)?.clone();
-        if let Some(Source::Notes(notes)) = p.sources.get(&clip.source).cloned() {
+        if let Some(Source::Notes(old_src)) = p.sources.get(&clip.source).cloned() {
             clip.source = match self.sources.get(&clip.source) {
                 Some(&s) => s,
                 None => {
                     let new = p.alloc_source_id();
-                    let notes = notes.notes.iter().map(|n| Note { id: p.alloc_note_id(), ..n.clone() }).collect();
-                    self.commands.push(Command::AddSource { id: new, source: Box::new(Source::Notes(NoteSource { notes })) });
+                    let notes = old_src.notes.iter().map(|n| Note { id: p.alloc_note_id(), ..n.clone() }).collect();
+                    self.commands.push(Command::AddSource { id: new, source: Box::new(Source::Notes(NoteSource { notes, pattern: old_src.pattern.clone() })) });
                     self.sources.insert(clip.source, new);
                     new
                 }
@@ -436,7 +436,7 @@ mod tests {
         // and an audio source.
         let notes_source = p.alloc_source_id();
         let notes = (0..3).map(|i| Note::new(p.alloc_note_id(), 60 + i, i as i64 * PPQ, PPQ / 2, 0.8)).collect();
-        Command::AddSource { id: notes_source, source: Box::new(Source::Notes(NoteSource { notes })) }.apply(&mut p).unwrap();
+        Command::AddSource { id: notes_source, source: Box::new(Source::Notes(NoteSource { notes, ..Default::default() })) }.apply(&mut p).unwrap();
         let audio_source = p.alloc_source_id();
         let audio = AudioSource { path: "a.wav".into(), hash: None, sample_rate: 48_000, channels: 2, frames: 48_000, warp: Warp::default(), key: None };
         Command::AddSource { id: audio_source, source: Box::new(Source::Audio(audio)) }.apply(&mut p).unwrap();

@@ -132,6 +132,8 @@ commands! {
     StackDetailView,
     Quantize,
     InsertMidiClip,
+    InsertStepClip,
+    ConvertStepClip,
     CaptureMidi,
     CaptureAutomation,
     SimplifyEnvelope,
@@ -225,6 +227,8 @@ pub static TABLE: &[Entry] = &[
     cmd(Cmd::DuplicateWithoutContent, "Duplicate Without Content", "Duplicate the selected tracks with their devices and routing, without clips or automation.", C::Tracks, &[]),
     cmd(Cmd::UnsoloAll, "Unsolo All Tracks", "Turn Solo off on every soloed track in one undo step.", C::Tracks, &[]),
     cmd(Cmd::InsertMidiClip, "Insert MIDI Clip", "An empty MIDI clip in the time selection, or one bar at the insert marker.", C::Editing, &["mod-shift-m"]),
+    cmd(Cmd::InsertStepClip, "Insert Step Sequencer Clip", "An empty step sequencer clip (rows of steps with their own length, rate, direction and swing) in the time selection, or one bar at the insert marker.", C::Editing, &["mod-shift-p"]),
+    cmd(Cmd::ConvertStepClip, "Convert Step Clip / MIDI Clip", "Turn the selected step sequencer clip into plain MIDI notes, or a MIDI clip into steps (notes snap to sixteenth steps).", C::Editing, &[]),
     cmd(Cmd::CaptureMidi, "Capture MIDI", "Turn what you played on armed tracks while the song rolled, the last minutes, into a MIDI clip at the positions you played it.", C::Editing, &[]),
     cmd(Cmd::CaptureAutomation, "Capture Automation", "Write the knob and fader moves of the last minutes into automation lanes, at the positions where you made them.", C::Editing, &[]),
     cmd(Cmd::SimplifyEnvelope, "Simplify Envelope", "Fewer breakpoints for the same automation curve: in the selected range, or in the whole lane.", C::Editing, &[]),
@@ -495,7 +499,7 @@ mod tests {
         // Every command of the table has a row, and a key, except the few
         // reached only from the palette and menus.
         const KEYLESS: &[Bound] =
-            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack), Bound::Cmd(Cmd::LoopToNextLocator), Bound::Cmd(Cmd::BounceInPlace), Bound::Cmd(Cmd::CaptureMidi), Bound::Cmd(Cmd::CaptureAutomation), Bound::Cmd(Cmd::SimplifyEnvelope), Bound::Cmd(Cmd::DuplicateWithoutContent), Bound::Cmd(Cmd::UnsoloAll), Bound::Cmd(Cmd::StackDetailView)];
+            &[Bound::Action("AddLibraryFolder"), Bound::Action("ToggleAutomationArm"), Bound::Action("CollectAndSave"), Bound::Action("FindMissingFiles"), Bound::Action("CheckForUpdates"), Bound::Cmd(Cmd::SliceToDrumRack), Bound::Cmd(Cmd::LoopToNextLocator), Bound::Cmd(Cmd::BounceInPlace), Bound::Cmd(Cmd::CaptureMidi), Bound::Cmd(Cmd::CaptureAutomation), Bound::Cmd(Cmd::SimplifyEnvelope), Bound::Cmd(Cmd::DuplicateWithoutContent), Bound::Cmd(Cmd::UnsoloAll), Bound::Cmd(Cmd::StackDetailView), Bound::Cmd(Cmd::ConvertStepClip)];
         for e in TABLE {
             assert!(!e.keys.is_empty() || KEYLESS.contains(&e.bound), "{} has no key", e.label);
             assert!(!e.label.is_empty() && e.help.ends_with('.'), "{}", e.label);

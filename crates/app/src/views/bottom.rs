@@ -40,14 +40,20 @@ pub enum ClipEditor {
     Sample,
     Piano,
     Steps,
+    /// A Step Sequencer clip: rows of steps with their own length, rate,
+    /// direction and swing (`step_clip.rs`).
+    StepClip,
 }
 
 /// The editor for the current tab and clip: audio clips always get the
-/// sample editor; the Steps tab shows the drum rack's step clip.
-pub fn clip_editor(tab: BottomTab, audio: bool) -> ClipEditor {
+/// sample editor; the Steps tab shows the drum rack's step grid; a clip that
+/// holds a step pattern (`pattern`) gets the step sequencer clip editor
+/// instead of the piano roll.
+pub fn clip_editor(tab: BottomTab, audio: bool, pattern: bool) -> ClipEditor {
     match tab {
         BottomTab::Steps => ClipEditor::Steps,
         _ if audio => ClipEditor::Sample,
+        _ if pattern => ClipEditor::StepClip,
         _ => ClipEditor::Piano,
     }
 }
@@ -62,7 +68,8 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
     let tab = ws.s.bottom_tab;
     let clip_view = tab != BottomTab::Devices;
     let audio = ws.s.selected_clip.and_then(|c| ws.s.project.clips.get(&c)).is_some_and(|c| matches!(ws.s.project.sources.get(&c.source), Some(Source::Audio(_))));
-    let editor = clip_editor(tab, audio);
+    let pattern = ws.s.selected_clip.is_some_and(|c| ws.s.clip_pattern(c).is_some());
+    let editor = clip_editor(tab, audio, pattern);
     let step_clip = ws.s.step_clip();
     // The clip the Clip View shows.
     let clip_id = match editor {
@@ -120,7 +127,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 .child(label(crate::paint::fit(&name, 144., TEXT_MD), TEXT_MD, pal.text).font_weight(FontWeight::MEDIUM))
         });
     // MIDI clips choose between the piano roll and the step sequencer.
-    if (clip_view || stacked) && !audio && step_clip.is_some() {
+    if (clip_view || stacked) && !audio && step_clip.is_some() && editor != ClipEditor::StepClip {
         let weak = cx.entity().downgrade();
         let on_editor: widgets::OnSelect = Rc::new(move |i, _, cx| {
             let _ = weak.update(cx, |this, cx| this.set_tab(if i == 0 { BottomTab::PianoRoll } else { BottomTab::Steps }, cx));
@@ -156,6 +163,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
                 ClipEditor::Sample => crate::views::sample_editor::render(ws, window, cx),
                 ClipEditor::Piano => crate::views::piano_roll::render(ws, window, cx),
                 ClipEditor::Steps => crate::views::steps::render(ws, window, cx),
+                ClipEditor::StepClip => crate::views::step_clip::render(ws, window, cx),
             };
             let props = clip_id.and_then(|id| clip_props(ws, id, editor, cx));
             div()
@@ -276,7 +284,7 @@ pub fn render(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspac
 // ───────────────────────────── Clip properties ─────────────────────────────
 
 /// One of Live's property boxes: a caption bar and its rows.
-fn section(title: &'static str, ic: Icon) -> Div {
+pub(super) fn section(title: &'static str, ic: Icon) -> Div {
     let pal = p();
     div().flex_none().flex().flex_col().border_b_1().border_color(border()).pb(px(SP2)).child(
         div()
@@ -291,7 +299,7 @@ fn section(title: &'static str, ic: Icon) -> Div {
 }
 
 /// A caption and its value on one row.
-fn row(caption: &'static str, value: impl IntoElement) -> Div {
+pub(super) fn row(caption: &'static str, value: impl IntoElement) -> Div {
     div()
         .h(px(ROW_H))
         .px(px(SP2))
@@ -303,7 +311,7 @@ fn row(caption: &'static str, value: impl IntoElement) -> Div {
 }
 
 /// A small text button of the properties column.
-fn small_button(id: impl Into<gpui::ElementId>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
+pub(super) fn small_button(id: impl Into<gpui::ElementId>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
     let pal = p();
     div()
         .id(id)
@@ -982,6 +990,24 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                 ));
             column = column.child(sample_box);
         }
+        Some(Source::Notes(src)) if src.pattern.is_some() => {
+            let rows = src.pattern.as_ref().map_or(0, |p| p.rows.len());
+            let hits = src.notes.len();
+            let steps_box = section("STEPS", Icon::Steps)
+                .child(row("Rows", mono(format!("{rows}"), TEXT_SM, pal.text)))
+                .child(row("Hits", mono(format!("{hits}"), TEXT_SM, pal.text)))
+                .child(
+                    div().px(px(SP2)).pt(px(SP1)).flex().gap(px(SP1)).child(
+                        small_button(("steps-to-notes", n), "Convert to Notes", true)
+                            .tooltip(widgets::tip("Turn the steps into plain MIDI notes", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.s.convert_to_notes(id);
+                                cx.notify();
+                            })),
+                    ),
+                );
+            column = column.child(steps_box);
+        }
         Some(Source::Notes(_)) => {
             let notes: Vec<Note> = ws.s.clip_notes(id).map(|(_, n)| n.notes.clone()).unwrap_or_default();
             let selected = notes.iter().filter(|n| ws.s.selected_notes.contains(&n.id)).count();
@@ -1054,6 +1080,12 @@ fn clip_props(ws: &mut Workspace, id: ClipId, editor: ClipEditor, cx: &mut Conte
                             move |this, _, _, cx| {
                                 this.s.selected_clip = Some(id);
                                 this.quantize_clip(cx);
+                            },
+                        )))
+                        .child(small_button(("notes-steps", n), "To Steps", has_notes).tooltip(widgets::tip("Turn the notes into a step sequencer clip (snapped to sixteenth steps)", None)).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.s.convert_to_steps(id);
+                                cx.notify();
                             },
                         )))
                         .child(small_button(("notes-scale", n), "Fit to Scale", has_notes).tooltip(widgets::tip("Move the notes into the key", None)).on_click(cx.listener(
@@ -1428,10 +1460,11 @@ mod tests {
 
     #[test]
     fn audio_clips_get_the_sample_editor_and_steps_stay_steps() {
-        assert_eq!(clip_editor(BottomTab::PianoRoll, true), ClipEditor::Sample);
-        assert_eq!(clip_editor(BottomTab::PianoRoll, false), ClipEditor::Piano);
-        assert_eq!(clip_editor(BottomTab::Steps, false), ClipEditor::Steps);
-        assert_eq!(clip_editor(BottomTab::Steps, true), ClipEditor::Steps);
+        assert_eq!(clip_editor(BottomTab::PianoRoll, true, false), ClipEditor::Sample);
+        assert_eq!(clip_editor(BottomTab::PianoRoll, false, false), ClipEditor::Piano);
+        assert_eq!(clip_editor(BottomTab::PianoRoll, false, true), ClipEditor::StepClip);
+        assert_eq!(clip_editor(BottomTab::Steps, false, false), ClipEditor::Steps);
+        assert_eq!(clip_editor(BottomTab::Steps, true, false), ClipEditor::Steps);
     }
 
     #[test]

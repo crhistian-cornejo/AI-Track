@@ -24,6 +24,7 @@ pub mod project;
 pub mod racks;
 pub mod routing;
 pub mod slice;
+pub mod steps;
 pub mod scale;
 pub mod takes;
 pub mod time;
@@ -35,5 +36,6 @@ pub use groove::{Groove, GrooveParams, GrooveSettings, GrooveSlot, NoteGroove, P
 pub use history::{History, Origin, Proposal, Transaction};
 pub use ids::*;
 pub use project::*;
+pub use steps::{Step, StepDirection, StepPattern, StepRate, StepRow};
 pub use scale::{Key, Scale, ScaleKind};
 pub use time::{Tick, TempoMap, TimeSignature, PPQ};

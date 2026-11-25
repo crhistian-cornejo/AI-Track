@@ -559,21 +559,9 @@ fn card(
         .into_any_element()
 }
 
-/// Fold or unfold a device. Folding is view state stored on the device, so
-/// it goes through a command too.
+/// Fold or unfold a device (one `SetDeviceCollapsed` step).
 pub fn toggle_fold(ws: &mut Workspace, id: DeviceId) {
-    let Some(mut dev) = ws.s.project.device(id).cloned() else { return };
-    let Some(slot) = racks::device_slot(&ws.s.project, id) else {
-        return;
-    };
-    dev.collapsed = !dev.collapsed;
-    ws.s.edit(if dev.collapsed { "Fold device" } else { "Show device" }, vec![
-            Command::RemoveDevice { id },
-            Command::AddDevice {
-                slot,
-                device: Box::new(dev),
-            },
-    ]);
+    ws.s.fold_device(id);
 }
 
 /// A knob wired to a drag; double-click resets to the default, Shift drags fine.

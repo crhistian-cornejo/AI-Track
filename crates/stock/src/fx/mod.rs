@@ -24,6 +24,7 @@ pub mod pitchshift;
 pub mod reverb;
 pub mod saturator;
 pub mod shaper;
+pub mod shaper_mod;
 pub mod stutter;
 pub mod transient;
 pub mod utility;

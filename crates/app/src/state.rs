@@ -1812,12 +1812,12 @@ impl AppState {
         Some(DeviceSlot::Track { track, index: self.project.track(track)?.devices.len() })
     }
 
-    /// Add a stock device at the end of `into` (see [`new_device_slot`](Self::new_device_slot)).
-    pub fn add_stock_device_in(&mut self, track: TrackId, into: Option<racks::Container>, plugin_id: &str, name: &str) -> Option<DeviceId> {
+    /// Where a new device `plugin_id` goes in `track`: the end of `into`, or
+    /// the end of the track's chain. The engine runs MIDI effects before
+    /// everything else, in the order they were put in: a new one goes after
+    /// the last MIDI effect of the chain, so the chain reads as it runs.
+    pub(crate) fn insert_slot(&self, track: TrackId, into: Option<racks::Container>, plugin_id: &str) -> Option<DeviceSlot> {
         let mut slot = self.new_device_slot(track, into)?;
-        // The engine runs MIDI effects before everything else, in the order they
-        // were put in: a new one goes after the last MIDI effect of the chain, so
-        // the chain reads as it runs.
         if (plugin_id.starts_with("midi.") || plugin_id == "rack.midi")
             && into.is_none()
             && let DeviceSlot::Track { index, .. } = &mut slot
@@ -1825,6 +1825,12 @@ impl AppState {
             let is_midi = |d: &Device| matches!(&d.kind, DeviceKind::Stock { plugin_id } if plugin_id.starts_with("midi.")) || matches!(&d.kind, DeviceKind::Rack(r) if r.kind == RackKind::Midi);
             *index = self.project.track(track)?.devices.iter().rposition(is_midi).map_or(0, |i| i + 1);
         }
+        Some(slot)
+    }
+
+    /// Add a stock device at the end of `into` (see [`new_device_slot`](Self::new_device_slot)).
+    pub fn add_stock_device_in(&mut self, track: TrackId, into: Option<racks::Container>, plugin_id: &str, name: &str) -> Option<DeviceId> {
+        let slot = self.insert_slot(track, into, plugin_id)?;
         let id = self.project.alloc_device_id();
         let mut device = Device::stock(id, plugin_id, name);
         if let Some(kind) = match plugin_id {
@@ -1834,7 +1840,7 @@ impl AppState {
             "rack.midi" => Some(RackKind::Midi),
             _ => None,
         } {
-            device.kind = DeviceKind::Rack(Rack::new(kind));
+            device.kind = DeviceKind::Rack(racks::fresh_rack(kind));
         }
         self.edit("Add device", vec![Command::AddDevice { slot, device: Box::new(device) }]).then_some(id)
     }
@@ -3013,6 +3019,24 @@ pub fn step_in_scale(scale: Scale, key: u8, dir: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_rack_has_one_empty_chain_in_one_undo_step_and_a_drum_rack_none() {
+        use aitrack_model::racks::{self, Container};
+        let mut s = AppState::new(Project::new("t"));
+        let t = s.add_track(TrackKind::Audio).unwrap();
+        let steps = s.history.steps().count();
+        let mut audio = None;
+        for (id, chains) in [("rack.audio", 1), ("rack.instrument", 1), ("rack.midi", 1), ("rack.drum", 0)] {
+            let r = s.add_stock_device(t, id, id).unwrap();
+            assert_eq!(s.rack_of(r).unwrap().chains.len(), chains, "{id}");
+            audio = audio.or(Some(r));
+        }
+        assert_eq!(s.history.steps().count(), steps + 4);
+        let rack = audio.unwrap();
+        let eq = s.add_stock_device_in(t, Some(Container::Rack { rack, chain: 0 }), "fx.eq", "EQ").unwrap();
+        assert_eq!(racks::device_slot(&s.project, eq), Some(aitrack_model::command::DeviceSlot::Rack { rack, chain: 0, index: 0 }));
+    }
 
     fn state() -> AppState {
         AppState::new(crate::demo::project())

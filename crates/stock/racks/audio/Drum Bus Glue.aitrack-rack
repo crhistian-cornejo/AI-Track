@@ -1,0 +1,293 @@
+{
+  "format": "aitrack-rack",
+  "format_version": 1,
+  "app_version": "0.0.8",
+  "name": "Drum Bus Glue",
+  "author": "AI-Track",
+  "tags": [
+    "drums",
+    "bus",
+    "glue",
+    "saturation"
+  ],
+  "kind": "audio",
+  "payload": {
+    "device": {
+      "id": 11,
+      "name": "Drum Bus Glue",
+      "kind": {
+        "type": "rack",
+        "kind": "audio",
+        "chains": [
+          {
+            "name": "Bus",
+            "color": 16739179,
+            "devices": [
+              {
+                "id": 12,
+                "name": "Drum Bus",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "fx.drumbus"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 0.5,
+                  "1": 0.3,
+                  "2": 0.5,
+                  "3": 0.1,
+                  "4": 1.0,
+                  "5": 0.5,
+                  "6": 0.2,
+                  "7": 0.43723458,
+                  "8": 0.64624065,
+                  "9": 0.4,
+                  "10": 1.0,
+                  "11": 0.6666667,
+                  "12": 1.0,
+                  "13": 1.0,
+                  "14": 1.0,
+                  "15": 1.0,
+                  "16": 1.0,
+                  "17": 1.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              },
+              {
+                "id": 13,
+                "name": "Compressor",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "fx.compressor"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 0.7,
+                  "1": 0.15051499,
+                  "2": 0.25,
+                  "3": 0.6975074,
+                  "4": 0.49680924,
+                  "5": 0.0,
+                  "6": 0.0,
+                  "7": 0.0,
+                  "8": 1.0,
+                  "9": 0.0,
+                  "10": 0.0,
+                  "11": 0.0,
+                  "12": 1.0,
+                  "13": 0.33333334,
+                  "14": 0.0,
+                  "15": 1.0,
+                  "16": 0.5,
+                  "17": 0.0,
+                  "18": 0.0,
+                  "19": 0.0,
+                  "20": 0.5643406,
+                  "21": 0.5,
+                  "22": 1.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              },
+              {
+                "id": 14,
+                "name": "Limiter",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "fx.limiter"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 0.0,
+                  "1": 0.9166667,
+                  "2": 0.63436335,
+                  "3": 1.0,
+                  "4": 0.10526316,
+                  "5": 1.0,
+                  "6": 0.5,
+                  "7": 1.0,
+                  "8": 0.6,
+                  "9": 0.5,
+                  "10": 0.0,
+                  "11": 0.0,
+                  "12": 0.0,
+                  "13": 0.0,
+                  "14": 0.0,
+                  "15": 0.0,
+                  "16": 0.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              }
+            ],
+            "volume_db": 0.0,
+            "pan": 0.0,
+            "mute": false,
+            "solo": false,
+            "note": null,
+            "key_range": [
+              0,
+              127
+            ],
+            "velocity_range": [
+              1,
+              127
+            ],
+            "selector_range": [
+              0,
+              127
+            ],
+            "key_fade": [
+              0,
+              0
+            ],
+            "vel_fade": [
+              0,
+              0
+            ],
+            "sel_fade": [
+              0,
+              0
+            ],
+            "choke": 0,
+            "play_note": null,
+            "sends": [],
+            "output": {
+              "type": "rack"
+            }
+          }
+        ],
+        "macros": [
+          {
+            "name": "Drive",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 12,
+                "param": 1,
+                "min": 0.0,
+                "max": 0.8
+              }
+            ]
+          },
+          {
+            "name": "Boom",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 12,
+                "param": 6,
+                "min": 0.0,
+                "max": 0.6
+              }
+            ]
+          },
+          {
+            "name": "Crunch",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 12,
+                "param": 3,
+                "min": 0.0,
+                "max": 0.6
+              }
+            ]
+          },
+          {
+            "name": "Glue",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 13,
+                "param": 0,
+                "min": 0.9,
+                "max": 0.5
+              }
+            ]
+          },
+          {
+            "name": "Macro 5",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 6",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 7",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 8",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 9",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 10",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 11",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 12",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 13",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 14",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 15",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 16",
+            "value": 0.0,
+            "mappings": []
+          }
+        ],
+        "variations": [],
+        "chain_selector": 0,
+        "returns": []
+      },
+      "enabled": true,
+      "params": {},
+      "state": null,
+      "preset": null,
+      "collapsed": false,
+      "sidechain": null
+    }
+  },
+  "requires": {
+    "plugins": [],
+    "samples": []
+  }
+}

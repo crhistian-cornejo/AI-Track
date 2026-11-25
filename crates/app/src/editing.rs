@@ -19,6 +19,7 @@ pub mod gestures;
 mod groups;
 pub mod locators;
 mod modulators;
+mod rack_presets;
 mod racks;
 pub mod menus;
 pub mod slice;

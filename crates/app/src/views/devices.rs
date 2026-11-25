@@ -25,6 +25,7 @@ use gpui::{
     Stateful, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 
+pub mod rack_presets;
 pub mod rack_ui;
 
 const KNOB: f32 = 32.;
@@ -76,6 +77,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             .on_drop(cx.listener(move |this, d: &DraggedDevice, _, cx| {
                 move_device(this, d.id, Container::Track(tid), usize::MAX);
                 cx.notify();
+            }))
+            // A rack dragged from the palette is added to the end of the chain too.
+            .drag_over::<rack_presets::DraggedRack>(|s, _, _, _| s.border_color(accent()))
+            .on_drop(cx.listener(move |this, d: &rack_presets::DraggedRack, _, cx| {
+                rack_presets::add(this, &d.source, tid, cx);
             }))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 let at = e.position();
@@ -468,6 +474,17 @@ fn card(
         .when_some(preset_pill, |h, pill| h.child(pill))
         .when(!matches!(&d.kind, DeviceKind::Stock { .. }), |h| h.child(badge(kind_label, pal.muted)))
         .when(plugin_warning.is_some(), |h| h.child(badge("SILENCED", pal.record)))
+        .when(matches!(&d.kind, DeviceKind::Rack(_)), |h| {
+            h.child(
+                widgets::sized_icon_button(("save-rack", id.0 as usize), Icon::Save, false, 20., 12.)
+                    .tooltip(widgets::tip("Save the rack as a preset of yours", None))
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        let at = e.position();
+                        rack_presets::open_save(this, id, point(at.x - px(8.), at.y + px(8.)), Some(window), cx);
+                    })),
+            )
+        })
         .when(matches!(&d.kind, DeviceKind::Rack(r) if r.kind != RackKind::Drum), |h| {
             let shown = ws.fx.macros.contains(&id);
             h.child(
@@ -559,21 +576,9 @@ fn card(
         .into_any_element()
 }
 
-/// Fold or unfold a device. Folding is view state stored on the device, so
-/// it goes through a command too.
+/// Fold or unfold a device (one `SetDeviceCollapsed` step).
 pub fn toggle_fold(ws: &mut Workspace, id: DeviceId) {
-    let Some(mut dev) = ws.s.project.device(id).cloned() else { return };
-    let Some(slot) = racks::device_slot(&ws.s.project, id) else {
-        return;
-    };
-    dev.collapsed = !dev.collapsed;
-    ws.s.edit(if dev.collapsed { "Fold device" } else { "Show device" }, vec![
-            Command::RemoveDevice { id },
-            Command::AddDevice {
-                slot,
-                device: Box::new(dev),
-            },
-    ]);
+    ws.s.fold_device(id);
 }
 
 /// A knob wired to a drag; double-click resets to the default, Shift drags fine.

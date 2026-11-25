@@ -105,6 +105,22 @@ impl AppState {
         })
     }
 
+    /// Fold or unfold a device: one sealed undo step. `false` if it does not
+    /// exist.
+    pub fn fold_device(&mut self, id: DeviceId) -> bool {
+        let Some(d) = self.project.device(id) else {
+            return false;
+        };
+        let collapsed = !d.collapsed;
+        self.seal();
+        let ok = self.edit(
+            if collapsed { "Fold device" } else { "Show device" },
+            vec![Command::SetDeviceCollapsed { device: id, collapsed }],
+        );
+        self.seal();
+        ok
+    }
+
     /// Whether Cmd+Shift+G has a rack to dissolve among the picked devices.
     pub fn can_ungroup_devices(&self) -> bool {
         self.selected_devices()
@@ -128,8 +144,8 @@ impl AppState {
                 continue;
             };
             for c in &step {
-                if let Command::AddDevice { device, .. } = c {
-                    freed.push(device.id);
+                if let Command::MoveDevice { id, .. } = c {
+                    freed.push(*id);
                 }
                 if c.clone().apply(&mut scratch).is_err() {
                     return false;
@@ -372,14 +388,39 @@ mod tests {
         assert_eq!(s.project.tracks, before);
     }
 
-    /// A track with an audio rack of two chains, a filter in the first.
+    #[test]
+    fn group_fold_and_ungroup_keep_a_macro_mapping_through_undo_and_redo() {
+        let (mut s, rack, filter) = rack_with_filter();
+        s.map_macro_param(rack, 0, filter, 0, 0.5).unwrap();
+        let mapped = |s: &AppState| s.rack_of(rack).unwrap().macros[0].mappings.iter().any(|m| m.device == filter);
+        let steps = s.history.steps().count();
+        s.click_device(filter, false, false);
+        let inner = s.group_devices().unwrap();
+        assert!(mapped(&s), "grouping inside the rack keeps the mapping");
+        assert!(s.fold_device(inner));
+        assert!(s.project.device(inner).unwrap().collapsed && mapped(&s));
+        assert!(s.ungroup_devices());
+        assert_eq!(s.selected_devices(), vec![filter]);
+        assert!(mapped(&s));
+        assert_eq!(s.history.steps().count(), steps + 3, "group, fold and ungroup are a step each");
+        for _ in 0..3 {
+            s.undo();
+            assert!(mapped(&s));
+        }
+        for _ in 0..3 {
+            s.redo();
+        }
+        assert!(mapped(&s) && s.project.device(inner).is_none());
+        assert!(!s.fold_device(DeviceId(9999)));
+    }
+
+    /// A track with an audio rack of two chains (the fresh one and B), a filter in the first.
     fn rack_with_filter() -> (AppState, DeviceId, DeviceId) {
         let mut s = AppState::new(Project::new("t"));
         let t = s.add_track(TrackKind::Audio).unwrap();
         let rack = s.add_stock_device(t, "rack.audio", "Rack").unwrap();
         let filter = s.project.alloc_device_id();
         s.edit("chains", vec![
-            Command::AddChain { rack, index: 0, chain: Box::new(Chain::new("A", Color::palette(1))) },
             Command::AddChain { rack, index: 1, chain: Box::new(Chain::new("B", Color::palette(2))) },
             Command::AddDevice { slot: DeviceSlot::Rack { rack, chain: 0, index: 0 }, device: Box::new(Device::stock(filter, "fx.filter", "Filter")) },
         ]);

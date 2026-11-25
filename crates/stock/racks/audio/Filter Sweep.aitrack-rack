@@ -1,0 +1,207 @@
+{
+  "format": "aitrack-rack",
+  "format_version": 1,
+  "app_version": "0.0.8",
+  "name": "Filter Sweep",
+  "author": "AI-Track",
+  "tags": [
+    "filter",
+    "sweep",
+    "performance"
+  ],
+  "kind": "audio",
+  "payload": {
+    "device": {
+      "id": 11,
+      "name": "Filter Sweep",
+      "kind": {
+        "type": "rack",
+        "kind": "audio",
+        "chains": [
+          {
+            "name": "Filter",
+            "color": 16739179,
+            "devices": [
+              {
+                "id": 12,
+                "name": "Filter",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "fx.filter"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 0.0,
+                  "1": 0.0,
+                  "2": 1.0,
+                  "3": 0.2,
+                  "4": 0.0,
+                  "5": 0.0,
+                  "6": 0.0,
+                  "7": 0.6058715,
+                  "8": 0.4117647,
+                  "9": 0.5,
+                  "10": 0.0,
+                  "11": 0.5,
+                  "12": 0.56632334,
+                  "13": 0.5676738,
+                  "14": 1.0,
+                  "15": 0.6666667,
+                  "16": 0.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              }
+            ],
+            "volume_db": 0.0,
+            "pan": 0.0,
+            "mute": false,
+            "solo": false,
+            "note": null,
+            "key_range": [
+              0,
+              127
+            ],
+            "velocity_range": [
+              1,
+              127
+            ],
+            "selector_range": [
+              0,
+              127
+            ],
+            "key_fade": [
+              0,
+              0
+            ],
+            "vel_fade": [
+              0,
+              0
+            ],
+            "sel_fade": [
+              0,
+              0
+            ],
+            "choke": 0,
+            "play_note": null,
+            "sends": [],
+            "output": {
+              "type": "rack"
+            }
+          }
+        ],
+        "macros": [
+          {
+            "name": "Cutoff",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 12,
+                "param": 2,
+                "min": 0.33333334,
+                "max": 1.0
+              }
+            ]
+          },
+          {
+            "name": "Resonance",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 12,
+                "param": 3,
+                "min": 0.0,
+                "max": 0.7
+              }
+            ]
+          },
+          {
+            "name": "Macro 3",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 4",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 5",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 6",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 7",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 8",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 9",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 10",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 11",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 12",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 13",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 14",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 15",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 16",
+            "value": 0.0,
+            "mappings": []
+          }
+        ],
+        "variations": [],
+        "chain_selector": 0,
+        "returns": []
+      },
+      "enabled": true,
+      "params": {},
+      "state": null,
+      "preset": null,
+      "collapsed": false,
+      "sidechain": null
+    }
+  },
+  "requires": {
+    "plugins": [],
+    "samples": []
+  }
+}

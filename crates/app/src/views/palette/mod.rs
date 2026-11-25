@@ -32,10 +32,11 @@ use crate::bridge::ExternalPlugin;
 use crate::icons::{Icon, icon};
 use crate::keys::{Bound, TABLE};
 use crate::motion;
+use crate::rack_library::{self, RackEntry};
 use crate::theme::*;
 use crate::widgets::{self, label, mono};
 use crate::workspace::{DraggedSample, Workspace, keys_match};
-use aitrack_model::{PluginFormat, Scale, ScaleKind};
+use aitrack_model::{PluginFormat, RackKind, Scale, ScaleKind};
 use aitrack_splice::SpliceSample;
 use gpui::{
     AnyElement, AppContext as _, Context, Div, Focusable as _, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -164,6 +165,8 @@ pub enum Item {
     Splice(Box<SpliceSample>),
     Device(DeviceRow),
     Preset(PresetRow),
+    /// One of the user's racks or a factory one.
+    Rack(RackEntry),
     /// Index into [`crate::keys::TABLE`].
     Command(usize),
     /// Index into the pack list.
@@ -241,6 +244,9 @@ pub struct PaletteState {
     pub settings: settings::PaletteSettings,
     loaded: bool,
     presets: Option<Vec<PresetRow>>,
+    /// The racks (yours, then the factory ones), read when first needed and
+    /// again after one is saved or deleted.
+    racks: Option<Vec<RackEntry>>,
     scroll: ScrollHandle,
     pub audition: SampleAudition,
     /// Cloud folders found on this machine (the "Add library…" picker).
@@ -255,6 +261,11 @@ pub struct PaletteState {
 }
 
 impl PaletteState {
+    /// Read the racks again the next time the palette opens or rebuilds.
+    pub fn invalidate_racks(&mut self) {
+        self.racks = None;
+    }
+
     /// The local sample results (Organize on disk works on them).
     pub fn sample_items(&self) -> Vec<crate::bridge::LibraryItem> {
         self.samples.iter().map(SampleRow::item).collect()
@@ -422,6 +433,9 @@ fn ensure(ws: &mut Workspace) {
         }
         ws.palette.presets = Some(list);
     }
+    if ws.palette.racks.is_none() {
+        ws.palette.racks = Some(rack_library::list(&rack_library::root()));
+    }
 }
 
 pub fn open(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -574,6 +588,26 @@ fn preset_rows(ws: &Workspace, q: &str) -> Vec<PresetRow> {
     }))
 }
 
+/// What a kind of rack is called in Live.
+fn rack_kind_label(kind: RackKind) -> &'static str {
+    match kind {
+        RackKind::Audio => "Audio Effect Rack",
+        RackKind::Instrument => "Instrument Rack",
+        RackKind::Midi => "MIDI Effect Rack",
+        RackKind::Drum => "Drum Rack",
+    }
+}
+
+/// The racks that match `q` by name, kind, `rack` or tag, best first (the
+/// order of `list` without text: yours, then the factory ones).
+pub(crate) fn rack_rows(list: &[RackEntry], q: &str) -> Vec<RackEntry> {
+    ranked(list.iter().filter_map(|r| {
+        let mut extra: Vec<&str> = vec![rack_kind_label(r.kind), "rack"];
+        extra.extend(r.tags.iter().map(String::as_str));
+        Some((text_score(q, &r.name, &extra)?, r.clone()))
+    }))
+}
+
 fn command_rows(q: &str) -> Vec<usize> {
     ranked(TABLE.iter().enumerate().filter(|(_, e)| e.bound != Bound::Action("TogglePalette")).filter_map(|(i, e)| Some((text_score(q, e.label, &[e.help, e.category.label()])?, i))))
 }
@@ -635,6 +669,8 @@ pub fn rebuild(ws: &mut Workspace) {
             }
             section(&mut rows, "Devices", device_rows(ws, &q).into_iter().map(Item::Device).collect(), ALL_DEVICES, true);
             if !q.is_empty() {
+                let racks = rack_rows(ws.palette.racks.as_deref().unwrap_or_default(), &q);
+                section(&mut rows, "Racks", racks.into_iter().map(Item::Rack).collect(), ALL_PRESETS, true);
                 section(&mut rows, "Presets", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), ALL_PRESETS, true);
             }
             let (from_splice, rest) = split_splice(samples());
@@ -701,7 +737,11 @@ pub fn rebuild(ws: &mut Workspace) {
                 section(&mut rows, title, items, 2000, true);
             }
         }
-        Tab::Presets => section(&mut rows, "", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), 400, false),
+        Tab::Presets => {
+            let racks = rack_rows(ws.palette.racks.as_deref().unwrap_or_default(), &q);
+            section(&mut rows, "Racks", racks.into_iter().map(Item::Rack).collect(), 400, true);
+            section(&mut rows, "Presets", preset_rows(ws, &q).into_iter().map(Item::Preset).collect(), 400, true);
+        }
         Tab::Commands => {
             let mut cmds: Vec<Item> = library_rows(ws, &q).into_iter().map(Item::Library).collect();
             cmds.extend(command_rows(&q).into_iter().map(Item::Command));
@@ -1107,6 +1147,15 @@ fn activate(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>
                     }
                 }
                 Err(e) => ws.toast(e, cx),
+            }
+        }
+        Item::Rack(r) => {
+            let Some(track) = ws.s.selected_track else {
+                ws.toast("Select a track first", cx);
+                return;
+            };
+            if crate::views::devices::rack_presets::add(ws, &r.source, track, cx) {
+                close(ws, window, cx);
             }
         }
         Item::Command(i) => {
@@ -1647,6 +1696,52 @@ fn render_preset(i: usize, pr: &PresetRow, selected: bool, cx: &mut Context<Work
         .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(label(pr.name.clone(), TEXT_MD, pal.text)).child(label(format!("{} · {}", pr.plugin, pr.category), TEXT_XS, pal.faint)))
         .when_some(pr.badge, |d, b| d.child(widgets::badge(b, pal.accent2)))
         .child(widgets::badge("Preset", pal.muted))
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+            this.palette.selected = i;
+            if e.click_count >= 2 {
+                activate(this, window, cx);
+            }
+            cx.notify();
+        }))
+        .into_any_element()
+}
+
+fn render_rack(i: usize, r: &RackEntry, selected: bool, cx: &mut Context<Workspace>) -> AnyElement {
+    let pal = p();
+    let drag = crate::views::devices::rack_presets::DraggedRack { source: r.source.clone(), name: r.name.clone() };
+    let entry = r.clone();
+    let user = r.user();
+    row_shell(i, selected, ITEM_ROW_H)
+        .child(div().w(px(48.)).flex_none().flex().justify_center().child(icon(if r.kind == RackKind::Drum { Icon::Drum } else { Icon::Grid }, 14., pal.muted)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(label(r.name.clone(), TEXT_MD, pal.text))
+                .child(label(format!("{} · {}", rack_kind_label(r.kind), if user { "Yours" } else { "Factory" }), TEXT_XS, pal.faint)),
+        )
+        .child(widgets::badge("Rack", pal.muted))
+        .when(user, |row| {
+            row.child(
+                widgets::sized_icon_button(("rack-del", i), Icon::Trash, false, 20., 12.)
+                    .tooltip(widgets::tip("Delete this rack", None))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        match rack_library::delete(&entry) {
+                            Ok(()) => this.toast(format!("Deleted {}", entry.name), cx),
+                            Err(e) => this.toast(e, cx),
+                        }
+                        this.palette.invalidate_racks();
+                        ensure(this);
+                        rebuild(this);
+                        cx.notify();
+                    })),
+            )
+        })
+        .on_drag(drag, |d: &crate::views::devices::rack_presets::DraggedRack, _, _, cx| cx.new(|_| d.clone()))
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
             this.palette.selected = i;
             if e.click_count >= 2 {
@@ -2314,6 +2409,7 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
             Row::Item(Item::Splice(s)) => render_splice(ws, i, s, sel, cx),
             Row::Item(Item::Device(d)) => render_device(ws, i, d, sel, cx),
             Row::Item(Item::Preset(pr)) => render_preset(i, pr, sel, cx),
+            Row::Item(Item::Rack(r)) => render_rack(i, r, sel, cx),
             Row::Item(Item::Command(c)) => render_command(i, *c, sel, cx),
             Row::Item(Item::Pack(k)) => render_pack(ws, i, *k, sel, cx),
             Row::Item(Item::Library(c)) => render_library_choice(ws, i, c, sel, cx),
@@ -2391,6 +2487,24 @@ mod tests {
         let tag = organ.tags.first().expect("a character tag");
         assert!(text_score(tag, &organ.name, &extra).is_some(), "character tags are search words");
         assert_eq!(preset_meta(&vault, "fx.eq/Mix/Air.json"), (Vec::new(), None), "other presets get nothing extra");
+    }
+
+    #[test]
+    fn racks_are_found_by_name_kind_and_tag() {
+        use crate::rack_library::{RackEntry, RackSource};
+        let e = |name: &str, kind, tags: &[&str], user: bool| RackEntry {
+            source: if user { RackSource::User(format!("/r/{name}.aitrack-rack").into()) } else { RackSource::Factory("audio/x.aitrack-rack") },
+            name: name.into(),
+            kind,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        };
+        let list = vec![e("My Bus", RackKind::Audio, &[], true), e("Parallel Compression", RackKind::Audio, &["drums"], false), e("Chord Arp", RackKind::Midi, &[], false)];
+        let names = |q: &str| rack_rows(&list, q).into_iter().map(|r| r.name).collect::<Vec<_>>();
+        assert_eq!(names(""), ["My Bus", "Parallel Compression", "Chord Arp"], "yours first, then the factory ones");
+        assert_eq!(names("midi"), ["Chord Arp"]);
+        assert_eq!(names("drums"), ["Parallel Compression"]);
+        assert_eq!(names("bus"), ["My Bus"]);
+        assert!(names("zzz").is_empty());
     }
 
     #[test]

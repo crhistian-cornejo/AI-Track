@@ -183,6 +183,9 @@ pub enum Command {
     SetSidechain { device: DeviceId, source: Option<TrackId> },
     SetDeviceState { device: DeviceId, state: Option<Vec<u8>>, preset: Option<String> },
     RenameDevice { device: DeviceId, name: String },
+    /// Fold a device to its title bar, or open it again. View state: the
+    /// device stays where it is, with its mappings, and the engine ignores it.
+    SetDeviceCollapsed { device: DeviceId, collapsed: bool },
 
     AddChain { rack: DeviceId, index: usize, chain: Box<Chain> },
     RemoveChain { rack: DeviceId, index: usize },
@@ -333,6 +336,7 @@ impl Command {
             SetSidechain { .. } => "Route sidechain",
             SetDeviceState { .. } => "Load preset",
             RenameDevice { .. } => "Rename device",
+            SetDeviceCollapsed { .. } => "Fold device",
             AddChain { .. } => "Add chain",
             RemoveChain { .. } => "Delete chain",
             UpdateChain { .. } => "Edit chain",
@@ -835,6 +839,10 @@ impl Command {
             RenameDevice { device, name } => {
                 let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
                 Ok(RenameDevice { device, name: std::mem::replace(&mut d.name, name) })
+            }
+            SetDeviceCollapsed { device, collapsed } => {
+                let d = p.device_mut(device).ok_or(CommandError::DeviceNotFound(device))?;
+                Ok(SetDeviceCollapsed { device, collapsed: std::mem::replace(&mut d.collapsed, collapsed) })
             }
 
             AddChain { rack, index, chain } => {
@@ -2083,6 +2091,22 @@ mod tests {
         q.ids = p.ids.clone(); // the allocator only ever moves up
         assert_eq!(&q, p, "inverse of {cmd:?}");
         after
+    }
+
+    #[test]
+    fn folding_a_device_is_one_command_that_keeps_its_mappings() {
+        let r = rack_rig();
+        let q = round_trip(&r.p, Command::SetDeviceCollapsed { device: r.eq, collapsed: true });
+        assert!(q.device(r.eq).unwrap().collapsed);
+        assert_eq!(rack_of(&q, r.rack).macros, rack_of(&r.p, r.rack).macros, "the macro on the EQ stays");
+        let fold = Command::SetDeviceCollapsed { device: r.eq, collapsed: true };
+        assert!(!fold.is_destructive());
+        assert_eq!(fold.label(), "Fold device");
+        assert_eq!(fold.frozen_target(&r.p), None);
+        assert_eq!(
+            Command::SetDeviceCollapsed { device: DeviceId(9999), collapsed: true }.apply(&mut r.p.clone()),
+            Err(CommandError::DeviceNotFound(DeviceId(9999)))
+        );
     }
 
     #[test]

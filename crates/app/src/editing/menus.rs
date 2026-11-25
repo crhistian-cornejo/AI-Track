@@ -8,7 +8,7 @@ use crate::keys::{self, Cmd};
 use crate::theme::*;
 use crate::widgets::{self, menu_item, mono};
 use crate::workspace::{MenuKind, Workspace};
-use aitrack_model::{Color, DeviceId, LocatorId, TrackId, TrackKind};
+use aitrack_model::{Color, DeviceId, DeviceKind, LocatorId, TrackId, TrackKind};
 use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window, prelude::FluentBuilder};
 
 /// A menu row with its shortcut on the right.
@@ -541,6 +541,14 @@ pub fn device_menu(
                 crate::editing::ungroup_selection(this, cx);
             },
         ));
+    }
+    let is_rack = ws.s.project.device(device).is_some_and(|d| matches!(d.kind, DeviceKind::Rack(_)));
+    let at = ws.menu.as_ref().map(|m| m.at);
+    if is_rack {
+        card = card.child(action("device-save-rack", Icon::Save, "Save as Preset…", None, false, cx, move |this, window, cx| {
+            let at = at.unwrap_or_default();
+            crate::views::devices::rack_presets::open_save(this, device, at, Some(window), cx);
+        }));
     }
     card.child(widgets::divider_h())
         .child(action(

@@ -285,6 +285,16 @@ fn frozen_fader_mods(devs: &[Device]) -> Vec<Device> {
     out
 }
 
+/// Whether a compiled device makes sound without being fed any: an
+/// instrument, or an Instrument or Drum Rack (which holds one).
+fn sounds_by_itself(n: &DeviceNode) -> bool {
+    match n {
+        DeviceNode::Proc(p) => p.is_instrument,
+        DeviceNode::Rack(r) => matches!(r.kind, aitrack_model::RackKind::Instrument | aitrack_model::RackKind::Drum),
+        DeviceNode::Missing(_) => false,
+    }
+}
+
 fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>, u32) {
     let mut nodes = Vec::with_capacity(devs.len());
     let mut latency = 0u32;
@@ -298,7 +308,10 @@ fn compile_devices(devs: &[Device], dc: &mut DevCx<'_, '_>) -> (Vec<DeviceNode>,
                 let max_lat = compiled.iter().map(|c| c.1).max().unwrap_or(0);
                 let max_ret = compiled_returns.iter().map(|c| c.1).max().unwrap_or(0);
                 let n_returns = rack.returns.len();
+                let plays_notes = matches!(rack.kind, aitrack_model::RackKind::Instrument | aitrack_model::RackKind::Drum);
                 let node = |c: &aitrack_model::Chain, devices: Vec<DeviceNode>, delay: u32, gain: (f32, f32)| ChainNode {
+                    // An Instrument or Drum chain with nothing in it that sounds by itself starts from silence.
+                    feeds_input: !plays_notes || devices.iter().any(sounds_by_itself),
                     devices,
                     gain,
                     note: c.note,

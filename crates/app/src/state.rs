@@ -665,7 +665,8 @@ impl AppState {
                 .then(|| {
                     self.project.track(track)?.arrangement.iter().filter(|p| p.start == start && p.lane == 0).find_map(|p| {
                         let c = self.project.clips.get(&p.clip).filter(|c| c.length == len)?;
-                        matches!(self.project.sources.get(&c.source), Some(Source::Notes(_))).then_some(c.source)
+                        // Not a step clip: its notes are its pattern's and cannot take more.
+                        matches!(self.project.sources.get(&c.source), Some(Source::Notes(n)) if n.pattern.is_none()).then_some(c.source)
                     })
                 })
                 .flatten();
@@ -3613,6 +3614,25 @@ mod tests {
         e.rec_take = Some(MidiTake { notes: vec![note(60, 5 * PPQ, 0)], start_tick: 5 * PPQ, end_tick: 7 * PPQ, passes: 1 });
         assert_eq!(s.poll_recording(&mut e).committed, 1);
         assert_eq!(clips_of(&s, t), [(5 * PPQ, 2 * PPQ, 1)]);
+    }
+
+    #[test]
+    fn a_loop_take_over_a_step_clip_gets_a_clip_of_its_own() {
+        use crate::bridge::{MidiTake, RecNote, StubEngine};
+        let mut s = AppState::new(Project::new("t"));
+        let t = armed_keys(&mut s);
+        s.edit("loop", vec![Command::SetLoop { region: Some((4 * PPQ, 8 * PPQ)) }]);
+        let (cmds, step_clip, _) = aitrack_model::steps::new_step_clip(&mut s.project, t, 4 * PPQ, 4 * PPQ, &[36], "Steps", Color::palette(0)).unwrap();
+        s.edit("steps", cmds);
+        s.seal();
+        let mut e = StubEngine::default();
+        let note = |key, at, pass| RecNote { pass, ..rec_note(t, key, at, PPQ / 2) };
+        e.rec_take = Some(MidiTake { notes: vec![note(60, 5 * PPQ, 0), note(62, 6 * PPQ, 1)], start_tick: 4 * PPQ, end_tick: 8 * PPQ, passes: 2 });
+        // A step clip's notes are its pattern's: the take cannot be added to it.
+        assert_eq!(s.poll_recording(&mut e).committed, 1, "the take is kept");
+        let recorded = s.project.track(t).unwrap().arrangement.iter().map(|p| p.clip).find(|&c| c != step_clip).expect("a new clip");
+        let Some(Source::Notes(n)) = s.project.sources.get(&s.project.clips[&recorded].source) else { panic!() };
+        assert_eq!(n.notes.len(), 2);
     }
 
     #[test]

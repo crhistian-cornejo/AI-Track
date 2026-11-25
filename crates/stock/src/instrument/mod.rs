@@ -3,6 +3,7 @@
 pub mod acid303;
 pub mod bloom;
 pub mod drum;
+pub mod drumsynth;
 pub mod granular;
 pub mod kick808;
 pub mod sample;

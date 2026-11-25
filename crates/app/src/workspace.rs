@@ -1346,6 +1346,33 @@ impl Workspace {
                     };
                 }
                 _ => {
+                    // `rack=audio|instrument|midi|drum` adds a new rack to the selected track
+                    // (`device=rack.audio` would make a stock device that is not a rack).
+                    if let Some(kind) = word.strip_prefix("rack=")
+                        && let Some(track) = self.s.selected_track
+                    {
+                        let (plugin, name) = match kind {
+                            "instrument" => ("rack.instrument", "Instrument Rack"),
+                            "midi" => ("rack.midi", "MIDI Effect Rack"),
+                            "drum" => ("rack.drum", "Drum Rack"),
+                            _ => ("rack.audio", "Audio Effect Rack"),
+                        };
+                        self.s.add_stock_device(track, plugin, name);
+                    }
+                    // `rackpreset=Parallel Compression` adds that saved or factory rack to the selected track.
+                    if let Some(name) = word.strip_prefix("rackpreset=")
+                        && let Some(track) = self.s.selected_track
+                        && let Some(entry) = crate::rack_library::list(&crate::rack_library::root()).into_iter().find(|e| e.name.eq_ignore_ascii_case(name))
+                    {
+                        views::devices::rack_presets::add(self, &entry.source, track, cx);
+                    }
+                    // `racksave` opens the Save popover of the selected track's first rack.
+                    if word == "racksave" {
+                        let rack = self.s.selected_track.and_then(|t| self.s.project.track(t)).and_then(|t| t.devices.iter().find(|d| matches!(d.kind, DeviceKind::Rack(_))).map(|d| d.id));
+                        if let Some(rack) = rack {
+                            views::devices::rack_presets::open_save(self, rack, gpui::point(px(480.), px(300.)), None, cx);
+                        }
+                    }
                     // `device=fx.shaper` appends a stock device to the selected track.
                     if let Some(plugin) = word.strip_prefix("device=")
                         && let Some(track) = self.s.selected_track

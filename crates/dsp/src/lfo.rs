@@ -25,6 +25,67 @@ impl LfoShape {
     }
 }
 
+/// Three more shapes, for LFOs that keep the seven of [`LfoShape`] as they
+/// are (that list cannot grow: its length is part of what presets saved
+/// with it mean): a drifting random walk and two curved ramps. Each is a
+/// function of the number of cycles run, so a tempo-synced LFO has the right
+/// value wherever the song starts and the random walk is the same on every
+/// render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraShape {
+    /// Slow drift: a smooth random value per cycle plus a slower one, a third
+    /// as fast, that moves it around (a 1/f-like wander).
+    Wander,
+    /// Starts flat at the bottom and speeds up to the top, then jumps back:
+    /// `2p² − 1`, not the straight line of [`LfoShape::SawUp`].
+    RampUp,
+    /// Starts at the top, falls fast and settles flat at the bottom:
+    /// `2(1 − p)² − 1`, the contour of a pluck.
+    RampDown,
+}
+
+impl ExtraShape {
+    pub const ALL: [ExtraShape; 3] = [ExtraShape::Wander, ExtraShape::RampUp, ExtraShape::RampDown];
+    pub const NAMES: &'static [&'static str] = &["Wander", "Ramp Up", "Ramp Down"];
+
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL[i.min(Self::ALL.len() - 1)]
+    }
+
+    /// The bipolar value (−1..1) after `cycles` periods (any real number: the
+    /// integer part picks the random targets of Wander, `seed` which walk).
+    pub fn value(self, cycles: f64, seed: u32) -> f32 {
+        let whole = cycles.floor();
+        let p = (cycles - whole) as f32;
+        match self {
+            ExtraShape::Wander => {
+                let third = cycles / 3.0;
+                let slow = glide(third.floor() as i64, (third - third.floor()) as f32, seed ^ 0x5BD1_E995);
+                0.6 * slow + 0.4 * glide(whole as i64, p, seed)
+            }
+            ExtraShape::RampUp => 2.0 * p * p - 1.0,
+            ExtraShape::RampDown => 2.0 * (1.0 - p) * (1.0 - p) - 1.0,
+        }
+    }
+}
+
+/// Cosine-interpolated random values: one target per integer, a smooth
+/// glide between neighbours (`p` is how far from `idx` to `idx + 1`).
+fn glide(idx: i64, p: f32, seed: u32) -> f32 {
+    let t = 0.5 - 0.5 * (p * std::f32::consts::PI).cos();
+    let (a, b) = (hash_unit(idx, seed), hash_unit(idx + 1, seed));
+    a + (b - a) * t
+}
+
+/// Deterministic noise in −1..1 for an integer.
+fn hash_unit(n: i64, seed: u32) -> f32 {
+    let mut z = (n as u64).wrapping_add(u64::from(seed) << 32).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+}
+
 /// Bipolar LFO (−1..1). Phase 0..1.
 #[derive(Clone, Copy, Debug)]
 pub struct Lfo {
@@ -312,6 +373,48 @@ mod tests {
                 assert!((-1.0..=1.0).contains(&v), "{shape:?} {v}");
             }
         }
+    }
+
+    #[test]
+    fn the_extra_shapes_are_bounded_deterministic_and_named() {
+        for shape in ExtraShape::ALL {
+            for i in 0..20_000 {
+                let cycles = i as f64 * 0.0137 - 40.0;
+                let v = shape.value(cycles, 7);
+                assert!((-1.0..=1.0).contains(&v), "{shape:?} {v}");
+                assert_eq!(v, shape.value(cycles, 7));
+            }
+        }
+        assert_eq!(ExtraShape::NAMES.len(), ExtraShape::ALL.len());
+        assert_eq!(ExtraShape::from_index(0), ExtraShape::Wander);
+        assert_eq!(ExtraShape::from_index(99), ExtraShape::RampDown);
+    }
+
+    #[test]
+    fn the_ramps_are_curved_rather_than_straight_and_repeat_every_cycle() {
+        let down = |c: f64| ExtraShape::RampDown.value(c, 0);
+        let up = |c: f64| ExtraShape::RampUp.value(c, 0);
+        assert_eq!((down(0.0), up(0.0)), (1.0, -1.0));
+        // Half way a saw is at 0; the ramps are at the curved −0.5.
+        assert!((down(0.5) + 0.5).abs() < 1e-6 && (up(0.5) + 0.5).abs() < 1e-6);
+        assert!(down(0.999) < -0.99 && up(0.999) > 0.99);
+        // Ramp Down falls faster at first than later, Ramp Up the other way.
+        assert!(down(0.0) - down(0.1) > down(0.8) - down(0.9));
+        assert!(up(0.9) - up(0.8) > up(0.1) - up(0.0));
+        assert!((down(0.3) - down(7.3)).abs() < 1e-6 && (up(0.3) - up(-4.7)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wander_glides_without_jumps_visits_both_halves_and_differs_with_the_seed() {
+        let wander = |c: f64, seed: u32| ExtraShape::Wander.value(c, seed);
+        let biggest = (0..100_000).map(|i| (wander(i as f64 * 0.001 + 0.001, 3) - wander(i as f64 * 0.001, 3)).abs()).fold(0.0, f32::max);
+        assert!(biggest < 0.01, "no jumps: {biggest}");
+        let values: Vec<f32> = (0..400).map(|i| wander(i as f64 * 0.5, 3)).collect();
+        assert!(values.iter().any(|v| *v > 0.3) && values.iter().any(|v| *v < -0.3), "it wanders over both halves");
+        assert!(values.iter().sum::<f32>().abs() / 400. < 0.25, "around the middle");
+        assert_ne!(wander(5.3, 1), wander(5.3, 2));
+        // A third of the movement is slower than the cycle: half a cycle apart it is not simply mirrored.
+        assert_ne!(wander(10.5, 3), wander(11.5, 3));
     }
 
     #[test]

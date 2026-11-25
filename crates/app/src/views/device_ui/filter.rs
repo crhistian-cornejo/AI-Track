@@ -11,6 +11,7 @@ use crate::workspace::Workspace;
 use aitrack_dsp::response::svf_cascade_db;
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, butterworth_q};
 use aitrack_dsp::ladder::{LadderKind, response_db};
+use aitrack_stock::fx::filter::ext::{self, Kind, Spec};
 use aitrack_stock::fx::filter::{ladder_kind, p, resonance_q};
 use gpui::{AnyElement, App, Context, Hsla, IntoElement, ParentElement, Pixels, Point, Styled, TextAlign, Window, div, px};
 
@@ -74,6 +75,27 @@ pub fn paint_ladder_response(window: &mut Window, cx: &mut App, r: Rect, (kind, 
     kit::line(window, &pts, 2., color);
 }
 
+/// The controls of a special type as `fx.filter` hands them to it.
+pub fn special_spec(cutoff: f32, resonance: f32, shape_percent: f32, slope24: bool) -> Spec {
+    Spec { cutoff, resonance, shape: shape_percent / 100., slope24 }
+}
+
+/// Response of a special type at `hz` as a plot fraction.
+fn special_frac(kind: Kind, spec: Spec, hz: f32, sample_rate: f64) -> f32 {
+    db_frac(ext::response_db(kind, spec, hz, sample_rate))
+}
+
+/// Grid, filled curve and outline of a special type's response.
+pub fn paint_special_response(window: &mut Window, cx: &mut App, r: Rect, (kind, spec): (Kind, Spec), sample_rate: f64, color: Hsla, labels: bool) {
+    kit::db_grid(window, cx, r, DB_BOTTOM, DB_TOP, 12., labels);
+    kit::freq_grid(window, cx, r, labels);
+    // A comb has a notch every few pixels: it gets every pixel column.
+    let n = if kind == Kind::Comb { (r.w as usize).clamp(32, 600) } else { ((r.w / 3.) as usize).clamp(32, 300) };
+    let pts = kit::sample_curve(r, n, |fx| special_frac(kind, spec, frac_freq(fx), sample_rate));
+    kit::fill_to(window, &pts, r.bottom(), with_alpha(color, 0.16));
+    kit::line(window, &pts, 2., color);
+}
+
 /// Where the cutoff node sits: on the curve at the cutoff frequency.
 pub fn node(sections: &[SvfCoeffs], cutoff: f32, sample_rate: f64) -> (f32, f32) {
     (freq_frac(cutoff), db_frac(svf_cascade_db(sections, cutoff as f64, sample_rate) as f32).clamp(0.04, 0.96))
@@ -83,9 +105,11 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     let (cutoff, resonance) = (dev.plain(p::CUTOFF), dev.plain(p::RESONANCE));
     let secs = sections(dev.choice(p::TYPE), dev.choice(p::SLOPE) == 1, cutoff, resonance, dev.sample_rate);
     let lad = ladder_kind(dev.choice(p::LADDER));
-    let (fx, fy) = match lad {
-        Some(k) => (freq_frac(cutoff), ladder_frac(k, cutoff, cutoff, resonance).clamp(0.04, 0.96)),
-        None => node(&secs, cutoff, dev.sample_rate),
+    let special = Kind::from_choice(dev.choice(p::SPECIAL)).map(|k| (k, special_spec(cutoff, resonance, dev.plain(p::SHAPE), dev.choice(p::SLOPE) == 1)));
+    let (fx, fy) = match (special, lad) {
+        (Some((k, spec)), _) => (freq_frac(cutoff), special_frac(k, spec, cutoff, dev.sample_rate).clamp(0.04, 0.96)),
+        (None, Some(k)) => (freq_frac(cutoff), ladder_frac(k, cutoff, cutoff, resonance).clamp(0.04, 0.96)),
+        (None, None) => node(&secs, cutoff, dev.sample_rate),
     };
     let reset = [p::CUTOFF, p::RESONANCE].map(|id| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()))).to_vec();
     let handles = vec![Handle { fx, fy, x: ax(p::CUTOFF, 1.), y: ax(p::RESONANCE, -1.1), alt: ax(p::RESONANCE, -1.5), index: 0, reset }];
@@ -107,9 +131,15 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             kit::txt(window, cx, "Env", a.min(b) + 4., r.bottom() - 28., lbl_sz, with_alpha(series(3), 0.9), TextAlign::Left);
         }
         let color = if enabled { pal.accent } else { pal.muted };
-        match lad {
-            Some(k) => paint_ladder_response(window, cx, r, (k, cutoff, resonance), color, true),
-            None => paint_response(window, cx, r, &secs, sr, color, true),
+        match (special, lad) {
+            (Some(sp), _) => {
+                paint_special_response(window, cx, r, sp, sr, color, true);
+                if sp.0 == Kind::Vowel {
+                    kit::txt(window, cx, ext::vowel_name(ext::position(cutoff)), r.px(fx) + 8., r.y + 4., lbl_sz, pal.text, TextAlign::Left);
+                }
+            }
+            (None, Some(k)) => paint_ladder_response(window, cx, r, (k, cutoff, resonance), color, true),
+            (None, None) => paint_response(window, cx, r, &secs, sr, color, true),
         }
         // Where the modulated cutoff is right now (left and right channel), with a live dot on the curve.
         for (ch, hz) in live.into_iter().enumerate() {
@@ -117,9 +147,10 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 let lfx = freq_frac(hz).clamp(0., 1.);
                 kit::vline(window, r, r.px(lfx), with_alpha(pal.accent2, 0.75));
                 if ch == 0 {
-                    let lfy = match lad {
-                        Some(k) => ladder_frac(k, hz, cutoff, resonance),
-                        None => db_frac(svf_cascade_db(&secs, hz as f64, sr) as f32),
+                    let lfy = match (special, lad) {
+                        (Some((k, spec)), _) => special_frac(k, spec, hz, sr),
+                        (None, Some(k)) => ladder_frac(k, hz, cutoff, resonance),
+                        (None, None) => db_frac(svf_cascade_db(&secs, hz as f64, sr) as f32),
                     };
                     let pt = r.pt(lfx, lfy.clamp(0.04, 0.96));
                     kit::dot(window, pt, 7., with_alpha(pal.accent2, 0.25), None);
@@ -140,14 +171,16 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             .child(win::captioned("Type", kit::pick(dev, p::TYPE, cx)))
             .child(win::captioned("Slope", kit::pick(dev, p::SLOPE, cx)))
             .child(win::captioned("Model", kit::pick(dev, p::LADDER, cx)))
+            .child(win::captioned("Special", kit::pick(dev, p::SPECIAL, cx)))
             .child(kit::pick(dev, p::LFO_SYNC, cx));
         let primary = vec![
             win::group(dev, "Filter", None, &[p::CUTOFF, p::RESONANCE, p::DRIVE, p::MIX], cx),
             win::group(dev, "Modulation", None, &[p::LFO_DEPTH, rate, p::ENV_AMOUNT], cx),
         ];
         let more = vec![
-            win::group(dev, "LFO", None, &[p::LFO_SHAPE, p::LFO_STEREO], cx),
-            win::group(dev, "Envelope", None, &[p::ENV_ATTACK, p::ENV_RELEASE], cx),
+            win::group(dev, "Special", None, &[p::SHAPE], cx),
+            win::group(dev, "LFO", None, &[p::LFO_SHAPE, p::LFO_EXTRA, p::LFO_STEREO], cx),
+            win::group(dev, "Envelope", None, &[p::ENV_ATTACK, p::ENV_RELEASE, p::ENV_SOURCE], cx),
             win::group(dev, "Output", None, &[p::OUTPUT], cx),
         ];
         let displays = div().child(div().flex_1().min_w(px(0.)).h_full().child(plot));
@@ -155,16 +188,19 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
     }
     kit::panel(if dev.big { 640. } else { 440. })
         .child(div().flex_1().min_h(px(0.)).child(plot))
-        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LADDER, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))
+        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TYPE, cx)).child(kit::pick(dev, p::SLOPE, cx)).child(kit::pick(dev, p::LADDER, cx)).child(kit::pick(dev, p::SPECIAL, cx)).child(kit::pick(dev, p::LFO_SYNC, cx)))
         .child(kit::strip(
             ws,
             dev,
             &[p::DRIVE, p::LFO_DEPTH, rate, p::ENV_AMOUNT, p::MIX],
             &[
+                p::SHAPE,
                 p::LFO_SHAPE,
+                p::LFO_EXTRA,
                 p::LFO_STEREO,
                 p::ENV_ATTACK,
                 p::ENV_RELEASE,
+                p::ENV_SOURCE,
                 p::OUTPUT,
             ],
             cx,
@@ -211,5 +247,26 @@ mod tests {
         assert_eq!(sections(0, true, 500., 20., 48_000.).len(), 2);
         assert_eq!(db_frac(DB_TOP), 0.);
         assert_eq!(db_frac(DB_BOTTOM), 1.);
+    }
+
+    #[test]
+    fn the_special_curve_is_what_the_filter_does() {
+        for (kind, choice, cutoff, reso, shape) in [(Kind::Dj, 1., 200., 40., 0.), (Kind::Morph, 4., 1_500., 30., 40.), (Kind::NotchLp, 6., 900., 20., 60.)] {
+            let spec = special_spec(cutoff, reso, shape, false);
+            for f in [cutoff * 0.3, cutoff * 0.8, cutoff * 1.4, cutoff * 3.] {
+                let mut filter = aitrack_stock::create("fx.filter").unwrap();
+                for (id, v) in [(p::SPECIAL, choice), (p::CUTOFF, cutoff), (p::RESONANCE, reso), (p::SHAPE, shape)] {
+                    set_plain(filter.as_mut(), id, v);
+                }
+                let n = 24_000;
+                let (l, _) = process_stereo(filter.as_mut(), sine(f, 0.1), n);
+                let x: Vec<f32> = (0..n).map(|i| sine(f, 0.1)(i).0).collect();
+                let measured = 20. * (rms(&l[n / 2..]) / rms(&x[n / 2..])).log10();
+                let drawn = ext::response_db(kind, spec, f, 48_000.);
+                if drawn > -55. {
+                    assert!((drawn - measured).abs() < 0.6, "{kind:?} at {f:.0} Hz: drawn {drawn:.2}, measured {measured:.2}");
+                }
+            }
+        }
     }
 }

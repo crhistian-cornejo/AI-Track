@@ -7,19 +7,23 @@
 //! to Scale the keys the voices really sound are lit, and a voice the scale
 //! moved shows where it came from.
 //!
-//! The device has no meter, so the picture is of the settings, not of notes
-//! being played.
+//! Under the six cells, cards for the **strum** (a small picture of when each
+//! note of the chord starts, drawn with the device's own functions), the
+//! **chance** seed and loop, and **Learn**: with Learn on the device listens
+//! to the keys played and publishes the chord through its meter; this editor
+//! then writes it into the voices in one undo step and switches Learn off. The
+//! rest of the picture is of the settings, not of notes being played.
 
 use super::kit::{self, Handle, PlotCfg, Rect, ax};
 use super::midi_kit as mk;
 use super::{Dev, ParamSet, set_many};
 use crate::theme::*;
+use crate::widgets::{label, mono};
 use crate::workspace::Workspace;
 use aitrack_model::{DeviceId, Project};
-use aitrack_stock::midi::chord::{VOICES, p};
+use aitrack_stock::midi::chord::{VOICES, learn_edits, meter, p, strum_gain, strum_position};
 use aitrack_stock::midi::theory::{Snap, scale_mask, snap_note};
-use crate::widgets::mono;
-use gpui::{AnyElement, Context, InteractiveElement, ParentElement, Styled, TextAlign, div, prelude::FluentBuilder, px};
+use gpui::{AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Styled, TextAlign, div, prelude::FluentBuilder, px};
 use std::rc::Rc;
 
 /// The keyboard shown (C1 to C7 would be too dense: the intervals reach ±36).
@@ -159,6 +163,8 @@ pub struct Voice {
     pub interval: i32,
     /// Percent.
     pub level: f32,
+    /// Percent: how often the voice sounds.
+    pub chance: f32,
 }
 
 /// The six voices and where they play for a key, `fit` moving them into the
@@ -180,19 +186,30 @@ pub fn sounding(voices: &[Voice; VOICES], key: i32, fit: Option<u16>) -> Vec<(us
 }
 
 pub fn read_voices(dev: &Dev) -> [Voice; VOICES] {
-    std::array::from_fn(|v| Voice { on: dev.on(p::on(v)), interval: dev.plain(p::interval(v)).round() as i32, level: dev.plain(p::level(v)) })
+    std::array::from_fn(|v| Voice {
+        on: dev.on(p::on(v)),
+        interval: dev.plain(p::interval(v)).round() as i32,
+        level: dev.plain(p::level(v)),
+        chance: dev.plain(p::chance(v)),
+    })
+}
+
+/// How solid a voice is drawn: 1 for a voice that always sounds, down to 0.4
+/// for one that never does.
+pub fn sureness(chance_percent: f32) -> f32 {
+    0.4 + 0.6 * (chance_percent / 100.).clamp(0., 1.)
 }
 
 /// What a double-click on `key` does: remove the voice that sounds there,
-/// else switch the first free voice on at that interval (level 100 %).
-/// `None` when every voice is taken. Returns plain edits.
+/// else switch the first free voice on at that interval (level and chance
+/// 100 %). `None` when every voice is taken. Returns plain edits.
 pub fn toggle_voice(voices: &[Voice; VOICES], key: i32) -> Option<Vec<(u32, f32)>> {
     let interval = key - PLAYED;
     if let Some(v) = voices.iter().position(|v| v.on && v.interval == interval) {
         return Some(vec![(p::on(v), 0.)]);
     }
     let free = voices.iter().position(|v| !v.on)?;
-    Some(vec![(p::on(free), 1.), (p::interval(free), interval as f32), (p::level(free), 100.)])
+    Some(vec![(p::on(free), 1.), (p::interval(free), interval as f32), (p::level(free), 100.), (p::chance(free), 100.)])
 }
 
 /// The mask of the device's scale.
@@ -222,17 +239,132 @@ pub fn follow_edits(project: &Project, dev: &Dev, root: u32, scale: u32) -> Opti
     Some(vec![(root, dev.info(root)?.to_normalized(r as f32)), (scale, dev.info(scale)?.to_normalized(k as f32))])
 }
 
+// ───────────────────────────── The strum ─────────────────────────────
+
+/// One note of the strum's picture: its key, where along the strum it
+/// starts (0…1 of its time) and its velocity factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrumNote {
+    pub key: i32,
+    pub at: f32,
+    pub gain: f32,
+}
+
+/// The notes of `heard` (what [`sounding`] says the played key makes) in the
+/// order the strum plays them, placed and tilted by the device's own
+/// [`strum_position`] and [`strum_gain`]. `direction` is the device's *Strum
+/// Direction*: Down-Up is drawn by its downstroke and Random from the bottom
+/// up, since the device decides those from the song position. Two voices on
+/// one key are one note.
+pub fn strum_notes(heard: &[(usize, i32)], direction: usize, tension: f32, ramp: f32) -> Vec<StrumNote> {
+    let mut keys: Vec<i32> = heard.iter().map(|(_, k)| *k).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if matches!(direction, 1 | 2) {
+        keys.reverse();
+    }
+    let n = keys.len();
+    keys.into_iter().enumerate().map(|(i, key)| StrumNote { key, at: strum_position(i, n, f64::from(tension)) as f32, gain: strum_gain(i, n, ramp) }).collect()
+}
+
+/// Width and height of the strum picture, and the width of one note in it.
+const PICTURE: (f32, f32) = (176., 48.);
+const NOTE_W: f32 = 16.;
+
+/// The strum card: when each note of the chord starts, and what shapes it.
+fn strum_card(ws: &mut Workspace, dev: &Dev, notes: Vec<StrumNote>, cx: &mut Context<Workspace>) -> gpui::Div {
+    let (enabled, ms, direction) = (dev.enabled, dev.plain(p::STRUM), dev.choice(p::STRUM_DIR));
+    let picture = kit::plot(ws, dev, PlotCfg { slot: 1, ..Default::default() }, cx, move |r, window, _| {
+        let pal = p();
+        let colour = if enabled { pal.accent } else { pal.muted };
+        let (pad, rows) = (SP2, VOICES as f32);
+        let row_h = (r.h - 2. * pad) / rows;
+        // The start and the end of the strum.
+        for x in [r.x + pad, r.right() - pad] {
+            kit::bar(window, x, r.y + pad / 2., 1., r.h - pad, 0., pal.grid_beat);
+        }
+        for n in &notes {
+            // The lowest note sits at the bottom, whatever order it is played in.
+            let row = notes.iter().filter(|o| o.key < n.key).count();
+            let x = r.x + pad + n.at * (r.w - 2. * pad - NOTE_W);
+            let y = r.bottom() - pad - (row as f32 + 1.) * row_h + 1.;
+            kit::bar(window, x, y, NOTE_W, (row_h - 2.).max(2.), 2., with_alpha(colour, (0.3 + 0.5 * n.gain / 1.5).clamp(0.2, 0.95)));
+        }
+    });
+    let caption = if ms <= 0. {
+        "all at once".to_owned()
+    } else {
+        let order = ["up", "down", "down on the beat, up between", "random order"][direction.min(3)];
+        format!("{} · {order}", mk::fmt_ms(ms))
+    };
+    let pal = p();
+    let shape = div().flex_none().flex().flex_col().gap(px(SP1)).child(div().flex_none().w(px(PICTURE.0)).h(px(PICTURE.1)).child(picture)).child(label(caption, TEXT_XS, pal.faint));
+    kit::section(dev, "STRUM", None, vec![shape.into_any_element(), kit::num(ws, dev, p::STRUM, cx), kit::pick(dev, p::STRUM_DIR, cx), kit::num(ws, dev, p::STRUM_TENSION, cx), kit::num(ws, dev, p::STRUM_VEL, cx)], cx)
+}
+
+// ───────────────────────────── Learn ─────────────────────────────
+
+/// The serial of the last chord the device learned, once it publishes one.
+pub fn serial_of(dev: &Dev) -> Option<f32> {
+    dev.meter.get(meter::SERIAL).copied()
+}
+
+/// The voices the chord in the device's meter becomes (normalised edits, with
+/// Learn back to Off); empty when it has learned nothing.
+pub fn learned_voices(dev: &Dev) -> Vec<(u32, f32)> {
+    let n = (dev.m(meter::COUNT).round().max(0.) as usize).min(VOICES);
+    let keys: Vec<u8> = (0..n).map(|i| dev.m(meter::KEYS + i).round().clamp(0., 127.) as u8).collect();
+    learn_edits(&keys).into_iter().filter_map(|(id, v)| dev.info(id).map(|i| (id, i.to_normalized(v)))).collect()
+}
+
+/// The slot of the view options that remembers the serial last looked at.
+const LEARN_SEEN: u8 = 7;
+
+/// A chord the device heard since this editor last looked, while Learn is
+/// on, goes into the voices (one undo step) and Learn is switched off. The
+/// first look only takes note of the serial.
+pub fn apply_learned(ws: &mut Workspace, dev: &Dev) {
+    let Some(serial) = serial_of(dev) else { return };
+    let seen = ws.fx.opts.insert((dev.id, LEARN_SEEN), serial);
+    if dev.on(p::LEARN) {
+        // Frames keep coming while the device listens, so the chord is seen the moment it is played.
+        ws.fx.keep_awake();
+        if seen.is_some_and(|s| s != serial) {
+            let edits = learned_voices(dev);
+            if !edits.is_empty() {
+                set_many(ws, "Learn chord", dev.id, &edits);
+            }
+        }
+    }
+}
+
+/// The Learn card: the switch, and what the device is waiting for.
+fn learn_card(dev: &Dev, cx: &mut Context<Workspace>) -> gpui::Div {
+    let pal = p();
+    let learning = dev.on(p::LEARN);
+    let held = dev.m(meter::LIVE).round() as usize;
+    let status = match (learning, held) {
+        (false, _) => "play a chord and keep what you hear".to_owned(),
+        (true, 0) => "listening: play the chord on your keyboard".to_owned(),
+        (true, n) => format!("listening: {n} key{} so far", if n == 1 { "" } else { "s" }),
+    };
+    let body = vec![kit::pick(dev, p::LEARN, cx), label(status, TEXT_XS, if learning { pal.accent } else { pal.faint }).into_any_element()];
+    kit::section(dev, "LEARN", None, body, cx)
+}
+
 fn note_name(key: i32) -> String {
     format!("{}{}", ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][key.rem_euclid(12) as usize], key.div_euclid(12) - 1)
 }
 
 pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> AnyElement {
     follow_project(ws, dev, p::ROOT, p::SCALE, p::FOLLOW_PROJECT);
+    apply_learned(ws, dev);
     let voices = read_voices(dev);
     let fit = dev.on(p::FIT).then(|| scale_of(dev));
     let enabled = dev.enabled;
     let boxes = piano(LO, HI);
     let out = sounding(&voices, PLAYED, fit);
+    let strummed = strum_notes(&out, dev.choice(p::STRUM_DIR), dev.plain(p::STRUM_TENSION) / 100., dev.plain(p::STRUM_VEL) / 100.);
     let win = mk::windowed(dev);
     let geo = Geo::of(win);
     // What comes out, named: the notes that sound and the chord they make.
@@ -290,7 +422,8 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         // The scale (when the chord is fitted) and the notes that sound.
         let tint = |key: i32| {
             if let Some((i, _)) = out.iter().find(|(_, k)| *k == key) {
-                Some(with_alpha(colour, 0.35 + 0.5 * (voices[*i].level / 200.).clamp(0., 1.)))
+                // A voice that does not always sound is drawn fainter.
+                Some(with_alpha(colour, (0.35 + 0.5 * (voices[*i].level / 200.).clamp(0., 1.)) * sureness(voices[*i].chance)))
             } else if key == PLAYED {
                 Some(accent_alpha(0.3))
             } else {
@@ -316,7 +449,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
             let x = keys.x + keys.w * *fx;
             let y = r.py(*fy);
             kit::bar(window, x - 1., y, 2., r.py(geo.lane_end) - y, 1., with_alpha(colour, 0.7));
-            kit::dot(window, gpui::point(px(x), px(y)), 6., colour, Some(pal.text));
+            kit::dot(window, gpui::point(px(x), px(y)), 6., with_alpha(colour, sureness(voices[*v].chance)), Some(pal.text));
             let text = if win { names.iter().find(|(i, _)| i == v).map_or_else(|| format!("{}", v + 1), |(_, n)| n.clone()) } else { format!("{}", v + 1) };
             kit::txt(window, cx, &text, x, y - 16., TEXT_SM, pal.text, TextAlign::Center);
         }
@@ -352,9 +485,13 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
                 .when(win, |d| d.child(mono(sounds.unwrap_or_else(|| "off".to_owned()), TEXT_SM, if dev.on(p::on(v)) { p().text } else { p().faint })))
                 .child(kit::pick(dev, p::on(v), cx))
                 .child(kit::num_w(ws, dev, p::interval(v), 68., cx))
-                .child(kit::num_w(ws, dev, p::level(v), 68., cx)),
+                .child(kit::num_w(ws, dev, p::level(v), 68., cx))
+                .child(kit::num_w(ws, dev, p::chance(v), 68., cx)),
         );
     }
+    let strum = strum_card(ws, dev, strummed, cx);
+    let chance = kit::section(dev, "CHANCE", None, vec![kit::num(ws, dev, p::SEED, cx), kit::pick(dev, p::LOOP, cx)], cx);
+    let learn = learn_card(dev, cx);
     let scale = div()
         .flex_none()
         .flex()
@@ -367,7 +504,7 @@ pub fn render(ws: &mut Workspace, dev: &Dev, cx: &mut Context<Workspace>) -> Any
         .child(kit::pick(dev, p::FOLLOW_PROJECT, cx));
 
     let frame = div().id(("chord-plot", dev.key(0))).size_full().rounded(px(r_md())).bg(p().well).border_1().border_color(border()).overflow_hidden().child(plot);
-    super::midi_kit::body_with(dev, "chord-body", 520., 108., 184., frame, vec![cells, scale])
+    super::midi_kit::body_with(dev, "chord-body", 520., 108., 184., frame, vec![cells, scale, strum, chance, learn])
 }
 
 #[cfg(test)]
@@ -441,7 +578,7 @@ mod tests {
         let v = read_voices(&d);
         // Voice 4 is the first free one.
         let add = toggle_voice(&v, 71).unwrap();
-        assert_eq!(add, vec![(p::on(3), 1.), (p::interval(3), 11.), (p::level(3), 100.)]);
+        assert_eq!(add, vec![(p::on(3), 1.), (p::interval(3), 11.), (p::level(3), 100.), (p::chance(3), 100.)]);
         // The major third is voice 2: clicking it removes it.
         assert_eq!(toggle_voice(&v, 64), Some(vec![(p::on(1), 0.)]));
         // Every voice on: nothing to add.
@@ -451,6 +588,80 @@ mod tests {
             x.interval += 100;
         }
         assert_eq!(toggle_voice(&full, 61), None);
+    }
+
+    #[test]
+    fn the_strum_picture_orders_the_notes_by_pitch_and_places_them_with_the_devices_own_math() {
+        let d = dev("midi.chord", &[]);
+        let heard = sounding(&read_voices(&d), 60, None);
+        let up = strum_notes(&heard, 0, 0., 0.);
+        assert_eq!(up.iter().map(|n| n.key).collect::<Vec<_>>(), vec![60, 64, 67]);
+        assert_eq!(up.iter().map(|n| n.at).collect::<Vec<_>>(), vec![0., 0.5, 1.]);
+        assert!(up.iter().all(|n| n.gain == 1.), "no tilt: every note at its own velocity");
+        let down = strum_notes(&heard, 1, 0., 0.);
+        assert_eq!(down.iter().map(|n| n.key).collect::<Vec<_>>(), vec![67, 64, 60]);
+        // Down-Up is drawn by its downstroke, Random from the bottom up (the order is the device's to roll).
+        assert_eq!(strum_notes(&heard, 2, 0., 0.), down);
+        assert_eq!(strum_notes(&heard, 3, 0., 0.), up);
+        // Tension and the velocity tilt come from the device's functions.
+        let bent = strum_notes(&heard, 0, 1., 1.);
+        assert!(bent[1].at < 0.1 && (bent[0].gain, bent[2].gain) == (0.5, 1.5), "{bent:?}");
+        // Two voices that landed on one key are one note; nothing sounding is an empty picture.
+        assert_eq!(strum_notes(&[(0, 60), (1, 60), (2, 67)], 0, 0., 0.).len(), 2);
+        assert!(strum_notes(&[], 0, 0., 0.).is_empty());
+    }
+
+    #[test]
+    fn the_strum_picture_is_what_the_device_plays() {
+        use aitrack_dsp::{Event, EventSink, MidiContext, Transport};
+        let sr = 48_000.0;
+        let set = [(p::STRUM, 100.), (p::STRUM_TENSION, 40.), (p::STRUM_VEL, 30.), (p::STRUM_DIR, 1.), (p::on(3), 1.), (p::interval(3), 11.)];
+        let mut device = aitrack_stock::create("midi.chord").unwrap();
+        device.prepare(sr, 8_192);
+        for (id, v) in set {
+            aitrack_stock::test_util::set_plain(device.as_mut(), id, v);
+        }
+        let events = [Event { offset: 0, kind: aitrack_dsp::EventKind::NoteOn { channel: 0, key: 60, velocity: 0.5, note_id: 1 } }];
+        let (mut out, mut dropped) = (Vec::with_capacity(64), 0);
+        let ctx = MidiContext { sample_rate: sr, frames: 8_192, events: &events, transport: &Transport::default() };
+        device.process_midi(&ctx, &mut EventSink::new(&mut out, &mut dropped));
+        let mut played: Vec<(u32, u8, f32)> = out
+            .iter()
+            .filter_map(|e| match e.kind {
+                aitrack_dsp::EventKind::NoteOn { key, velocity, .. } => Some((e.offset, key, velocity)),
+                _ => None,
+            })
+            .collect();
+        played.sort_by_key(|n| (n.0, n.1));
+        let d = dev("midi.chord", &set);
+        let picture = strum_notes(&sounding(&read_voices(&d), 60, None), d.choice(p::STRUM_DIR), d.plain(p::STRUM_TENSION) / 100., d.plain(p::STRUM_VEL) / 100.);
+        assert_eq!(played.len(), 4);
+        assert_eq!(picture.len(), 4);
+        for (n, (offset, key, velocity)) in picture.iter().zip(&played) {
+            assert_eq!(n.key, i32::from(*key));
+            let at = *offset as f32 / (0.1 * sr as f32);
+            assert!((at - n.at).abs() < 1. / 4_800., "{key}: drawn at {}, played at {at}", n.at);
+            assert!((velocity - 0.5 * n.gain).abs() < 1e-5, "{key}: drawn {}, played {velocity}", 0.5 * n.gain);
+        }
+    }
+
+    #[test]
+    fn a_chord_the_device_heard_is_read_from_its_meter_and_becomes_normalised_voices() {
+        let with_meter = |learn: f32, meter: Vec<f32>| Dev { meter: std::rc::Rc::new(meter), ..dev("midi.chord", &[(p::LEARN, learn)]) };
+        assert_eq!(serial_of(&dev("midi.chord", &[])), None, "no meter published yet");
+        let d = with_meter(1., vec![3., 3., 60., 63., 67., 0., 0., 0., 0.]);
+        assert_eq!(serial_of(&d), Some(3.));
+        let edits = learned_voices(&d);
+        assert!(edits.iter().all(|(_, v)| (0.0..=1.0).contains(v)), "normalised: {edits:?}");
+        let norm = |id: u32, plain: f32| (id, d.to_norm(id, plain));
+        for want in [norm(p::on(0), 1.), norm(p::interval(0), 0.), norm(p::interval(1), 3.), norm(p::interval(2), 7.), norm(p::level(2), 100.), norm(p::on(3), 0.), norm(p::LEARN, 0.)] {
+            assert!(edits.contains(&want), "{want:?} missing from {edits:?}");
+        }
+        // A meter that says nothing was learned writes nothing.
+        assert!(learned_voices(&with_meter(1., vec![1., 0., 0., 0., 0., 0., 0., 0., 0.])).is_empty());
+        // A meter cut short is read as far as it goes.
+        assert_eq!(serial_of(&with_meter(1., vec![5.])), Some(5.));
+        assert!(learned_voices(&with_meter(1., vec![5.])).is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Every MIDI effect of the registry: `process_midi` never touches the heap,
-//! writes sorted events inside the block, and (for the four devices of the
-//! timing/pitch family) closes every note it opens, under every factory
+//! writes sorted events inside the block, and (for the devices of the
+//! timing/pitch family and the chord) closes every note it opens, under every factory
 //! preset and under extreme and scrambled parameters.
 
 use aitrack_dsp::{Category, Event, EventKind, EventSink, MidiContext, Processor, Transport};
@@ -51,8 +51,9 @@ fn counted(f: impl FnOnce()) -> usize {
 
 const SR: f64 = 48_000.0;
 const BLOCK: usize = 128;
-/// The four devices this file checks note by note.
-const PAIRED: [&str; 4] = ["midi.echo", "midi.random", "midi.length", "midi.pitch"];
+/// The devices this file checks note by note: the timing/pitch family, and
+/// the chord (its strum delays notes by up to half a second).
+const PAIRED: [&str; 5] = ["midi.echo", "midi.random", "midi.length", "midi.pitch", "midi.chord"];
 
 fn midi_effects() -> Vec<&'static str> {
     aitrack_stock::registry().iter().filter(|e| e.category == Category::MidiEffect).map(|e| e.id).collect()

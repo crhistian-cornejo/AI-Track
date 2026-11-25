@@ -6,16 +6,24 @@
 //! log-frequency, so sweeps are zipper-free. Zero latency in the SVF modes; the ladders run 2× oversampled and
 //! delay by about two samples.
 //!
+//! Added later, each under an id of its own with a default that is the old
+//! behaviour: `Special` (DJ, Comb, Vowel, Morph, Resample, Notch+LP — see
+//! [`ext`] — instead of Type, Slope and Ladder), `Shape` (their second
+//! dimension), `LFO Extra` (Wander, Ramp Up, Ramp Down in place of the LFO
+//! shape) and `Envelope Source` (the follower can listen to the sidechain).
+//!
 //! Meter layout: `[cutoff L (Hz), cutoff R (Hz), envelope (0..1)]`.
 
-use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, write_meter};
+use crate::common::{ParamStore, Segmented, drive, for_frames, load_state, sanitize, save_state, sidechain_frame, write_meter};
 use aitrack_dsp::envelope::{DetectorMode, EnvelopeFollower};
 use aitrack_dsp::ladder::{Ladder, LadderKind};
-use aitrack_dsp::lfo::{Lfo, LfoShape, SYNC_DIVISIONS, division_beats, division_hz};
+use aitrack_dsp::lfo::{ExtraShape, Lfo, LfoShape, SYNC_DIVISIONS, division_beats, division_hz};
 use aitrack_dsp::shaper::{Adaa1, ShaperKind};
 use aitrack_dsp::smooth::Smoother;
 use aitrack_dsp::svf::{SvfCoeffs, SvfMode, SvfState, butterworth_q};
 use aitrack_dsp::{Category, EventKind, ParamInfo, PluginInfo, ProcessContext, Processor, db_to_gain};
+
+pub mod ext;
 
 pub const ID: &str = "fx.filter";
 
@@ -38,11 +46,21 @@ pub mod p {
     pub const OUTPUT: u32 = 15;
     /// 0 = the SVF modes above; 1..=4 = a ladder filter (replaces Type/Slope).
     pub const LADDER: u32 = 16;
+    /// 0 = Type/Slope/Ladder as before; 1..=6 = a special type of [`super::ext`].
+    pub const SPECIAL: u32 = 17;
+    /// Second dimension of the special types, 0..100 %.
+    pub const SHAPE: u32 = 18;
+    /// 0 = the LFO Shape list; 1..=3 = Wander, Ramp Up, Ramp Down.
+    pub const LFO_EXTRA: u32 = 19;
+    /// 0 = the follower listens to the input, 1 = to the sidechain.
+    pub const ENV_SOURCE: u32 = 20;
 }
 
 const TYPES: &[&str] = &["Low-pass", "High-pass", "Band-pass", "Notch", "Peak"];
 pub const LADDERS: &[&str] = &["Off", "Moog 24", "OTA 24", "OTA 12", "Diode 18"];
 const SLOPES: &[&str] = &["12 dB/oct", "24 dB/oct"];
+pub const LFO_EXTRAS: &[&str] = &["Off", "Wander", "Ramp Up", "Ramp Down"];
+const ENV_SOURCES: &[&str] = &["Input", "Sidechain"];
 const OFF_ON: &[&str] = &["Off", "On"];
 const UPDATE: usize = 8;
 
@@ -66,6 +84,10 @@ pub fn params() -> Vec<ParamInfo> {
         ParamInfo::new(p::MIX, "Mix", 0.0, 100.0, 100.0).unit("%"),
         ParamInfo::new(p::OUTPUT, "Output", -24.0, 12.0, 0.0).unit("dB").short("Out"),
         ParamInfo::new(p::LADDER, "Ladder", 0.0, 4.0, 0.0).choices(LADDERS).short("Ladder"),
+        ParamInfo::new(p::SPECIAL, "Special", 0.0, (ext::NAMES.len() - 1) as f32, 0.0).choices(ext::NAMES).short("Special"),
+        ParamInfo::new(p::SHAPE, "Shape", 0.0, 100.0, 0.0).unit("%"),
+        ParamInfo::new(p::LFO_EXTRA, "LFO Extra Shape", 0.0, (LFO_EXTRAS.len() - 1) as f32, 0.0).choices(LFO_EXTRAS).short("Extra"),
+        ParamInfo::new(p::ENV_SOURCE, "Envelope Source", 0.0, 1.0, 0.0).choices(ENV_SOURCES).short("Source"),
     ]
 }
 
@@ -74,13 +96,14 @@ pub fn resonance_q(res: f32) -> f32 {
     0.5 * 50f32.powf((res / 100.0).clamp(0.0, 1.0))
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Channel {
     st: [SvfState; 2],
     c: [SvfCoeffs; 2],
     shaper: Option<Adaa1>,
     cutoff: f32,
     ladder: Ladder,
+    ext: ext::Ext,
 }
 
 /// The ladder topology a `Ladder` parameter value stands for.
@@ -100,6 +123,9 @@ pub struct Filter {
     sr: f64,
     ch: [Channel; 2],
     lfo: [Lfo; 2],
+    /// Cycles run by each LFO, for the shapes that are a function of them.
+    cycles: [f64; 2],
+    special: Option<ext::Kind>,
     env: EnvelopeFollower,
     base_oct: Smoother,
     wet: Smoother,
@@ -133,12 +159,14 @@ impl Filter {
                 params: params.clone(),
                 inputs: 2,
                 outputs: 2,
-                has_sidechain: false,
+                has_sidechain: true,
             },
             params: ParamStore::new(&params),
             sr: 48_000.0,
-            ch: [Channel { shaper: Some(Adaa1::new(ShaperKind::Tanh)), cutoff: 1000.0, ..Default::default() }; 2],
+            ch: std::array::from_fn(|_| Channel { shaper: Some(Adaa1::new(ShaperKind::Tanh)), cutoff: 1000.0, ..Default::default() }),
             lfo: [Lfo::new(11), Lfo::new(12)],
+            cycles: [0.0; 2],
+            special: None,
             env: EnvelopeFollower::new(DetectorMode::Peak),
             base_oct: Smoother::new(0.0),
             wet: Smoother::new(1.0),
@@ -164,6 +192,14 @@ impl Filter {
         for l in &mut self.lfo {
             l.shape = shape;
         }
+        let special = ext::Kind::from_choice(self.params.choice(p::SPECIAL));
+        if special != self.special {
+            // Another type starts from silence: the states of one mean nothing to the next.
+            for c in &mut self.ch {
+                c.ext.reset();
+            }
+            self.special = special;
+        }
         self.env.set_times(self.params.plain(p::ENV_ATTACK), self.params.plain(p::ENV_RELEASE), self.sr);
         if self.first {
             for s in [&mut self.base_oct, &mut self.wet, &mut self.dry, &mut self.drive] {
@@ -174,6 +210,18 @@ impl Filter {
     }
 
     fn design(&mut self, ch: usize, cutoff: f32) {
+        if let Some(kind) = self.special {
+            let spec = ext::Spec {
+                cutoff,
+                resonance: self.params.plain(p::RESONANCE),
+                shape: self.params.plain(p::SHAPE) / 100.0,
+                slope24: self.params.choice(p::SLOPE) == 1,
+            };
+            let c = &mut self.ch[ch];
+            c.cutoff = cutoff;
+            c.ext.design(kind, spec);
+            return;
+        }
         if let Some(kind) = ladder_kind(self.params.choice(p::LADDER)) {
             let c = &mut self.ch[ch];
             c.cutoff = cutoff;
@@ -231,10 +279,16 @@ impl Segmented for Filter {
             let cycle = division_beats(div);
             self.lfo[0].sync_to_beats(beats, cycle, 0.0);
             self.lfo[1].sync_to_beats(beats, cycle, offset);
+            self.cycles = [beats / cycle, beats / cycle + offset];
         } else if dirty {
             let ph = self.lfo[0].phase();
             self.lfo[1].set_phase(ph + offset);
         }
+        let extra = self.params.choice(p::LFO_EXTRA).checked_sub(1).map(ExtraShape::from_index);
+        let cycle_step = f64::from(rate) / self.sr;
+        let from_sidechain = self.params.choice(p::ENV_SOURCE) == 1;
+        let sc = if from_sidechain { ctx.sidechain } else { None };
+        let special = self.special;
         let lfo_depth = self.params.plain(p::LFO_DEPTH);
         let env_amt = self.params.plain(p::ENV_AMOUNT);
         let two = self.params.choice(p::SLOPE) == 1;
@@ -251,7 +305,10 @@ impl Segmented for Filter {
                 let base = self.base_oct.advance(UPDATE);
                 let env = self.env_level.min(1.0);
                 for c in 0..2 {
-                    let lfo = self.lfo[c].value();
+                    let lfo = match extra {
+                        Some(shape) => shape.value(self.cycles[c], 11),
+                        None => self.lfo[c].value(),
+                    };
                     let oct = (base + lfo * lfo_depth + env * env_amt).clamp(0.0, nyq_oct);
                     self.design(c, 20.0 * 2f32.powf(oct));
                 }
@@ -259,9 +316,12 @@ impl Segmented for Filter {
             }
             let n = self.counter.min(end - i);
             let seg_end = i + n;
-            let Self { ch, lfo, env, wet, dry, drive: drv, env_level, .. } = self;
-            for_frames(buf, i, seg_end, |_, l, r| {
-                *env_level = env.process(0.5 * (l + r));
+            let Self { ch, lfo, cycles, env, wet, dry, drive: drv, env_level, .. } = self;
+            for_frames(buf, i, seg_end, |n, l, r| {
+                let (el, er) = if from_sidechain && sc.is_some() { sidechain_frame(sc, n) } else { (l, r) };
+                *env_level = env.process(0.5 * (el + er));
+                cycles[0] += cycle_step;
+                cycles[1] += cycle_step;
                 lfo[0].advance(1);
                 lfo[1].advance(1);
                 let g = drv.next();
@@ -275,7 +335,9 @@ impl Segmented for Filter {
                     {
                         y = s.process(y * g) / g.sqrt();
                     }
-                    if use_ladder {
+                    if let Some(kind) = special {
+                        y = c.ext.process(kind, y);
+                    } else if use_ladder {
                         y = c.ladder.process(y);
                     } else {
                         y = c.st[0].process(&c.c[0], y);
@@ -302,6 +364,7 @@ impl Processor for Filter {
         self.sr = sample_rate;
         for c in &mut self.ch {
             c.ladder.set_sample_rate(sample_rate as f32);
+            c.ext.prepare(sample_rate);
         }
         self.base_oct.set_time(15.0, sample_rate);
         for s in [&mut self.wet, &mut self.dry, &mut self.drive] {
@@ -321,7 +384,9 @@ impl Processor for Filter {
                 s.reset();
             }
             c.ladder.reset();
+            c.ext.reset();
         }
+        self.cycles = [0.0; 2];
         self.env.reset();
         self.env_level = 0.0;
         self.lfo[0].reset(0.0);
@@ -461,5 +526,84 @@ mod tests {
         let mut m = [0.0; 3];
         f.meter(&mut m);
         assert!(m[0] > 800.0, "{}", m[0]);
+    }
+    #[test]
+    fn a_special_type_takes_the_place_of_type_slope_and_ladder() {
+        let mut f = Filter::new();
+        set_plain(&mut f, p::LADDER, 1.0);
+        set_plain(&mut f, p::SPECIAL, 1.0); // DJ
+        set_plain(&mut f, p::RESONANCE, 0.0);
+        set_plain(&mut f, p::CUTOFF, 100.0); // left of the middle: a low-pass closing
+        assert!(gain_db(&mut f, 8000.0) < -20.0);
+        set_plain(&mut f, p::CUTOFF, 8000.0); // right of it: a high-pass closing
+        assert!(gain_db(&mut f, 100.0) < -20.0 && gain_db(&mut f, 12000.0).abs() < 2.0);
+        // Off again: the ladder is back and passes the bass.
+        set_plain(&mut f, p::SPECIAL, 0.0);
+        set_plain(&mut f, p::CUTOFF, 800.0);
+        assert!(gain_db(&mut f, 100.0).abs() < 1.5 && gain_db(&mut f, 8000.0) < -20.0);
+    }
+
+    #[test]
+    fn the_new_ids_default_to_the_old_behaviour() {
+        let defaults = params();
+        let value = |id: u32| defaults.iter().find(|i| i.id == id).unwrap().default;
+        assert_eq!([p::SPECIAL, p::SHAPE, p::LFO_EXTRA, p::ENV_SOURCE].map(value), [0.0; 4]);
+        assert_eq!(defaults.iter().find(|i| i.id == p::SPECIAL).unwrap().choices.len(), ext::NAMES.len());
+        assert_eq!(defaults.iter().find(|i| i.id == p::LFO_EXTRA).unwrap().choices.len(), 4);
+    }
+
+    #[test]
+    fn the_extra_lfo_shapes_sweep_the_cutoff() {
+        for extra in [1.0, 2.0, 3.0] {
+            let mut f = Filter::new();
+            set_plain(&mut f, p::LFO_DEPTH, 2.0);
+            set_plain(&mut f, p::LFO_RATE, 2.0);
+            set_plain(&mut f, p::LFO_EXTRA, extra);
+            f.prepare(SR, 128);
+            let mut seen = (f32::MAX, 0.0f32);
+            for _ in 0..80 {
+                process_stereo_prepared(&mut f, sine(100.0, 0.1), 1200, &Transport::default());
+                let mut m = [0.0; 3];
+                f.meter(&mut m);
+                seen = (seen.0.min(m[0]), seen.1.max(m[0]));
+            }
+            assert!(seen.1 > seen.0 * 2.0, "extra shape {extra}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn the_follower_can_listen_to_the_sidechain() {
+        use aitrack_dsp::AudioBuffer;
+        let run = |source: f32| {
+            let mut f = Filter::new();
+            set_plain(&mut f, p::CUTOFF, 200.0);
+            set_plain(&mut f, p::ENV_AMOUNT, 3.0);
+            set_plain(&mut f, p::ENV_SOURCE, source);
+            f.prepare(SR, 128);
+            let mut buf = AudioBuffer::new(2, 128);
+            let mut side = AudioBuffer::new(2, 128);
+            let tr = Transport::default();
+            for _ in 0..40 {
+                for c in 0..2 {
+                    buf.channel_mut(c).fill(0.0);
+                    for (i, v) in side.channel_mut(c).iter_mut().enumerate() {
+                        *v = 0.9 * (i as f32 * 0.1).sin();
+                    }
+                }
+                let mut ctx = ProcessContext { sample_rate: SR, buffer: &mut buf, sidechain: Some(&side), events: &[], transport: &tr };
+                f.process(&mut ctx);
+            }
+            let mut m = [0.0; 3];
+            f.meter(&mut m);
+            m
+        };
+        assert!(f_has_sidechain());
+        let (input, side) = (run(0.0), run(1.0));
+        assert!(input[2] < 0.01 && input[0] < 300.0, "input source ignores the sidechain: {input:?}");
+        assert!(side[2] > 0.3 && side[0] > 800.0, "sidechain source opens the filter: {side:?}");
+    }
+
+    fn f_has_sidechain() -> bool {
+        Filter::new().info().has_sidechain
     }
 }

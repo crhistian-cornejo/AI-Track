@@ -49,6 +49,8 @@ pub enum Glyph {
     Chord,
     Rack,
     Split,
+    /// A pumping curve: down on the beat, back up by the off-beat (the shaper as a modulator).
+    Pump,
 }
 
 /// The glyph for one of our devices (`fx.compressor`, `instrument.drum`…).
@@ -82,6 +84,7 @@ pub fn for_stock(id: &str) -> Glyph {
         "instrument.vault" => Glyph::Vault,
         "midi.arp" => Glyph::Arp,
         "midi.chord" => Glyph::Chord,
+        "mod.shaper" => Glyph::Pump,
         id if id.starts_with("midi.") => Glyph::Notes,
         id if id.starts_with("rack.") => Glyph::Rack,
         id if id.starts_with("instrument.") => Glyph::Synth,
@@ -184,6 +187,7 @@ pub fn shapes(g: Glyph) -> Vec<Shape> {
             curve(32, |x| sine(x, 3.0, 0.0) * 0.45 + 0.05),
             curve(32, |x| 0.95 - (sine(x, 1.5, 0.2) - 0.1) * 0.45),
         ],
+        Pump => vec![Shape::Faint(0.05, 0.15, 0.9, 0.0), Shape::Line(vec![(0.05, 0.15), (0.2, 0.88), (0.34, 0.88), (0.62, 0.15), (0.78, 0.15), (0.78, 0.88), (0.95, 0.88)])],
     }
 }
 
@@ -219,7 +223,7 @@ mod tests {
         "fx.amp", "fx.analyzer", "fx.autopan", "fx.buscomp", "fx.chorus", "fx.clipper", "fx.compressor", "fx.console", "fx.crusher", "fx.delay", "fx.drum_extract", "fx.drumbus", "fx.eq",
         "fx.filter", "fx.gate", "fx.limiter", "fx.mbdyn", "fx.midside", "fx.multiband", "fx.reverb", "fx.saturator", "fx.shaper", "fx.stutter", "fx.tape", "fx.transient", "fx.utility",
         "instrument.acid303", "instrument.drum", "instrument.drumsynth", "instrument.granular", "instrument.kick808", "instrument.sampler", "instrument.synth", "instrument.vault", "instrument.wavetable", "midi.arp",
-        "midi.chord", "midi.echo", "midi.length", "midi.pitch", "midi.random", "midi.scale", "midi.velocity", "rack.audio", "rack.drum", "rack.instrument", "rack.midi",
+        "midi.chord", "midi.echo", "midi.length", "midi.pitch", "midi.random", "midi.scale", "midi.velocity", "mod.shaper", "rack.audio", "rack.drum", "rack.instrument", "rack.midi",
     ];
 
     #[test]

@@ -78,9 +78,16 @@ pub fn params() -> Vec<ParamInfo> {
 
 /// The curve's six points in time order, from plain parameter values.
 pub fn curve_points(plain: impl Fn(u32) -> f32) -> [(f32, f32); 6] {
-    let mut mid = p::NODES.map(|(x, y)| (plain(x).clamp(0.0, 1.0), plain(y).clamp(0.0, 1.0)));
+    curve_points_with(plain, p::Y0, p::NODES, p::Y5)
+}
+
+/// As [`curve_points`] for a device that keeps the same curve under other
+/// parameter ids (`mod.shaper`): the start level, the four free nodes as
+/// `(time, level)` and the end level.
+pub fn curve_points_with(plain: impl Fn(u32) -> f32, start: u32, nodes: [(u32, u32); 4], end: u32) -> [(f32, f32); 6] {
+    let mut mid = nodes.map(|(x, y)| (plain(x).clamp(0.0, 1.0), plain(y).clamp(0.0, 1.0)));
     mid.sort_unstable_by(|a, b| a.0.total_cmp(&b.0)); // never allocates: this runs on the audio thread
-    [(0.0, plain(p::Y0).clamp(0.0, 1.0)), mid[0], mid[1], mid[2], mid[3], (1.0, plain(p::Y5).clamp(0.0, 1.0))]
+    [(0.0, plain(start).clamp(0.0, 1.0)), mid[0], mid[1], mid[2], mid[3], (1.0, plain(end).clamp(0.0, 1.0))]
 }
 
 /// Level (0..=1) of the curve at `phase` (0..1). `tension` is −1..1: positive
@@ -365,6 +372,29 @@ mod tests {
             _ => 0.5,
         });
         assert_eq!(crossed[1], (0.1, 0.9));
+    }
+
+    #[test]
+    fn a_device_with_other_ids_gets_the_same_sorted_curve() {
+        // Ids 20..=29 stand for start, four nodes (time, level) and end; the nodes are out of order.
+        let value = |id: u32| match id {
+            20 => 0.1,
+            21 => 0.8,
+            22 => 0.2,
+            23 => 0.1,
+            24 => 0.9,
+            25 => 0.5,
+            26 => 0.5,
+            27 => 0.4,
+            28 => 0.6,
+            _ => 0.7,
+        };
+        let pts = curve_points_with(value, 20, [(21, 22), (23, 24), (25, 26), (27, 28)], 29);
+        assert_eq!(pts, [(0.0, 0.1), (0.1, 0.9), (0.4, 0.6), (0.5, 0.5), (0.8, 0.2), (1.0, 0.7)]);
+        // And `curve_points` is that function on this device's own ids.
+        let defaults = params();
+        let own = |id: u32| defaults.iter().find(|i| i.id == id).unwrap().default;
+        assert_eq!(curve_points(own), curve_points_with(own, p::Y0, p::NODES, p::Y5));
     }
 
     #[test]

@@ -434,6 +434,13 @@ impl UiState {
         self.drag.is_some() || self.last_change.elapsed() < Duration::from_millis(1200)
     }
 
+    /// Keep the frames coming for a while although nothing moves: an editor
+    /// that waits for something the engine will publish (a chord the device
+    /// is learning) asks for this on every frame it is drawn.
+    pub fn keep_awake(&mut self) {
+        self.last_change = Instant::now();
+    }
+
     /// The canvas bounds of a device's plot `slot`, written during prepaint.
     pub fn region(&mut self, device: DeviceId, slot: u8) -> Region {
         let w = self.painting.map_or(0, |w| w.as_u64());
@@ -736,6 +743,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.autopan"
             | "mod.lfo"
             | "mod.envfollow"
+            | "mod.shaper"
             | "fx.crusher"
             | "fx.drumbus"
             | "fx.stutter"
@@ -788,6 +796,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.autopan" => autopan::render(ws, dev, cx),
         "mod.lfo" => modulator::render_lfo(ws, dev, d, cx),
         "mod.envfollow" => modulator::render_env(ws, dev, d, cx),
+        "mod.shaper" => modulator::render_shaper(ws, dev, d, cx),
         "fx.crusher" => crusher::render(ws, dev, cx),
         "fx.drumbus" => drumbus::render(ws, dev, cx),
         "fx.stutter" => stutter::render(ws, dev, cx),
@@ -879,6 +888,14 @@ mod tests {
         d.advance((5000., 70.), false, false);
         assert_eq!(d.x.unwrap().value, 1.);
         assert!(d.advance((6000., 70.), false, false).is_empty());
+    }
+
+    #[test]
+    fn an_editor_waiting_for_the_engine_can_keep_the_frames_coming() {
+        let mut ui = UiState::default();
+        assert!(!ui.wants_frames(), "nothing changing: no frames");
+        ui.keep_awake();
+        assert!(ui.wants_frames());
     }
 
     #[test]

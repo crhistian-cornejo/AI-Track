@@ -19,7 +19,8 @@ use crate::theme::*;
 use crate::widgets::{self, label, menu_card, menu_header, menu_item, mono};
 use crate::workspace::{Drag, KnobTarget, Workspace};
 use aitrack_model::{Device, DeviceId, ModMapping, ModTarget, Project};
-use aitrack_stock::fx::{envfollow, lfo};
+use aitrack_stock::fx::shaper::level_at;
+use aitrack_stock::fx::{envfollow, lfo, shaper_mod};
 use gpui::{
     AnyElement, Context, Div, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString, Stateful,
     StatefulInteractiveElement, Styled, TextAlign, div, prelude::FluentBuilder, px,
@@ -496,6 +497,84 @@ pub fn render_env(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Wo
     kit::panel(if dev.big { 720. } else { 640. }).child(div().flex_1().min_h(px(0.)).flex().gap(px(SP3)).child(left).child(right)).into_any_element()
 }
 
+// ───────────────────────────── Shaper ─────────────────────────────
+
+/// The output (0..1) of `mod.shaper` over one cycle at `n` points, as the
+/// device computes it before its smoothing: the curve at the cycle's phase
+/// (`phase` is the shift in 0..1), placed by depth and offset.
+#[cfg(test)]
+pub fn shaper_curve(points: &[(f32, f32); 6], tension: f32, depth: f32, offset: f32, phase: f32, n: usize) -> Vec<f32> {
+    (0..n).map(|i| shaper_mod::output_of(level_at(points, tension, (phase + i as f32 / n as f32).rem_euclid(1.)), depth, offset)).collect()
+}
+
+pub fn render_shaper(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Workspace>) -> AnyElement {
+    use shaper_mod::p;
+    let points = shaper_mod::curve_points(|id| dev.plain(id));
+    let (tension, depth, offset) = (dev.plain(p::TENSION) / 100., dev.plain(p::DEPTH) / 100., dev.plain(p::OFFSET) / 100.);
+    let default = |id: u32| (id, dev.info(id).map_or(0.5, |i| i.default_normalized()));
+    // One handle per node, each bound to its own parameters (a node dragged
+    // past its neighbour keeps its identity; the curve sorts them by time).
+    let mut handles = vec![Handle { fx: 0., fy: out_frac(dev.plain(p::Y0)), y: ax(p::Y0, -1. / SPAN), index: 0, reset: vec![default(p::Y0)], ..Default::default() }];
+    for (i, (x, y)) in p::NODES.into_iter().enumerate() {
+        handles.push(Handle {
+            fx: dev.plain(x).clamp(0., 1.),
+            fy: out_frac(dev.plain(y)),
+            x: ax(x, 1.),
+            y: ax(y, -1. / SPAN),
+            index: i + 1,
+            reset: vec![default(x), default(y)],
+            ..Default::default()
+        });
+    }
+    handles.push(Handle { fx: 1., fy: out_frac(dev.plain(p::Y5)), y: ax(p::Y5, -1. / SPAN), index: 5, reset: vec![default(p::Y5)], ..Default::default() });
+    let marks: Vec<(f32, f32)> = handles.iter().map(|h| (h.fx, h.fy)).collect();
+    let live = dev.meter.len() >= 2;
+    let (out, head) = (dev.m(0).clamp(0., 1.), dev.m(1).clamp(0., 1.));
+    let (enabled, selected) = (dev.enabled, dev.selected);
+    let trigger = dev.choice(p::TRIGGER);
+    let title = format!("{} · cycle {} · depth {:.0}%", shaper_mod::TRIGGERS.get(trigger).copied().unwrap_or("Sync").to_lowercase(), dev.text(p::DIVISION), depth * 100.);
+    let plot = kit::plot(ws, dev, PlotCfg { slot: 0, handles, keys: true, ..Default::default() }, cx, move |r, window, cx| {
+        let pal = p();
+        let color = if enabled { pal.accent } else { pal.muted };
+        for q in 1..4 {
+            kit::vline(window, r, r.px(q as f32 / 4.), if q == 2 { pal.grid_bar } else { pal.grid_beat });
+        }
+        kit::hline(window, r, r.py(out_frac(0.5)), pal.grid_bar);
+        kit::hline(window, r, r.py(out_frac(1.)), pal.grid_beat);
+        kit::hline(window, r, r.py(out_frac(0.)), pal.grid_beat);
+        let n = ((r.w / 2.) as usize).clamp(48, 400);
+        // What the targets receive: the curve with depth and offset, shaded.
+        let applied = kit::sample_curve(r, n, |fx| out_frac(shaper_mod::output_of(level_at(&points, tension, fx), depth, offset)));
+        kit::fill_to(window, &applied, r.py(out_frac(0.)), with_alpha(color, 0.14));
+        // The curve as drawn, and its nodes.
+        let drawn = kit::sample_curve(r, n, |fx| out_frac(level_at(&points, tension, fx)));
+        kit::line(window, &drawn, 1.5, with_alpha(color, 0.95));
+        for (i, (fx, fy)) in marks.iter().enumerate() {
+            let on = i == selected;
+            kit::dot(window, r.pt(*fx, *fy), if on { 7. } else { 5.5 }, if on { pal.accent } else { pal.well }, Some(if on { pal.text } else { color }));
+        }
+        if live {
+            kit::vline(window, r, r.px(head), with_alpha(pal.text, 0.3));
+            kit::dot(window, r.pt(head, out_frac(out)), 4., pal.text, None);
+        }
+        kit::txt(window, cx, "1", r.x + 6., r.py(out_frac(1.)) - 12., TEXT_XS, pal.faint, TextAlign::Left);
+        kit::txt(window, cx, "0", r.x + 6., r.py(out_frac(0.)) - 12., TEXT_XS, pal.faint, TextAlign::Left);
+    });
+    let left = div()
+        .flex_1()
+        .min_w(px(0.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .gap(px(SP2))
+        .child(kit::plot_header(title, None))
+        .child(div().flex_1().min_h(px(0.)).child(plot))
+        .child(div().flex_none().flex().items_center().gap(px(SP1)).child(kit::pick(dev, p::TRIGGER, cx)).child(kit::pick(dev, p::DIVISION, cx)))
+        .child(kit::strip(ws, dev, &[p::DEPTH, p::OFFSET, p::SMOOTH, p::TENSION], &[p::PHASE], cx));
+    let right = targets_panel(ws, d, cx);
+    kit::panel(if dev.big { 760. } else { 680. }).child(div().flex_1().min_h(px(0.)).flex().gap(px(SP3)).child(left).child(right)).into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +659,43 @@ mod tests {
         set_map_mode(Some(DeviceId(987_654)));
         assert_eq!(live_map_mode(&s.project), None);
         assert_eq!(map_mode(), None);
+    }
+
+    #[test]
+    fn the_shaper_picture_is_the_output_of_the_device() {
+        use aitrack_dsp::{ModBlock, Processor};
+        let setup = [(shaper_mod::p::SMOOTH, 0.), (shaper_mod::p::TENSION, 30.), (shaper_mod::p::DEPTH, 80.), (shaper_mod::p::OFFSET, 10.), (shaper_mod::p::Y2, 0.4)];
+        let d = super::super::testing::dev("mod.shaper", &setup);
+        let points = shaper_mod::curve_points(|id| d.plain(id));
+        let picture = shaper_curve(&points, 0.3, 0.8, 0.1, 0., 750);
+        // The device over one beat at 120 bpm (the default division is a quarter note), 750 control steps.
+        let mut device = shaper_mod::ShaperMod::new();
+        device.prepare(48_000., 128);
+        for (id, v) in setup {
+            aitrack_stock::test_util::set_plain(&mut device, id, v);
+        }
+        let beats: Vec<f64> = (0..750).map(|k| (k * 32) as f64 / 24_000.).collect();
+        let m = ModBlock { sample_rate: 48_000., playing: true, bpm: 120., step: 32, frames: 750 * 32, start_samples: 0, beats: &beats, events: &[] };
+        let mut out = vec![0.; 750];
+        assert!(device.modulate(&m, &mut out));
+        for (k, (drawn, played)) in picture.iter().zip(&out).enumerate() {
+            assert!((drawn - played).abs() < 1e-3, "step {k}: drawn {drawn}, device {played}");
+        }
+        assert!(picture.iter().all(|v| (0. ..=1.).contains(v)));
+        // A phase shift moves the start of the picture along the curve.
+        let shifted = shaper_curve(&points, 0.3, 0.8, 0.1, 0.5, 750);
+        assert_eq!(shifted[0], picture[375]);
+    }
+
+    #[test]
+    fn a_shaper_drives_up_to_eight_targets_like_the_other_modulators() {
+        let mut s = crate::state::AppState::new(Project::new("t"));
+        let t = s.add_track(TrackKind::Audio).unwrap();
+        let eq = s.add_stock_device(t, "fx.eq", "EQ").unwrap();
+        let m = s.add_stock_device(t, "mod.shaper", "Shaper Mod").unwrap();
+        for param in 0..aitrack_model::MAX_MOD_MAPPINGS as u32 {
+            assert!(s.map_modulator(m, ModTarget::Param { device: eq, param }).is_ok(), "target {param}");
+        }
+        assert!(s.map_modulator(m, ModTarget::Param { device: eq, param: 99 }).is_err(), "the ninth is refused");
     }
 }

@@ -54,9 +54,10 @@ impl SpectrumAnalyzer {
             let t = i as f32 / (n_bands - 1) as f32;
             let fc = f_lo * ratio.powf(t);
             let half = ratio.powf(0.5 / (n_bands - 1) as f32);
-            let lo = ((fc / half) / bin_hz).floor().max(1.0) as usize;
+            // Bands above Nyquist (a low device rate) read the top bin.
+            let lo = (((fc / half) / bin_hz).floor().max(1.0) as usize).min(nyq_bin - 1);
             let hi = (((fc * half) / bin_hz).ceil() as usize).clamp(lo + 1, nyq_bin);
-            band_map.push((lo.min(nyq_bin - 1), hi, fc / bin_hz));
+            band_map.push((lo, hi, fc / bin_hz));
             band_freq.push(fc);
         }
         let scratch = fft.make_scratch_vec();
@@ -180,5 +181,18 @@ mod tests {
         assert!((peak + 6.02).abs() < 1.5, "{peak}");
         // Far away bands are quiet.
         assert!(a.bands()[0] < -60.0);
+    }
+
+    #[test]
+    fn bands_above_nyquist_do_not_panic_at_low_sample_rates() {
+        // A 16 or 22.05 kHz device (a Bluetooth headset in call mode) puts
+        // the top of a 20 Hz – 20 kHz display above Nyquist.
+        for sr in [8_000.0, 16_000.0, 22_050.0] {
+            let mut a = SpectrumAnalyzer::new(4096, 96, 20.0, 20_000.0, sr);
+            for n in 0..8_192 {
+                a.push_sample((std::f32::consts::TAU * 440.0 * n as f32 / sr as f32).sin());
+            }
+            assert!(a.bands().iter().all(|b| b.is_finite()), "{sr}");
+        }
     }
 }

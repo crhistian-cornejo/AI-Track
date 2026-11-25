@@ -25,6 +25,7 @@ use gpui::{
     Stateful, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 
+pub mod rack_presets;
 pub mod rack_ui;
 
 const KNOB: f32 = 32.;
@@ -468,6 +469,17 @@ fn card(
         .when_some(preset_pill, |h, pill| h.child(pill))
         .when(!matches!(&d.kind, DeviceKind::Stock { .. }), |h| h.child(badge(kind_label, pal.muted)))
         .when(plugin_warning.is_some(), |h| h.child(badge("SILENCED", pal.record)))
+        .when(matches!(&d.kind, DeviceKind::Rack(_)), |h| {
+            h.child(
+                widgets::sized_icon_button(("save-rack", id.0 as usize), Icon::Save, false, 20., 12.)
+                    .tooltip(widgets::tip("Save the rack as a preset of yours", None))
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        let at = e.position();
+                        rack_presets::open_save(this, id, point(at.x - px(8.), at.y + px(8.)), Some(window), cx);
+                    })),
+            )
+        })
         .when(matches!(&d.kind, DeviceKind::Rack(r) if r.kind != RackKind::Drum), |h| {
             let shown = ws.fx.macros.contains(&id);
             h.child(

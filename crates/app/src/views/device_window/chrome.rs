@@ -209,15 +209,23 @@ pub fn save(ws: &mut Workspace, device: DeviceId, name: &str, cx: &mut Context<W
     cx.notify();
 }
 
-/// The name field of the Save popover (made on first use); Enter saves.
-fn name_field(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>) -> Entity<TextInput> {
+/// The name field of a Save popover (made on first use); Enter calls
+/// `submit` with the name. A device keeps one field, so a device always
+/// saves the same way (presets for a plugin, a preset for a rack).
+pub(crate) fn name_field(
+    ws: &mut Workspace,
+    device: DeviceId,
+    placeholder: &'static str,
+    submit: fn(&mut Workspace, DeviceId, &str, &mut Context<Workspace>),
+    cx: &mut Context<Workspace>,
+) -> Entity<TextInput> {
     if let Some(n) = ws.fx.chrome.get(&device).and_then(|c| c.name.clone()) {
         return n;
     }
-    let input = cx.new(|cx| TextInput::new(cx, "Preset name", Some(Icon::Pencil)));
+    let input = cx.new(|cx| TextInput::new(cx, placeholder, Some(Icon::Pencil)));
     let sub = cx.subscribe(&input, move |ws: &mut Workspace, _, e: &InputEvent, cx| {
         if let InputEvent::Submit(t) = e {
-            save(ws, device, t, cx);
+            submit(ws, device, t, cx);
         }
     });
     let c = ws.fx.chrome.entry(device).or_default();
@@ -232,7 +240,7 @@ pub(super) fn open_save(ws: &mut Workspace, device: DeviceId, at: gpui::Point<gp
     let device_name = ws.s.project.device(device).map(|d| d.name.clone()).unwrap_or_default();
     let loaded = ws.s.project.device(device).and_then(|d| d.preset.clone());
     let suggestion = presets::suggest_name(loaded.as_deref(), &device_name, &list);
-    let input = name_field(ws, device, cx);
+    let input = name_field(ws, device, "Preset name", save, cx);
     input.update(cx, |i, cx| i.set_text(&suggestion, cx));
     input.focus_handle(cx).focus(window, cx);
     ws.fx.pop = None;
@@ -463,7 +471,7 @@ pub fn preset_menu(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Worksp
 /// The Save popover: a name and the button.
 pub fn save_card(ws: &mut Workspace, device: DeviceId, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     let pal = p();
-    let input = name_field(ws, device, cx);
+    let input = name_field(ws, device, "Preset name", save, cx);
     let for_button = input.clone();
     let plugin_name = ws.s.project.device(device)?.name.clone();
     Some(

@@ -259,6 +259,8 @@ pub enum PopKind {
     Presets(DeviceId),
     /// The name field of a Device Window's Save preset popover.
     SavePreset(DeviceId),
+    /// The name field of the Save popover of a rack (Device View).
+    SaveRack(DeviceId),
     /// The synth window's menus (wavetables, matrix sources and destinations…).
     Synth(crate::views::device_window::synth::SynthPop),
     /// Every parameter a modulator can be mapped to.
@@ -594,6 +596,7 @@ pub fn overlay(ws: &mut Workspace, window: Option<WindowId>, cx: &mut Context<Wo
         PopKind::Sidechain { device, param } => sidechain_menu(ws, *device, *param, cx)?,
         PopKind::Presets(device) => crate::views::device_window::chrome::preset_menu(ws, *device, cx)?,
         PopKind::SavePreset(device) => crate::views::device_window::chrome::save_card(ws, *device, cx)?,
+        PopKind::SaveRack(rack) => crate::views::devices::rack_presets::save_card(ws, *rack, cx)?,
         PopKind::Synth(pop) => crate::views::device_window::synth::pop_menu(ws, pop, cx)?,
         PopKind::ModTarget(device) => modulator::target_menu(ws, *device, cx)?,
     };

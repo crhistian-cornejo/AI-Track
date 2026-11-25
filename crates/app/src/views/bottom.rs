@@ -46,14 +46,15 @@ pub enum ClipEditor {
 }
 
 /// The editor for the current tab and clip: audio clips always get the
-/// sample editor; the Steps tab shows the drum rack's step grid; a clip that
-/// holds a step pattern (`pattern`) gets the step sequencer clip editor
-/// instead of the piano roll.
+/// sample editor; a clip that holds a step pattern (`pattern`) gets the step
+/// sequencer clip editor, on any tab; otherwise the Steps tab shows the drum
+/// rack's step grid and the others the piano roll.
 pub fn clip_editor(tab: BottomTab, audio: bool, pattern: bool) -> ClipEditor {
     match tab {
+        // A step clip's notes come from its pattern: the drum grid cannot edit them.
+        _ if pattern && !audio => ClipEditor::StepClip,
         BottomTab::Steps => ClipEditor::Steps,
         _ if audio => ClipEditor::Sample,
-        _ if pattern => ClipEditor::StepClip,
         _ => ClipEditor::Piano,
     }
 }
@@ -1465,6 +1466,7 @@ mod tests {
         assert_eq!(clip_editor(BottomTab::PianoRoll, false, true), ClipEditor::StepClip);
         assert_eq!(clip_editor(BottomTab::Steps, false, false), ClipEditor::Steps);
         assert_eq!(clip_editor(BottomTab::Steps, true, false), ClipEditor::Steps);
+        assert_eq!(clip_editor(BottomTab::Steps, false, true), ClipEditor::StepClip, "a step clip on a drum track keeps its own editor");
     }
 
     #[test]

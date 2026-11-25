@@ -29,6 +29,7 @@ pub mod clipper;
 pub mod crusher;
 pub mod delay;
 pub mod drum;
+pub mod drumsynth;
 pub mod drum_extract;
 pub mod drumbus;
 pub mod dynamics;
@@ -760,6 +761,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "instrument.drum"
             | "instrument.vault"
             | "instrument.bloom"
+            | "instrument.drumsynth"
     )
 }
 
@@ -811,6 +813,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "instrument.drum" => drum::render(ws, dev, d, cx),
         "instrument.vault" => vault::render(ws, dev, cx),
         "instrument.bloom" => bloom::render(ws, dev, d, cx),
+        "instrument.drumsynth" => drumsynth::render(ws, dev, cx),
         _ => generic::render(ws, dev, cx),
     }
 }

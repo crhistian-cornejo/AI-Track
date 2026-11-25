@@ -77,6 +77,7 @@ static REGISTRY: &[StockPlugin] = &[
     StockPlugin { id: instrument::sampler::ID, name: "Sampler", category: Category::Instrument, tags: &["sampler", "one-shot", "loop"], create: instrument::sampler::create },
     StockPlugin { id: instrument::drum::ID, name: "Drum Sampler", category: Category::Instrument, tags: &["drums", "sampler", "pads"], create: instrument::drum::create },
     StockPlugin { id: instrument::granular::ID, name: "Granular", category: Category::Instrument, tags: &["granular", "texture", "pad", "freeze", "live", "sampler"], create: instrument::granular::create },
+    StockPlugin { id: instrument::drumsynth::ID, name: "Drum Synth", category: Category::Instrument, tags: &["drums", "synth", "kit", "kick", "snare", "hat", "clap", "percussion", "808", "909"], create: instrument::drumsynth::create },
     StockPlugin { id: midi::arp::ID, name: "Arpeggiator", category: Category::MidiEffect, tags: &["midi", "arpeggiator", "pattern", "sequencer"], create: midi::arp::create },
     StockPlugin { id: midi::chord::ID, name: "Chord", category: Category::MidiEffect, tags: &["midi", "chord", "harmony"], create: midi::chord::create },
     StockPlugin { id: midi::scale::ID, name: "Scale", category: Category::MidiEffect, tags: &["midi", "scale", "key", "quantize", "harmony"], create: midi::scale::create },

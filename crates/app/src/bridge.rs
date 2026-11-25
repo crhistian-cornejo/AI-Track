@@ -603,6 +603,16 @@ fn stub_device_meter(plugin: &str, playing: bool, beat: f32, secs: f32, out: &mu
         "fx.filter" => put(&[0.0, 0.0, env]),
         "instrument.wavetable" => put(&[if playing { 3.0 } else { 0.0 }, 0.5 * env, 0.46 * env]),
         "instrument.acid303" => put(&[if playing { 1.0 } else { 0.0 }, if playing { ((beat * 4.0) as usize % 16) as f32 } else { -1.0 }, 0.6 * env, env]),
+        "instrument.drumsynth" => {
+            let mut v = [0.0f32; 13];
+            for (k, l) in v[..9].iter_mut().enumerate() {
+                *l = if playing && (beat * 2.0) as usize % 9 == k { env } else { 0.0 };
+            }
+            v[9] = 0.8 * env;
+            v[10] = if playing { 1.0 } else { 0.0 };
+            v[11] = -1.0;
+            put(&v)
+        }
         "instrument.kick808" => put(&[if playing { 1.0 } else { 0.0 }, 0.25, 0.85 * env, env]),
         "instrument.sampler" => put(&[if playing { 1.0 } else { 0.0 }, if playing { beat.fract() } else { 0.0 }, 0.5 * env]),
         "instrument.drum" => {

@@ -78,6 +78,11 @@ pub fn render(ws: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -
                 move_device(this, d.id, Container::Track(tid), usize::MAX);
                 cx.notify();
             }))
+            // A rack dragged from the palette is added to the end of the chain too.
+            .drag_over::<rack_presets::DraggedRack>(|s, _, _, _| s.border_color(accent()))
+            .on_drop(cx.listener(move |this, d: &rack_presets::DraggedRack, _, cx| {
+                rack_presets::add(this, &d.source, tid, cx);
+            }))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 let at = e.position();
                 this.open_menu(MenuKind::AddDevice(tid), point(at.x - px(124.), at.y - px(260.)), cx);

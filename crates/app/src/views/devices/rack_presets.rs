@@ -1,16 +1,17 @@
 //! Racks as presets in the Device View: the Save popover of a rack (from its
-//! title bar or its menu). The file work is `rack_library`; the project-side
+//! title bar or its menu) and adding one from the palette (Enter, or a drag
+//! into the chain). The file work is `rack_library`; the project-side
 //! steps are `AppState::rack_preset_for_save` (see `editing/rack_presets.rs`).
 
-use crate::icons::Icon;
-use crate::rack_library;
+use crate::icons::{Icon, icon};
+use crate::rack_library::{self, RackSource};
 use crate::theme::*;
 use crate::views::device_ui::PopKind;
 use crate::views::device_window::chrome::name_field;
 use crate::widgets::{self, label};
 use crate::workspace::Workspace;
-use aitrack_model::DeviceId;
-use gpui::{AnyElement, Context, FontWeight, Focusable, IntoElement, ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, Window, div, px};
+use aitrack_model::{DeviceId, TrackId};
+use gpui::{AnyElement, Context, FontWeight, Focusable, IntoElement, ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled, Window, div, px};
 
 /// Open the Save popover of `rack` at `at`, with the rack's name in the
 /// field (focused when there is a window to focus it in).
@@ -81,9 +82,61 @@ pub fn save(ws: &mut Workspace, rack: DeviceId, name: &str, cx: &mut Context<Wor
                 );
             }
             ws.toast(text, cx);
-            // A3.6: the palette lists racks; refresh it here.
+            ws.palette.invalidate_racks();
         }
         Err(e) => ws.toast(e, cx),
     }
     cx.notify();
+}
+
+/// A rack being dragged from the palette into a chain.
+#[derive(Clone, Debug)]
+pub struct DraggedRack {
+    pub source: RackSource,
+    pub name: String,
+}
+
+impl Render for DraggedRack {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pal = p();
+        div()
+            .px(px(SP2))
+            .h(px(TAB_BAR_H))
+            .flex()
+            .items_center()
+            .gap(px(SP2))
+            .rounded(px(r_md()))
+            .bg(pal.raised)
+            .border_1()
+            .border_color(accent())
+            .shadow_lg()
+            .child(icon(Icon::Grid, 12., pal.accent))
+            .child(label(self.name.clone(), TEXT_SM, pal.text))
+    }
+}
+
+/// Add the rack behind `source` at the end of `track`'s chain, as one undo
+/// step, and say what it is missing. Opens the Devices tab, where it shows.
+pub fn add(ws: &mut Workspace, source: &RackSource, track: TrackId, cx: &mut Context<Workspace>) -> bool {
+    let preset = match rack_library::read(source) {
+        Ok(p) => p,
+        Err(e) => {
+            ws.toast(e, cx);
+            return false;
+        }
+    };
+    let installed = ws.b.plugins.external_plugins().to_vec();
+    let Some(load) = ws.s.add_rack_preset(track, &preset, &installed, &|f| f.exists()) else {
+        ws.toast("Could not add the rack", cx);
+        return false;
+    };
+    ws.bottom_open = true;
+    ws.set_tab(crate::state::BottomTab::Devices, cx);
+    ws.s.ed.devices = vec![load.device];
+    ws.toast(
+        if load.missing.is_empty() { format!("Added {}", preset.name) } else { format!("Added {} · missing: {}", preset.name, load.missing.join(", ")) },
+        cx,
+    );
+    cx.notify();
+    true
 }

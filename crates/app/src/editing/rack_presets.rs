@@ -3,8 +3,6 @@
 //! are the project-side steps: store the live plugin states, and add the
 //! rack as one undo step.
 
-#![allow(dead_code)] // TODO(A3.5): drop once the views use it.
-
 use crate::bridge::ExternalPlugin;
 use crate::state::AppState;
 use aitrack_model::rack_preset::{Missing, RackPreset};

@@ -3,8 +3,6 @@
 //! embedded in `aitrack-stock`. The file format is `aitrack_model::rack_preset`;
 //! this module is the only place that touches the disk for racks.
 
-#![allow(dead_code)] // TODO(A3.5): drop once the views use it.
-
 use crate::project_io::write_atomic;
 use crate::views::device_window::presets::clean_name;
 use aitrack_model::RackKind;

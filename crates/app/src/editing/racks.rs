@@ -414,14 +414,13 @@ mod tests {
         assert!(!s.fold_device(DeviceId(9999)));
     }
 
-    /// A track with an audio rack of two chains, a filter in the first.
+    /// A track with an audio rack of two chains (the fresh one and B), a filter in the first.
     fn rack_with_filter() -> (AppState, DeviceId, DeviceId) {
         let mut s = AppState::new(Project::new("t"));
         let t = s.add_track(TrackKind::Audio).unwrap();
         let rack = s.add_stock_device(t, "rack.audio", "Rack").unwrap();
         let filter = s.project.alloc_device_id();
         s.edit("chains", vec![
-            Command::AddChain { rack, index: 0, chain: Box::new(Chain::new("A", Color::palette(1))) },
             Command::AddChain { rack, index: 1, chain: Box::new(Chain::new("B", Color::palette(2))) },
             Command::AddDevice { slot: DeviceSlot::Rack { rack, chain: 0, index: 0 }, device: Box::new(Device::stock(filter, "fx.filter", "Filter")) },
         ]);

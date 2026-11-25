@@ -372,7 +372,7 @@ fn chain_column(ws: &mut Workspace, id: DeviceId, rack: &Rack, sel: usize, ret: 
     let pal = p();
     let (home, devices, usable) = match ret {
         Some(i) => (Container::Return { rack: id, index: i }, rack.returns[i].devices.clone(), true),
-        None => (Container::Rack { rack: id, chain: sel }, rack.chains.get(sel).map(|c| c.devices.clone()).unwrap_or_default(), !rack.chains.is_empty()),
+        None => (Container::Rack { rack: id, chain: sel }, rack.chains.get(sel).map(|c| c.devices.clone()).unwrap_or_default(), !rack.chains.is_empty() || rack.kind != RackKind::Drum),
     };
     let empty = devices.is_empty();
     let drop = div()

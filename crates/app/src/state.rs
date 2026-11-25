@@ -1834,7 +1834,7 @@ impl AppState {
             "rack.midi" => Some(RackKind::Midi),
             _ => None,
         } {
-            device.kind = DeviceKind::Rack(Rack::new(kind));
+            device.kind = DeviceKind::Rack(racks::fresh_rack(kind));
         }
         self.edit("Add device", vec![Command::AddDevice { slot, device: Box::new(device) }]).then_some(id)
     }
@@ -3017,6 +3017,24 @@ pub fn step_in_scale(scale: Scale, key: u8, dir: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_rack_has_one_empty_chain_in_one_undo_step_and_a_drum_rack_none() {
+        use aitrack_model::racks::{self, Container};
+        let mut s = AppState::new(Project::new("t"));
+        let t = s.add_track(TrackKind::Audio).unwrap();
+        let steps = s.history.steps().count();
+        let mut audio = None;
+        for (id, chains) in [("rack.audio", 1), ("rack.instrument", 1), ("rack.midi", 1), ("rack.drum", 0)] {
+            let r = s.add_stock_device(t, id, id).unwrap();
+            assert_eq!(s.rack_of(r).unwrap().chains.len(), chains, "{id}");
+            audio = audio.or(Some(r));
+        }
+        assert_eq!(s.history.steps().count(), steps + 4);
+        let rack = audio.unwrap();
+        let eq = s.add_stock_device_in(t, Some(Container::Rack { rack, chain: 0 }), "fx.eq", "EQ").unwrap();
+        assert_eq!(racks::device_slot(&s.project, eq), Some(aitrack_model::command::DeviceSlot::Rack { rack, chain: 0, index: 0 }));
+    }
 
     fn state() -> AppState {
         AppState::new(crate::demo::project())

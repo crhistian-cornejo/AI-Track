@@ -1330,6 +1330,30 @@ mod tests {
         out
     }
 
+    /// A step clip is its rendered pattern: a one-beat pattern over a clip
+    /// that loops over it plays its first step again on every pass, and a
+    /// step's chance is the note's probability.
+    #[test]
+    fn step_clip_plays_its_rendered_pattern_on_every_loop_pass() {
+        use aitrack_model::steps::{self, StepPattern};
+        let mut row = aitrack_model::StepRow::new(36);
+        row.edit_step(0, |s| s.on = true);
+        row.edit_step(2, |s| {
+            s.on = true;
+            s.chance = 0.5;
+        });
+        let pattern = StepPattern { rows: vec![row], span: PPQ };
+        let mut p = aitrack_model::Project::new("t");
+        let notes = steps::render_notes(&mut p, &pattern);
+        assert_eq!(notes.iter().map(|n| n.probability).collect::<Vec<_>>(), vec![1.0, 0.5]);
+        let src = NoteSource { notes, pattern: Some(pattern) };
+        let c = CompiledClip::midi(ClipId(1), &clip(0, 3 * PPQ, Some((0, PPQ))), &src);
+        let ons = collect(&c, 0, Some(3 * PPQ), 1500);
+        // 480 samples per beat; the second step is a coin per pass, so only the sure one is checked.
+        let sure: Vec<i64> = ons.iter().map(|(at, _)| *at).filter(|at| at % 480 == 0).collect();
+        assert_eq!(sure, vec![0, 480, 960]);
+    }
+
     #[test]
     fn plain_clip_exactly_once() {
         // sr 960 at 120 BPM → 480 samples per beat.

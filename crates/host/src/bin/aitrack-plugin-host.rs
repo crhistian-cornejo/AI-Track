@@ -3,5 +3,6 @@
 //! protocol on stdin/stdout. See `aitrack_host::sandbox::protocol`.
 
 fn main() {
+    aitrack_host::helper::init(aitrack_host::helper::Role::PluginHost);
     std::process::exit(aitrack_host::sandbox::server::host_main());
 }

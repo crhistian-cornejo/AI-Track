@@ -6,7 +6,7 @@
 //! blocklists the file.
 
 fn main() {
-    aitrack_host::sandbox::disable_crash_dialogs();
+    aitrack_host::helper::init(aitrack_host::helper::Role::Scanner);
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(aitrack_host::scan::scanner_main(&args));
 }

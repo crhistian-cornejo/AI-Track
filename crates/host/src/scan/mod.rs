@@ -161,6 +161,14 @@ pub fn scanner_main(args: &[String]) -> i32 {
         Ok(Err(e)) => ScanPayload::Error(e.to_string()),
         Err(_) => ScanPayload::Error("plugin panicked during scan".into()),
     };
+    // What the plugin wanted to tell the user in a dialog (see `helper`) explains the failure.
+    let payload = match payload {
+        ScanPayload::Error(e) => match crate::helper::take_alerts() {
+            alerts if alerts.is_empty() => ScanPayload::Error(e),
+            alerts => ScanPayload::Error(format!("{e} (the plugin said: {})", alerts.join(" / "))),
+        },
+        ok => ok,
+    };
     let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialise\"}".into());
     // A fresh line, in case the plugin left a partial line on stdout.
     println!("\n{RESULT_SENTINEL}{json}");

@@ -23,6 +23,7 @@
 pub mod clap;
 pub mod editor;
 pub mod error;
+pub mod helper;
 pub mod info;
 mod io;
 pub mod params;

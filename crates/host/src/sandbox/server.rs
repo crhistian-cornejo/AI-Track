@@ -49,7 +49,6 @@ fn loaded_reply(p: &HostedPlugin) -> Response {
 /// Entry point of `aitrack-plugin-host`. Runs until the parent sends
 /// `Shutdown` or closes stdin (parent died).
 pub fn host_main() -> i32 {
-    super::disable_crash_dialogs();
     // Plugin editors on Windows (JUCE, VSTGUI) expect an OLE apartment on
     // their thread for drag and drop and the clipboard; GPUI does this for
     // the app, the sandbox has to do it itself. Never uninitialised: the

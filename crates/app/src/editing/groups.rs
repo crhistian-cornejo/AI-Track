@@ -161,4 +161,24 @@ mod tests {
         }
         assert_eq!(s.project.tracks, before);
     }
+
+    #[test]
+    fn a_track_added_to_a_group_goes_after_its_nested_groups_members() {
+        let (mut s, ids) = state();
+        s.click_track(ids[1], false, false);
+        s.click_track(ids[2], true, false);
+        let inner = s.group_tracks().unwrap();
+        s.click_track(ids[0], false, false);
+        s.click_track(inner, true, false);
+        let outer = s.group_tracks().unwrap();
+        let order = |s: &AppState| s.project.tracks.iter().map(|t| t.id).collect::<Vec<_>>();
+        let pos = |s: &AppState, id| s.project.track_index(id).unwrap();
+        assert!(pos(&s, ids[1]) == pos(&s, inner) + 1 && pos(&s, ids[2]) == pos(&s, inner) + 2, "{:?}", order(&s));
+        s.click_track(outer, false, false);
+        let new = s.add_track(TrackKind::Audio).unwrap();
+        assert_eq!(s.project.track(new).unwrap().parent, Some(outer));
+        // The inner group's tracks stay right under it; the new one comes after the whole group.
+        assert_eq!((pos(&s, ids[1]), pos(&s, ids[2])), (pos(&s, inner) + 1, pos(&s, inner) + 2), "{:?}", order(&s));
+        assert_eq!(pos(&s, new), pos(&s, ids[2]).max(pos(&s, ids[0])) + 1, "{:?}", order(&s));
+    }
 }

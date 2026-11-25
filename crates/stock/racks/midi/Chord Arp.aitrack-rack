@@ -1,0 +1,257 @@
+{
+  "format": "aitrack-rack",
+  "format_version": 1,
+  "app_version": "0.0.8",
+  "name": "Chord Arp",
+  "author": "AI-Track",
+  "tags": [
+    "chords",
+    "arpeggio",
+    "midi"
+  ],
+  "kind": "midi",
+  "payload": {
+    "device": {
+      "id": 11,
+      "name": "Chord Arp",
+      "kind": {
+        "type": "rack",
+        "kind": "midi",
+        "chains": [
+          {
+            "name": "Chords",
+            "color": 16739179,
+            "devices": [
+              {
+                "id": 12,
+                "name": "Chord",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "midi.chord"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 1.0,
+                  "1": 0.5,
+                  "2": 0.5,
+                  "3": 1.0,
+                  "4": 0.5555556,
+                  "5": 0.5,
+                  "6": 1.0,
+                  "7": 0.5972222,
+                  "8": 0.5,
+                  "9": 0.0,
+                  "10": 0.6666667,
+                  "11": 0.5,
+                  "12": 0.0,
+                  "13": 0.7222222,
+                  "14": 0.5,
+                  "15": 0.0,
+                  "16": 0.7638889,
+                  "17": 0.5,
+                  "18": 0.0,
+                  "19": 0.0,
+                  "20": 0.083333336,
+                  "21": 0.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              },
+              {
+                "id": 13,
+                "name": "Arpeggiator",
+                "kind": {
+                  "type": "stock",
+                  "plugin_id": "midi.arp"
+                },
+                "enabled": true,
+                "params": {
+                  "0": 0.0,
+                  "1": 0.5833333,
+                  "2": 0.2964824,
+                  "3": 0.0,
+                  "4": 1.0,
+                  "5": 0.0,
+                  "6": 0.5,
+                  "7": 0.0,
+                  "8": 0.33333334,
+                  "9": 1.0,
+                  "10": 0.0,
+                  "11": 0.0,
+                  "12": 0.78571427,
+                  "13": 1.0,
+                  "14": 0.78571427,
+                  "15": 0.78571427,
+                  "16": 0.78571427,
+                  "17": 0.78571427,
+                  "18": 0.78571427,
+                  "19": 0.78571427,
+                  "20": 0.78571427,
+                  "21": 0.78571427,
+                  "22": 0.0
+                },
+                "state": null,
+                "preset": null,
+                "collapsed": false,
+                "sidechain": null
+              }
+            ],
+            "volume_db": 0.0,
+            "pan": 0.0,
+            "mute": false,
+            "solo": false,
+            "note": null,
+            "key_range": [
+              0,
+              127
+            ],
+            "velocity_range": [
+              1,
+              127
+            ],
+            "selector_range": [
+              0,
+              127
+            ],
+            "key_fade": [
+              0,
+              0
+            ],
+            "vel_fade": [
+              0,
+              0
+            ],
+            "sel_fade": [
+              0,
+              0
+            ],
+            "choke": 0,
+            "play_note": null,
+            "sends": [],
+            "output": {
+              "type": "rack"
+            }
+          }
+        ],
+        "macros": [
+          {
+            "name": "Gate",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 13,
+                "param": 2,
+                "min": 0.04522613,
+                "max": 0.7487437
+              }
+            ]
+          },
+          {
+            "name": "Swing",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 13,
+                "param": 5,
+                "min": 0.0,
+                "max": 0.5
+              }
+            ]
+          },
+          {
+            "name": "Octaves",
+            "value": 0.0,
+            "mappings": [
+              {
+                "device": 13,
+                "param": 3,
+                "min": 0.0,
+                "max": 1.0
+              }
+            ]
+          },
+          {
+            "name": "Macro 4",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 5",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 6",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 7",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 8",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 9",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 10",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 11",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 12",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 13",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 14",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 15",
+            "value": 0.0,
+            "mappings": []
+          },
+          {
+            "name": "Macro 16",
+            "value": 0.0,
+            "mappings": []
+          }
+        ],
+        "variations": [],
+        "chain_selector": 0,
+        "returns": []
+      },
+      "enabled": true,
+      "params": {},
+      "state": null,
+      "preset": null,
+      "collapsed": false,
+      "sidechain": null
+    }
+  },
+  "requires": {
+    "plugins": [],
+    "samples": []
+  }
+}

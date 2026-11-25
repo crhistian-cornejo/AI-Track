@@ -36,4 +36,35 @@ mod tests {
         }
         assert!(racks_dir().ends_with("racks"));
     }
+
+    #[test]
+    fn every_factory_rack_loads_and_uses_real_stock_devices_and_params() {
+        use aitrack_model::rack_preset::{RackPreset, kind_slug};
+        use aitrack_model::{DeviceKind, visit_devices};
+        let all = factory();
+        assert_eq!(all.len(), 4);
+        for (rel, json) in all {
+            let preset = RackPreset::from_json(json).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert_eq!(*rel, format!("{}/{}.aitrack-rack", kind_slug(preset.kind), preset.name));
+            assert!(preset.requires.plugins.is_empty() && preset.requires.samples.is_empty(), "{rel}");
+            let mut inside = Vec::new();
+            visit_devices(std::slice::from_ref(preset.device()), &mut |d| {
+                inside.push(d.id);
+                match &d.kind {
+                    DeviceKind::Stock { plugin_id } => {
+                        let proc = crate::create(plugin_id).unwrap_or_else(|| panic!("{rel}: no stock device {plugin_id}"));
+                        for k in d.params.keys() {
+                            assert!(proc.info().params.iter().any(|i| i.id == *k), "{rel}: {plugin_id} has no param {k}");
+                        }
+                    }
+                    DeviceKind::Rack(_) => {}
+                    DeviceKind::Plugin { .. } => panic!("{rel}: a factory rack uses only stock devices"),
+                }
+            });
+            let DeviceKind::Rack(r) = &preset.device().kind else { panic!("{rel}") };
+            let mapped: Vec<_> = r.macros.iter().flat_map(|m| &m.mappings).collect();
+            assert!(!mapped.is_empty(), "{rel}: a factory rack has its macros mapped");
+            assert!(mapped.iter().all(|m| inside.contains(&m.device) && (0.0..=1.0).contains(&m.min) && (0.0..=1.0).contains(&m.max)), "{rel}");
+        }
+    }
 }

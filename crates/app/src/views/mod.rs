@@ -17,6 +17,7 @@ pub mod meters;
 pub mod mixer;
 pub mod palette;
 pub mod piano_roll;
+pub mod step_clip;
 pub mod plugins;
 pub mod prefs;
 pub mod sample_editor;

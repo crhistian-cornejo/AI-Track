@@ -307,6 +307,8 @@ pub struct Regions {
     pub piano: Cell<Bounds<Pixels>>,
     pub velocity: Cell<Bounds<Pixels>>,
     pub steps: Cell<Bounds<Pixels>>,
+    pub step_grid: Cell<Bounds<Pixels>>,
+    pub step_lane: Cell<Bounds<Pixels>>,
 }
 
 pub struct Workspace {

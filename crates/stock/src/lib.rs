@@ -15,6 +15,7 @@ pub mod instrument;
 mod measure;
 pub mod midi;
 pub mod presets;
+pub mod racks;
 mod stub;
 #[doc(hidden)]
 pub mod test_util;

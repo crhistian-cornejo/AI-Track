@@ -25,7 +25,7 @@ impl Default for TimeSignature {
 impl TimeSignature {
     /// Length of one bar in ticks.
     pub fn bar_ticks(self) -> Tick {
-        PPQ * 4 * self.numerator as i64 / self.denominator.max(1) as i64
+        PPQ * 4 * self.numerator.max(1) as i64 / self.denominator.max(1) as i64
     }
 }
 
@@ -243,5 +243,14 @@ mod tests {
         let map = TempoMap::constant(120.0);
         assert_eq!(map.bars_beats(0), (1, 1, 0));
         assert_eq!(map.bars_beats(4 * PPQ + PPQ + 10), (2, 2, 10));
+    }
+
+    #[test]
+    fn a_zero_numerator_counts_as_one_beat_per_bar() {
+        // A script or an agent can send any signature; a bar of zero ticks would divide by zero.
+        let mut map = TempoMap::constant(120.0);
+        map.signatures = vec![(0, TimeSignature { numerator: 0, denominator: 4 })];
+        assert_eq!(map.signatures[0].1.bar_ticks(), PPQ);
+        assert_eq!(map.bars_beats(2 * PPQ + 5), (3, 1, 5));
     }
 }

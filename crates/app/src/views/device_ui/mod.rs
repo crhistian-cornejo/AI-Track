@@ -742,6 +742,7 @@ pub fn has_editor(plugin: &str) -> bool {
             | "fx.autopan"
             | "mod.lfo"
             | "mod.envfollow"
+            | "mod.shaper"
             | "fx.crusher"
             | "fx.drumbus"
             | "fx.stutter"
@@ -793,6 +794,7 @@ pub fn editor(ws: &mut Workspace, plugin: &str, dev: &Dev, d: &Device, cx: &mut 
         "fx.autopan" => autopan::render(ws, dev, cx),
         "mod.lfo" => modulator::render_lfo(ws, dev, d, cx),
         "mod.envfollow" => modulator::render_env(ws, dev, d, cx),
+        "mod.shaper" => modulator::render_shaper(ws, dev, d, cx),
         "fx.crusher" => crusher::render(ws, dev, cx),
         "fx.drumbus" => drumbus::render(ws, dev, cx),
         "fx.stutter" => stutter::render(ws, dev, cx),

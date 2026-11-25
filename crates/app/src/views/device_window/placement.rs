@@ -110,6 +110,7 @@ pub fn editor_extent(plugin: &str) -> (f32, f32) {
         "fx.multiband" => (780., 400.),
         "fx.clipper" => (680., 480.),
         "fx.filter" | "fx.shaper" | "fx.autopan" | "fx.crusher" | "fx.chorus" => (680., 380.),
+        "mod.shaper" => (760., 460.),
         "fx.stutter" => (700., 668.),
         "fx.drumbus" => (720., 520.),
         "fx.reverb" | "fx.delay" => (860., 440.),

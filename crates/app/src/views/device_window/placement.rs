@@ -120,6 +120,7 @@ pub fn editor_extent(plugin: &str) -> (f32, f32) {
         "instrument.kick808" => (720., 560.),
         "instrument.acid303" => (960., 640.),
         "instrument.bloom" => (1080., 800.),
+        "instrument.drumsynth" => (760., 440.),
         _ => (700., 380.),
     }
 }

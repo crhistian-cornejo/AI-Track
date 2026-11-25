@@ -76,7 +76,7 @@ pub fn for_stock(id: &str) -> Glyph {
         "instrument.wavetable" => Glyph::Wavetable,
         "instrument.acid303" => Glyph::Acid,
         "instrument.kick808" => Glyph::Kick,
-        "instrument.drum" | "rack.drum" => Glyph::Drums,
+        "instrument.drum" | "instrument.drumsynth" | "rack.drum" => Glyph::Drums,
         "instrument.sampler" => Glyph::Sampler,
         "instrument.granular" => Glyph::Grains,
         "instrument.vault" => Glyph::Vault,
@@ -218,7 +218,7 @@ mod tests {
     const ALL: &[&str] = &[
         "fx.amp", "fx.analyzer", "fx.autopan", "fx.buscomp", "fx.chorus", "fx.clipper", "fx.compressor", "fx.console", "fx.crusher", "fx.delay", "fx.drum_extract", "fx.drumbus", "fx.eq",
         "fx.filter", "fx.gate", "fx.limiter", "fx.mbdyn", "fx.midside", "fx.multiband", "fx.reverb", "fx.saturator", "fx.shaper", "fx.stutter", "fx.tape", "fx.transient", "fx.utility",
-        "instrument.acid303", "instrument.drum", "instrument.granular", "instrument.kick808", "instrument.sampler", "instrument.synth", "instrument.vault", "instrument.wavetable", "midi.arp",
+        "instrument.acid303", "instrument.drum", "instrument.drumsynth", "instrument.granular", "instrument.kick808", "instrument.sampler", "instrument.synth", "instrument.vault", "instrument.wavetable", "midi.arp",
         "midi.chord", "midi.echo", "midi.length", "midi.pitch", "midi.random", "midi.scale", "midi.velocity", "rack.audio", "rack.drum", "rack.instrument", "rack.midi",
     ];
 

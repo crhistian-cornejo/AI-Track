@@ -326,7 +326,7 @@ pub fn stock_group(plugin_id: &str) -> Option<DeviceGroup> {
         "instrument.synth" | "instrument.acid303" => DeviceGroup::InstAnalog,
         "instrument.wavetable" => DeviceGroup::InstWavetable,
         "instrument.sampler" | "instrument.granular" => DeviceGroup::InstSampler,
-        "instrument.drum" | "instrument.kick808" | "instrument.bloom" => DeviceGroup::InstDrums,
+        "instrument.drum" | "instrument.kick808" | "instrument.bloom" | "instrument.drumsynth" => DeviceGroup::InstDrums,
         "instrument.vault" | "rack.instrument" => DeviceGroup::InstMulti,
         "rack.drum" => DeviceGroup::InstDrums,
         "fx.eq" => DeviceGroup::FxEq,

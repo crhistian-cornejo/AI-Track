@@ -502,6 +502,7 @@ pub fn render_env(ws: &mut Workspace, dev: &Dev, d: &Device, cx: &mut Context<Wo
 /// The output (0..1) of `mod.shaper` over one cycle at `n` points, as the
 /// device computes it before its smoothing: the curve at the cycle's phase
 /// (`phase` is the shift in 0..1), placed by depth and offset.
+#[cfg(test)]
 pub fn shaper_curve(points: &[(f32, f32); 6], tension: f32, depth: f32, offset: f32, phase: f32, n: usize) -> Vec<f32> {
     (0..n).map(|i| shaper_mod::output_of(level_at(points, tension, (phase + i as f32 / n as f32).rem_euclid(1.)), depth, offset)).collect()
 }

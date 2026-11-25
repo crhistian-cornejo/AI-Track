@@ -283,6 +283,8 @@ impl Segmented for Filter {
         } else if dirty {
             let ph = self.lfo[0].phase();
             self.lfo[1].set_phase(ph + offset);
+            // The extra shapes run on `cycles`: the right one keeps the same offset.
+            self.cycles[1] = self.cycles[0] + offset;
         }
         let extra = self.params.choice(p::LFO_EXTRA).checked_sub(1).map(ExtraShape::from_index);
         let cycle_step = f64::from(rate) / self.sr;
@@ -433,6 +435,22 @@ mod tests {
     fn gain_db(f: &mut Filter, hz: f32) -> f32 {
         let (l, _) = process_stereo(f, sine(hz, 0.1), 24_000);
         20.0 * (rms(&l[12_000..]) / (0.1 / std::f32::consts::SQRT_2)).log10()
+    }
+
+    #[test]
+    fn the_extra_lfo_shapes_follow_the_stereo_offset_when_free_running() {
+        for shape in 1..LFO_EXTRAS.len() {
+            let mut f = Filter::new();
+            set_plain(&mut f, p::CUTOFF, 800.0);
+            set_plain(&mut f, p::LFO_DEPTH, 3.0);
+            set_plain(&mut f, p::LFO_RATE, 1.0);
+            set_plain(&mut f, p::LFO_STEREO, 180.0);
+            set_plain(&mut f, p::LFO_EXTRA, shape as f32);
+            let (l, r) = process_stereo(&mut f, sine(1000.0, 0.1), 24_000);
+            let (a, b) = (rms(&l[12_000..]), rms(&r[12_000..]));
+            // Wander drifts slowly, so its two sides differ by little; without the offset they are equal.
+            assert!((a - b).abs() / b > 1e-3, "{}: left {a} and right {b} move together", LFO_EXTRAS[shape]);
+        }
     }
 
     #[test]

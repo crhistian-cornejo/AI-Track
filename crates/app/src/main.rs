@@ -34,6 +34,7 @@ mod mixer_routing;
 mod real;
 mod session_edit;
 mod state;
+mod step_edit;
 mod take_lanes;
 mod traffic_lights;
 mod theme;

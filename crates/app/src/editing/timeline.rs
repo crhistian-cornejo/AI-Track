@@ -259,6 +259,32 @@ impl AppState {
         Some(clip)
     }
 
+    /// Ctrl+Shift+P: an empty step clip on the selected instrument track,
+    /// over the time selection when it covers that track, else one bar at
+    /// the insert marker. What was there is replaced.
+    pub fn insert_step_clip(&mut self) -> Option<ClipId> {
+        let track = self.selected_track.and_then(|t| self.project.track(t)).filter(|t| t.kind == TrackKind::Instrument)?;
+        let (track, color) = (track.id, self.clip_color_for(track.color));
+        let bar = self.grid_spec(GridView::Arrange).bar;
+        let (start, end) = match self.time_selection().filter(|s| s.tracks.contains(&track)) {
+            Some(sel) => (sel.start, sel.end),
+            None => (self.ed.marker, self.ed.marker + bar),
+        };
+        let keys = self.step_keys(track);
+        let mut plan = Plan::new(self);
+        plan.clear(track, start, end);
+        let (cmds, clip, placement) = steps::new_step_clip(&mut plan.p, track, start, end - start, &keys, "Step Clip", color)?;
+        for c in cmds {
+            plan.run(c);
+        }
+        if !self.commit("Insert step clip", plan) {
+            return None;
+        }
+        self.ed.area = Area::Arrange;
+        self.select_clips([placement], Some(placement));
+        Some(clip)
+    }
+
     pub fn rename_clip(&mut self, clip: ClipId, name: &str) -> bool {
         let name = name.trim();
         let Some(old) = self.project.clips.get(&clip).filter(|c| !name.is_empty() && c.name != name) else { return false };

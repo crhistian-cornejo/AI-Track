@@ -9,7 +9,7 @@ use crate::theme::*;
 use crate::widgets::{self, menu_item, mono};
 use crate::workspace::{MenuKind, Workspace};
 use aitrack_model::{Color, DeviceId, LocatorId, TrackId, TrackKind};
-use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window};
+use gpui::{AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Window, prelude::FluentBuilder};
 
 /// A menu row with its shortcut on the right.
 fn item(id: &'static str, icon: Icon, text: &'static str, hint: Option<String>, checked: bool) -> Stateful<gpui::Div> {
@@ -93,6 +93,8 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
     // The clip under the mouse, when it is audio and other clips play its file too.
     let clip_color = clips.first().and_then(|(_, pl, _)| ws.s.project.clips.get(&pl.clip)).map(|c| c.color).filter(|c| clips.iter().all(|(_, pl, _)| ws.s.project.clips.get(&pl.clip).is_some_and(|x| x.color == *c)));
     let sample = ws.s.selected_placement.and_then(|(_, id)| ws.s.placement(id)).map(|(_, pl, _)| pl.clip).filter(|c| ws.s.sample_targets(*c).len() > 1);
+    let is_steps = ws.s.selected_clip.is_some_and(|c| ws.s.clip_pattern(c).is_some());
+    let is_notes = ws.s.selected_clip.and_then(|c| ws.s.project.clips.get(&c)).is_some_and(|c| matches!(ws.s.project.sources.get(&c.source), Some(aitrack_model::Source::Notes(_))));
     let card = widgets::menu_card("clip-menu", 240.)
         .child(command("clip-cut", Icon::Scissors, "Cut", Cmd::Cut, cx))
         .child(command("clip-copy", Icon::Copy, "Copy", Cmd::Copy, cx))
@@ -122,6 +124,7 @@ pub fn clip_menu(ws: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement 
             None => {}
         }))
         .child(command("clip-consolidate", Icon::Group, "Consolidate", Cmd::Consolidate, cx))
+        .when(is_notes, |d| d.child(command("clip-convert-steps", Icon::Steps, if is_steps { "Convert to MIDI Notes" } else { "Convert to Steps" }, Cmd::ConvertStepClip, cx)))
         .child(command("clip-bounce", Icon::Waveform, "Bounce to New Track", Cmd::BounceToNewTrack, cx))
         .child(command("clip-paste-bounced", Icon::Paste, "Paste Bounced Audio", Cmd::PasteBounced, cx))
         .child(command("clip-rename", Icon::Pencil, "Rename", Cmd::Rename, cx))
@@ -200,6 +203,7 @@ pub fn lane_menu(cx: &mut Context<Workspace>) -> AnyElement {
         .child(command("lane-paste-bounced", Icon::Paste, "Paste Bounced Audio", Cmd::PasteBounced, cx))
         .child(command("lane-bounce", Icon::Waveform, "Bounce to New Track", Cmd::BounceToNewTrack, cx))
         .child(command("lane-midi-clip", Icon::MusicNote, "Insert MIDI Clip", Cmd::InsertMidiClip, cx))
+        .child(command("lane-step-clip", Icon::Steps, "Insert Step Sequencer Clip", Cmd::InsertStepClip, cx))
         .child(widgets::divider_h())
         .child(action("lane-audio-track", Icon::Waveform, "Insert Audio Track", keys::action_hint("AddAudioTrack"), false, cx, |this, _, _| {
             this.s.add_track(TrackKind::Audio);

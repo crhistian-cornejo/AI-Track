@@ -245,17 +245,20 @@ impl History {
     }
 
     pub fn undo(&mut self, project: &mut Project) -> Result<bool, CommandError> {
-        let Some(mut t) = self.undo.pop() else { return Ok(false) };
+        let Some(t) = self.undo.last_mut() else { return Ok(false) };
+        // A batch is atomic: when it fails the project is untouched, and so is the step.
         Command::Batch { commands: t.backward.clone() }.apply(project)?;
         t.coalesce = None;
+        let t = self.undo.pop().expect("the step just undone");
         self.redo.push(t);
         self.revision += 1;
         Ok(true)
     }
 
     pub fn redo(&mut self, project: &mut Project) -> Result<bool, CommandError> {
-        let Some(t) = self.redo.pop() else { return Ok(false) };
+        let Some(t) = self.redo.last() else { return Ok(false) };
         Command::Batch { commands: t.forward.clone() }.apply(project)?;
+        let t = self.redo.pop().expect("the step just redone");
         self.undo.push(t);
         self.revision += 1;
         Ok(true)
@@ -339,6 +342,23 @@ mod tests {
         h.apply(&mut p, "Vol", Origin::User, vec![Command::SetTrack { id, change: TrackProp::VolumeDb(-3.0) }]).unwrap();
         assert!(h.undo(&mut p).unwrap());
         assert_eq!(p.track(id).unwrap().volume_db, 0.0);
+        assert!(h.redo(&mut p).unwrap());
+        assert_eq!(p.track(id).unwrap().volume_db, -3.0);
+    }
+
+    #[test]
+    fn a_failed_undo_or_redo_keeps_the_step() {
+        let (mut p, mut h, id) = setup();
+        h.apply(&mut p, "Vol", Origin::User, vec![Command::SetTrack { id, change: TrackProp::VolumeDb(-3.0) }]).unwrap();
+        // The track goes away behind the history's back: the step cannot apply now.
+        let mut gone = p.clone();
+        gone.tracks.retain(|t| t.id != id);
+        assert!(h.undo(&mut gone).is_err());
+        assert_eq!(h.undo_label(), Some("Vol"), "the step is still there to undo");
+        assert!(h.undo(&mut p).unwrap());
+        assert_eq!(p.track(id).unwrap().volume_db, 0.0);
+        assert!(h.redo(&mut gone).is_err());
+        assert_eq!(h.redo_label(), Some("Vol"), "the step is still there to redo");
         assert!(h.redo(&mut p).unwrap());
         assert_eq!(p.track(id).unwrap().volume_db, -3.0);
     }

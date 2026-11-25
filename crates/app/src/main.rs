@@ -30,6 +30,7 @@ mod motion;
 mod paint;
 mod plugin_prefs;
 mod project_io;
+mod rack_library;
 mod mixer_routing;
 mod real;
 mod session_edit;

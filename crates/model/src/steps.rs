@@ -287,8 +287,8 @@ pub fn render_notes(p: &mut Project, pattern: &StepPattern) -> Vec<Note> {
 /// The pattern a notes source plays as steps at `rate`: one row per key (high
 /// to low), each note snapped to the nearest step, rows as long as `span`
 /// at that rate. A step keeps the loudest note that landed on it; notes
-/// outside the span are dropped, and the steps never go past
-/// [`MAX_ROW_STEPS`] (a longer span is cut).
+/// outside the span are dropped, the steps never go past [`MAX_ROW_STEPS`]
+/// (a longer span is cut), and keys past the [`MAX_ROWS`] highest are dropped.
 pub fn pattern_from_notes(notes: &[Note], span: Tick, rate: StepRate) -> StepPattern {
     let step_ticks = rate.ticks();
     let length = ((span + step_ticks - 1) / step_ticks).clamp(1, Tick::from(MAX_ROW_STEPS)) as u16;
@@ -298,10 +298,11 @@ pub fn pattern_from_notes(notes: &[Note], span: Tick, rate: StepRate) -> StepPat
     keys.truncate(MAX_ROWS);
     let mut pattern = StepPattern { rows: keys.iter().map(|k| StepRow { length, rate, ..StepRow::new(*k) }).collect(), span };
     for n in notes.iter().filter(|n| !n.muted) {
-        let i = ((n.start as f64 / step_ticks as f64).round() as i64).max(0) as usize;
-        if i >= usize::from(length) || n.start >= span {
+        if n.start >= span {
             continue;
         }
+        // Rounded to the nearest step; the last half-step still belongs to the last one.
+        let i = ((n.start as f64 / step_ticks as f64).round() as i64).clamp(0, i64::from(length) - 1) as usize;
         let Some(r) = pattern.row_of(n.key) else { continue };
         pattern.rows[r].edit_step(i, |s| {
             if !s.on || n.velocity > s.velocity {
@@ -421,6 +422,13 @@ mod tests {
             r.edit_step(*i, |s| s.on = true);
         }
         r
+    }
+
+    #[test]
+    fn a_note_in_the_last_half_step_lands_on_the_last_step() {
+        let note = Note::new(NoteId(1), 36, 4 * PPQ - PPQ / 8, PPQ / 8, 0.8);
+        let pat = pattern_from_notes(&[note], 4 * PPQ, StepRate::Sixteenth);
+        assert!(pat.rows[0].steps.last().is_some_and(|s| s.on), "the note is kept, on step 16");
     }
 
     #[test]

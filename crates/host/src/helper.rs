@@ -39,6 +39,8 @@ pub fn take_alerts() -> Vec<String> {
     std::mem::take(&mut *ALERTS.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+// Only the macOS `NSAlert` replacement records alerts (and the tests, everywhere).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn record_alert(text: String) {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if !text.is_empty() {
